@@ -13,6 +13,6 @@ categories.workspace = true
 description = "A Rust library for controlling and orchestrating LLM interactions"
 
 [dependencies]
-neuromance-common = { path = "../neuromance-common" }
+neuromance-common = { version = "0.0.1", path = "../neuromance-common" }
 
 [dev-dependencies]
