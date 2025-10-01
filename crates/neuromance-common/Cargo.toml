@@ -1,0 +1,21 @@
+[package]
+name = "neuromance-common"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Common types and data structures for LLM conversation and tool management"
+
+[dependencies]
+anyhow = { workspace = true }
+typed-builder = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
