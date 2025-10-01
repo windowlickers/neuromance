@@ -1,0 +1,18 @@
+[package]
+name = "neuromance"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "A Rust library for controlling and orchestrating LLM interactions"
+
+[dependencies]
+neuromance-common = { path = "../neuromance-common" }
+
+[dev-dependencies]
