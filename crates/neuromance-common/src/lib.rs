@@ -21,8 +21,21 @@
 //! // Add a user message
 //! let msg = Message::user(conv.id, "What time is it?");
 //!
-//! // Define a tool
-//! let tool = Tool {
+//! // Define a tool using the builder pattern
+//! let tool = Tool::builder()
+//!     .function(Function {
+//!         name: "get_current_time".to_string(),
+//!         description: "Get the current date and time in UTC format. Takes no parameters.".to_string(),
+//!         parameters: serde_json::json!({
+//!             "type": "object",
+//!             "properties": {},
+//!             "required": [],
+//!         }),
+//!     })
+//!     .build();
+//!
+//! // Or using struct initialization (the r#type field defaults to "function")
+//! let tool_alt = Tool {
 //!     r#type: "function".to_string(),
 //!     function: Function {
 //!         name: "get_current_time".to_string(),
@@ -35,12 +48,23 @@
 //!     },
 //! };
 //!
-//! // Create a tool call
+//! // Create a tool call using the into() conversion
 //! let tool_call = ToolCall::new("get_current_time", Vec::<String>::new());
 //! ```
 
+/// Chat conversation and message types.
+///
+/// Provides types for managing conversations, messages, and message roles.
 pub mod chat;
+/// Client configuration and request/response types.
+///
+/// Contains types for configuring LLM clients and making chat completion requests.
+pub mod client;
+/// Tool calling and function execution types.
+///
+/// Provides types for defining and executing functions/tools that LLMs can call.
 pub mod tools;
 
 pub use chat::{Conversation, ConversationStatus, Message, MessageRole};
+pub use client::{ChatRequest, ChatResponse, Config, FinishReason, RetryConfig, ToolChoice, Usage};
 pub use tools::{Function, FunctionCall, Parameters, Property, Tool, ToolApproval, ToolCall};

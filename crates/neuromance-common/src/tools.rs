@@ -73,6 +73,27 @@ pub struct FunctionCall {
 }
 
 /// Represents a complete tool call from an LLM, including ID and function details.
+///
+/// # Note on Arguments Validation
+///
+/// When tool calls are created from API responses, the arguments in `function.arguments`
+/// are passed through as-is without validation. Users should validate and parse these
+/// arguments when executing tools:
+///
+/// ```rust,ignore
+/// use anyhow::{Context, Result};
+/// use serde::Deserialize;
+///
+/// #[derive(Deserialize)]
+/// struct ToolArgs {
+///     // Your tool-specific fields
+/// }
+///
+/// fn parse_tool_args(arguments: &str) -> Result<ToolArgs> {
+///     serde_json::from_str(arguments)
+///         .context("Failed to parse tool arguments")
+/// }
+/// ```
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct ToolCall {
     /// Unique identifier for this tool call
@@ -373,5 +394,167 @@ mod tests {
         let call2 = ToolCall::new("func", Vec::<String>::new());
 
         assert_ne!(call1.id, call2.id);
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn fuzz_tool_call_deserialization(data in prop::collection::vec(any::<u8>(), 0..1000)) {
+            // Should not panic on arbitrary bytes
+            let _ = serde_json::from_slice::<ToolCall>(&data);
+        }
+
+        #[test]
+        fn fuzz_function_call_with_arbitrary_args(
+            name in ".*",
+            args in prop::collection::vec(".*", 0..10),
+        ) {
+            let call = FunctionCall {
+                name: name.clone(),
+                arguments: args.clone(),
+            };
+
+            // Should serialize and deserialize
+            let json = serde_json::to_string(&call).unwrap();
+            let parsed: FunctionCall = serde_json::from_str(&json).unwrap();
+            assert_eq!(call.name, parsed.name);
+            assert_eq!(call.arguments, parsed.arguments);
+        }
+
+        #[test]
+        fn fuzz_tool_call_new_with_special_chars(
+            func_name in r#"[a-zA-Z0-9_\-\.]{1,50}"#,
+            args in prop::collection::vec(r#"[\\x00-\\x7F]*"#, 0..5),
+        ) {
+            let call = ToolCall::new(func_name.clone(), args.clone());
+
+            assert_eq!(call.function.name, func_name);
+            assert_eq!(call.function.arguments, args);
+            assert_eq!(call.call_type, "function");
+            assert!(!call.id.is_empty());
+        }
+
+        #[test]
+        fn fuzz_tool_deserialization(data in prop::collection::vec(any::<u8>(), 0..1000)) {
+            // Should not panic on arbitrary bytes
+            let _ = serde_json::from_slice::<Tool>(&data);
+        }
+
+        #[test]
+        fn fuzz_function_with_arbitrary_json_params(
+            name in ".*",
+            description in ".*",
+        ) {
+            // Create various JSON parameter structures
+            let params_variants = vec![
+                serde_json::json!({}),
+                serde_json::json!({"type": "object"}),
+                serde_json::json!({"type": "object", "properties": {}, "required": []}),
+                serde_json::json!(null),
+                serde_json::json!([]),
+                serde_json::json!("string"),
+            ];
+
+            for params in params_variants {
+                let func = Function {
+                    name: name.clone(),
+                    description: description.clone(),
+                    parameters: params.clone(),
+                };
+
+                // Should serialize and deserialize
+                let json = serde_json::to_string(&func).unwrap();
+                let parsed: Function = serde_json::from_str(&json).unwrap();
+                assert_eq!(func.name, parsed.name);
+                assert_eq!(func.description, parsed.description);
+            }
+        }
+
+        #[test]
+        fn fuzz_parameters_with_arbitrary_properties(
+            num_props in 0usize..10,
+        ) {
+            let mut properties = HashMap::new();
+
+            for i in 0..num_props {
+                properties.insert(
+                    format!("prop_{}", i),
+                    Property {
+                        prop_type: format!("type_{}", i % 3),
+                        description: format!("desc_{}", i),
+                    },
+                );
+            }
+
+            let params = Parameters {
+                param_type: "object".to_string(),
+                properties: properties.clone(),
+                required: (0..num_props).map(|i| format!("prop_{}", i)).collect(),
+            };
+
+            // Should serialize and deserialize
+            let json = serde_json::to_string(&params).unwrap();
+            let parsed: Parameters = serde_json::from_str(&json).unwrap();
+            assert_eq!(params.param_type, parsed.param_type);
+            assert_eq!(params.properties.len(), parsed.properties.len());
+            assert_eq!(params.required, parsed.required);
+        }
+
+        #[test]
+        fn fuzz_tool_approval_serialization(
+            approval_type in 0usize..3,
+            reason in ".*",
+        ) {
+            let approval = match approval_type {
+                0 => ToolApproval::Approved,
+                1 => ToolApproval::Denied(reason),
+                _ => ToolApproval::Quit,
+            };
+
+            // Should serialize and deserialize
+            let json = serde_json::to_string(&approval).unwrap();
+            let parsed: ToolApproval = serde_json::from_str(&json).unwrap();
+            assert_eq!(approval, parsed);
+        }
+
+        #[test]
+        fn fuzz_tool_call_with_malformed_json_args(
+            func_name in ".*",
+            num_args in 0usize..10,
+        ) {
+            // Generate various potentially malformed JSON strings
+            let malformed_jsons = vec![
+                "{",
+                "}",
+                "[",
+                "]",
+                "null",
+                "undefined",
+                r#"{"incomplete": "#,
+                r#"{"key": "value"}"#,
+                "",
+                "   ",
+            ];
+
+            let args: Vec<String> = (0..num_args)
+                .map(|i| malformed_jsons[i % malformed_jsons.len()].to_string())
+                .collect();
+
+            let call = ToolCall::new(func_name.clone(), args.clone());
+
+            // Should create the call even with malformed JSON args
+            assert_eq!(call.function.name, func_name);
+            assert_eq!(call.function.arguments, args);
+
+            // Should serialize and deserialize the ToolCall itself
+            let json = serde_json::to_string(&call).unwrap();
+            let parsed: ToolCall = serde_json::from_str(&json).unwrap();
+            assert_eq!(call.function.arguments, parsed.function.arguments);
+        }
     }
 }

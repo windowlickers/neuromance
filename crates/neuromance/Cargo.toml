@@ -14,5 +14,6 @@ description = "A Rust library for controlling and orchestrating LLM interactions
 
 [dependencies]
 neuromance-common = { version = "0.0.1", path = "../neuromance-common" }
+neuromance-client = { version = "0.0.1", path = "../neuromance-client" }
 
 [dev-dependencies]
