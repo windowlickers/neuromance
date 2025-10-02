@@ -1,0 +1,1125 @@
+//! OpenAI-compatible client implementation.
+//!
+//! This module provides a client for interacting with OpenAI and OpenAI-compatible APIs.
+//!
+//! # Features
+//!
+//! - **Chat Completions**: Implementation of the Chat completions API
+//! - **Tool/Function Calling**: Support for function calling and tool use
+//! - **Automatic Retries**: Configurable exponential backoff with jitter for transient failures
+//! - **Secure API Keys**: Uses the `secrecy` crate to prevent accidental exposure
+//!
+//! # Examples
+//!
+//! ## Basic Chat Completion
+//!
+//! ```no_run
+//! use neuromance_client::{OpenAIClient, LLMClient};
+//! use neuromance_common::client::{Config, ChatRequest};
+//! use neuromance_common::chat::Conversation;
+//!
+//! # async fn example() -> anyhow::Result<()> {
+//! // Configure the client
+//! let config = Config::new("openai", "gpt-4")
+//!     .with_api_key("sk-...")
+//!     .with_base_url("https://api.openai.com/v1");
+//!
+//! let client = OpenAIClient::new(config)?;
+//!
+//! // Create a conversation and add messages
+//! let mut conversation = Conversation::new()
+//!     .with_title("Example Chat");
+//!
+//! conversation.add_message(
+//!     conversation.system_message("You are a helpful assistant")
+//! )?;
+//!
+//! conversation.add_message(
+//!     conversation.user_message("Hello!")
+//! )?;
+//!
+//! // Send the chat request
+//! let request = ChatRequest::new(conversation.get_messages().to_vec());
+//! let response = client.chat(request).await?;
+//!
+//! println!("Response: {}", response.message.content);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Using Custom Retry Configuration
+//!
+//! ```no_run
+//! use neuromance_client::OpenAIClient;
+//! use neuromance_common::client::{Config, RetryConfig};
+//! use std::time::Duration;
+//!
+//! # fn example() -> anyhow::Result<()> {
+//! let retry_config = RetryConfig {
+//!     max_retries: 5,
+//!     initial_delay: Duration::from_millis(500),
+//!     max_delay: Duration::from_secs(60),
+//!     backoff_multiplier: 2.0,
+//!     jitter: true,
+//! };
+//!
+//! let config = Config::new("openai", "gpt-4")
+//!     .with_api_key("sk-...")
+//!     .with_retry_config(retry_config);
+//!
+//! let client = OpenAIClient::new(config)?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Message Builder Pattern
+//!
+//! The module provides a type-safe builder for constructing OpenAI messages:
+//!
+//! ```
+//! use neuromance_client::openai::OpenAIMessage;
+//! use neuromance_common::chat::MessageRole;
+//!
+//! let message = OpenAIMessage::builder()
+//!     .role(MessageRole::User)
+//!     .content(Some("Hello, GPT!".to_string()))
+//!     .build();
+//! ```
+//!
+//! # Error Handling
+//!
+//! The client handles various error scenarios:
+//!
+//! - **Authentication errors (401)**: Invalid or missing API keys
+//! - **Rate limiting (429)**: Automatic retry with exponential backoff
+//! - **Server errors (5xx)**: Transient failures with configurable retries
+//! - **Invalid responses**: Missing or malformed response data
+//!
+//! # Security
+//!
+//! API keys are stored using the `secrecy` crate, which:
+//! - Prevents accidental logging or display of sensitive data
+//! - Zeros memory on drop to minimize exposure window
+//! - Requires explicit `expose_secret()` calls for access
+
+use std::collections::HashMap;
+use std::marker::PhantomData;
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Result;
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use log::{debug, error, warn};
+use reqwest_middleware::ClientWithMiddleware;
+use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};
+use reqwest_retry_after::RetryAfterMiddleware;
+use secrecy::{ExposeSecret, SecretString};
+use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
+
+use neuromance_common::chat::Message;
+use neuromance_common::client::{ChatRequest, ChatResponse, Config, Usage};
+use neuromance_common::tools::{FunctionCall, ToolCall};
+
+use crate::error::{ClientError, ErrorResponse};
+use crate::openai::{ChatCompletionRequest, ChatCompletionResponse, OpenAIMessage};
+use crate::LLMClient;
+
+/// Type-state marker types for compile-time validation.
+///
+/// These types are used to enforce correct message construction at compile time
+/// using the type-state pattern.
+mod builder_states {
+    /// Initial builder state before a role is set.
+    pub struct NoRole;
+    /// Builder state after a role has been set.
+    pub struct HasRole;
+}
+
+/// Builder for constructing OpenAI messages with compile-time validation.
+///
+/// Uses the type-state pattern to ensure messages are built correctly:
+/// - Messages must have a role set before being built
+/// - Invalid state transitions are prevented at compile time
+///
+/// # Examples
+///
+/// ```
+/// use neuromance_client::openai::OpenAIMessage;
+/// use neuromance_common::chat::MessageRole;
+///
+/// // Valid: role is set
+/// let message = OpenAIMessage::builder()
+///     .role(MessageRole::User)
+///     .content(Some("Hello".to_string()))
+///     .build();
+/// ```
+pub struct OpenAIMessageBuilder<State> {
+    _state: PhantomData<State>,
+    role: Option<neuromance_common::chat::MessageRole>,
+    content: Option<String>,
+    name: Option<String>,
+    tool_calls: Option<SmallVec<[crate::openai::OpenAIToolCall; 2]>>,
+    tool_call_id: Option<String>,
+}
+
+impl OpenAIMessageBuilder<builder_states::NoRole> {
+    /// Creates a new message builder in the initial state.
+    ///
+    /// The builder starts in `NoRole` state and requires calling `role()`
+    /// before `build()` can be called.
+    pub fn new() -> Self {
+        Self {
+            _state: PhantomData,
+            role: None,
+            content: None,
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    /// Sets the message role and transitions to `HasRole` state.
+    ///
+    /// This is the only transition from `NoRole` to `HasRole` state,
+    /// enforcing that every message must have a role.
+    ///
+    /// # Arguments
+    ///
+    /// * `role` - The message role (User, Assistant, System, or Tool)
+    pub fn role(
+        self,
+        role: neuromance_common::chat::MessageRole,
+    ) -> OpenAIMessageBuilder<builder_states::HasRole> {
+        OpenAIMessageBuilder {
+            _state: PhantomData,
+            role: Some(role),
+            content: self.content,
+            name: self.name,
+            tool_calls: self.tool_calls,
+            tool_call_id: self.tool_call_id,
+        }
+    }
+}
+
+impl OpenAIMessageBuilder<builder_states::HasRole> {
+    /// Sets the message content.
+    ///
+    /// # Arguments
+    ///
+    /// * `content` - The text content of the message
+    pub fn content(mut self, content: impl Into<String>) -> Self {
+        self.content = Some(content.into());
+        self
+    }
+
+    /// Sets the message name (optional author identifier).
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The name of the message author
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// Sets the tool calls for this message.
+    ///
+    /// Used when the assistant wants to call functions/tools.
+    ///
+    /// # Arguments
+    ///
+    /// * `tool_calls` - Vector of tool calls to execute
+    pub fn tool_calls(mut self, tool_calls: SmallVec<[crate::openai::OpenAIToolCall; 2]>) -> Self {
+        self.tool_calls = Some(tool_calls);
+        self
+    }
+
+    /// Sets the tool call ID for tool response messages.
+    ///
+    /// Used when this message is a response to a tool call.
+    ///
+    /// # Arguments
+    ///
+    /// * `tool_call_id` - The ID of the tool call this message responds to
+    pub fn tool_call_id(mut self, tool_call_id: impl Into<String>) -> Self {
+        self.tool_call_id = Some(tool_call_id.into());
+        self
+    }
+
+    /// Builds the OpenAI message.
+    ///
+    /// Only available in `HasRole` state, ensuring the role is always set.
+    pub fn build(self) -> OpenAIMessage {
+        OpenAIMessage {
+            role: self.role.expect("Role must be set"),
+            content: self.content,
+            name: self.name,
+            tool_calls: self.tool_calls,
+            tool_call_id: self.tool_call_id,
+        }
+    }
+}
+
+impl Default for OpenAIMessageBuilder<builder_states::NoRole> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Client for OpenAI-compatible APIs.
+///
+/// Supports chat completions with tool/function calling for any API
+/// that implements the OpenAI chat completions specification.
+///
+/// # Security
+///
+/// The API key is stored using the `secrecy` crate to prevent accidental
+/// exposure through debug logs or memory dumps. `SecretString` automatically
+/// zeroes memory when dropped via zeroize.
+#[derive(Clone)]
+pub struct OpenAIClient {
+    client: ClientWithMiddleware,
+    api_key: SecretString,
+    base_url: String,
+    config: Arc<Config>,
+}
+
+// Custom Debug implementation to avoid exposing API key
+impl std::fmt::Debug for OpenAIClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenAIClient")
+            .field("api_key", &"[REDACTED]")
+            .field("base_url", &self.base_url)
+            .field("config", &self.config)
+            .finish()
+    }
+}
+
+impl OpenAIClient {
+    /// Create a new OpenAI client from a configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Client configuration including API key and base URL
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use neuromance_client::OpenAIClient;
+    /// use neuromance_common::client::Config;
+    ///
+    /// let config = Config::new("openai", "gpt-4")
+    ///     .with_api_key("sk-...")
+    ///     .with_base_url("https://api.openai.com/v1");
+    ///
+    /// let client = OpenAIClient::new(config)?;
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    pub fn new(config: Config) -> Result<Self> {
+        let api_key = config
+            .api_key
+            .clone()
+            .ok_or_else(|| ClientError::ConfigurationError("API key is required".to_string()))?;
+        let base_url = config
+            .base_url
+            .clone()
+            .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+
+        // Build retry policy from config
+        let retry_policy = ExponentialBackoff::builder()
+            .retry_bounds(
+                config.retry_config.initial_delay,
+                config.retry_config.max_delay,
+            )
+            .build_with_max_retries(config.retry_config.max_retries as u32);
+
+        // Create reqwest client with timeout configuration
+        // None means no timeout (useful for slow hardware/long-running requests)
+        let reqwest_client = match config.timeout_seconds {
+            Some(timeout) => reqwest::Client::builder()
+                .timeout(Duration::from_secs(timeout))
+                .build()?,
+            None => reqwest::Client::builder().build()?,
+        };
+
+        // Create client with retry middleware
+        // NOTE: RetryAfterMiddleware should be added before RetryTransientMiddleware
+        // so that Retry-After headers are respected before falling back to exponential backoff
+        let client = reqwest_middleware::ClientBuilder::new(reqwest_client)
+            .with(RetryAfterMiddleware::new())
+            .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+            .build();
+
+        Ok(Self {
+            client,
+            api_key,
+            base_url,
+            config: Arc::new(config),
+        })
+    }
+
+    /// Set a custom base URL for the API endpoint.
+    ///
+    /// Useful for connecting to OpenAI-compatible services like Azure OpenAI,
+    /// local models, or proxy servers.
+    ///
+    /// # Arguments
+    ///
+    /// * `base_url` - The base URL (e.g., `https://api.openai.com/v1`)
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        let base_url = base_url.into();
+        Arc::make_mut(&mut self.config).base_url = Some(base_url.clone());
+        self.base_url = base_url;
+        self
+    }
+
+    /// Set the model to use for chat completions.
+    ///
+    /// # Arguments
+    ///
+    /// * `model` - The model name (e.g., "gpt-4", "gpt-3.5-turbo")
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        Arc::make_mut(&mut self.config).model = model.into();
+        self
+    }
+
+    async fn make_request<T: for<'de> Deserialize<'de>>(
+        &self,
+        endpoint: &str,
+        body: &impl Serialize,
+    ) -> Result<T, ClientError> {
+        let url = format!("{}/{}", self.base_url, endpoint);
+
+        // Validate URL construction
+        reqwest::Url::parse(&url).map_err(|e| {
+            ClientError::ConfigurationError(format!("Invalid URL '{}': {}", url, e))
+        })?;
+
+        let response = self
+            .client
+            .post(&url)
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.api_key.expose_secret()),
+            )
+            .header("Content-Type", "application/json")
+            .body(serde_json::to_string(body).map_err(ClientError::SerializationError)?)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await.map_err(|e| {
+                warn!("Failed to read error response body: {}", e);
+                ClientError::NetworkError(e)
+            })?;
+
+            // Extract the error message from structured response or use raw text
+            let error_message = match serde_json::from_str::<ErrorResponse>(&error_text) {
+                Ok(parsed) => {
+                    debug!("Parsed structured error response");
+                    parsed.error.message
+                }
+                Err(parse_err) => {
+                    debug!(
+                        "Failed to parse error response as JSON: {}. Using raw text instead.",
+                        parse_err
+                    );
+                    error_text
+                }
+            };
+
+            error!(
+                "API request failed with status {}: {}",
+                status.as_u16(),
+                error_message
+            );
+
+            return Err(match status.as_u16() {
+                401 => ClientError::AuthenticationError(error_message),
+                429 => ClientError::RateLimitError { retry_after: None },
+                _ => ClientError::ModelError(error_message),
+            });
+        }
+
+        let response_text = response.text().await?;
+        let parsed_response: T =
+            serde_json::from_str(&response_text).map_err(ClientError::SerializationError)?;
+
+        Ok(parsed_response)
+    }
+
+    /// Convert an OpenAI message to our internal message format.
+    ///
+    /// # Note on Tool Arguments
+    ///
+    /// This method does not validate the JSON structure of tool call arguments.
+    /// The arguments come directly from the API response and are passed through as-is.
+    /// Users should validate and parse these arguments when executing tools:
+    ///
+    /// ```rust,ignore
+    /// use anyhow::{Context, Result};
+    /// use serde::Deserialize;
+    ///
+    /// #[derive(Deserialize)]
+    /// struct ToolArgs {
+    ///     // Your tool-specific fields
+    /// }
+    ///
+    /// fn parse_tool_args(arguments: &str) -> Result<ToolArgs> {
+    ///     serde_json::from_str(arguments)
+    ///         .context("Failed to parse tool arguments")
+    /// }
+    /// ```
+    fn convert_openai_message_to_message(
+        &self,
+        openai_msg: &OpenAIMessage,
+        conversation_id: uuid::Uuid,
+    ) -> Message {
+        let role = openai_msg.role;
+
+        let tool_calls = openai_msg
+            .tool_calls
+            .as_ref()
+            .map(|tcs| {
+                tcs.iter()
+                    .map(|tc| ToolCall {
+                        id: tc.id.to_string(),
+                        call_type: tc.r#type.to_string(),
+                        function: FunctionCall {
+                            name: tc.function.name.to_string(),
+                            // OpenAI returns a single JSON string; wrap it in a Vec for our FunctionCall type
+                            // NOTE: We don't validate the JSON here - validation should happen at tool execution time
+                            arguments: if tc.function.arguments.is_empty() {
+                                vec![]
+                            } else {
+                                vec![tc.function.arguments.to_string()]
+                            },
+                        },
+                    })
+                    .collect::<SmallVec<_>>()
+            })
+            .unwrap_or_default();
+
+        Message {
+            id: uuid::Uuid::new_v4(),
+            conversation_id,
+            role,
+            content: openai_msg.content.clone().unwrap_or_default(),
+            tool_calls,
+            tool_call_id: openai_msg.tool_call_id.clone(),
+            name: openai_msg.name.clone(),
+            timestamp: Utc::now(),
+            metadata: HashMap::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl LLMClient for OpenAIClient {
+    fn config(&self) -> &Config {
+        &self.config
+    }
+
+    fn supports_tools(&self) -> bool {
+        true
+    }
+
+    fn supports_streaming(&self) -> bool {
+        false
+    }
+
+    async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
+        self.validate_request(&request)?;
+
+        let mut openai_request = ChatCompletionRequest::from((&request, self.config.as_ref()));
+        openai_request.stream = Some(false);
+
+        let response: ChatCompletionResponse = self
+            .make_request("chat/completions", &openai_request)
+            .await?;
+
+        // Validate response has at least one choice
+        let choice = response.choices.first().ok_or_else(|| {
+            warn!(
+                "Received empty choices array from API. Response ID: {}, Model: {}",
+                response.id, response.model
+            );
+            ClientError::InvalidResponse("API returned no choices in response".to_string())
+        })?;
+
+        // Get conversation_id from first message (validated earlier, but handle defensively)
+        let conversation_id = request
+            .messages
+            .first()
+            .ok_or_else(|| {
+                error!("Request has no messages despite passing validation");
+                ClientError::InvalidRequest("Request must contain at least one message".to_string())
+            })?
+            .conversation_id;
+
+        let message = self.convert_openai_message_to_message(&choice.message, conversation_id);
+
+        let finish_reason = choice
+            .finish_reason
+            .as_ref()
+            .and_then(|reason| reason.parse().ok());
+
+        let usage = response.usage.map(|u| Usage {
+            prompt_tokens: u.prompt_tokens,
+            completion_tokens: u.completion_tokens,
+            total_tokens: u.total_tokens,
+            cost: None,
+            input_tokens_details: u.input_tokens_details,
+            output_tokens_details: u.output_tokens_details,
+        });
+
+        Ok(ChatResponse {
+            message,
+            model: response.model,
+            usage,
+            finish_reason,
+            created_at: DateTime::from_timestamp(response.created as i64, 0)
+                .unwrap_or_else(Utc::now),
+            response_id: Some(response.id),
+            metadata: HashMap::new(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use neuromance_common::chat::{Message, MessageRole};
+    use neuromance_common::client::FinishReason;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn create_test_config(base_url: &str) -> Config {
+        Config::new("openai", "gpt-4")
+            .with_api_key("test-key")
+            .with_base_url(base_url)
+    }
+
+    fn create_test_message() -> Message {
+        Message {
+            id: uuid::Uuid::new_v4(),
+            conversation_id: uuid::Uuid::new_v4(),
+            role: MessageRole::User,
+            content: "Hello".to_string(),
+            tool_calls: SmallVec::new(),
+            tool_call_id: None,
+            name: None,
+            timestamp: Utc::now(),
+            metadata: HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_successful_chat_completion() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header("authorization", "Bearer test-key"))
+            .and(header("content-type", "application/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "chatcmpl-123",
+                "object": "chat.completion",
+                "created": 1677652288,
+                "model": "gpt-4",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "Hello! How can I help you today?"
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 20,
+                    "total_tokens": 30
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let client = OpenAIClient::new(config).unwrap();
+
+        let message = create_test_message();
+        let request = ChatRequest::new(vec![message]);
+
+        let response = client.chat(request).await.unwrap();
+
+        assert_eq!(response.model, "gpt-4");
+        assert_eq!(response.message.content, "Hello! How can I help you today?");
+        assert_eq!(response.message.role, MessageRole::Assistant);
+        assert_eq!(response.finish_reason, Some(FinishReason::Stop));
+
+        let usage = response.usage.unwrap();
+        assert_eq!(usage.prompt_tokens, 10);
+        assert_eq!(usage.completion_tokens, 20);
+        assert_eq!(usage.total_tokens, 30);
+    }
+
+    #[tokio::test]
+    async fn test_chat_completion_with_different_finish_reasons() {
+        let test_cases = vec![
+            ("stop", FinishReason::Stop),
+            ("length", FinishReason::Length),
+            ("tool_calls", FinishReason::ToolCalls),
+            ("content_filter", FinishReason::ContentFilter),
+        ];
+
+        for (reason_str, expected_reason) in test_cases {
+            let mock_server = MockServer::start().await;
+
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "chatcmpl-123",
+                    "object": "chat.completion",
+                    "created": 1677652288,
+                    "model": "gpt-4",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "Test response"
+                        },
+                        "finish_reason": reason_str
+                    }]
+                })))
+                .mount(&mock_server)
+                .await;
+
+            let config = create_test_config(&mock_server.uri());
+            let client = OpenAIClient::new(config).unwrap();
+
+            let message = create_test_message();
+            let request = ChatRequest::new(vec![message]);
+
+            let response = client.chat(request).await.unwrap();
+            assert_eq!(response.finish_reason, Some(expected_reason));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_unknown_finish_reason() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "chatcmpl-123",
+                "object": "chat.completion",
+                "created": 1677652288,
+                "model": "gpt-4",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "Test response"
+                    },
+                    "finish_reason": "unknown_reason"
+                }]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let client = OpenAIClient::new(config).unwrap();
+
+        let message = create_test_message();
+        let request = ChatRequest::new(vec![message]);
+
+        let response = client.chat(request).await.unwrap();
+        // Unknown finish reasons should parse as None (using and_then with parse().ok())
+        assert_eq!(response.finish_reason, None);
+    }
+
+    #[tokio::test]
+    async fn test_authentication_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "error": {
+                    "message": "Invalid API key",
+                    "type": "invalid_request_error",
+                    "code": "invalid_api_key"
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let client = OpenAIClient::new(config).unwrap();
+
+        let message = create_test_message();
+        let request = ChatRequest::new(vec![message]);
+
+        let result = client.chat(request).await;
+        assert!(result.is_err());
+
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("Invalid API key"));
+    }
+
+    #[tokio::test]
+    async fn test_rate_limit_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+                "error": {
+                    "message": "Rate limit exceeded",
+                    "type": "rate_limit_error"
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let client = OpenAIClient::new(config).unwrap();
+
+        let message = create_test_message();
+        let request = ChatRequest::new(vec![message]);
+
+        let result = client.chat(request).await;
+        assert!(result.is_err());
+
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("Rate limit"));
+    }
+
+    #[tokio::test]
+    async fn test_model_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "error": {
+                    "message": "Internal server error",
+                    "type": "server_error"
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let client = OpenAIClient::new(config).unwrap();
+
+        let message = create_test_message();
+        let request = ChatRequest::new(vec![message]);
+
+        let result = client.chat(request).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_empty_choices_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "chatcmpl-123",
+                "object": "chat.completion",
+                "created": 1677652288,
+                "model": "gpt-4",
+                "choices": []
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let client = OpenAIClient::new(config).unwrap();
+
+        let message = create_test_message();
+        let request = ChatRequest::new(vec![message]);
+
+        let result = client.chat(request).await;
+        assert!(result.is_err());
+
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("no choices"));
+    }
+
+    #[tokio::test]
+    async fn test_chat_completion_with_tool_calls() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "chatcmpl-123",
+                "object": "chat.completion",
+                "created": 1677652288,
+                "model": "gpt-4",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_abc123",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": "{\"location\":\"San Francisco\",\"unit\":\"celsius\"}"
+                            }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": {
+                    "prompt_tokens": 15,
+                    "completion_tokens": 25,
+                    "total_tokens": 40
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let client = OpenAIClient::new(config).unwrap();
+
+        let message = create_test_message();
+        let request = ChatRequest::new(vec![message]);
+
+        let response = client.chat(request).await.unwrap();
+
+        assert_eq!(response.finish_reason, Some(FinishReason::ToolCalls));
+        assert_eq!(response.message.tool_calls.len(), 1);
+
+        let tool_call = &response.message.tool_calls[0];
+        assert_eq!(tool_call.id, "call_abc123");
+        assert_eq!(tool_call.call_type, "function");
+        assert_eq!(tool_call.function.name, "get_weather");
+        assert_eq!(
+            tool_call.function.arguments[0],
+            "{\"location\":\"San Francisco\",\"unit\":\"celsius\"}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_chat_completion_with_usage_details() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "chatcmpl-123",
+                "object": "chat.completion",
+                "created": 1677652288,
+                "model": "gpt-4",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "Test response"
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 20,
+                    "total_tokens": 30,
+                    "input_tokens_details": {
+                        "cached_tokens": 5
+                    },
+                    "output_tokens_details": {
+                        "reasoning_tokens": 3
+                    }
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let client = OpenAIClient::new(config).unwrap();
+
+        let message = create_test_message();
+        let request = ChatRequest::new(vec![message]);
+
+        let response = client.chat(request).await.unwrap();
+
+        let usage = response.usage.unwrap();
+        assert_eq!(usage.prompt_tokens, 10);
+        assert_eq!(usage.completion_tokens, 20);
+        assert_eq!(usage.total_tokens, 30);
+
+        let input_details = usage.input_tokens_details.unwrap();
+        assert_eq!(input_details.cached_tokens, 5);
+
+        let output_details = usage.output_tokens_details.unwrap();
+        assert_eq!(output_details.reasoning_tokens, 3);
+    }
+}
+
+#[cfg(test)]
+mod fuzz_tests {
+    use crate::openai::{ChatCompletionResponse, OpenAIMessage};
+    use neuromance_common::chat::MessageRole;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn fuzz_openai_response_parsing(data in prop::collection::vec(any::<u8>(), 0..1000)) {
+            // Should not panic on malformed responses
+            let _ = serde_json::from_slice::<ChatCompletionResponse>(&data);
+        }
+
+        #[test]
+        fn fuzz_openai_message_parsing(data in prop::collection::vec(any::<u8>(), 0..1000)) {
+            // Should not panic on malformed message data
+            let _ = serde_json::from_slice::<OpenAIMessage>(&data);
+        }
+
+        #[test]
+        fn fuzz_openai_response_with_invalid_fields(
+            id_str in ".*",
+            model_str in ".*",
+            created_val in any::<u64>(),
+        ) {
+            // Create various malformed response JSON
+            let json_variants = vec![
+                format!(r#"{{"id":"{}","object":"chat.completion","created":{},"model":"{}","choices":[]}}"#,
+                    id_str, created_val, model_str),
+                r#"{"choices":[]}"#.to_string(),
+                r#"{"id":"test","choices":null}"#.to_string(),
+                format!(r#"{{"id":"{}","created":{},"model":"{}"}}"#, id_str, created_val, model_str),
+            ];
+
+            for json in json_variants {
+                let _ = serde_json::from_str::<ChatCompletionResponse>(&json);
+            }
+        }
+
+        #[test]
+        fn fuzz_openai_message_with_missing_fields(
+            role_idx in 0usize..4,
+            content in prop::option::of(".*"),
+        ) {
+            let role_str = match role_idx {
+                0 => "user",
+                1 => "assistant",
+                2 => "system",
+                _ => "tool",
+            };
+
+            let json = if let Some(c) = content {
+                let escaped = c.replace('\\', "\\\\").replace('"', "\\\"");
+                format!(r#"{{"role":"{}","content":"{}"}}"#, role_str, escaped)
+            } else {
+                format!(r#"{{"role":"{}"}}"#, role_str)
+            };
+
+            let _ = serde_json::from_str::<OpenAIMessage>(&json);
+        }
+
+        #[test]
+        fn fuzz_openai_message_with_tool_calls(
+            num_tool_calls in 0usize..5,
+        ) {
+            let mut tool_calls_json = Vec::new();
+            for i in 0..num_tool_calls {
+                tool_calls_json.push(format!(
+                    r#"{{"id":"call_{}","type":"function","function":{{"name":"func_{}","arguments":"{{}}"}}}}"#,
+                    i, i
+                ));
+            }
+
+            let json = if num_tool_calls > 0 {
+                format!(
+                    r#"{{"role":"assistant","content":null,"tool_calls":[{}]}}"#,
+                    tool_calls_json.join(",")
+                )
+            } else {
+                r#"{"role":"assistant","content":"test"}"#.to_string()
+            };
+
+            let result = serde_json::from_str::<OpenAIMessage>(&json);
+            if result.is_ok() {
+                let msg = result.unwrap();
+                assert_eq!(msg.role, MessageRole::Assistant);
+            }
+        }
+
+        #[test]
+        fn fuzz_chat_completion_with_extreme_values(
+            created_timestamp in any::<u64>(),
+            num_choices in 0usize..10,
+        ) {
+            let choices: Vec<String> = (0..num_choices)
+                .map(|i| format!(
+                    r#"{{"index":{},"message":{{"role":"assistant","content":"Response {}"}},"finish_reason":"stop"}}"#,
+                    i, i
+                ))
+                .collect();
+
+            let json = format!(
+                r#"{{"id":"test","object":"chat.completion","created":{},"model":"gpt-4","choices":[{}]}}"#,
+                created_timestamp,
+                choices.join(",")
+            );
+
+            let result = serde_json::from_str::<ChatCompletionResponse>(&json);
+            if result.is_ok() {
+                let response = result.unwrap();
+                assert_eq!(response.choices.len(), num_choices);
+                assert_eq!(response.created, created_timestamp);
+            }
+        }
+
+        #[test]
+        fn fuzz_openai_function_arguments(
+            func_name in ".*",
+            args_json in ".*",
+        ) {
+            let json = format!(
+                r#"{{"name":"{}","arguments":"{}"}}"#,
+                func_name.replace('\\', "\\\\").replace('"', "\\\""),
+                args_json.replace('\\', "\\\\").replace('"', "\\\"")
+            );
+
+            let _ = serde_json::from_str::<crate::openai::OpenAIFunction>(&json);
+        }
+
+        #[test]
+        fn fuzz_response_with_usage_details(
+            prompt_tokens in 0u32..100000,
+            completion_tokens in 0u32..100000,
+        ) {
+            let total = prompt_tokens + completion_tokens;
+            let json = format!(
+                r#"{{
+                    "id":"test",
+                    "object":"chat.completion",
+                    "created":1234567890,
+                    "model":"gpt-4",
+                    "choices":[{{"index":0,"message":{{"role":"assistant","content":"test"}},"finish_reason":"stop"}}],
+                    "usage":{{"prompt_tokens":{},"completion_tokens":{},"total_tokens":{}}}
+                }}"#,
+                prompt_tokens, completion_tokens, total
+            );
+
+            let result = serde_json::from_str::<ChatCompletionResponse>(&json);
+            if result.is_ok() {
+                let response = result.unwrap();
+                let usage = response.usage.unwrap();
+                assert_eq!(usage.prompt_tokens, prompt_tokens);
+                assert_eq!(usage.completion_tokens, completion_tokens);
+                assert_eq!(usage.total_tokens, total);
+            }
+        }
+    }
+}

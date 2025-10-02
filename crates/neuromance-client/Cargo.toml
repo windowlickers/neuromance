@@ -1,0 +1,44 @@
+[package]
+name = "neuromance-client"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "A Rust client library for interacting with LLM inference providers"
+
+[dependencies]
+tokio.workspace = true
+anyhow.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+reqwest-middleware.workspace = true
+reqwest-retry.workspace = true
+reqwest-retry-after.workspace = true
+typed-builder.workspace = true
+log.workspace = true
+secrecy.workspace = true
+smallvec.workspace = true
+
+neuromance-common = { version = "0.0.1", path = "../neuromance-common" }
+
+[dev-dependencies]
+clap = { version = "4.0", features = ["derive", "env"] }
+log.workspace = true
+env_logger.workspace = true
+chrono-tz.workspace = true
+once_cell = "1.19"
+wiremock = "0.6"
+proptest = "1.4"
+
