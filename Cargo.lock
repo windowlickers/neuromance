@@ -1025,7 +1025,7 @@ dependencies = [
 
 [[package]]
 name = "neuromance"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "neuromance-client",
  "neuromance-common",
@@ -1033,7 +1033,7 @@ dependencies = [
 
 [[package]]
 name = "neuromance-client"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1063,7 +1063,7 @@ dependencies = [
 
 [[package]]
 name = "neuromance-common"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "chrono",
