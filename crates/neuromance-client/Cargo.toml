@@ -15,6 +15,7 @@ description = "A Rust client library for interacting with LLM inference provider
 [dependencies]
 tokio.workspace = true
 anyhow.workspace = true
+futures.workspace = true
 futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -23,6 +24,7 @@ uuid.workspace = true
 chrono.workspace = true
 async-trait.workspace = true
 reqwest.workspace = true
+reqwest-eventsource.workspace = true
 reqwest-middleware.workspace = true
 reqwest-retry.workspace = true
 reqwest-retry-after.workspace = true
@@ -41,4 +43,9 @@ chrono-tz.workspace = true
 once_cell = "1.19"
 wiremock = "0.6"
 proptest = "1.4"
+criterion = "0.7"
+
+[[bench]]
+name = "streaming"
+harness = false
 

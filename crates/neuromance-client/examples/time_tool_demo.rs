@@ -179,7 +179,7 @@ async fn main() -> Result<()> {
     let start_time = Instant::now();
 
     // Send the chat request
-    let response = client.chat(request).await?;
+    let response = client.chat(&request).await?;
 
     info!("Response received!");
     info!("Model: {}", response.model);
@@ -234,7 +234,7 @@ async fn main() -> Result<()> {
         let pretty_request = serde_json::to_string_pretty(&follow_up_request.clone())?;
         debug!("\n{}", pretty_request);
 
-        let final_response = client.chat(follow_up_request).await?;
+        let final_response = client.chat(&follow_up_request).await?;
         info!("Final response:\n\n {}", final_response.message.content);
 
         if let Some(final_usage) = final_response.usage {

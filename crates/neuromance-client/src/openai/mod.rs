@@ -15,7 +15,7 @@ use neuromance_common::client::{ChatRequest, Config, Usage};
 use neuromance_common::tools::{FunctionCall, Tool, ToolCall};
 
 pub mod client;
-pub use client::OpenAIClient;
+pub use client::{OpenAIClient, convert_chunk_to_chat_chunk};
 
 /// A single choice from a chat completion response.
 ///
@@ -198,6 +198,13 @@ pub struct ChatCompletionRequest {
     /// Tool selection strategy (optional).
     #[builder(default)]
     pub tool_choice: Option<serde_json::Value>,
+    /// Whether to enable thinking mode (vendor-specific, optional).
+    #[builder(default)]
+    pub enable_thinking: Option<bool>,
+    /// Stream options for controlling streaming behavior (optional).
+    #[builder(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<serde_json::Value>,
 }
 
 /// Conversion from a generic `ChatRequest` to OpenAI-specific format.
@@ -229,6 +236,7 @@ impl From<(&ChatRequest, &Config)> for ChatCompletionRequest {
             .stream(Some(request.stream))
             .tools(tools)
             .tool_choice(request.tool_choice.as_ref().map(|tc| tc.clone().into()))
+            .enable_thinking(request.enable_thinking)
             .build()
     }
 }
@@ -275,6 +283,97 @@ pub struct ChatCompletionResponse {
     /// Array of generated completions (length equals `n` parameter).
     pub choices: Vec<ChatChoice>,
     /// Token usage statistics (if available).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+}
+
+/// A single choice from a streaming chat completion chunk.
+///
+/// Each chunk contains a delta with incremental updates to the message.
+#[derive(Debug, Deserialize)]
+pub struct ChatStreamChoice {
+    /// The index of this choice in the response array.
+    pub index: u32,
+    /// Incremental message delta for this chunk.
+    pub delta: OpenAIMessageDelta,
+    /// Why generation stopped (only present in final chunk).
+    pub finish_reason: Option<String>,
+}
+
+/// Delta representing incremental changes to a message.
+///
+/// Used in streaming responses to communicate partial updates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenAIMessageDelta {
+    /// The role (only present in first chunk).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<MessageRole>,
+    /// Incremental content added in this chunk.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    /// Incremental tool calls (for function calling).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<SmallVec<[OpenAIToolCallDelta; 2]>>,
+}
+
+/// Delta representing incremental changes to a tool call.
+///
+/// Tool calls may be built across multiple streaming chunks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenAIToolCallDelta {
+    /// Index of this tool call in the array.
+    pub index: u32,
+    /// Unique identifier (only present in first chunk for this tool call).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Type of tool call (only present in first chunk).
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<String>,
+    /// Incremental function call data.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function: Option<OpenAIFunctionDelta>,
+}
+
+/// Delta representing incremental changes to a function call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenAIFunctionDelta {
+    /// Function name (only present in first chunk).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Incremental arguments added in this chunk.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<String>,
+}
+
+/// Chunk from a streaming chat completion.
+///
+/// Each chunk represents an incremental update to the response.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use neuromance_client::openai::ChatCompletionChunk;
+/// # let chunk: ChatCompletionChunk = serde_json::from_str("{}").unwrap();
+/// // Process streaming delta
+/// if let Some(choice) = chunk.choices.first() {
+///     if let Some(content) = &choice.delta.content {
+///         print!("{}", content);
+///     }
+/// }
+/// ```
+#[derive(Debug, Deserialize)]
+pub struct ChatCompletionChunk {
+    /// Unique identifier for this completion stream.
+    pub id: String,
+    /// Object type, typically "chat.completion.chunk".
+    pub object: String,
+    /// Unix timestamp of when this chunk was created.
+    pub created: u64,
+    /// The model generating this stream.
+    pub model: String,
+    /// Array of delta choices.
+    pub choices: Vec<ChatStreamChoice>,
+    /// Token usage (only present in final chunk for some providers).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
 }

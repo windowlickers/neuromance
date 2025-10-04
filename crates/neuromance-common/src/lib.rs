@@ -65,6 +65,9 @@ pub mod client;
 /// Provides types for defining and executing functions/tools that LLMs can call.
 pub mod tools;
 
+pub mod agents;
+
+pub use agents::{AgentContext, AgentMemory, AgentMessage, AgentResponse, AgentState, AgentStats};
 pub use chat::{Conversation, ConversationStatus, Message, MessageRole};
 pub use client::{ChatRequest, ChatResponse, Config, FinishReason, RetryConfig, ToolChoice, Usage};
 pub use tools::{Function, FunctionCall, Parameters, Property, Tool, ToolApproval, ToolCall};
