@@ -31,4 +31,11 @@
 //! - **Tool Calling**: Define and execute function calls from LLM responses
 //! - **Serialization**: Full serde support for all types
 
+pub mod core;
+pub mod error;
+
+pub use neuromance_client::*;
 pub use neuromance_common::*;
+pub use neuromance_tools::*;
+
+pub use core::Core;

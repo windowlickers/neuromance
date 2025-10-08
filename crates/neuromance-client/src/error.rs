@@ -23,50 +23,6 @@ pub struct ErrorDetail {
     pub message: String,
 }
 
-/// Validation errors for message and request construction.
-///
-/// These errors indicate issues with the format or content of requests
-/// before they are sent to the API.
-#[derive(Debug, Error)]
-#[non_exhaustive]
-pub enum ValidationError {
-    /// Conversation ID validation failed.
-    ///
-    /// The provided conversation ID is empty, malformed, or invalid.
-    #[error("Invalid conversation ID")]
-    InvalidConversationId,
-
-    /// Message role is invalid.
-    ///
-    /// The role must be one of: user, assistant, system, or tool.
-    #[error("Invalid role")]
-    InvalidRole,
-
-    /// Message content validation failed.
-    ///
-    /// Content is empty, too long, or contains invalid characters.
-    #[error("Invalid content")]
-    InvalidContent,
-
-    /// Metadata format is invalid.
-    ///
-    /// Metadata must be valid JSON and meet size constraints.
-    #[error("Invalid metadata")]
-    InvalidMetadata,
-
-    /// Tool calls are malformed.
-    ///
-    /// Tool call structure doesn't match the expected format.
-    #[error("Invalid tool calls")]
-    InvalidToolCalls,
-
-    /// Tool call ID is missing or invalid.
-    ///
-    /// Tool responses must reference a valid tool call ID.
-    #[error("Invalid tool call ID")]
-    InvalidToolCallId,
-}
-
 /// Errors that can occur when interacting with LLM APIs.
 ///
 /// This enum covers all error conditions from network failures to API-specific
@@ -98,6 +54,10 @@ pub enum ClientError {
     /// The API key is missing, invalid, or revoked. Check your credentials.
     #[error("Authentication error: {0}")]
     AuthenticationError(String),
+
+    /// use reqwest_eventsource::{Error as EventSourceError};
+    #[error("EventSource error: {0}")]
+    EventSourceError(#[from] reqwest_eventsource::Error),
 
     /// Rate limit exceeded (HTTP 429).
     ///

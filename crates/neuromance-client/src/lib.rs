@@ -2,103 +2,74 @@
 //!
 //! Client library for interacting with LLM inference providers.
 //!
-//! This crate provides a unified interface for communicating with various LLM providers
-//! through the `LLMClient` trait. Currently supports:
-//! - OpenAI-compatible APIs
-//! - Tool/function calling
-//! - Non-streaming chat completions
-//!
-//! ## Example
-//!
-//! ```no_run
-//! use neuromance_client::{LLMClient, OpenAIClient};
-//! use neuromance_common::{Config, Message};
-//! use uuid::Uuid;
-//!
-//! # async fn example() -> anyhow::Result<()> {
-//! // Create a client configuration
-//! let config = Config::new("openai", "gpt-4")
-//!     .with_api_key("your-api-key")
-//!     .with_base_url("https://api.openai.com/v1");
-//!
-//! // Initialize the client
-//! let client = OpenAIClient::new(config)?;
-//!
-//! // Create a chat request
-//! let conversation_id = Uuid::new_v4();
-//! let message = Message::user(conversation_id, "Hello, world!");
-//! let request = (client.config().clone(), vec![message]).into();
-//!
-//! // Send the request
-//! let response = client.chat(request).await?;
-//! println!("Response: {}", response.message.content);
-//! # Ok(())
-//! # }
-//! ```
+//! Provides a unified `LLMClient` trait for various LLM providers. Currently supports
+//! OpenAI-compatible APIs with tool/function calling and streaming.
+
+use std::pin::Pin;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use futures::Stream;
 
+use neuromance_common::client::ChatChunk;
 use neuromance_common::{ChatRequest, ChatResponse, Config};
 
-pub mod error;
+mod error;
 pub mod openai;
 
 pub use error::ClientError;
 pub use openai::OpenAIClient;
 
+/// A retry policy for SSE streams that never retries.
+///
+/// Useful for handling retries at a higher level rather than automatic reconnection.
+pub struct NoRetryPolicy;
+
+impl reqwest_eventsource::retry::RetryPolicy for NoRetryPolicy {
+    fn retry(
+        &self,
+        _error: &reqwest_eventsource::Error,
+        _last_retry: Option<(usize, std::time::Duration)>,
+    ) -> Option<std::time::Duration> {
+        // Never retry - return None to indicate no retry should happen
+        None
+    }
+
+    fn set_reconnection_time(&mut self, _duration: std::time::Duration) {
+        // Ignored - we never retry anyway
+    }
+}
+
 /// Trait for LLM client implementations.
 ///
 /// Provides a unified interface for interacting with different LLM providers.
-/// Implementations must support async operations and be thread-safe (Send + Sync).
+/// Implementations must be async and thread-safe (Send + Sync).
 #[must_use = "LLMClient must be used to make requests"]
 #[async_trait]
 pub trait LLMClient: Send + Sync {
     /// Get the client's configuration.
-    ///
-    /// Returns a reference to the configuration used to initialize this client.
     fn config(&self) -> &Config;
 
     /// Send a chat completion request to the LLM.
+    async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse>;
+
+    /// Send a streaming chat completion request to the LLM.
     ///
-    /// # Arguments
-    ///
-    /// * `request` - The chat completion request containing messages and parameters
-    ///
-    /// # Returns
-    ///
-    /// A `ChatResponse` containing the model's reply, usage information, and metadata.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The request fails validation
-    /// - Network communication fails
-    /// - The API returns an error (authentication, rate limit, etc.)
-    /// - The response cannot be parsed
-    async fn chat(&self, request: ChatRequest) -> Result<ChatResponse>;
+    /// Returns a stream of incremental response chunks for real-time display.
+    async fn chat_stream(
+        &self,
+        request: &ChatRequest,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatChunk>> + Send>>>;
 
     /// Check if the client supports tool/function calling.
-    ///
-    /// Returns `true` if this client can handle requests with tools.
     fn supports_tools(&self) -> bool;
 
     /// Check if the client supports streaming responses.
-    ///
-    /// Returns `true` if this client can handle streaming chat completions.
-    /// Note: Streaming is not yet implemented.
     fn supports_streaming(&self) -> bool;
 
     /// Validate a configuration object.
     ///
-    /// Checks that configuration parameters are within valid ranges:
-    /// - `temperature`: 0.0 to 2.0
-    /// - `top_p`: 0.0 to 1.0
-    /// - `frequency_penalty`: -2.0 to 2.0
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if any parameter is out of range.
+    /// Checks parameter ranges: temperature (0.0-2.0), top_p (0.0-1.0), frequency_penalty (-2.0-2.0).
     fn validate_config(&self, config: Config) -> Result<()> {
         if config
             .temperature
@@ -123,14 +94,7 @@ pub trait LLMClient: Send + Sync {
 
     /// Validate a chat request before sending.
     ///
-    /// Checks that:
-    /// - At least one message is provided
-    /// - Tools are not used if the client doesn't support them
-    /// - Streaming is not requested if the client doesn't support it
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if validation fails.
+    /// Checks messages exist and that tools/streaming are supported if requested.
     fn validate_request(&self, request: &ChatRequest) -> Result<()> {
         request
             .validate_has_messages()
@@ -196,7 +160,7 @@ mod tests {
             &self.config
         }
 
-        async fn chat(&self, _request: ChatRequest) -> Result<ChatResponse> {
+        async fn chat(&self, _request: &ChatRequest) -> Result<ChatResponse> {
             Ok(ChatResponse {
                 message: create_test_message(),
                 model: "mock-model".to_string(),
@@ -206,6 +170,28 @@ mod tests {
                 response_id: Some("test-response".to_string()),
                 metadata: HashMap::new(),
             })
+        }
+
+        async fn chat_stream(
+            &self,
+            _request: &ChatRequest,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatChunk>> + Send>>> {
+            use futures::stream;
+
+            // Create a simple mock stream with one chunk
+            let chunk = ChatChunk {
+                model: "mock-model".to_string(),
+                delta_content: Some("Hello".to_string()),
+                delta_role: Some(neuromance_common::chat::MessageRole::Assistant),
+                delta_tool_calls: None,
+                finish_reason: None,
+                usage: None,
+                response_id: Some("test-response".to_string()),
+                created_at: chrono::Utc::now(),
+                metadata: HashMap::new(),
+            };
+
+            Ok(Box::pin(stream::iter(vec![Ok(chunk)])))
         }
 
         fn supports_tools(&self) -> bool {
@@ -253,7 +239,7 @@ mod tests {
         let client = MockLLMClient::new();
         let request = ChatRequest {
             model: Some("test-model".to_string()),
-            messages: vec![],
+            messages: vec![].into(),
             tools: None,
             tool_choice: None,
             temperature: None,
@@ -264,6 +250,7 @@ mod tests {
             stop: None,
             stream: false,
             user: None,
+            enable_thinking: None,
             metadata: HashMap::new(),
         };
 
@@ -279,7 +266,7 @@ mod tests {
         let client = MockLLMClient::new();
         let request = ChatRequest {
             model: Some("test-model".to_string()),
-            messages: vec![create_test_message()],
+            messages: vec![create_test_message()].into(),
             tools: None,
             tool_choice: None,
             temperature: None,
@@ -290,6 +277,7 @@ mod tests {
             stop: None,
             stream: false,
             user: None,
+            enable_thinking: None,
             metadata: HashMap::new(),
         };
 
@@ -302,7 +290,7 @@ mod tests {
         let client = MockLLMClient::without_tools();
         let request = ChatRequest {
             model: Some("test-model".to_string()),
-            messages: vec![create_test_message()],
+            messages: vec![create_test_message()].into(),
             tools: Some(vec![create_test_tool()]),
             tool_choice: None,
             temperature: None,
@@ -313,6 +301,7 @@ mod tests {
             stop: None,
             stream: false,
             user: None,
+            enable_thinking: None,
             metadata: HashMap::new(),
         };
 
@@ -328,7 +317,7 @@ mod tests {
         let client = MockLLMClient::new();
         let request = ChatRequest {
             model: Some("test-model".to_string()),
-            messages: vec![create_test_message()],
+            messages: vec![create_test_message()].into(),
             tools: Some(vec![create_test_tool()]),
             tool_choice: Some(ToolChoice::Auto),
             temperature: None,
@@ -339,6 +328,7 @@ mod tests {
             stop: None,
             stream: false,
             user: None,
+            enable_thinking: None,
             metadata: HashMap::new(),
         };
 
@@ -351,7 +341,7 @@ mod tests {
         let client = MockLLMClient::without_streaming();
         let request = ChatRequest {
             model: Some("test-model".to_string()),
-            messages: vec![create_test_message()],
+            messages: vec![create_test_message()].into(),
             tools: None,
             tool_choice: None,
             temperature: None,
@@ -362,6 +352,7 @@ mod tests {
             stop: None,
             stream: true,
             user: None,
+            enable_thinking: None,
             metadata: HashMap::new(),
         };
 
@@ -377,7 +368,7 @@ mod tests {
         let client = MockLLMClient::new();
         let request = ChatRequest {
             model: Some("test-model".to_string()),
-            messages: vec![create_test_message()],
+            messages: vec![create_test_message()].into(),
             tools: None,
             tool_choice: None,
             temperature: None,
@@ -388,6 +379,7 @@ mod tests {
             stop: None,
             stream: true,
             user: None,
+            enable_thinking: None,
             metadata: HashMap::new(),
         };
 
@@ -426,7 +418,7 @@ mod tests {
         let client = MockLLMClient::new();
         let request = ChatRequest {
             model: Some("test-model".to_string()),
-            messages: vec![create_test_message()],
+            messages: vec![create_test_message()].into(),
             tools: None,
             tool_choice: None,
             temperature: None,
@@ -437,10 +429,11 @@ mod tests {
             stop: None,
             stream: false,
             user: None,
+            enable_thinking: None,
             metadata: HashMap::new(),
         };
 
-        let result = client.chat(request).await;
+        let result = client.chat(&request).await;
         assert!(result.is_ok());
 
         let response = result.unwrap();

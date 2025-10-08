@@ -40,7 +40,7 @@
 //!
 //! // Send the chat request
 //! let request = ChatRequest::new(conversation.get_messages().to_vec());
-//! let response = client.chat(request).await?;
+//! let response = client.chat(&request).await?;
 //!
 //! println!("Response: {}", response.message.content);
 //! # Ok(())
@@ -104,27 +104,32 @@
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use futures::stream::{Stream, StreamExt};
 use log::{debug, error, warn};
+use reqwest_eventsource::{Event, EventSource};
 use reqwest_middleware::ClientWithMiddleware;
-use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};
+use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
 use reqwest_retry_after::RetryAfterMiddleware;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
 use neuromance_common::chat::Message;
-use neuromance_common::client::{ChatRequest, ChatResponse, Config, Usage};
+use neuromance_common::client::{ChatChunk, ChatRequest, ChatResponse, Config, Usage};
 use neuromance_common::tools::{FunctionCall, ToolCall};
 
 use crate::error::{ClientError, ErrorResponse};
-use crate::openai::{ChatCompletionRequest, ChatCompletionResponse, OpenAIMessage};
-use crate::LLMClient;
+use crate::openai::{
+    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, OpenAIMessage,
+};
+use crate::{LLMClient, NoRetryPolicy};
 
 /// Type-state marker types for compile-time validation.
 ///
@@ -281,7 +286,8 @@ impl Default for OpenAIMessageBuilder<builder_states::NoRole> {
 #[derive(Clone)]
 pub struct OpenAIClient {
     client: ClientWithMiddleware,
-    api_key: SecretString,
+    streaming_client: reqwest::Client,
+    api_key: Arc<SecretString>,
     base_url: String,
     config: Arc<Config>,
 }
@@ -294,6 +300,75 @@ impl std::fmt::Debug for OpenAIClient {
             .field("base_url", &self.base_url)
             .field("config", &self.config)
             .finish()
+    }
+}
+
+/// Convert an OpenAI streaming chunk to our common ChatChunk format.
+///
+/// Handles delta updates for content, role, and tool calls.
+pub fn convert_chunk_to_chat_chunk(chunk: &ChatCompletionChunk) -> ChatChunk {
+    let choice = chunk.choices.first();
+
+    let delta_content = choice.and_then(|c| c.delta.content.clone());
+    let delta_role = choice.and_then(|c| c.delta.role);
+    let finish_reason = choice
+        .and_then(|c| c.finish_reason.as_ref())
+        .and_then(|reason| reason.parse().ok());
+
+    // Convert tool call deltas if present
+    let delta_tool_calls =
+        choice
+            .and_then(|c| c.delta.tool_calls.as_ref())
+            .map(|tool_call_deltas| {
+                // Pre-allocate capacity based on the number of deltas in this chunk
+                // This avoids reallocations during collection
+                let mut result = Vec::with_capacity(tool_call_deltas.len());
+
+                for delta in tool_call_deltas {
+                    // We need at least an ID to create a ToolCall
+                    if let Some(id) = delta.id.as_ref() {
+                        let call_type = delta
+                            .r#type
+                            .clone()
+                            .unwrap_or_else(|| "function".to_string());
+
+                        if let Some(function) = delta.function.as_ref() {
+                            let name = function.name.clone().unwrap_or_default();
+                            let arguments = function
+                                .arguments
+                                .as_ref()
+                                .map(|args| vec![args.clone()])
+                                .unwrap_or_default();
+
+                            result.push(ToolCall {
+                                id: id.clone(),
+                                call_type,
+                                function: FunctionCall { name, arguments },
+                            });
+                        }
+                    }
+                }
+
+                result
+            });
+
+    ChatChunk {
+        model: chunk.model.clone(),
+        delta_content,
+        delta_role,
+        delta_tool_calls,
+        finish_reason,
+        usage: chunk.usage.clone().map(|u| Usage {
+            prompt_tokens: u.prompt_tokens,
+            completion_tokens: u.completion_tokens,
+            total_tokens: u.total_tokens,
+            cost: None,
+            input_tokens_details: u.input_tokens_details,
+            output_tokens_details: u.output_tokens_details,
+        }),
+        response_id: Some(chunk.id.clone()),
+        created_at: DateTime::from_timestamp(chunk.created as i64, 0).unwrap_or_else(Utc::now),
+        metadata: HashMap::new(),
     }
 }
 
@@ -347,14 +422,15 @@ impl OpenAIClient {
         // Create client with retry middleware
         // NOTE: RetryAfterMiddleware should be added before RetryTransientMiddleware
         // so that Retry-After headers are respected before falling back to exponential backoff
-        let client = reqwest_middleware::ClientBuilder::new(reqwest_client)
+        let client = reqwest_middleware::ClientBuilder::new(reqwest_client.clone())
             .with(RetryAfterMiddleware::new())
             .with(RetryTransientMiddleware::new_with_policy(retry_policy))
             .build();
 
         Ok(Self {
             client,
-            api_key,
+            streaming_client: reqwest_client,
+            api_key: Arc::new(api_key),
             base_url,
             config: Arc::new(config),
         })
@@ -484,8 +560,10 @@ impl OpenAIClient {
             .tool_calls
             .as_ref()
             .map(|tcs| {
-                tcs.iter()
-                    .map(|tc| ToolCall {
+                // Pre-allocate capacity to avoid reallocations during collection
+                let mut result = SmallVec::with_capacity(tcs.len());
+                for tc in tcs {
+                    result.push(ToolCall {
                         id: tc.id.to_string(),
                         call_type: tc.r#type.to_string(),
                         function: FunctionCall {
@@ -498,8 +576,9 @@ impl OpenAIClient {
                                 vec![tc.function.arguments.to_string()]
                             },
                         },
-                    })
-                    .collect::<SmallVec<_>>()
+                    });
+                }
+                result
             })
             .unwrap_or_default();
 
@@ -528,13 +607,13 @@ impl LLMClient for OpenAIClient {
     }
 
     fn supports_streaming(&self) -> bool {
-        false
+        true
     }
 
-    async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
-        self.validate_request(&request)?;
+    async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse> {
+        self.validate_request(request)?;
 
-        let mut openai_request = ChatCompletionRequest::from((&request, self.config.as_ref()));
+        let mut openai_request = ChatCompletionRequest::from((request, self.config.as_ref()));
         openai_request.stream = Some(false);
 
         let response: ChatCompletionResponse = self
@@ -586,6 +665,93 @@ impl LLMClient for OpenAIClient {
             response_id: Some(response.id),
             metadata: HashMap::new(),
         })
+    }
+
+    async fn chat_stream(
+        &self,
+        request: &ChatRequest,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatChunk>> + Send>>> {
+        self.validate_request(request)?;
+
+        let mut openai_request = ChatCompletionRequest::from((request, self.config.as_ref()));
+        openai_request.stream = Some(true);
+        openai_request.stream_options = Some(serde_json::json!({
+            "include_usage": true
+        }));
+
+        let url = format!("{}/{}", self.base_url, "chat/completions");
+
+        // Validate URL construction
+        reqwest::Url::parse(&url).map_err(|e| {
+            ClientError::ConfigurationError(format!("Invalid URL '{}': {}", url, e))
+        })?;
+
+        // Build the request with SSE headers
+        // Use the reusable streaming_client (without retry middleware to avoid interfering with SSE)
+        let request_builder = self
+            .streaming_client
+            .post(&url)
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.api_key.expose_secret()),
+            )
+            .header("Content-Type", "application/json")
+            .json(&openai_request);
+
+        // Create the EventSource
+        // We handle retries at a higher level in Core
+        let mut event_source = EventSource::new(request_builder).map_err(|e| {
+            ClientError::ConfigurationError(format!("Failed to create event source: {}", e))
+        })?;
+
+        // Disable automatic retries - we handle retries at the Core level
+        event_source.set_retry_policy(Box::new(NoRetryPolicy));
+
+        // Convert the EventSource stream into our ChatChunk stream
+        let stream = event_source.filter_map(move |event| async move {
+            match event {
+                Ok(Event::Open) => {
+                    debug!("Stream connection opened");
+                    None
+                }
+                Ok(Event::Message(message)) => {
+                    // OpenAI sends [DONE] to signal completion
+                    if message.data == "[DONE]" {
+                        debug!("Stream completed with [DONE] marker");
+                        return None;
+                    }
+
+                    // Parse the chunk
+                    match serde_json::from_str::<ChatCompletionChunk>(&message.data) {
+                        Ok(chunk) => {
+                            // Convert to our common ChatChunk type
+                            let chat_chunk = convert_chunk_to_chat_chunk(&chunk);
+                            Some(Ok(chat_chunk))
+                        }
+                        Err(e) => {
+                            warn!("Failed to parse streaming chunk: {}", e);
+                            debug!("Problematic chunk data: {}", message.data);
+                            Some(Err(ClientError::SerializationError(e).into()))
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Check if this is a normal stream end
+                    match ClientError::from(e) {
+                        ClientError::EventSourceError(reqwest_eventsource::Error::StreamEnded) => {
+                            debug!("Stream ended normally");
+                            None
+                        }
+                        other_error => {
+                            error!("Stream error: {}", other_error);
+                            Some(Err(other_error.into()))
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(Box::pin(stream))
     }
 }
 
@@ -653,7 +819,7 @@ mod tests {
         let message = create_test_message();
         let request = ChatRequest::new(vec![message]);
 
-        let response = client.chat(request).await.unwrap();
+        let response = client.chat(&request).await.unwrap();
 
         assert_eq!(response.model, "gpt-4");
         assert_eq!(response.message.content, "Hello! How can I help you today?");
@@ -703,7 +869,7 @@ mod tests {
             let message = create_test_message();
             let request = ChatRequest::new(vec![message]);
 
-            let response = client.chat(request).await.unwrap();
+            let response = client.chat(&request).await.unwrap();
             assert_eq!(response.finish_reason, Some(expected_reason));
         }
     }
@@ -737,7 +903,7 @@ mod tests {
         let message = create_test_message();
         let request = ChatRequest::new(vec![message]);
 
-        let response = client.chat(request).await.unwrap();
+        let response = client.chat(&request).await.unwrap();
         // Unknown finish reasons should parse as None (using and_then with parse().ok())
         assert_eq!(response.finish_reason, None);
     }
@@ -764,7 +930,7 @@ mod tests {
         let message = create_test_message();
         let request = ChatRequest::new(vec![message]);
 
-        let result = client.chat(request).await;
+        let result = client.chat(&request).await;
         assert!(result.is_err());
 
         let error_msg = result.unwrap_err().to_string();
@@ -792,7 +958,7 @@ mod tests {
         let message = create_test_message();
         let request = ChatRequest::new(vec![message]);
 
-        let result = client.chat(request).await;
+        let result = client.chat(&request).await;
         assert!(result.is_err());
 
         let error_msg = result.unwrap_err().to_string();
@@ -820,7 +986,7 @@ mod tests {
         let message = create_test_message();
         let request = ChatRequest::new(vec![message]);
 
-        let result = client.chat(request).await;
+        let result = client.chat(&request).await;
         assert!(result.is_err());
     }
 
@@ -846,7 +1012,7 @@ mod tests {
         let message = create_test_message();
         let request = ChatRequest::new(vec![message]);
 
-        let result = client.chat(request).await;
+        let result = client.chat(&request).await;
         assert!(result.is_err());
 
         let error_msg = result.unwrap_err().to_string();
@@ -895,7 +1061,7 @@ mod tests {
         let message = create_test_message();
         let request = ChatRequest::new(vec![message]);
 
-        let response = client.chat(request).await.unwrap();
+        let response = client.chat(&request).await.unwrap();
 
         assert_eq!(response.finish_reason, Some(FinishReason::ToolCalls));
         assert_eq!(response.message.tool_calls.len(), 1);
@@ -950,7 +1116,7 @@ mod tests {
         let message = create_test_message();
         let request = ChatRequest::new(vec![message]);
 
-        let response = client.chat(request).await.unwrap();
+        let response = client.chat(&request).await.unwrap();
 
         let usage = response.usage.unwrap();
         assert_eq!(usage.prompt_tokens, 10);

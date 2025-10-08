@@ -1,0 +1,25 @@
+[package]
+name = "neuromance-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Interactive command-line interface for LLM interactions"
+
+[dependencies]
+neuromance = { version = "0.0.3", path = "../neuromance" }
+neuromance-tools = { version = "0.0.3", path = "../neuromance-tools" }
+rustyline = "17.0.1"
+anyhow = "1.0"
+tokio = { version = "1", features = ["full"] }
+serde_json = "1.0"
+secrecy = "0.10"
+clap = { version = "4.4", features = ["derive"] }
+colored = "3.0"
+futures = "0.3"

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -82,7 +83,7 @@ impl From<ToolChoice> for serde_json::Value {
 ///
 /// This enum provides information about whether generation completed naturally,
 /// was truncated, or was interrupted for another reason.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Copy)]
 #[non_exhaustive]
 pub enum FinishReason {
     /// Generation completed naturally at a stop sequence or end of response.
@@ -258,7 +259,7 @@ pub struct OutputTokensDetails {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatRequest {
     /// The conversation messages to send to the model.
-    pub messages: Vec<Message>,
+    pub messages: Arc<[Message]>,
     /// The model identifier to use for generation.
     pub model: Option<String>,
     /// Sampling temperature controlling randomness (0.0 to 2.0).
@@ -289,6 +290,8 @@ pub struct ChatRequest {
     pub stream: bool,
     /// End-user identifier for tracking and abuse prevention.
     pub user: Option<String>,
+    /// Whether to enable thinking mode (vendor-specific, e.g., Qwen models).
+    pub enable_thinking: Option<bool>,
     /// Additional metadata to attach to this request.
     pub metadata: HashMap<String, serde_json::Value>,
 }
@@ -321,9 +324,9 @@ impl ChatRequest {
     /// let msg = Message::new(Uuid::new_v4(), MessageRole::User, "Hello!");
     /// let request = ChatRequest::new(vec![msg]);
     /// ```
-    pub fn new(messages: Vec<Message>) -> Self {
+    pub fn new(messages: impl Into<Arc<[Message]>>) -> Self {
         Self {
-            messages,
+            messages: messages.into(),
             model: None,
             temperature: None,
             max_tokens: None,
@@ -335,6 +338,7 @@ impl ChatRequest {
             tool_choice: None,
             stream: false,
             user: None,
+            enable_thinking: None,
             metadata: HashMap::new(),
         }
     }
@@ -342,6 +346,27 @@ impl ChatRequest {
 
 impl From<(&Config, Vec<Message>)> for ChatRequest {
     fn from((config, messages): (&Config, Vec<Message>)) -> Self {
+        Self {
+            messages: messages.into(),
+            model: Some(config.model.clone()),
+            temperature: config.temperature,
+            max_tokens: config.max_tokens,
+            top_p: config.top_p,
+            frequency_penalty: config.frequency_penalty,
+            presence_penalty: config.presence_penalty,
+            stop: config.stop_sequences.clone(),
+            tools: None,
+            tool_choice: None,
+            stream: false,
+            user: None,
+            enable_thinking: None,
+            metadata: HashMap::new(),
+        }
+    }
+}
+
+impl From<(&Config, Arc<[Message]>)> for ChatRequest {
+    fn from((config, messages): (&Config, Arc<[Message]>)) -> Self {
         Self {
             messages,
             model: Some(config.model.clone()),
@@ -355,6 +380,7 @@ impl From<(&Config, Vec<Message>)> for ChatRequest {
             tool_choice: None,
             stream: false,
             user: None,
+            enable_thinking: None,
             metadata: HashMap::new(),
         }
     }
@@ -482,6 +508,16 @@ impl ChatRequest {
         self
     }
 
+    /// Enables or disables thinking mode (vendor-specific).
+    ///
+    /// # Arguments
+    ///
+    /// * `enable_thinking` - Whether to enable thinking mode
+    pub fn with_thinking(mut self, enable_thinking: bool) -> Self {
+        self.enable_thinking = Some(enable_thinking);
+        self
+    }
+
     /// Validate that this request has at least one message.
     ///
     /// # Errors
@@ -498,34 +534,34 @@ impl ChatRequest {
     pub fn validate(&self) -> anyhow::Result<()> {
         self.validate_has_messages()?;
 
-        if let Some(temp) = self.temperature {
-            if !(0.0..=2.0).contains(&temp) {
-                anyhow::bail!("Temperature must be between 0.0 and 2.0, got {}", temp);
-            }
+        if let Some(temp) = self.temperature
+            && !(0.0..=2.0).contains(&temp)
+        {
+            anyhow::bail!("Temperature must be between 0.0 and 2.0, got {}", temp);
         }
 
-        if let Some(top_p) = self.top_p {
-            if !(0.0..=1.0).contains(&top_p) {
-                anyhow::bail!("top_p must be between 0.0 and 1.0, got {}", top_p);
-            }
+        if let Some(top_p) = self.top_p
+            && !(0.0..=1.0).contains(&top_p)
+        {
+            anyhow::bail!("top_p must be between 0.0 and 1.0, got {}", top_p);
         }
 
-        if let Some(freq_penalty) = self.frequency_penalty {
-            if !(-2.0..=2.0).contains(&freq_penalty) {
-                anyhow::bail!(
-                    "frequency_penalty must be between -2.0 and 2.0, got {}",
-                    freq_penalty
-                );
-            }
+        if let Some(freq_penalty) = self.frequency_penalty
+            && !(-2.0..=2.0).contains(&freq_penalty)
+        {
+            anyhow::bail!(
+                "frequency_penalty must be between -2.0 and 2.0, got {}",
+                freq_penalty
+            );
         }
 
-        if let Some(pres_penalty) = self.presence_penalty {
-            if !(-2.0..=2.0).contains(&pres_penalty) {
-                anyhow::bail!(
-                    "presence_penalty must be between -2.0 and 2.0, got {}",
-                    pres_penalty
-                );
-            }
+        if let Some(pres_penalty) = self.presence_penalty
+            && !(-2.0..=2.0).contains(&pres_penalty)
+        {
+            anyhow::bail!(
+                "presence_penalty must be between -2.0 and 2.0, got {}",
+                pres_penalty
+            );
         }
 
         Ok(())
@@ -592,6 +628,33 @@ pub struct ChatResponse {
     /// Unique identifier for this response from the provider.
     pub response_id: Option<String>,
     /// Additional metadata about this response.
+    pub metadata: HashMap<String, serde_json::Value>,
+}
+
+/// A chunk from a streaming chat completion.
+///
+/// Represents an incremental update to a chat response. Multiple chunks
+/// are combined to form the complete response. Typically received from
+/// streaming APIs where the response is delivered incrementally.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatChunk {
+    /// The model identifier that generated this chunk.
+    pub model: String,
+    /// Incremental content added in this chunk.
+    pub delta_content: Option<String>,
+    /// The role of the message (only present in first chunk).
+    pub delta_role: Option<crate::chat::MessageRole>,
+    /// Tool calls being built incrementally.
+    pub delta_tool_calls: Option<Vec<crate::tools::ToolCall>>,
+    /// Reason why generation stopped (only present in final chunk).
+    pub finish_reason: Option<FinishReason>,
+    /// Token usage statistics (only present in final chunk for some providers).
+    pub usage: Option<Usage>,
+    /// Unique identifier for this response stream.
+    pub response_id: Option<String>,
+    /// Timestamp when this chunk was created.
+    pub created_at: DateTime<Utc>,
+    /// Additional metadata about this chunk.
     pub metadata: HashMap<String, serde_json::Value>,
 }
 
@@ -665,8 +728,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            provider: "unknown".to_string(),
-            model: "gpt-oss-120b".to_string(),
+            provider: "ollama".to_string(),
+            model: "gpt-oss:20b".to_string(),
             base_url: None,
             api_key: None,
             organization: None,
@@ -904,34 +967,34 @@ impl Config {
     /// - `frequency_penalty` must be between -2.0 and 2.0
     /// - `presence_penalty` must be between -2.0 and 2.0
     pub fn validate(&self) -> anyhow::Result<()> {
-        if let Some(temp) = self.temperature {
-            if !(0.0..=2.0).contains(&temp) {
-                anyhow::bail!("Temperature must be between 0.0 and 2.0, got {}", temp);
-            }
+        if let Some(temp) = self.temperature
+            && !(0.0..=2.0).contains(&temp)
+        {
+            anyhow::bail!("Temperature must be between 0.0 and 2.0, got {}", temp);
         }
 
-        if let Some(top_p) = self.top_p {
-            if !(0.0..=1.0).contains(&top_p) {
-                anyhow::bail!("top_p must be between 0.0 and 1.0, got {}", top_p);
-            }
+        if let Some(top_p) = self.top_p
+            && !(0.0..=1.0).contains(&top_p)
+        {
+            anyhow::bail!("top_p must be between 0.0 and 1.0, got {}", top_p);
         }
 
-        if let Some(freq_penalty) = self.frequency_penalty {
-            if !(-2.0..=2.0).contains(&freq_penalty) {
-                anyhow::bail!(
-                    "frequency_penalty must be between -2.0 and 2.0, got {}",
-                    freq_penalty
-                );
-            }
+        if let Some(freq_penalty) = self.frequency_penalty
+            && !(-2.0..=2.0).contains(&freq_penalty)
+        {
+            anyhow::bail!(
+                "frequency_penalty must be between -2.0 and 2.0, got {}",
+                freq_penalty
+            );
         }
 
-        if let Some(pres_penalty) = self.presence_penalty {
-            if !(-2.0..=2.0).contains(&pres_penalty) {
-                anyhow::bail!(
-                    "presence_penalty must be between -2.0 and 2.0, got {}",
-                    pres_penalty
-                );
-            }
+        if let Some(pres_penalty) = self.presence_penalty
+            && !(-2.0..=2.0).contains(&pres_penalty)
+        {
+            anyhow::bail!(
+                "presence_penalty must be between -2.0 and 2.0, got {}",
+                pres_penalty
+            );
         }
 
         Ok(())
@@ -1152,8 +1215,7 @@ mod proptests {
         assert!(!request_no_tools.has_tools());
 
         // Test with empty tools vector
-        let request_empty_tools = ChatRequest::new(vec![msg.clone()])
-            .with_tools(vec![]);
+        let request_empty_tools = ChatRequest::new(vec![msg.clone()]).with_tools(vec![]);
         assert!(!request_empty_tools.has_tools());
 
         // Test with tools present
@@ -1162,11 +1224,8 @@ mod proptests {
             description: "A test function".to_string(),
             parameters: serde_json::json!({}),
         };
-        let tool = Tool::builder()
-            .function(function)
-            .build();
-        let request_with_tools = ChatRequest::new(vec![msg])
-            .with_tools(vec![tool]);
+        let tool = Tool::builder().function(function).build();
+        let request_with_tools = ChatRequest::new(vec![msg]).with_tools(vec![tool]);
         assert!(request_with_tools.has_tools());
     }
 }
