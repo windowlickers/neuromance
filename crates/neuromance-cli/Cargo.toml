@@ -13,8 +13,8 @@ categories.workspace = true
 description = "Interactive command-line interface for LLM interactions"
 
 [dependencies]
-neuromance = { version = "0.0.3", path = "../neuromance" }
-neuromance-tools = { version = "0.0.3", path = "../neuromance-tools" }
+neuromance = { version = "0.0.4", path = "../neuromance" }
+neuromance-tools = { version = "0.0.4", path = "../neuromance-tools" }
 rustyline = "17.0.1"
 anyhow = "1.0"
 tokio = { version = "1", features = ["full"] }
