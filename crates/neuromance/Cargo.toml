@@ -23,9 +23,9 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
 
-neuromance-common = { version = "0.0.4", path = "../neuromance-common" }
-neuromance-client = { version = "0.0.4", path = "../neuromance-client" }
-neuromance-tools = { version = "0.0.4", path = "../neuromance-tools" }
+neuromance-common = { version = "0.0.5", path = "../neuromance-common" }
+neuromance-client = { version = "0.0.5", path = "../neuromance-client" }
+neuromance-tools = { version = "0.0.5", path = "../neuromance-tools" }
 
 [dev-dependencies]
 clap = { workspace = true }
