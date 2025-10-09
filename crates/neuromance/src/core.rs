@@ -1,11 +1,12 @@
 use std::collections::HashSet;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
 use chrono::Utc;
-use futures::StreamExt;
-use log::{debug, info};
+use futures::{FutureExt, StreamExt};
+use log::{debug, info, warn};
 
 use neuromance_client::{ClientError, LLMClient};
 use neuromance_common::chat::{Message, MessageRole};
@@ -14,59 +15,143 @@ use neuromance_common::tools::{ToolApproval, ToolCall};
 use neuromance_tools::ToolExecutor;
 
 use crate::error::CoreError;
+use crate::events::{CoreEvent, EventCallback, ToolApprovalCallback};
 
-/// Type alias for tool approval callback functions
-pub type ToolApprovalCallback = Box<dyn Fn(&ToolCall) -> ToolApproval + Send + Sync>;
-
-/// Type alias for streaming content callback functions
-pub type StreamingCallback = Box<dyn Fn(&str) + Send + Sync>;
-
+/// Core orchestration layer for LLM conversations with tool execution
+///
+/// Core manages the conversation loop, including streaming, tool execution,
+/// and event emission. It uses an event-driven architecture where a single
+/// event callback receives all events (streaming, tool results, usage, etc.).
 pub struct Core<C: LLMClient> {
     pub client: C,
-    // REVIEW could just work off common::client::Config
-    // pub config: CoreConfig,
+    /// Enable streaming mode for chat responses
+    pub streaming: bool,
+    /// Total number of tool calls the LLM can make before returning to the user.
     pub max_turns: Option<u32>,
     /// Execute all tools regardless of their auto_approve value
     pub auto_approve_tools: bool,
+    /// how the model selects which tool to call, if any.
     pub tool_choice: ToolChoice,
-    /// Enable streaming mode for chat responses
-    pub streaming: bool,
-
+    /// Holds tools in ToolRegistry and executes tools
     pub tool_executor: ToolExecutor,
+    /// Optional bi-directional callback for Tool approval
     pub tool_approval_callback: Option<ToolApprovalCallback>,
-    /// Optional callback for streaming content chunks
-    pub streaming_callback: Option<StreamingCallback>,
+    /// Optional event callback for all Core events
+    pub event_callback: Option<EventCallback>,
 }
 
 impl<C: LLMClient> Core<C> {
     pub fn new(client: C) -> Self {
         Self {
             client,
+            streaming: false,
             max_turns: None,
             auto_approve_tools: false,
             tool_choice: ToolChoice::Auto,
-            streaming: false,
             tool_executor: ToolExecutor::new(),
             tool_approval_callback: None,
-            streaming_callback: None,
+            event_callback: None,
         }
     }
 
-    pub fn with_tool_approval_callback<F>(mut self, callback: F) -> Self
+    /// Set callback for tool approval decisions
+    /// Use when a tool is not auto-approved and `auto_approve_tools` is false.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use neuromance::{Core, ToolApproval};
+    /// # use neuromance_client::openai::OpenAIClient;
+    /// # let client: OpenAIClient = unimplemented!();
+    /// let core = Core::new(client)
+    ///     .with_tool_approval_callback(|tool_call| {
+    ///         // Clone to move into async block (avoids lifetime issues)
+    ///         let tool_call = tool_call.clone();
+    ///         async move {
+    ///             // Could prompt user, check policy, etc.
+    ///             println!("Tool requested: {}", tool_call.function.name);
+    ///             ToolApproval::Approved
+    ///         }
+    ///     });
+    /// ```
+    pub fn with_tool_approval_callback<F, Fut>(mut self, callback: F) -> Self
     where
-        F: Fn(&ToolCall) -> ToolApproval + Send + Sync + 'static,
+        F: Fn(&ToolCall) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ToolApproval> + Send + 'static,
     {
-        self.tool_approval_callback = Some(Box::new(callback));
+        self.tool_approval_callback =
+            Some(Box::new(move |tool_call| Box::pin(callback(tool_call))));
         self
     }
 
-    pub fn with_streaming<F>(mut self, callback: F) -> Self
+    /// Callback for all CoreEvents
+    /// This callback receives notifications about streaming content, tool execution
+    /// results, and token usage.
+    ///
+    /// # Events
+    /// - [`CoreEvent::Streaming`] - Content chunks as they arrive from the LLM
+    /// - [`CoreEvent::ToolResult`] - Results from tool execution (success or failure)
+    /// - [`CoreEvent::Usage`] - Token usage information from LLM responses
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use neuromance::{Core, CoreEvent};
+    /// # use neuromance_client::openai::OpenAIClient;
+    /// # let client: OpenAIClient = unimplemented!();
+    /// let core = Core::new(client)
+    ///     .with_event_callback(|event| async move {
+    ///         match event {
+    ///             CoreEvent::Streaming(chunk) => print!("{}", chunk),
+    ///             CoreEvent::ToolResult { name, result, success } => {
+    ///                 println!("Tool '{}' completed: {}", name, result);
+    ///             }
+    ///             CoreEvent::Usage(usage) => {
+    ///                 println!("Tokens used: {}", usage.total_tokens);
+    ///             }
+    ///         }
+    ///     });
+    /// ```
+    pub fn with_event_callback<F, Fut>(mut self, callback: F) -> Self
     where
-        F: Fn(&str) + Send + Sync + 'static,
+        F: Fn(CoreEvent) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
     {
-        self.streaming = true;
-        self.streaming_callback = Some(Box::new(callback));
+        self.event_callback = Some(Box::new(move |event| Box::pin(callback(event))));
         self
+    }
+
+    /// Enable streaming mode
+    pub fn with_streaming(mut self) -> Self {
+        self.streaming = true;
+        self
+    }
+
+    /// Emit an event, catching any panics from the callback
+    async fn emit_event(&self, event: CoreEvent) {
+        if let Some(ref callback) = self.event_callback {
+            // Use catch_unwind to prevent callback panics from propagating
+            match std::panic::AssertUnwindSafe(callback(event.clone()))
+                .catch_unwind()
+                .await
+            {
+                Ok(()) => {}
+                Err(e) => {
+                    // Log the panic but continue execution
+                    let panic_msg = if let Some(s) = e.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else if let Some(s) = e.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "Unknown panic".to_string()
+                    };
+                    warn!(
+                        "Event callback panicked while processing {:?}: {}",
+                        event, panic_msg
+                    );
+                }
+            }
+        }
     }
 
     /// Send a chat request with retry logic for transient failures
@@ -110,21 +195,22 @@ impl<C: LLMClient> Core<C> {
     async fn chat_stream_accumulated(&self, request: &ChatRequest) -> Result<ChatResponse> {
         let mut stream = self.client.chat_stream(request).await?;
 
-        let mut accumulated_content = String::new();
+        // Pre-allocate capacity for typical streaming responses
+        // Average LLM response is ~200-500 chars, allocate for 1KB to reduce reallocations
+        let mut accumulated_content = String::with_capacity(1024);
         let mut response_metadata = None;
         let mut role = None;
-        let mut tool_calls: Vec<ToolCall> = Vec::new();
+        // Most responses have 0-3 tool calls, pre-allocate for 4 to avoid most reallocations
+        let mut tool_calls: Vec<ToolCall> = Vec::with_capacity(4);
         let mut finish_reason = None;
 
         while let Some(chunk_result) = stream.next().await {
             let chunk = chunk_result?;
 
-            // Accumulate content and invoke callback if present
+            // Accumulate content and emit event if callback present
             if let Some(ref content) = chunk.delta_content {
                 accumulated_content.push_str(content);
-                if let Some(ref callback) = self.streaming_callback {
-                    callback(content);
-                }
+                self.emit_event(CoreEvent::Streaming(content.clone())).await;
             }
 
             // Capture role from first chunk
@@ -218,6 +304,11 @@ impl<C: LLMClient> Core<C> {
                 serde_json::to_string_pretty(&response)?
             );
 
+            // Emit usage event if callback present
+            if let Some(ref usage) = response.usage {
+                self.emit_event(CoreEvent::Usage(usage.clone())).await;
+            }
+
             // Extract data we need before consuming the message
             let conversation_id = response.message.conversation_id;
             let tool_calls = response.message.tool_calls.clone();
@@ -258,7 +349,7 @@ impl<C: LLMClient> Core<C> {
                 let approval = if is_auto_approved {
                     ToolApproval::Approved
                 } else if let Some(ref callback) = self.tool_approval_callback {
-                    callback(tool_call)
+                    callback(tool_call).await
                 } else {
                     // No callback provided and not auto-approved, deny by default
                     ToolApproval::Denied("No approval mechanism configured".to_string())
@@ -274,6 +365,15 @@ impl<C: LLMClient> Core<C> {
                             Ok(result) => {
                                 debug!("Tool {} executed successfully", tool_name);
                                 debug!("Tool result: {}", result);
+
+                                // Emit tool result event
+                                self.emit_event(CoreEvent::ToolResult {
+                                    name: tool_name.clone(),
+                                    result: result.clone(),
+                                    success: true,
+                                })
+                                .await;
+
                                 // Add tool result as a message
                                 let tool_message = Message::tool(
                                     conversation_id,
@@ -286,10 +386,20 @@ impl<C: LLMClient> Core<C> {
                             }
                             Err(e) => {
                                 debug!("Tool {} execution failed: {}", tool_name, e);
+                                let error_msg = format!("Tool execution failed: {}", e);
+
+                                // Emit tool result event
+                                self.emit_event(CoreEvent::ToolResult {
+                                    name: tool_name.clone(),
+                                    result: error_msg.clone(),
+                                    success: false,
+                                })
+                                .await;
+
                                 // Add error as tool message
                                 let error_message = Message::tool(
                                     conversation_id,
-                                    format!("Tool execution failed: {}", e),
+                                    error_msg,
                                     tool_call.id.clone(),
                                     tool_call.function.name.clone(),
                                 )?;
@@ -351,5 +461,115 @@ impl<C: LLMClient> Core<C> {
                 .into());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use neuromance_client::openai::OpenAIClient;
+    use neuromance_common::client::Config;
+
+    /// Test that event callbacks handle panics gracefully
+    #[tokio::test]
+    async fn test_event_callback_panic_handling() {
+        let config = Config::new("test", "test-model").with_api_key("test-key");
+        let client = OpenAIClient::new(config).expect("Failed to create client");
+
+        let counter = Arc::new(tokio::sync::Mutex::new(0));
+        let counter_clone = Arc::clone(&counter);
+
+        let core = Core::new(client).with_event_callback(move |event| {
+            let counter = Arc::clone(&counter_clone);
+            async move {
+                let mut count = counter.lock().await;
+                *count += 1;
+                if *count == 2 {
+                    panic!("Intentional panic in event callback");
+                }
+                drop(event);
+            }
+        });
+
+        core.emit_event(CoreEvent::Streaming("test1".to_string()))
+            .await;
+        core.emit_event(CoreEvent::Streaming("test2".to_string()))
+            .await;
+        core.emit_event(CoreEvent::Streaming("test3".to_string()))
+            .await;
+
+        let final_count = *counter.lock().await;
+        assert_eq!(final_count, 3);
+    }
+
+    /// Test that tool approval callback is registered and can deny tools
+    #[tokio::test]
+    async fn test_tool_approval_callback() {
+        let config = Config::new("test", "test-model").with_api_key("test-key");
+        let client = OpenAIClient::new(config).expect("Failed to create client");
+
+        let core = Core::new(client).with_tool_approval_callback(|tool_call| {
+            let tool_name = tool_call.function.name.clone();
+            async move {
+                if tool_name == "dangerous" {
+                    ToolApproval::Denied("Not allowed".to_string())
+                } else {
+                    ToolApproval::Approved
+                }
+            }
+        });
+
+        assert!(core.tool_approval_callback.is_some());
+    }
+
+    /// Test Core without callbacks
+    #[tokio::test]
+    async fn test_core_without_callbacks() {
+        let config = Config::new("test", "test-model").with_api_key("test-key");
+        let client = OpenAIClient::new(config).expect("Failed to create client");
+        let core = Core::new(client);
+
+        assert!(core.event_callback.is_none());
+        assert!(core.tool_approval_callback.is_none());
+
+        // Should not panic
+        core.emit_event(CoreEvent::Streaming("test".to_string()))
+            .await;
+    }
+
+    /// Test multiple event types
+    #[tokio::test]
+    async fn test_multiple_event_types() {
+        let config = Config::new("test", "test-model").with_api_key("test-key");
+        let client = OpenAIClient::new(config).expect("Failed to create client");
+
+        let events = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let events_clone = Arc::clone(&events);
+
+        let core = Core::new(client).with_event_callback(move |event| {
+            let events = Arc::clone(&events_clone);
+            async move {
+                let event_type = match event {
+                    CoreEvent::Streaming(_) => "streaming",
+                    CoreEvent::ToolResult { .. } => "tool",
+                    CoreEvent::Usage(_) => "usage",
+                };
+                events.lock().await.push(event_type);
+            }
+        });
+
+        core.emit_event(CoreEvent::Streaming("chunk".to_string()))
+            .await;
+        core.emit_event(CoreEvent::ToolResult {
+            name: "test".to_string(),
+            result: "ok".to_string(),
+            success: true,
+        })
+        .await;
+
+        let captured = events.lock().await;
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[0], "streaming");
+        assert_eq!(captured[1], "tool");
     }
 }

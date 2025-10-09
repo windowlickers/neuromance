@@ -1307,7 +1307,7 @@ dependencies = [
 
 [[package]]
 name = "neuromance"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1320,6 +1320,7 @@ dependencies = [
  "neuromance-common",
  "neuromance-tools",
  "regex",
+ "secrecy",
  "serde_json",
  "thiserror 2.0.17",
  "tokio",
@@ -1328,7 +1329,7 @@ dependencies = [
 
 [[package]]
 name = "neuromance-agent"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1348,7 +1349,7 @@ dependencies = [
 
 [[package]]
 name = "neuromance-cli"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -1364,7 +1365,7 @@ dependencies = [
 
 [[package]]
 name = "neuromance-client"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1397,7 +1398,7 @@ dependencies = [
 
 [[package]]
 name = "neuromance-common"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1412,7 +1413,7 @@ dependencies = [
 
 [[package]]
 name = "neuromance-tools"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "anyhow",
  "async-trait",

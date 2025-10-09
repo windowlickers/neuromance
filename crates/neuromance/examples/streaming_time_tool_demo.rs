@@ -7,7 +7,7 @@ use clap::Parser;
 use log::info;
 use uuid::Uuid;
 
-use neuromance::Core;
+use neuromance::{Core, CoreEvent};
 use neuromance_client::openai::client::OpenAIClient;
 use neuromance_common::chat::{Message, MessageRole};
 use neuromance_common::client::Config;
@@ -65,43 +65,64 @@ async fn main() -> Result<()> {
     // Create OpenAI client
     let client = OpenAIClient::new(config.clone())?;
 
-    // Create Core instance with streaming enabled
+    // Create mutable Core instance
     let mut core = Core::new(client);
+    // It's a time tool, no need for approval.
     core.auto_approve_tools = args.auto_approve;
+    // total amount of tool calls the LLM can make basically
     core.max_turns = Some(args.max_turns);
 
-    // Enable streaming with a callback that prints chunks as they arrive
-    core = core.with_streaming(|chunk| {
-        print!("{}", chunk);
-        std::io::stdout().flush().unwrap();
-    });
+    // set streaming enabled and setup CoreEvent callback to print chunks as they arrive
+    core = core
+        .with_streaming()
+        .with_event_callback(|event| async move {
+            match event {
+                CoreEvent::Streaming(chunk) => {
+                    print!("{}", chunk);
+                    std::io::stdout().flush().unwrap();
+                }
+                CoreEvent::ToolResult {
+                    name,
+                    result,
+                    success,
+                } => {
+                    info!(
+                        "Tool '{}' completed with success={}: {}",
+                        name, success, result
+                    );
+                }
+                CoreEvent::Usage(usage) => {
+                    info!("Token usage: {} total tokens", usage.total_tokens);
+                }
+            }
+        });
 
-    // Register the time tool using the new tools crate
+    // declare the time tool
     let time_tool: Arc<dyn ToolImplementation> = Arc::new(CurrentTimeTool);
     info!(
         "Registering tool: {}",
         time_tool.get_definition().function.name
     );
 
+    // add the time tool to the tool registry
     core.tool_executor.add_tool_arc(time_tool);
 
-    // Create the initial conversation
+    // create the conversation
     let conversation_id = Uuid::new_v4();
     let mut messages: Vec<Message> = Vec::new();
 
-    // Push system message so the assistant is a pirate
+    // push system message so the assistant is a pirate
     messages.push(Message::system(
         conversation_id,
         "You always speak like a pirate.",
     ));
 
-    // Push our question "What time is it?"
+    // push the user message "What time is it?"
     messages.push(Message::user(conversation_id, &args.message));
 
-    // Start timing the request
     let start_time = Instant::now();
 
-    // Use the core's chat_with_tool_loop for automatic tool handling
+    // use the core's chat_with_tool_loop for automatic tool handling
     info!("Starting streaming conversation with automatic tool execution...");
     info!("");
     println!("Assistant: ");
@@ -109,16 +130,15 @@ async fn main() -> Result<()> {
     let original_message_count = messages.len();
     let final_messages = core.chat_with_tool_loop(messages.clone()).await?;
 
-    // Calculate total time
     let total_duration = start_time.elapsed();
 
     println!("\n");
     info!("Conversation completed!");
 
-    // Add new messages to original vector
+    // add new messages to original vector
     messages.extend_from_slice(&final_messages[original_message_count..]);
 
-    // Get the final assistant message
+    // get the final assistant message
     if let Some(final_msg) = messages
         .iter()
         .rev()
@@ -127,7 +147,6 @@ async fn main() -> Result<()> {
         info!("Full accumulated response: {}", final_msg.content);
     }
 
-    // Print total time taken
     info!("Total request time: {:.2}ms", total_duration.as_millis());
 
     Ok(())

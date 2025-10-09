@@ -59,8 +59,3 @@ pub fn display_assistant_header() {
 pub fn display_assistant_end() {
     println!();
 }
-
-/// Display a warning message to the user
-pub fn display_warning(message: &str) {
-    println!("\n⚠ {} {}", "Warning:".bright_yellow().bold(), message);
-}
