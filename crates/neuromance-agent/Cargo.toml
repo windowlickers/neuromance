@@ -20,10 +20,10 @@ log = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 
-neuromance = { version = "0.0.4", path = "../neuromance" }
-neuromance-common = { version = "0.0.4", path = "../neuromance-common" }
-neuromance-client = { version = "0.0.4", path = "../neuromance-client" }
-neuromance-tools = { version = "0.0.4", path = "../neuromance-tools" }
+neuromance = { version = "0.0.5", path = "../neuromance" }
+neuromance-common = { version = "0.0.5", path = "../neuromance-common" }
+neuromance-client = { version = "0.0.5", path = "../neuromance-client" }
+neuromance-tools = { version = "0.0.5", path = "../neuromance-tools" }
 
 
 [dev-dependencies]
