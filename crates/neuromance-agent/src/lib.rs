@@ -212,6 +212,8 @@ impl<C: LLMClient + Send + Sync> Agent for BaseAgent<C> {
 
     async fn execute(&mut self, messages: Option<Vec<Message>>) -> Result<AgentResponse> {
         info!("Agent {} executing", self.id);
+        self.core.auto_approve_tools = true;
+        self.core.max_turns = Some(3);
         self.core.tool_choice = self.tool_choice.clone();
 
         // Use provided messages or fall back to stored messages

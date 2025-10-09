@@ -7,8 +7,10 @@
 //!
 //! ## Quick Start
 //!
-//! ```rust
-//! use neuromance::{Conversation, Message, ToolCall};
+//! ```rust,no_run
+//! use neuromance::{Conversation, Message, Core, CoreEvent, ToolApproval};
+//! # use neuromance::OpenAIClient;
+//! # let client: OpenAIClient = unimplemented!();
 //!
 //! // Create a conversation
 //! let mut conversation = Conversation::new().with_title("My Chat");
@@ -20,8 +22,23 @@
 //! conversation.add_message(user_msg).expect("Failed to add message");
 //! conversation.add_message(assistant_msg).expect("Failed to add message");
 //!
-//! // Create a tool call
-//! let tool_call = ToolCall::new("get_current_time", Vec::<String>::new());
+//! // Core uses event-driven architecture for streaming and monitoring
+//! let core = Core::new(client)
+//!     .with_streaming()
+//!     .with_event_callback(|event| async move {
+//!         match event {
+//!             CoreEvent::Streaming(chunk) => print!("{}", chunk),
+//!             CoreEvent::ToolResult { name, .. } => println!("Tool executed: {}", name),
+//!             CoreEvent::Usage(usage) => println!("Tokens: {}", usage.total_tokens),
+//!         }
+//!     })
+//!     .with_tool_approval_callback(|tool_call| {
+//!         let tool_call = tool_call.clone();
+//!         async move {
+//!             println!("Approve {}?", tool_call.function.name);
+//!             ToolApproval::Approved // Or prompt user
+//!         }
+//!     });
 //! ```
 //!
 //! ## Features
@@ -33,9 +50,11 @@
 
 pub mod core;
 pub mod error;
+pub mod events;
 
 pub use neuromance_client::*;
 pub use neuromance_common::*;
 pub use neuromance_tools::*;
 
 pub use core::Core;
+pub use events::{CoreEvent, EventCallback, ToolApprovalCallback};

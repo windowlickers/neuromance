@@ -31,6 +31,7 @@ neuromance-tools = { version = "0.0.5", path = "../neuromance-tools" }
 clap = { workspace = true }
 env_logger = { workspace = true }
 colored = { workspace = true }
+secrecy = { workspace = true }
 
 [[example]]
 name = "streaming_time_tool_demo"

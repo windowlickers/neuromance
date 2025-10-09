@@ -1,21 +1,20 @@
 //! Neuromance CLI - Interactive REPL for LLM conversations
 //!
 //! This CLI provides a rustyline-based interface for managing conversations with LLMs.
-//! Users can edit messages in the buffer and resubmit them to continue the conversation.
 use std::io::Write;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use colored::Colorize;
-use futures::StreamExt;
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 use secrecy::SecretString;
+use tokio::sync::Mutex;
 
-use neuromance::{ChatRequest, ToolChoice};
 use neuromance::{
-    Config, Conversation, Core, LLMClient, Message, MessageRole, OpenAIClient, ToolCall, Usage,
+    Config, Conversation, Core, CoreEvent, Message, MessageRole, OpenAIClient, ToolApproval,
+    ToolCall, Usage,
 };
 use neuromance_tools::{ThinkTool, ToolImplementation, create_todo_tools};
 
@@ -25,7 +24,7 @@ mod display;
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Base URL for the API endpoint
-    #[arg(long, default_value = "https://api.openai.com/v1")]
+    #[arg(long, default_value = "https://127.0.0.1:11434/v1")]
     base_url: String,
 
     /// API key for authentication (or set OPENAI_API_KEY env var)
@@ -33,7 +32,7 @@ struct Args {
     api_key: Option<String>,
 
     /// Model to use for chat completion
-    #[arg(long, default_value = "gpt-4")]
+    #[arg(long, default_value = "gpt-oss:20b")]
     model: String,
 
     /// Path to MCP (Model Context Protocol) configuration file
@@ -45,10 +44,9 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Parse command line arguments
+    // cli & config
     let args = Args::parse();
 
-    // Initialize the LLM client
     let api_key = args
         .api_key
         .or_else(|| std::env::var("OPENAI_API_KEY").ok())
@@ -59,14 +57,71 @@ async fn main() -> Result<()> {
     config.api_key = Some(api_key);
     config.base_url = Some(args.base_url.clone());
 
+    // declare LLM client
     let client = OpenAIClient::new(config)?;
 
-    // Initialize Core with tools and streaming
-    let mut core = Core::new(client);
-    core.auto_approve_tools = true;
-    core.streaming = true;
+    // tool approval editor, locks when prompting user to approve/deny tools
+    let approval_editor = Arc::new(Mutex::new(DefaultEditor::new()?));
 
-    // Register built-in tools
+    // usage tracker, updates via event callback
+    let total_usage = Arc::new(Mutex::new(Usage {
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        total_tokens: 0,
+        cost: None,
+        input_tokens_details: None,
+        output_tokens_details: None,
+    }));
+
+    // initialize neuromance core
+    //
+    // NOTE: callbacks use async closure pattern for shared state
+    // `move |arg| { let captured = Arc::clone(&captured); async move { ... } }`
+    let mut core = Core::new(client)
+        .with_streaming()
+        .with_tool_approval_callback({
+            let editor = Arc::clone(&approval_editor);
+            move |tool_call: &ToolCall| {
+                // clone ToolCall and move into async block to avoid lifetime issues
+                let tool_call = tool_call.clone();
+                let editor = Arc::clone(&editor);
+                async move { prompt_for_tool_approval(&tool_call, &editor).await }
+            }
+        })
+        .with_event_callback({
+            let usage = Arc::clone(&total_usage);
+            move |event: CoreEvent| {
+                // Arc::clone inside closure for each invocation
+                let usage = Arc::clone(&usage);
+                async move {
+                    match event {
+                        CoreEvent::Streaming(chunk) => {
+                            print!("{}", chunk);
+                            std::io::stdout().flush().ok();
+                        }
+                        CoreEvent::ToolResult {
+                            name,
+                            result,
+                            success,
+                        } => {
+                            display::display_tool_result(&name, &result, success);
+                        }
+                        CoreEvent::Usage(u) => {
+                            // await async lock so we can update usage
+                            let mut total = usage.lock().await;
+                            total.prompt_tokens += u.prompt_tokens;
+                            total.completion_tokens += u.completion_tokens;
+                            total.total_tokens += u.total_tokens;
+                        }
+                    }
+                }
+            }
+        });
+
+    core.auto_approve_tools = false;
+    core.max_turns = Some(10);
+
+    // tool registration
     let think_tool: Arc<dyn ToolImplementation> = Arc::new(ThinkTool);
     core.tool_executor.add_tool_arc(Arc::clone(&think_tool));
 
@@ -79,42 +134,38 @@ async fn main() -> Result<()> {
 
     let registered_tools = ["think", "read_todos", "write_todos"];
 
-    // Load MCP configuration if provided
+    // load MCP conf if provided
     if let Some(mcp_config_path) = &args.mcp_config {
         use neuromance_tools::mcp::McpManager;
         use std::path::Path;
 
         println!("Loading MCP configuration from: {}", mcp_config_path);
         match McpManager::from_config_file(Path::new(mcp_config_path)).await {
-            Ok(mcp_manager) => {
-                // Get all tools from MCP servers
-                match mcp_manager.get_all_tools().await {
-                    Ok(mcp_tools) => {
-                        let mcp_tool_count = mcp_tools.len();
+            Ok(mcp_manager) => match mcp_manager.get_all_tools().await {
+                Ok(mcp_tools) => {
+                    let mcp_tool_count = mcp_tools.len();
 
-                        for tool in mcp_tools {
-                            core.tool_executor.add_tool_arc(tool);
-                        }
-
-                        // Get server status to count active servers
-                        let status = mcp_manager.get_status().await;
-                        let server_count = status
-                            .values()
-                            .filter(|s| {
-                                matches!(s, neuromance_tools::mcp::ServerStatus::Connected { .. })
-                            })
-                            .count();
-
-                        println!(
-                            "Successfully loaded {} MCP tool(s) from {} server(s)",
-                            mcp_tool_count, server_count
-                        );
+                    for tool in mcp_tools {
+                        core.tool_executor.add_tool_arc(tool);
                     }
-                    Err(e) => {
-                        eprintln!("Warning: Failed to load MCP tools: {}", e);
-                    }
+
+                    let status = mcp_manager.get_status().await;
+                    let server_count = status
+                        .values()
+                        .filter(|s| {
+                            matches!(s, neuromance_tools::mcp::ServerStatus::Connected { .. })
+                        })
+                        .count();
+
+                    println!(
+                        "Successfully loaded {} MCP tool(s) from {} server(s)",
+                        mcp_tool_count, server_count
+                    );
                 }
-            }
+                Err(e) => {
+                    eprintln!("Warning: Failed to load MCP tools: {}", e);
+                }
+            },
             Err(e) => {
                 eprintln!("Warning: Failed to load MCP configuration: {}", e);
                 eprintln!("Continuing without MCP tools...");
@@ -124,25 +175,27 @@ async fn main() -> Result<()> {
 
     println!("Registered tools: {}\n", registered_tools.join(", "));
 
-    // Initialize conversation
+    // initialize conversation
     let mut conversation = Conversation::new()
         .with_title("CLI Chat Session")
         .with_description("Interactive conversation with LLM");
 
-    // Add system message
+    // set system message
     let system_msg =
         conversation.system_message("You are a helpful assistant. Be concise and informative.");
     conversation.add_message(system_msg)?;
 
-    // Initialize rustyline editor
+    // initialize rustyline editor
     let mut rl = DefaultEditor::new()?;
     let history_file = ".neuromance_history";
 
-    // Load history if it exists
+    // load history if it exists
     if rl.load_history(history_file).is_err() {
         println!("No previous history found.");
     }
 
+    // print usage menu
+    // TODO: put this in display.rs
     println!("Neuromance CLI");
     println!("Commands:");
     println!("  /edit <index> - Edit message at index and resubmit from that point");
@@ -150,72 +203,71 @@ async fn main() -> Result<()> {
     println!("  /clear        - Clear conversation (keeps system message)");
     println!("  /quit         - Exit the CLI");
     println!();
+    println!("Tool Approval:");
+    println!("  When a tool is requested, you'll be prompted to approve:");
+    println!("  /yes or /y    - Approve the tool execution");
+    println!("  /no or /n     - Deny the tool execution");
+    println!("  /quit or /q   - Abort the entire conversation");
+    println!();
 
-    // Track usage stats
-    let mut total_usage = Usage {
-        prompt_tokens: 0,
-        completion_tokens: 0,
-        total_tokens: 0,
-        cost: None,
-        input_tokens_details: None,
-        output_tokens_details: None,
-    };
-
+    // core cli loop
     loop {
+        let (prompt_tokens, completion_tokens, total_tokens) = {
+            let usage = total_usage.lock().await;
+            (
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens,
+            )
+        };
+        // PS1
+        // ╭─● You [↑0 ↓0 Σ0]
+        // ╰─○
+        // TODO: put this in display.rs
         let prompt = format!(
             "\n╭─● {} [{}↑{} {}↓{} {}Σ{}]\n╰─○ ",
             "You".bright_cyan().bold(),
             "".cyan(),
-            total_usage.prompt_tokens.to_string().cyan(),
+            prompt_tokens.to_string().cyan(),
             "".green(),
-            total_usage.completion_tokens.to_string().green(),
+            completion_tokens.to_string().green(),
             "".yellow(),
-            total_usage.total_tokens.to_string().yellow()
+            total_tokens.to_string().yellow()
         );
         let readline = rl.readline(&prompt);
         match readline {
             Ok(line) => {
                 let line = line.trim();
 
-                // Add to history
+                // add to history
                 rl.add_history_entry(line)?;
 
-                // Handle commands
+                // handle commands
                 if line.starts_with('/') {
-                    if handle_command(
-                        line,
-                        &mut conversation,
-                        &mut rl,
-                        &mut core,
-                        &mut total_usage,
-                    )
-                    .await?
+                    if handle_command(line, &mut conversation, &mut rl, &mut core, &total_usage)
+                        .await?
                     {
-                        break; // Exit if command returns true
+                        break; // exit if command returns true
                     }
                     continue;
                 }
 
-                // Skip empty input
+                // empty input skip
                 if line.is_empty() {
                     continue;
                 }
 
-                // Add user message
+                // add user message
                 let user_msg = conversation.user_message(line);
                 conversation.add_message(user_msg)?;
 
-                // Send to LLM with tool execution support
-                match execute_with_tools(&mut core, &mut conversation).await {
-                    Ok(usage) => {
-                        if let Some(u) = usage {
-                            total_usage.prompt_tokens += u.prompt_tokens;
-                            total_usage.completion_tokens += u.completion_tokens;
-                            total_usage.total_tokens += u.total_tokens;
-                        }
+                // send conversation using neuromance core
+                match execute_conversation(&mut core, &mut conversation).await {
+                    Ok(()) => {
+                        // Successfully completed - messages already in conversation
                     }
                     Err(e) => {
-                        eprintln!("Error: {}", e);
+                        eprintln!("\n{} {}", "Error:".red().bold(), e);
                     }
                 }
             }
@@ -234,7 +286,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Save history
+    // save history
     rl.save_history(history_file)?;
     println!("Goodbye!");
 
@@ -247,7 +299,7 @@ async fn handle_command(
     conversation: &mut Conversation,
     rl: &mut DefaultEditor,
     core: &mut Core<OpenAIClient>,
-    total_usage: &mut Usage,
+    total_usage: &Arc<Mutex<Usage>>,
 ) -> Result<bool> {
     let parts: Vec<&str> = command.split_whitespace().collect();
 
@@ -261,9 +313,10 @@ async fn handle_command(
         Some("/clear") => {
             clear_conversation(conversation)?;
             // Reset usage stats
-            total_usage.prompt_tokens = 0;
-            total_usage.completion_tokens = 0;
-            total_usage.total_tokens = 0;
+            let mut usage = total_usage.lock().await;
+            usage.prompt_tokens = 0;
+            usage.completion_tokens = 0;
+            usage.total_tokens = 0;
         }
         Some("/edit") => {
             if let Some(index_str) = parts.get(1) {
@@ -395,142 +448,130 @@ async fn edit_message(
     println!("\nMessage edited. Resubmitting...\n");
 
     // Resubmit to LLM with tool execution
-    match execute_with_tools(core, conversation).await {
-        Ok(_usage) => {
-            // Messages already displayed by execute_with_tools
+    match execute_conversation(core, conversation).await {
+        Ok(()) => {
+            // Successfully completed
         }
         Err(e) => {
-            eprintln!("Error: {}", e);
+            eprintln!("\n{} {}", "Error:".red().bold(), e);
         }
     }
 
     Ok(())
 }
 
-/// Execute conversation with Core's tool loop, displaying results with streaming
-async fn execute_with_tools(
-    core: &mut Core<OpenAIClient>,
-    conversation: &mut Conversation,
-) -> Result<Option<Usage>> {
-    let mut total_usage = Usage {
-        prompt_tokens: 0,
-        completion_tokens: 0,
-        total_tokens: 0,
-        cost: None,
-        input_tokens_details: None,
-        output_tokens_details: None,
+/// Prompt user for tool approval with `/yes`, `/no`, or `/quit` commands
+///
+/// Mutex is safe here: only held during user I/O, Core doesn't re-enter while waiting.
+/// Timeout provides failsafe against unexpected deadlocks.
+async fn prompt_for_tool_approval(
+    tool_call: &ToolCall,
+    editor: &Arc<Mutex<DefaultEditor>>,
+) -> ToolApproval {
+    // Display the tool request
+    display::display_tool_call_request(tool_call);
+
+    // Parse arguments for display
+    let args_display = if tool_call.function.arguments.is_empty() {
+        "{}".to_string()
+    } else if tool_call.function.arguments.len() == 1 {
+        tool_call.function.arguments[0].clone()
+    } else {
+        format!("[{}]", tool_call.function.arguments.join(", "))
     };
 
-    let max_turns = 10;
-    let mut turn = 0;
+    println!(
+        "\n{} Execute tool '{}' with arguments: {}",
+        "Tool Approval Required:".yellow().bold(),
+        tool_call.function.name.bright_green(),
+        args_display.bright_cyan()
+    );
+    println!(
+        "{} /yes or /y to approve, /no or /n to deny, /quit or /q to abort",
+        "→".yellow()
+    );
+
+    // Acquire lock with timeout as defensive measure
+    let mut ed = match tokio::time::timeout(std::time::Duration::from_secs(30), editor.lock()).await
+    {
+        Ok(guard) => guard,
+        Err(_) => {
+            eprintln!("{} Editor lock timeout", "!".red().bold());
+            return ToolApproval::Denied("Editor lock timeout".to_string());
+        }
+    };
 
     loop {
-        turn += 1;
-        if turn > max_turns {
-            display::display_warning(&format!(
-                "Maximum tool execution turns ({}) reached. Response may be incomplete.",
-                max_turns
-            ));
-            break;
-        }
+        let prompt = format!("{} ", "Approve?".yellow().bold());
+        match ed.readline(&prompt) {
+            Ok(line) => {
+                let line = line.trim();
+                ed.add_history_entry(line).ok();
 
-        // Create request
-        let request =
-            ChatRequest::from((core.client.config(), conversation.get_messages().to_vec()))
-                .with_tools(core.tool_executor.get_all_tools())
-                .with_tool_choice(ToolChoice::Auto);
-
-        // Stream the response
-        let mut stream = core.client.chat_stream(&request).await?;
-        // Pre-allocate capacity for typical streaming responses
-        // Average LLM response is ~200-500 chars, allocate for 1KB to reduce reallocations
-        let mut accumulated_content = String::with_capacity(1024);
-        // Most responses have 0-3 tool calls, pre-allocate for 4 to avoid most reallocations
-        let mut tool_calls = Vec::with_capacity(4);
-        let mut usage_info = None;
-        let mut has_shown_header = false;
-
-        while let Some(chunk_result) = stream.next().await {
-            let chunk = chunk_result?;
-
-            // Display content as it streams
-            if let Some(content) = &chunk.delta_content {
-                if !has_shown_header {
-                    display::display_assistant_header();
-                    has_shown_header = true;
+                match line {
+                    "/yes" | "/y" => {
+                        println!("{} Tool approved\n", "✓".green().bold());
+                        return ToolApproval::Approved;
+                    }
+                    "/no" | "/n" => {
+                        println!("{} Tool denied\n", "✗".red().bold());
+                        return ToolApproval::Denied("User denied tool execution".to_string());
+                    }
+                    "/quit" | "/q" => {
+                        println!("{} Aborting conversation\n", "!".red().bold());
+                        return ToolApproval::Quit;
+                    }
+                    _ => {
+                        println!(
+                            "{} Invalid response. Use /yes, /no, or /quit",
+                            "!".yellow().bold()
+                        );
+                        continue;
+                    }
                 }
-                print!("{}", content);
-                std::io::stdout().flush()?;
-                accumulated_content.push_str(content);
             }
-
-            // Accumulate tool calls
-            if let Some(delta_calls) = &chunk.delta_tool_calls {
-                tool_calls = ToolCall::merge_deltas(tool_calls, delta_calls);
+            Err(ReadlineError::Interrupted) => {
+                println!("{} Tool denied (CTRL-C)\n", "✗".red().bold());
+                return ToolApproval::Denied("User interrupted with CTRL-C".to_string());
             }
-
-            // Capture usage
-            if let Some(usage) = chunk.usage {
-                usage_info = Some(usage);
+            Err(ReadlineError::Eof) => {
+                println!("{} Aborting conversation (CTRL-D)\n", "!".red().bold());
+                return ToolApproval::Quit;
             }
-        }
-
-        // Update total usage
-        if let Some(usage) = usage_info {
-            total_usage.prompt_tokens += usage.prompt_tokens;
-            total_usage.completion_tokens += usage.completion_tokens;
-            total_usage.total_tokens += usage.total_tokens;
-        }
-
-        // Create assistant message
-        let assistant_msg = conversation.assistant_message(&accumulated_content);
-        let assistant_msg_with_tools = if !tool_calls.is_empty() {
-            assistant_msg.with_tool_calls(tool_calls.clone())?
-        } else {
-            assistant_msg
-        };
-        conversation.add_message(assistant_msg_with_tools)?;
-
-        // If no tool calls, end the branch and we're done
-        if tool_calls.is_empty() {
-            if has_shown_header {
-                display::display_assistant_end();
-            }
-            break;
-        }
-
-        // Display and execute tool calls (continues the branch)
-        for tool_call in &tool_calls {
-            display::display_tool_call_request(tool_call);
-
-            // Execute the tool (auto-approved in this CLI)
-            match core.tool_executor.execute_tool(tool_call).await {
-                Ok(result) => {
-                    display::display_tool_result(&tool_call.function.name, &result, true);
-
-                    let tool_msg = Message::tool(
-                        conversation.id,
-                        result,
-                        tool_call.id.clone(),
-                        tool_call.function.name.clone(),
-                    )?;
-                    conversation.add_message(tool_msg)?;
-                }
-                Err(e) => {
-                    let error_msg = format!("Tool execution failed: {}", e);
-                    display::display_tool_result(&tool_call.function.name, &error_msg, false);
-
-                    let tool_msg = Message::tool(
-                        conversation.id,
-                        error_msg,
-                        tool_call.id.clone(),
-                        tool_call.function.name.clone(),
-                    )?;
-                    conversation.add_message(tool_msg)?;
-                }
+            Err(e) => {
+                eprintln!("Error reading input: {}", e);
+                return ToolApproval::Denied(format!("Error reading input: {}", e));
             }
         }
     }
+}
 
-    Ok(Some(total_usage))
+/// Execute conversation using Core's built-in tool loop with streaming
+async fn execute_conversation(
+    core: &mut Core<OpenAIClient>,
+    conversation: &mut Conversation,
+) -> Result<()> {
+    // Display assistant header before streaming starts
+    display::display_assistant_header();
+
+    // Use Core's chat_with_tool_loop which handles:
+    // - Streaming with callback
+    // - Tool approval via callback
+    // - Tool execution
+    // - Max turns checking
+    let messages = core
+        .chat_with_tool_loop(conversation.get_messages().to_vec())
+        .await?;
+
+    // Update conversation with all messages from the loop
+    // The tool loop returns all messages including assistant responses and tool results
+    // We need to add only the new ones (skip messages already in conversation)
+    let existing_count = conversation.get_messages().len();
+    for msg in messages.into_iter().skip(existing_count) {
+        conversation.add_message(msg)?;
+    }
+
+    display::display_assistant_end();
+
+    Ok(())
 }
