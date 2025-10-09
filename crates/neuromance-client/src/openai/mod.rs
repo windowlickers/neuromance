@@ -42,6 +42,7 @@ pub struct OpenAIMessage {
     pub role: MessageRole,
     /// The text content of the message (optional for tool calls).
     #[builder(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     /// Optional name of the message author.
     #[builder(default)]
@@ -49,6 +50,7 @@ pub struct OpenAIMessage {
     pub name: Option<String>,
     /// Tool calls requested by the assistant (optional).
     #[builder(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<SmallVec<[OpenAIToolCall; 2]>>,
     /// ID of the tool call this message is responding to (for tool messages).
     #[builder(default)]
@@ -70,9 +72,16 @@ impl From<&Message> for OpenAIMessage {
             None
         };
 
+        // Only include content if it's non-empty
+        let content = if !message.content.is_empty() {
+            Some(message.content.clone())
+        } else {
+            None
+        };
+
         OpenAIMessage::builder()
             .role(message.role)
-            .content(Some(message.content.clone()))
+            .content(content)
             .name(message.name.clone())
             .tool_calls(tool_calls)
             .tool_call_id(message.tool_call_id.clone())
@@ -164,42 +173,55 @@ pub struct ChatCompletionRequest {
     pub messages: Vec<OpenAIMessage>,
     /// Maximum tokens to generate (optional).
     #[builder(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
     /// Sampling temperature 0.0 to 2.0 (optional).
     #[builder(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     /// Nucleus sampling threshold 0.0 to 1.0 (optional).
     #[builder(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
     /// Number of completions to generate (optional, default 1).
     #[builder(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub n: Option<u32>,
     /// Stop sequences (optional).
     #[builder(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub stop: Option<Vec<String>>,
     /// Presence penalty -2.0 to 2.0 (optional).
     #[builder(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub presence_penalty: Option<f32>,
     /// Frequency penalty -2.0 to 2.0 (optional).
     #[builder(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub frequency_penalty: Option<f32>,
     /// Token bias map for modifying likelihoods (optional).
     #[builder(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub logit_bias: Option<HashMap<String, f32>>,
     /// End-user identifier for tracking (optional).
     #[builder(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
     /// Whether to stream the response (optional, default false).
     #[builder(default = Some(false))]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
     /// Tools available for function calling (optional).
     #[builder(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<Tool>>,
     /// Tool selection strategy (optional).
     #[builder(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<serde_json::Value>,
     /// Whether to enable thinking mode (vendor-specific, optional).
     #[builder(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub enable_thinking: Option<bool>,
     /// Stream options for controlling streaming behavior (optional).
     #[builder(default)]
