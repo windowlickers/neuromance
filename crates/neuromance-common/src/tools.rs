@@ -7,7 +7,7 @@ use typed_builder::TypedBuilder;
 use uuid::Uuid;
 
 /// Represents the approval status of a tool call.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub enum ToolApproval {
     /// The tool call is approved and should be executed.
     Approved,
@@ -18,7 +18,7 @@ pub enum ToolApproval {
 }
 
 /// Describes a single property in a function parameter schema.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct Property {
     /// The JSON type (e.g., "string", "number", "object").
     #[serde(rename = "type")]
@@ -28,7 +28,7 @@ pub struct Property {
 }
 
 /// Defines the parameter schema for a function using JSON Schema conventions.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct Parameters {
     /// The JSON type, typically "object".
     #[serde(rename = "type")]
@@ -40,7 +40,7 @@ pub struct Parameters {
 }
 
 /// Describes a function that can be called by an LLM.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct Function {
     /// The name of the function.
     pub name: String,
@@ -51,7 +51,7 @@ pub struct Function {
 }
 
 /// Represents a tool available to the LLM, typically wrapping a function.
-#[derive(Debug, Clone, Serialize, Deserialize, TypedBuilder, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, TypedBuilder, Eq, PartialEq)]
 pub struct Tool {
     /// The type of tool (defaults to "function").
     #[serde(rename = "type")]
@@ -95,7 +95,7 @@ impl ToolCall {
             id: Uuid::new_v4().to_string(),
             function: FunctionCall {
                 name: name.into(),
-                arguments: arguments.into_iter().map(|arg| arg.into()).collect(),
+                arguments: arguments.into_iter().map(Into::into).collect(),
             },
             call_type: "function".to_string(),
         }
@@ -105,6 +105,7 @@ impl ToolCall {
     ///
     /// Used when processing streaming LLM responses where tool calls arrive incrementally.
     /// Argument fragments are concatenated for matching IDs.
+    #[must_use]
     pub fn merge_deltas(mut accumulated: Vec<Self>, deltas: &[Self]) -> Vec<Self> {
         for delta in deltas {
             if let Some(existing) = accumulated.iter_mut().find(|tc| tc.id == delta.id) {
@@ -130,6 +131,9 @@ impl ToolCall {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::expect_used)]
+
     use super::*;
 
     #[test]
@@ -515,6 +519,9 @@ mod tests {
 
 #[cfg(test)]
 mod proptests {
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::expect_used)]
+
     use super::*;
     use proptest::prelude::*;
 

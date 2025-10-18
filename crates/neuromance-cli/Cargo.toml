@@ -12,6 +12,9 @@ keywords.workspace = true
 categories.workspace = true
 description = "Interactive command-line interface for LLM interactions"
 
+[lints]
+workspace = true
+
 [dependencies]
 neuromance = { version = "0.0.6", path = "../neuromance" }
 neuromance-tools = { version = "0.0.6", path = "../neuromance-tools" }

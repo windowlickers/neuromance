@@ -12,6 +12,9 @@ keywords.workspace = true
 categories.workspace = true
 description = "Tool execution framework for Neuromance LLM library"
 
+[lints]
+workspace = true
+
 [dependencies]
 anyhow.workspace = true 
 async-trait.workspace = true 

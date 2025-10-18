@@ -1,6 +1,6 @@
 //! OpenAI-compatible client implementation.
 //!
-//! This module provides a client for interacting with OpenAI and OpenAI-compatible APIs.
+//! This module provides a client for interacting with `OpenAI` and OpenAI-compatible APIs.
 //!
 //! # Features
 //!
@@ -74,7 +74,7 @@
 //!
 //! ## Message Builder Pattern
 //!
-//! The module provides a type-safe builder for constructing OpenAI messages:
+//! The module provides a type-safe builder for constructing `OpenAI` messages:
 //!
 //! ```
 //! use neuromance_client::openai::OpenAIMessage;
@@ -142,7 +142,7 @@ mod builder_states {
     pub struct HasRole;
 }
 
-/// Builder for constructing OpenAI messages with compile-time validation.
+/// Builder for constructing `OpenAI` messages with compile-time validation.
 ///
 /// Uses the type-state pattern to ensure messages are built correctly:
 /// - Messages must have a role set before being built
@@ -174,7 +174,8 @@ impl OpenAIMessageBuilder<builder_states::NoRole> {
     ///
     /// The builder starts in `NoRole` state and requires calling `role()`
     /// before `build()` can be called.
-    pub fn new() -> Self {
+    #[must_use]
+    pub const fn new() -> Self {
         Self {
             _state: PhantomData,
             role: None,
@@ -193,6 +194,7 @@ impl OpenAIMessageBuilder<builder_states::NoRole> {
     /// # Arguments
     ///
     /// * `role` - The message role (User, Assistant, System, or Tool)
+    #[must_use]
     pub fn role(
         self,
         role: neuromance_common::chat::MessageRole,
@@ -214,6 +216,7 @@ impl OpenAIMessageBuilder<builder_states::HasRole> {
     /// # Arguments
     ///
     /// * `content` - The text content of the message
+    #[must_use]
     pub fn content(mut self, content: impl Into<String>) -> Self {
         self.content = Some(content.into());
         self
@@ -224,6 +227,7 @@ impl OpenAIMessageBuilder<builder_states::HasRole> {
     /// # Arguments
     ///
     /// * `name` - The name of the message author
+    #[must_use]
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
@@ -236,6 +240,7 @@ impl OpenAIMessageBuilder<builder_states::HasRole> {
     /// # Arguments
     ///
     /// * `tool_calls` - Vector of tool calls to execute
+    #[must_use]
     pub fn tool_calls(mut self, tool_calls: SmallVec<[crate::openai::OpenAIToolCall; 2]>) -> Self {
         self.tool_calls = Some(tool_calls);
         self
@@ -248,14 +253,20 @@ impl OpenAIMessageBuilder<builder_states::HasRole> {
     /// # Arguments
     ///
     /// * `tool_call_id` - The ID of the tool call this message responds to
+    #[must_use]
     pub fn tool_call_id(mut self, tool_call_id: impl Into<String>) -> Self {
         self.tool_call_id = Some(tool_call_id.into());
         self
     }
 
-    /// Builds the OpenAI message.
+    /// Builds the `OpenAI` message.
     ///
     /// Only available in `HasRole` state, ensuring the role is always set.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the role is not set (should not happen in `HasRole` state).
+    #[must_use]
     pub fn build(self) -> OpenAIMessage {
         OpenAIMessage {
             role: self.role.expect("Role must be set"),
@@ -273,10 +284,10 @@ impl Default for OpenAIMessageBuilder<builder_states::NoRole> {
     }
 }
 
-/// Client for OpenAI-compatible APIs.
+/// Client for `OpenAI`-compatible APIs.
 ///
 /// Supports chat completions with tool/function calling for any API
-/// that implements the OpenAI chat completions specification.
+/// that implements the `OpenAI` chat completions specification.
 ///
 /// # Security
 ///
@@ -299,11 +310,11 @@ impl std::fmt::Debug for OpenAIClient {
             .field("api_key", &"[REDACTED]")
             .field("base_url", &self.base_url)
             .field("config", &self.config)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
-/// Convert an OpenAI streaming chunk to our common ChatChunk format.
+/// Convert an `OpenAI` streaming chunk to our common `ChatChunk` format.
 ///
 /// Handles delta updates for content, role, and tool calls.
 pub fn convert_chunk_to_chat_chunk(chunk: &ChatCompletionChunk) -> ChatChunk {
@@ -367,13 +378,14 @@ pub fn convert_chunk_to_chat_chunk(chunk: &ChatCompletionChunk) -> ChatChunk {
             output_tokens_details: u.output_tokens_details,
         }),
         response_id: Some(chunk.id.clone()),
-        created_at: DateTime::from_timestamp(chunk.created as i64, 0).unwrap_or_else(Utc::now),
+        created_at: DateTime::from_timestamp(i64::try_from(chunk.created).unwrap_or(0), 0)
+            .unwrap_or_else(Utc::now),
         metadata: HashMap::new(),
     }
 }
 
 impl OpenAIClient {
-    /// Create a new OpenAI client from a configuration.
+    /// Create a new `OpenAI` client from a configuration.
     ///
     /// # Arguments
     ///
@@ -392,6 +404,10 @@ impl OpenAIClient {
     /// let client = OpenAIClient::new(config)?;
     /// # Ok::<(), anyhow::Error>(())
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the API key is missing or HTTP client creation fails.
     pub fn new(config: Config) -> Result<Self> {
         let api_key = config
             .api_key
@@ -408,7 +424,7 @@ impl OpenAIClient {
                 config.retry_config.initial_delay,
                 config.retry_config.max_delay,
             )
-            .build_with_max_retries(config.retry_config.max_retries as u32);
+            .build_with_max_retries(u32::try_from(config.retry_config.max_retries).unwrap_or(3));
 
         // Create reqwest client with timeout configuration
         // None means no timeout (useful for slow hardware/long-running requests)
@@ -438,12 +454,13 @@ impl OpenAIClient {
 
     /// Set a custom base URL for the API endpoint.
     ///
-    /// Useful for connecting to OpenAI-compatible services like Azure OpenAI,
+    /// Useful for connecting to `OpenAI`-compatible services like Azure `OpenAI`,
     /// local models, or proxy servers.
     ///
     /// # Arguments
     ///
     /// * `base_url` - The base URL (e.g., `https://api.openai.com/v1`)
+    #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         let base_url = base_url.into();
         Arc::make_mut(&mut self.config).base_url = Some(base_url.clone());
@@ -456,21 +473,22 @@ impl OpenAIClient {
     /// # Arguments
     ///
     /// * `model` - The model name (e.g., "gpt-4", "gpt-3.5-turbo")
+    #[must_use]
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         Arc::make_mut(&mut self.config).model = model.into();
         self
     }
 
-    async fn make_request<T: for<'de> Deserialize<'de>>(
+    async fn make_request<T: for<'de> Deserialize<'de>, B: Serialize + Sync>(
         &self,
         endpoint: &str,
-        body: &impl Serialize,
+        body: &B,
     ) -> Result<T, ClientError> {
         let url = format!("{}/{}", self.base_url, endpoint);
 
         // Validate URL construction
         reqwest::Url::parse(&url).map_err(|e| {
-            ClientError::ConfigurationError(format!("Invalid URL '{}': {}", url, e))
+            ClientError::ConfigurationError(format!("Invalid URL '{url}': {e}"))
         })?;
 
         let response = self
@@ -488,7 +506,7 @@ impl OpenAIClient {
         if !response.status().is_success() {
             let status = response.status();
             let error_text = response.text().await.map_err(|e| {
-                warn!("Failed to read error response body: {}", e);
+                warn!("Failed to read error response body: {e}");
                 ClientError::NetworkError(e)
             })?;
 
@@ -500,8 +518,7 @@ impl OpenAIClient {
                 }
                 Err(parse_err) => {
                     debug!(
-                        "Failed to parse error response as JSON: {}. Using raw text instead.",
-                        parse_err
+                        "Failed to parse error response as JSON: {parse_err}. Using raw text instead."
                     );
                     error_text
                 }
@@ -527,7 +544,7 @@ impl OpenAIClient {
         Ok(parsed_response)
     }
 
-    /// Convert an OpenAI message to our internal message format.
+    /// Convert an `OpenAI` message to our internal message format.
     ///
     /// # Note on Tool Arguments
     ///
@@ -550,7 +567,6 @@ impl OpenAIClient {
     /// }
     /// ```
     fn convert_openai_message_to_message(
-        &self,
         openai_msg: &OpenAIMessage,
         conversation_id: uuid::Uuid,
     ) -> Message {
@@ -639,7 +655,7 @@ impl LLMClient for OpenAIClient {
             })?
             .conversation_id;
 
-        let message = self.convert_openai_message_to_message(&choice.message, conversation_id);
+        let message = Self::convert_openai_message_to_message(&choice.message, conversation_id);
 
         let finish_reason = choice
             .finish_reason
@@ -660,7 +676,7 @@ impl LLMClient for OpenAIClient {
             model: response.model,
             usage,
             finish_reason,
-            created_at: DateTime::from_timestamp(response.created as i64, 0)
+            created_at: DateTime::from_timestamp(i64::try_from(response.created).unwrap_or(0), 0)
                 .unwrap_or_else(Utc::now),
             response_id: Some(response.id),
             metadata: HashMap::new(),
@@ -683,7 +699,7 @@ impl LLMClient for OpenAIClient {
 
         // Validate URL construction
         reqwest::Url::parse(&url).map_err(|e| {
-            ClientError::ConfigurationError(format!("Invalid URL '{}': {}", url, e))
+            ClientError::ConfigurationError(format!("Invalid URL '{url}': {e}"))
         })?;
 
         // Build the request with SSE headers
@@ -701,7 +717,7 @@ impl LLMClient for OpenAIClient {
         // Create the EventSource
         // We handle retries at a higher level in Core
         let mut event_source = EventSource::new(request_builder).map_err(|e| {
-            ClientError::ConfigurationError(format!("Failed to create event source: {}", e))
+            ClientError::ConfigurationError(format!("Failed to create event source: {e}"))
         })?;
 
         // Disable automatic retries - we handle retries at the Core level
@@ -729,7 +745,7 @@ impl LLMClient for OpenAIClient {
                             Some(Ok(chat_chunk))
                         }
                         Err(e) => {
-                            warn!("Failed to parse streaming chunk: {}", e);
+                            warn!("Failed to parse streaming chunk: {e}");
                             debug!("Problematic chunk data: {}", message.data);
                             Some(Err(ClientError::SerializationError(e).into()))
                         }
@@ -743,7 +759,7 @@ impl LLMClient for OpenAIClient {
                             None
                         }
                         other_error => {
-                            error!("Stream error: {}", other_error);
+                            error!("Stream error: {other_error}");
                             Some(Err(other_error.into()))
                         }
                     }
@@ -757,6 +773,9 @@ impl LLMClient for OpenAIClient {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::expect_used)]
+
     use super::*;
     use neuromance_common::chat::{Message, MessageRole};
     use neuromance_common::client::FinishReason;
@@ -1133,6 +1152,9 @@ mod tests {
 
 #[cfg(test)]
 mod fuzz_tests {
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::expect_used)]
+
     use crate::openai::{ChatCompletionResponse, OpenAIMessage};
     use neuromance_common::chat::MessageRole;
     use proptest::prelude::*;

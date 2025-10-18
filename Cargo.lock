@@ -1307,7 +1307,7 @@ dependencies = [
 
 [[package]]
 name = "neuromance"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1329,7 +1329,7 @@ dependencies = [
 
 [[package]]
 name = "neuromance-agent"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1349,7 +1349,7 @@ dependencies = [
 
 [[package]]
 name = "neuromance-cli"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "anyhow",
  "clap",
@@ -1365,7 +1365,7 @@ dependencies = [
 
 [[package]]
 name = "neuromance-client"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1398,7 +1398,7 @@ dependencies = [
 
 [[package]]
 name = "neuromance-common"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1413,7 +1413,7 @@ dependencies = [
 
 [[package]]
 name = "neuromance-tools"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "anyhow",
  "async-trait",

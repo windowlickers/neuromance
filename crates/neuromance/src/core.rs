@@ -28,11 +28,11 @@ pub struct Core<C: LLMClient> {
     pub streaming: bool,
     /// Total number of tool calls the LLM can make before returning to the user.
     pub max_turns: Option<u32>,
-    /// Execute all tools regardless of their auto_approve value
+    /// Execute all tools regardless of their `auto_approve` value
     pub auto_approve_tools: bool,
     /// how the model selects which tool to call, if any.
     pub tool_choice: ToolChoice,
-    /// Holds tools in ToolRegistry and executes tools
+    /// Holds tools in `ToolRegistry` and executes tools
     pub tool_executor: ToolExecutor,
     /// Optional bi-directional callback for Tool approval
     pub tool_approval_callback: Option<ToolApprovalCallback>,
@@ -74,6 +74,7 @@ impl<C: LLMClient> Core<C> {
     ///         }
     ///     });
     /// ```
+    #[must_use]
     pub fn with_tool_approval_callback<F, Fut>(mut self, callback: F) -> Self
     where
         F: Fn(&ToolCall) -> Fut + Send + Sync + 'static,
@@ -84,7 +85,7 @@ impl<C: LLMClient> Core<C> {
         self
     }
 
-    /// Callback for all CoreEvents
+    /// Callback for all `CoreEvents`
     /// This callback receives notifications about streaming content, tool execution
     /// results, and token usage.
     ///
@@ -112,6 +113,7 @@ impl<C: LLMClient> Core<C> {
     ///         }
     ///     });
     /// ```
+    #[must_use]
     pub fn with_event_callback<F, Fut>(mut self, callback: F) -> Self
     where
         F: Fn(CoreEvent) -> Fut + Send + Sync + 'static,
@@ -122,7 +124,8 @@ impl<C: LLMClient> Core<C> {
     }
 
     /// Enable streaming mode
-    pub fn with_streaming(mut self) -> Self {
+    #[must_use]
+    pub const fn with_streaming(mut self) -> Self {
         self.streaming = true;
         self
     }
@@ -138,17 +141,14 @@ impl<C: LLMClient> Core<C> {
                 Ok(()) => {}
                 Err(e) => {
                     // Log the panic but continue execution
-                    let panic_msg = if let Some(s) = e.downcast_ref::<&str>() {
-                        s.to_string()
-                    } else if let Some(s) = e.downcast_ref::<String>() {
-                        s.clone()
-                    } else {
-                        "Unknown panic".to_string()
-                    };
-                    warn!(
-                        "Event callback panicked while processing {:?}: {}",
-                        event, panic_msg
+                    let panic_msg = e.downcast_ref::<&str>().map_or_else(
+                        || {
+                            e.downcast_ref::<String>()
+                                .map_or_else(|| "Unknown panic".to_string(), String::clone)
+                        },
+                        |s| (*s).to_string(),
                     );
+                    warn!("Event callback panicked while processing {event:?}: {panic_msg}");
                 }
             }
         }
@@ -167,8 +167,7 @@ impl<C: LLMClient> Core<C> {
                     // Check if this is a retryable error
                     let is_retryable = e
                         .downcast_ref::<ClientError>()
-                        .map(|client_err| client_err.is_retryable())
-                        .unwrap_or(false);
+                        .is_some_and(ClientError::is_retryable);
 
                     if attempt < config.retry_config.max_retries && is_retryable {
                         debug!(
@@ -268,6 +267,10 @@ impl<C: LLMClient> Core<C> {
     }
 
     /// Internal method to handle the chat loop with tool execution
+    ///
+    /// # Errors
+    /// Returns an error if the chat request fails or tool execution fails.
+    #[allow(clippy::too_many_lines)]
     pub async fn chat_with_tool_loop(&self, mut messages: Vec<Message>) -> Result<Vec<Message>> {
         let mut turn_count = 0;
         let mut pending_tool_calls: HashSet<String> = HashSet::new();
@@ -284,7 +287,7 @@ impl<C: LLMClient> Core<C> {
                 "Executing chat turn ({}/{})",
                 turn_count + 1,
                 self.max_turns
-                    .map_or("unlimited".to_string(), |max| max.to_string()),
+                    .map_or_else(|| "unlimited".to_string(), |max| max.to_string()),
             );
             debug!(
                 "Chat request:\n {}",
@@ -338,13 +341,13 @@ impl<C: LLMClient> Core<C> {
                 // Track pending tool call
                 pending_tool_calls.insert(tool_call.id.clone());
 
-                debug!("Tool Name: {} (id: {})", tool_name, call_id);
+                debug!("Tool Name: {tool_name} (id: {call_id})");
                 debug!("Tool Arguments: {:?}", tool_call.function.arguments);
 
                 // Check if tool is auto-approved
                 let is_auto_approved =
                     self.auto_approve_tools || self.tool_executor.is_tool_auto_approved(tool_name);
-                debug!("Tool auto-approved: {}", is_auto_approved);
+                debug!("Tool auto-approved: {is_auto_approved}");
 
                 let approval = if is_auto_approved {
                     ToolApproval::Approved
@@ -355,16 +358,16 @@ impl<C: LLMClient> Core<C> {
                     ToolApproval::Denied("No approval mechanism configured".to_string())
                 };
 
-                debug!("Tool Approval Status: {:?}", approval);
+                debug!("Tool Approval Status: {approval:?}");
 
                 match approval {
                     ToolApproval::Approved => {
-                        debug!("Executing tool: {}", tool_name);
+                        debug!("Executing tool: {tool_name}");
                         // Execute the tool
                         match self.tool_executor.execute_tool(tool_call).await {
                             Ok(result) => {
-                                debug!("Tool {} executed successfully", tool_name);
-                                debug!("Tool result: {}", result);
+                                debug!("Tool {tool_name} executed successfully");
+                                debug!("Tool result: {result}");
 
                                 // Emit tool result event
                                 self.emit_event(CoreEvent::ToolResult {
@@ -385,8 +388,8 @@ impl<C: LLMClient> Core<C> {
                                 pending_tool_calls.remove(&tool_call.id);
                             }
                             Err(e) => {
-                                debug!("Tool {} execution failed: {}", tool_name, e);
-                                let error_msg = format!("Tool execution failed: {}", e);
+                                debug!("Tool {tool_name} execution failed: {e}");
+                                let error_msg = format!("Tool execution failed: {e}");
 
                                 // Emit tool result event
                                 self.emit_event(CoreEvent::ToolResult {
@@ -409,11 +412,11 @@ impl<C: LLMClient> Core<C> {
                         }
                     }
                     ToolApproval::Denied(reason) => {
-                        debug!("Tool {} denied: {}", tool_name, reason);
+                        debug!("Tool {tool_name} denied: {reason}");
                         // Tool not approved
                         let denial_message = Message::tool(
                             conversation_id,
-                            format!("Tool execution denied: {}", reason),
+                            format!("Tool execution denied: {reason}"),
                             tool_call.id.clone(),
                             tool_call.function.name.clone(),
                         )?;
@@ -431,10 +434,7 @@ impl<C: LLMClient> Core<C> {
                 }
             }
 
-            debug!(
-                "Completed processing {} tool calls, continuing conversation",
-                tool_calls_count
-            );
+            debug!("Completed processing {tool_calls_count} tool calls, continuing conversation");
 
             // Update Arc with new messages after tool execution
             messages_arc = messages.clone().into();
@@ -455,8 +455,7 @@ impl<C: LLMClient> Core<C> {
                 && turn_count >= max
             {
                 return Err(CoreError::MaxTurnsExceeded(format!(
-                    "Exceeded maximum turns: {} (configured max: {})",
-                    turn_count, max
+                    "Exceeded maximum turns: {turn_count} (configured max: {max})"
                 ))
                 .into());
             }
@@ -466,6 +465,9 @@ impl<C: LLMClient> Core<C> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::expect_used)]
+
     use super::*;
     use neuromance_client::openai::OpenAIClient;
     use neuromance_common::client::Config;

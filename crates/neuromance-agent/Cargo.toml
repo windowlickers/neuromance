@@ -12,6 +12,9 @@ keywords.workspace = true
 categories.workspace = true
 description = "Agent framework for autonomous task execution with LLMs"
 
+[lints]
+workspace = true
+
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }

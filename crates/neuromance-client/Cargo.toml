@@ -12,6 +12,9 @@ keywords.workspace = true
 categories.workspace = true
 description = "A Rust client library for interacting with LLM inference providers"
 
+[lints]
+workspace = true
+
 [dependencies]
 tokio.workspace = true
 anyhow.workspace = true

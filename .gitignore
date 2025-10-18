@@ -25,3 +25,4 @@ target
 *perf.data*
 flamegraph.svg
 mcp_config.toml
+.direnv

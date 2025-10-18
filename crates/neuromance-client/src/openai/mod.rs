@@ -1,6 +1,6 @@
-//! OpenAI API types and client implementation.
+//! `OpenAI` API types and client implementation.
 //!
-//! This module provides types for the OpenAI chat completions API
+//! This module provides types for the `OpenAI` chat completions API
 //! and a client implementation that works with any OpenAI-compatible endpoint.
 
 use std::borrow::Cow;
@@ -29,13 +29,13 @@ pub struct ChatChoice {
     pub message: OpenAIMessage,
     /// Why generation stopped for this choice.
     ///
-    /// Common values: "stop", "length", "tool_calls", "content_filter"
+    /// Common values: "stop", "length", "`tool_calls`", "`content_filter`"
     pub finish_reason: Option<String>,
 }
 
 /// OpenAI-compatible message format.
 ///
-/// Wrapper type for serializing/deserializing messages to the OpenAI API format.
+/// Wrapper type for serializing/deserializing messages to the `OpenAI` API format.
 #[derive(Debug, Clone, Serialize, Deserialize, TypedBuilder)]
 pub struct OpenAIMessage {
     /// The role of the message author (user, assistant, system, or tool).
@@ -60,7 +60,9 @@ pub struct OpenAIMessage {
 
 impl From<&Message> for OpenAIMessage {
     fn from(message: &Message) -> Self {
-        let tool_calls = if !message.tool_calls.is_empty() {
+        let tool_calls = if message.tool_calls.is_empty() {
+            None
+        } else {
             Some(
                 message
                     .tool_calls
@@ -68,18 +70,16 @@ impl From<&Message> for OpenAIMessage {
                     .map(OpenAIToolCall::from)
                     .collect(),
             )
-        } else {
-            None
         };
 
         // Only include content if it's non-empty
-        let content = if !message.content.is_empty() {
-            Some(message.content.clone())
-        } else {
+        let content = if message.content.is_empty() {
             None
+        } else {
+            Some(message.content.clone())
         };
 
-        OpenAIMessage::builder()
+        Self::builder()
             .role(message.role)
             .content(content)
             .name(message.name.clone())
@@ -116,7 +116,7 @@ impl From<&ToolCall> for OpenAIToolCall {
     }
 }
 
-fn default_tool_call_type() -> Cow<'static, str> {
+const fn default_tool_call_type() -> Cow<'static, str> {
     Cow::Borrowed("function")
 }
 
@@ -141,15 +141,14 @@ impl From<&FunctionCall> for OpenAIFunction {
             arguments: function_call
                 .arguments
                 .first()
-                .map(|s| Cow::Owned(s.clone()))
-                .unwrap_or(Cow::Borrowed("")),
+                .map_or(Cow::Borrowed(""), |s| Cow::Owned(s.clone())),
         }
     }
 }
 
 /// Request for a chat completion.
 ///
-/// Contains all parameters for the OpenAI chat completions API.
+/// Contains all parameters for the `OpenAI` chat completions API.
 ///
 /// # Examples
 ///
@@ -169,7 +168,7 @@ impl From<&FunctionCall> for OpenAIFunction {
 pub struct ChatCompletionRequest {
     /// The model identifier to use (e.g., "gpt-4", "gpt-3.5-turbo").
     pub model: String,
-    /// The conversation messages in OpenAI format.
+    /// The conversation messages in `OpenAI` format.
     pub messages: Vec<OpenAIMessage>,
     /// Maximum tokens to generate (optional).
     #[builder(default)]
@@ -231,7 +230,7 @@ pub struct ChatCompletionRequest {
 
 /// Conversion from a generic `ChatRequest` to OpenAI-specific format.
 ///
-/// Maps common request parameters to the OpenAI API format, using the provided
+/// Maps common request parameters to the `OpenAI` API format, using the provided
 /// configuration for defaults like the model name.
 impl From<(&ChatRequest, &Config)> for ChatCompletionRequest {
     fn from((request, config): (&ChatRequest, &Config)) -> Self {
@@ -240,7 +239,7 @@ impl From<(&ChatRequest, &Config)> for ChatCompletionRequest {
 
         let tools: Option<Vec<Tool>> = request.tools.clone();
 
-        ChatCompletionRequest::builder()
+        Self::builder()
             .model(
                 request
                     .model
@@ -267,6 +266,7 @@ impl ChatCompletionRequest {
     /// Add logit bias to the request.
     ///
     /// Modifies the likelihood of specified tokens appearing in the completion.
+    #[must_use]
     pub fn with_logit_bias(mut self, logit_bias: HashMap<String, f32>) -> Self {
         self.logit_bias = Some(logit_bias);
         self

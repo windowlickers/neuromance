@@ -69,7 +69,11 @@ pub trait LLMClient: Send + Sync {
 
     /// Validate a configuration object.
     ///
-    /// Checks parameter ranges: temperature (0.0-2.0), top_p (0.0-1.0), frequency_penalty (-2.0-2.0).
+    /// Checks parameter ranges: `temperature` (0.0-2.0), `top_p` (0.0-1.0), `frequency_penalty` (-2.0-2.0).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any parameter is out of range.
     fn validate_config(&self, config: Config) -> Result<()> {
         if config
             .temperature
@@ -95,6 +99,10 @@ pub trait LLMClient: Send + Sync {
     /// Validate a chat request before sending.
     ///
     /// Checks messages exist and that tools/streaming are supported if requested.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if validation fails.
     fn validate_request(&self, request: &ChatRequest) -> Result<()> {
         request
             .validate_has_messages()
@@ -114,6 +122,9 @@ pub trait LLMClient: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::expect_used)]
+
     use super::*;
     use neuromance_common::chat::Message;
     use neuromance_common::client::{ChatResponse, ToolChoice};

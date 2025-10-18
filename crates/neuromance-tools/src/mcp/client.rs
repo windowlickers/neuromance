@@ -22,6 +22,9 @@ pub struct McpClientWrapper {
 
 impl McpClientWrapper {
     /// Connect to an MCP server using the provided configuration
+    ///
+    /// # Errors
+    /// Returns an error if the connection fails.
     pub async fn connect(config: McpServerConfig) -> Result<Self> {
         log::info!("Connecting to MCP server '{}'...", config.id);
 
@@ -78,11 +81,15 @@ impl McpClientWrapper {
     }
 
     /// Get the server sink for making calls
+    #[must_use]
     pub fn peer(&self) -> ServerSink {
         self.service.peer().clone()
     }
 
     /// Call a tool on this MCP server
+    ///
+    /// # Errors
+    /// Returns an error if the tool call fails.
     pub async fn call_tool(
         &self,
         name: &str,
@@ -109,6 +116,9 @@ impl McpClientWrapper {
     }
 
     /// Refresh the list of available tools
+    ///
+    /// # Errors
+    /// Returns an error if fetching tools fails.
     pub async fn refresh_tools(&self) -> Result<()> {
         log::debug!("Refreshing tools for server '{}'", self.server_config.id);
 
@@ -119,6 +129,7 @@ impl McpClientWrapper {
         for tool in tools_list {
             tools.insert(tool.name.clone().to_string(), tool);
         }
+        drop(tools);
 
         Ok(())
     }
@@ -136,6 +147,9 @@ impl McpClientWrapper {
     }
 
     /// Shutdown the client
+    ///
+    /// # Errors
+    /// Returns an error if shutdown fails.
     pub async fn shutdown(self) -> Result<()> {
         self.service.cancel().await?;
         Ok(())

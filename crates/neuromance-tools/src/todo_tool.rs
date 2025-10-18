@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt::Write;
 use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
@@ -10,7 +11,7 @@ use crate::ToolImplementation;
 use neuromance_common::tools::{Function, Property, Tool};
 
 /// Status of a todo item
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TodoStatus {
     Pending,
@@ -35,7 +36,7 @@ pub struct TodoReadTool {
 }
 
 impl TodoReadTool {
-    pub fn new(storage: TodoStorage) -> Self {
+    pub const fn new(storage: TodoStorage) -> Self {
         Self { storage }
     }
 }
@@ -79,8 +80,9 @@ impl ToolImplementation for TodoReadTool {
                 TodoStatus::InProgress => "[→]",
                 TodoStatus::Completed => "[✓]",
             };
-            response.push_str(&format!("{} {}\n", status_symbol, todo.content));
+            let _ = writeln!(response, "{status_symbol} {}", todo.content);
         }
+        drop(todos);
 
         Ok(response)
     }
@@ -96,7 +98,7 @@ pub struct TodoWriteTool {
 }
 
 impl TodoWriteTool {
-    pub fn new(storage: TodoStorage) -> Self {
+    pub const fn new(storage: TodoStorage) -> Self {
         Self { storage }
     }
 }
@@ -145,7 +147,7 @@ impl ToolImplementation for TodoWriteTool {
             .ok_or_else(|| anyhow::anyhow!("Missing 'todos' parameter"))?;
 
         let todos: Vec<TodoItem> = serde_json::from_value(todos_value.clone())
-            .map_err(|e| anyhow::anyhow!("Invalid todo items format: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Invalid todo items format: {e}"))?;
 
         // Validate that exactly one task is in_progress
         let in_progress_count = todos
@@ -154,13 +156,12 @@ impl ToolImplementation for TodoWriteTool {
             .count();
         if in_progress_count != 1 {
             return Err(anyhow::anyhow!(
-                "Exactly one task must be in_progress, found {}",
-                in_progress_count
+                "Exactly one task must be in_progress, found {in_progress_count}"
             ));
         }
 
         // Update the stored todos
-        *self.storage.write().unwrap() = todos.clone();
+        self.storage.write().unwrap().clone_from(&todos);
 
         // Format the response
         let mut response = String::from("TODO LIST UPDATED:\n");
@@ -170,7 +171,7 @@ impl ToolImplementation for TodoWriteTool {
                 TodoStatus::InProgress => "[→]",
                 TodoStatus::Completed => "[✓]",
             };
-            response.push_str(&format!("{} {}\n", status_symbol, todo.content));
+            let _ = writeln!(response, "{status_symbol} {}", todo.content);
         }
 
         Ok(response)
@@ -181,7 +182,8 @@ impl ToolImplementation for TodoWriteTool {
     }
 }
 
-/// Create a pair of TodoRead and TodoWrite tools that share the same storage
+/// Create a pair of `TodoRead` and `TodoWrite` tools that share the same storage
+#[must_use]
 pub fn create_todo_tools() -> (TodoReadTool, TodoWriteTool) {
     let storage = Arc::new(RwLock::new(Vec::new()));
     (
@@ -192,6 +194,9 @@ pub fn create_todo_tools() -> (TodoReadTool, TodoWriteTool) {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::expect_used)]
+
     use super::*;
     use serde_json::json;
 

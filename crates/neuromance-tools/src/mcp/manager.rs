@@ -17,12 +17,18 @@ pub struct McpManager {
 
 impl McpManager {
     /// Create a new MCP manager from a config file
+    ///
+    /// # Errors
+    /// Returns an error if the config file cannot be read or connections fail.
     pub async fn from_config_file(path: &Path) -> Result<Self> {
         let config = McpConfig::from_file(path)?;
         Self::new(config).await
     }
 
     /// Create a new MCP manager with the given configuration
+    ///
+    /// # Errors
+    /// Returns an error if connections fail.
     pub async fn new(config: McpConfig) -> Result<Self> {
         let manager = Self {
             config,
@@ -36,6 +42,9 @@ impl McpManager {
     }
 
     /// Connect to all configured MCP servers
+    ///
+    /// # Errors
+    /// Returns an error if no servers can be connected.
     pub async fn connect_all(&self) -> Result<()> {
         let mut clients = self.clients.write().await;
 
@@ -91,32 +100,41 @@ impl McpManager {
         if clients.is_empty() {
             return Err(anyhow::anyhow!("Failed to connect to any MCP servers"));
         }
+        drop(clients);
 
         Ok(())
     }
 
     /// Connect to a specific MCP server
+    ///
+    /// # Errors
+    /// Returns an error if the server is not found or connection fails.
     pub async fn connect_server(&self, server_id: &str) -> Result<()> {
         let server_config = self
             .config
             .servers
             .iter()
             .find(|s| s.id == server_id)
-            .ok_or_else(|| anyhow::anyhow!("Server '{}' not found in configuration", server_id))?
+            .ok_or_else(|| anyhow::anyhow!("Server '{server_id}' not found in configuration"))?
             .clone();
 
         let client = McpClientWrapper::connect(server_config).await?;
 
-        let mut clients = self.clients.write().await;
-        clients.insert(server_id.to_string(), Arc::new(client));
+        self.clients
+            .write()
+            .await
+            .insert(server_id.to_string(), Arc::new(client));
 
         Ok(())
     }
 
     /// Disconnect from a specific MCP server
+    ///
+    /// # Errors
+    /// Returns an error if shutdown fails.
     pub async fn disconnect_server(&self, server_id: &str) -> Result<()> {
-        let mut clients = self.clients.write().await;
-        if let Some(client) = clients.remove(server_id) {
+        let client = self.clients.write().await.remove(server_id);
+        if let Some(client) = client {
             // Shut down the client gracefully
             if let Ok(client) = Arc::try_unwrap(client) {
                 client.shutdown().await?;
@@ -126,11 +144,13 @@ impl McpManager {
     }
 
     /// Get all available tools from all connected MCP servers
+    ///
+    /// # Errors
+    /// This function currently cannot fail but returns Result for API consistency.
     pub async fn get_all_tools(&self) -> Result<Vec<Arc<dyn ToolImplementation>>> {
         let mut tools: Vec<Arc<dyn ToolImplementation>> = Vec::new();
-        let clients = self.clients.read().await;
 
-        for (server_id, client) in clients.iter() {
+        for (server_id, client) in self.clients.read().await.iter() {
             let mcp_tools = client.get_tools().await;
 
             for mcp_tool in mcp_tools {
@@ -143,6 +163,9 @@ impl McpManager {
     }
 
     /// Get a specific tool by name
+    ///
+    /// # Errors
+    /// Returns an error if the tool name format is invalid, server is not connected, or tool not found.
     pub async fn get_tool(&self, full_name: &str) -> Result<Arc<dyn ToolImplementation>> {
         // Parse full name (format: server_id.tool_name)
         let parts: Vec<&str> = full_name.splitn(2, '.').collect();
@@ -155,30 +178,36 @@ impl McpManager {
         let server_id = parts[0];
         let tool_name = parts[1];
 
-        let clients = self.clients.read().await;
-        let client = clients
+        let client = self
+            .clients
+            .read()
+            .await
             .get(server_id)
-            .ok_or_else(|| anyhow::anyhow!("Server '{}' not connected", server_id))?;
+            .ok_or_else(|| anyhow::anyhow!("Server '{server_id}' not connected"))?
+            .clone();
 
-        let tools = client.tools.read().await;
-        let mcp_tool = tools
+        let mcp_tool = client
+            .tools
+            .read()
+            .await
             .get(tool_name)
             .ok_or_else(|| {
-                anyhow::anyhow!("Tool '{}' not found on server '{}'", tool_name, server_id)
+                anyhow::anyhow!("Tool '{tool_name}' not found on server '{server_id}'")
             })?
             .clone();
 
-        let adapter = McpToolAdapter::new(server_id.to_string(), client.clone(), mcp_tool);
+        let adapter = McpToolAdapter::new(server_id.to_string(), client, mcp_tool);
 
         Ok(Arc::new(adapter) as Arc<dyn ToolImplementation>)
     }
 
     /// Refresh tools for all connected servers
+    ///
+    /// # Errors
+    /// Returns an error if refreshing tools fails on any server.
     pub async fn refresh_all_tools(&self) -> Result<()> {
-        let clients = self.clients.read().await;
-
-        for (server_id, client) in clients.iter() {
-            log::info!("Refreshing tools for server '{}'...", server_id);
+        for (server_id, client) in self.clients.read().await.iter() {
+            log::info!("Refreshing tools for server '{server_id}'...");
             client.refresh_tools().await?;
         }
 
@@ -188,16 +217,14 @@ impl McpManager {
     /// Get the status of all MCP servers
     pub async fn get_status(&self) -> HashMap<String, ServerStatus> {
         let mut status_map = HashMap::new();
-        let clients = self.clients.read().await;
 
         for server_config in &self.config.servers {
-            let status = if let Some(client) = clients.get(&server_config.id) {
+            let status = if let Some(client) = self.clients.read().await.get(&server_config.id) {
                 let tools_count = client.get_tools().await.len();
                 let server_info = client
                     .service
                     .peer_info()
-                    .map(|info| info.server_info.name.clone())
-                    .unwrap_or_else(|| "Unknown".to_string());
+                    .map_or_else(|| "Unknown".to_string(), |info| info.server_info.name.clone());
                 ServerStatus::Connected {
                     tools_count,
                     server_name: server_info,
@@ -212,10 +239,12 @@ impl McpManager {
     }
 
     /// Shutdown all connections
+    ///
+    /// # Errors
+    /// Returns an error if shutting down a client fails.
     pub async fn shutdown(self) -> Result<()> {
-        let mut clients = self.clients.write().await;
-        for (server_id, client) in clients.drain() {
-            log::info!("Shutting down connection to '{}'", server_id);
+        for (server_id, client) in self.clients.write().await.drain() {
+            log::info!("Shutting down connection to '{server_id}'");
             if let Ok(client) = Arc::try_unwrap(client) {
                 client.shutdown().await?;
             }

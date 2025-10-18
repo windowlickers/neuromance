@@ -12,6 +12,9 @@ keywords.workspace = true
 categories.workspace = true
 description = "A Rust library for controlling and orchestrating LLM interactions"
 
+[lints]
+workspace = true
+
 [dependencies]
 anyhow = { workspace = true }
 chrono = { workspace = true }

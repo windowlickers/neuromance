@@ -9,7 +9,7 @@ use rmcp::model::Tool as McpTool;
 
 use super::client::McpClientWrapper;
 
-/// Adapter that wraps an MCP tool as a ToolImplementation
+/// Adapter that wraps an MCP tool as a `ToolImplementation`
 pub struct McpToolAdapter {
     pub server_id: String,
     pub tool_name: String,
@@ -19,6 +19,7 @@ pub struct McpToolAdapter {
 }
 
 impl McpToolAdapter {
+    #[must_use]
     pub fn new(server_id: String, client: Arc<McpClientWrapper>, mcp_tool: McpTool) -> Self {
         let tool_name = mcp_tool.name.to_string();
         let auto_approved = client.server_config.auto_approve;
@@ -32,7 +33,8 @@ impl McpToolAdapter {
         }
     }
 
-    /// Get the full tool name (server_id.tool_name)
+    /// Get the full tool name (`server_id.tool_name`)
+    #[must_use]
     pub fn full_name(&self) -> String {
         format!("{}.{}", self.server_id, self.tool_name)
     }
@@ -94,13 +96,15 @@ impl ToolImplementation for McpToolAdapter {
                     .mcp_tool
                     .description
                     .as_ref()
-                    .map(|d| d.to_string())
-                    .unwrap_or_else(|| {
-                        format!(
-                            "MCP tool '{}' from server '{}'",
-                            self.tool_name, self.server_id
-                        )
-                    }),
+                    .map_or_else(
+                        || {
+                            format!(
+                                "MCP tool '{}' from server '{}'",
+                                self.tool_name, self.server_id
+                            )
+                        },
+                        std::string::ToString::to_string,
+                    ),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": properties,
@@ -130,31 +134,42 @@ impl ToolImplementation for McpToolAdapter {
         }
 
         // Extract the content from the response
-        let content = result
-            .content
-            .into_iter()
-            .next()
-            .map(|content| {
-                if let Some(text_content) = content.as_text() {
-                    text_content.text.clone()
-                } else if let Some(image_content) = content.as_image() {
-                    format!(
-                        "[Image: {} bytes, type: {}]",
-                        image_content.data.len(),
-                        image_content.mime_type
-                    )
-                } else if let Some(resource) = content.as_resource() {
-                    match &resource.resource {
-                        rmcp::model::ResourceContents::TextResourceContents { uri, .. }
-                        | rmcp::model::ResourceContents::BlobResourceContents { uri, .. } => {
-                            format!("[Resource: {}]", uri)
-                        }
-                    }
-                } else {
-                    "[Unknown content type]".to_string()
-                }
-            })
-            .unwrap_or_else(|| "No content returned".to_string());
+        let content = result.content.into_iter().next().map_or_else(
+            || "No content returned".to_string(),
+            |content| {
+                content.as_text().map_or_else(
+                    || {
+                        content.as_image().map_or_else(
+                            || {
+                                content.as_resource().map_or_else(
+                                    || "[Unknown content type]".to_string(),
+                                    |resource| match &resource.resource {
+                                        rmcp::model::ResourceContents::TextResourceContents {
+                                            uri,
+                                            ..
+                                        }
+                                        | rmcp::model::ResourceContents::BlobResourceContents {
+                                            uri,
+                                            ..
+                                        } => {
+                                            format!("[Resource: {uri}]")
+                                        }
+                                    },
+                                )
+                            },
+                            |image_content| {
+                                format!(
+                                    "[Image: {} bytes, type: {}]",
+                                    image_content.data.len(),
+                                    image_content.mime_type
+                                )
+                            },
+                        )
+                    },
+                    |text_content| text_content.text.clone(),
+                )
+            },
+        );
 
         Ok(content)
     }

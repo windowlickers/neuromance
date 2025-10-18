@@ -55,7 +55,7 @@ pub enum ClientError {
     #[error("Authentication error: {0}")]
     AuthenticationError(String),
 
-    /// use reqwest_eventsource::{Error as EventSourceError};
+    /// SSE event source error.
     #[error("EventSource error: {0}")]
     EventSourceError(#[from] reqwest_eventsource::Error),
 
@@ -127,7 +127,7 @@ pub enum ClientError {
     /// The content violates the provider's usage policies.
     #[error("Content filtered: {reason}")]
     ContentFiltered {
-        /// Reason for filtering (e.g., "violence", "hate_speech").
+        /// Reason for filtering (e.g., "violence", "hate speech").
         reason: String,
     },
 
@@ -143,15 +143,15 @@ pub enum ClientError {
     #[error("Temperature must be between 0.0 & 2.0")]
     InvalidTemperature,
 
-    /// top_p parameter out of valid range.
+    /// `top_p` parameter out of valid range.
     ///
-    /// top_p must be between 0.0 and 1.0.
+    /// `top_p` must be between 0.0 and 1.0.
     #[error("TopP must be between 0.0 & 1.0")]
     InvalidTopP,
 
-    /// frequency_penalty parameter out of valid range.
+    /// `frequency_penalty` parameter out of valid range.
     ///
-    /// frequency_penalty must be between -2.0 and 2.0.
+    /// `frequency_penalty` must be between -2.0 and 2.0.
     #[error("FrequencyPenalty must be between -2.0 & 2.0")]
     InvalidFrequencyPenalty,
 }
@@ -160,7 +160,7 @@ impl ClientError {
     /// Check if this error is potentially retryable.
     ///
     /// Returns `true` for network errors, timeouts, rate limits, and service unavailable errors.
-    pub fn is_retryable(&self) -> bool {
+    pub const fn is_retryable(&self) -> bool {
         matches!(
             self,
             Self::NetworkError(_)
@@ -172,19 +172,19 @@ impl ClientError {
     }
 
     /// Check if this is an authentication error.
-    pub fn is_authentication_error(&self) -> bool {
+    pub const fn is_authentication_error(&self) -> bool {
         matches!(self, Self::AuthenticationError(_))
     }
 
     /// Check if this is a rate limit error.
-    pub fn is_rate_limit_error(&self) -> bool {
+    pub const fn is_rate_limit_error(&self) -> bool {
         matches!(self, Self::RateLimitError { .. })
     }
 
     /// Get the retry-after duration if this is a rate limit error.
     ///
     /// Returns the suggested wait time before retrying the request.
-    pub fn retry_after(&self) -> Option<Duration> {
+    pub const fn retry_after(&self) -> Option<Duration> {
         match self {
             Self::RateLimitError { retry_after } => *retry_after,
             _ => None,

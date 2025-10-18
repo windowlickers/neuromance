@@ -123,39 +123,51 @@ pub struct McpSettings {
     pub debug: bool,
 }
 
-fn default_max_retries() -> usize {
+const fn default_max_retries() -> usize {
     3
 }
 
 impl McpConfig {
     /// Load configuration from a YAML file
+    ///
+    /// # Errors
+    /// Returns an error if the file cannot be read or parsed.
     pub fn from_yaml_file(path: &std::path::Path) -> anyhow::Result<Self> {
         let contents = std::fs::read_to_string(path)?;
-        let config: McpConfig = serde_yaml::from_str(&contents)?;
+        let config: Self = serde_yaml::from_str(&contents)?;
         config.validate()?;
         Ok(config)
     }
 
     /// Load configuration from a JSON file
+    ///
+    /// # Errors
+    /// Returns an error if the file cannot be read or parsed.
     pub fn from_json_file(path: &std::path::Path) -> anyhow::Result<Self> {
         let contents = std::fs::read_to_string(path)?;
-        let config: McpConfig = serde_json::from_str(&contents)?;
+        let config: Self = serde_json::from_str(&contents)?;
         config.validate()?;
         Ok(config)
     }
 
     /// Load configuration from TOML file
+    ///
+    /// # Errors
+    /// Returns an error if the file cannot be read or parsed.
     pub fn from_toml_file(path: &std::path::Path) -> anyhow::Result<Self> {
         let contents = std::fs::read_to_string(path)?;
-        let config: McpConfig = toml::from_str(&contents)?;
+        let config: Self = toml::from_str(&contents)?;
         config.validate()?;
         Ok(config)
     }
 
     /// Load from file based on extension
+    ///
+    /// # Errors
+    /// Returns an error if the file cannot be read, parsed, or has an unsupported extension.
     pub fn from_file(path: &std::path::Path) -> anyhow::Result<Self> {
         match path.extension().and_then(|s| s.to_str()) {
-            Some("yaml") | Some("yml") => Self::from_yaml_file(path),
+            Some("yaml" | "yml") => Self::from_yaml_file(path),
             Some("json") => Self::from_json_file(path),
             Some("toml") => Self::from_toml_file(path),
             _ => Err(anyhow::anyhow!(

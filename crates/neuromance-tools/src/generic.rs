@@ -80,10 +80,10 @@ impl ToolImplementation for CalculatorTool {
             "2 + 2" => 4.0,
             "10 * 5" => 50.0,
             "100 / 4" => 25.0,
-            _ => return Err(anyhow::anyhow!("Unsupported expression: {}", expression)),
+            _ => return Err(anyhow::anyhow!("Unsupported expression: {expression}")),
         };
 
-        Ok(format!("{} = {}", expression, result))
+        Ok(format!("{expression} = {result}"))
     }
 
     fn is_auto_approved(&self) -> bool {

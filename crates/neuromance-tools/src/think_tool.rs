@@ -48,7 +48,7 @@ impl ToolImplementation for ThinkTool {
             .ok_or_else(|| anyhow::anyhow!("Missing or invalid 'thought' parameter"))?;
 
         // Return the thought in a structured way that makes it clear this is internal reasoning
-        Ok(format!("THOUGHT RECORDED: {}", thought))
+        Ok(format!("THOUGHT RECORDED: {thought}"))
     }
 
     fn is_auto_approved(&self) -> bool {
@@ -58,6 +58,9 @@ impl ToolImplementation for ThinkTool {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::expect_used)]
+
     use super::*;
     use serde_json::json;
 

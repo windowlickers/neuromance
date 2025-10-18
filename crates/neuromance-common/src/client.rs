@@ -53,10 +53,10 @@ pub enum ToolChoice {
 impl fmt::Display for ToolChoice {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ToolChoice::Auto => write!(f, "auto"),
-            ToolChoice::None => write!(f, "none"),
-            ToolChoice::Required => write!(f, "required"),
-            ToolChoice::Function { name } => write!(f, "{}", name),
+            Self::Auto => write!(f, "auto"),
+            Self::None => write!(f, "none"),
+            Self::Required => write!(f, "required"),
+            Self::Function { name } => write!(f, "{name}"),
         }
     }
 }
@@ -64,9 +64,9 @@ impl fmt::Display for ToolChoice {
 impl From<ToolChoice> for serde_json::Value {
     fn from(tool_choice: ToolChoice) -> Self {
         match tool_choice {
-            ToolChoice::Auto => serde_json::Value::String("auto".to_string()),
-            ToolChoice::None => serde_json::Value::String("none".to_string()),
-            ToolChoice::Required => serde_json::Value::String("required".to_string()),
+            ToolChoice::Auto => Self::String("auto".to_string()),
+            ToolChoice::None => Self::String("none".to_string()),
+            ToolChoice::Required => Self::String("required".to_string()),
             ToolChoice::Function { name } => {
                 serde_json::json!({
                     "type": "function",
@@ -116,11 +116,11 @@ pub enum FinishReason {
 impl fmt::Display for FinishReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            FinishReason::Stop => write!(f, "stop"),
-            FinishReason::Length => write!(f, "length"),
-            FinishReason::ToolCalls => write!(f, "tool_calls"),
-            FinishReason::ContentFilter => write!(f, "content_filter"),
-            FinishReason::ModelError => write!(f, "model_error"),
+            Self::Stop => write!(f, "stop"),
+            Self::Length => write!(f, "length"),
+            Self::ToolCalls => write!(f, "tool_calls"),
+            Self::ContentFilter => write!(f, "content_filter"),
+            Self::ModelError => write!(f, "model_error"),
         }
     }
 }
@@ -130,12 +130,12 @@ impl FromStr for FinishReason {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "stop" => Ok(FinishReason::Stop),
-            "length" => Ok(FinishReason::Length),
-            "tool_calls" => Ok(FinishReason::ToolCalls),
-            "content_filter" => Ok(FinishReason::ContentFilter),
-            "model_error" => Ok(FinishReason::ModelError),
-            _ => anyhow::bail!("Unknown finish reason: {}", s),
+            "stop" => Ok(Self::Stop),
+            "length" => Ok(Self::Length),
+            "tool_calls" => Ok(Self::ToolCalls),
+            "content_filter" => Ok(Self::ContentFilter),
+            "model_error" => Ok(Self::ModelError),
+            _ => anyhow::bail!("Unknown finish reason: {s}"),
         }
     }
 }
@@ -299,7 +299,7 @@ pub struct ChatRequest {
 impl fmt::Display for ChatRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match serde_json::to_string(self) {
-            Ok(json) => write!(f, "{}", json),
+            Ok(json) => write!(f, "{json}"),
             Err(_) => write!(f, "Error serializing ChatRequest to JSON"),
         }
     }
@@ -392,6 +392,7 @@ impl ChatRequest {
     /// # Arguments
     ///
     /// * `model` - The model identifier (e.g., "gpt-4", "claude-3-opus")
+    #[must_use]
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.model = Some(model.into());
         self
@@ -404,7 +405,8 @@ impl ChatRequest {
     /// * `temperature` - Value between 0.0 and 2.0
     ///
     /// Higher values produce more random output.
-    pub fn with_temperature(mut self, temperature: f32) -> Self {
+    #[must_use]
+    pub const fn with_temperature(mut self, temperature: f32) -> Self {
         self.temperature = Some(temperature);
         self
     }
@@ -414,7 +416,8 @@ impl ChatRequest {
     /// # Arguments
     ///
     /// * `max_tokens` - Maximum tokens in the response
-    pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
+    #[must_use]
+    pub const fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = Some(max_tokens);
         self
     }
@@ -426,7 +429,8 @@ impl ChatRequest {
     /// * `top_p` - Value between 0.0 and 1.0
     ///
     /// Lower values make output more focused.
-    pub fn with_top_p(mut self, top_p: f32) -> Self {
+    #[must_use]
+    pub const fn with_top_p(mut self, top_p: f32) -> Self {
         self.top_p = Some(top_p);
         self
     }
@@ -438,7 +442,8 @@ impl ChatRequest {
     /// * `frequency_penalty` - Value between -2.0 and 2.0
     ///
     /// Positive values discourage token repetition.
-    pub fn with_frequency_penalty(mut self, frequency_penalty: f32) -> Self {
+    #[must_use]
+    pub const fn with_frequency_penalty(mut self, frequency_penalty: f32) -> Self {
         self.frequency_penalty = Some(frequency_penalty);
         self
     }
@@ -450,7 +455,8 @@ impl ChatRequest {
     /// * `presence_penalty` - Value between -2.0 and 2.0
     ///
     /// Positive values encourage discussing new topics.
-    pub fn with_presence_penalty(mut self, presence_penalty: f32) -> Self {
+    #[must_use]
+    pub const fn with_presence_penalty(mut self, presence_penalty: f32) -> Self {
         self.presence_penalty = Some(presence_penalty);
         self
     }
@@ -460,11 +466,12 @@ impl ChatRequest {
     /// # Arguments
     ///
     /// * `stop_sequences` - An iterable of strings to use as stop sequences
+    #[must_use]
     pub fn with_stop_sequences(
         mut self,
         stop_sequences: impl IntoIterator<Item = impl Into<String>>,
     ) -> Self {
-        self.stop = Some(stop_sequences.into_iter().map(|s| s.into()).collect());
+        self.stop = Some(stop_sequences.into_iter().map(Into::into).collect());
         self
     }
 
@@ -473,6 +480,7 @@ impl ChatRequest {
     /// # Arguments
     ///
     /// * `tools` - Vector of tool definitions
+    #[must_use]
     pub fn with_tools(mut self, tools: Vec<Tool>) -> Self {
         self.tools = Some(tools);
         self
@@ -483,6 +491,7 @@ impl ChatRequest {
     /// # Arguments
     ///
     /// * `tool_choice` - Strategy for how the model should select tools
+    #[must_use]
     pub fn with_tool_choice(mut self, tool_choice: ToolChoice) -> Self {
         self.tool_choice = Some(tool_choice);
         self
@@ -493,7 +502,8 @@ impl ChatRequest {
     /// # Arguments
     ///
     /// * `stream` - Whether to stream the response
-    pub fn with_streaming(mut self, stream: bool) -> Self {
+    #[must_use]
+    pub const fn with_streaming(mut self, stream: bool) -> Self {
         self.stream = stream;
         self
     }
@@ -503,6 +513,7 @@ impl ChatRequest {
     /// # Arguments
     ///
     /// * `metadata` - Key-value pairs of metadata
+    #[must_use]
     pub fn with_metadata(mut self, metadata: HashMap<String, serde_json::Value>) -> Self {
         self.metadata = metadata;
         self
@@ -513,7 +524,8 @@ impl ChatRequest {
     /// # Arguments
     ///
     /// * `enable_thinking` - Whether to enable thinking mode
-    pub fn with_thinking(mut self, enable_thinking: bool) -> Self {
+    #[must_use]
+    pub const fn with_thinking(mut self, enable_thinking: bool) -> Self {
         self.enable_thinking = Some(enable_thinking);
         self
     }
@@ -531,37 +543,35 @@ impl ChatRequest {
     }
 
     /// Validates all configuration parameters
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if validation fails (empty messages, invalid `temperature`/`top_p` ranges).
     pub fn validate(&self) -> anyhow::Result<()> {
         self.validate_has_messages()?;
 
         if let Some(temp) = self.temperature
             && !(0.0..=2.0).contains(&temp)
         {
-            anyhow::bail!("Temperature must be between 0.0 and 2.0, got {}", temp);
+            anyhow::bail!("Temperature must be between 0.0 and 2.0, got {temp}");
         }
 
         if let Some(top_p) = self.top_p
             && !(0.0..=1.0).contains(&top_p)
         {
-            anyhow::bail!("top_p must be between 0.0 and 1.0, got {}", top_p);
+            anyhow::bail!("top_p must be between 0.0 and 1.0, got {top_p}");
         }
 
         if let Some(freq_penalty) = self.frequency_penalty
             && !(-2.0..=2.0).contains(&freq_penalty)
         {
-            anyhow::bail!(
-                "frequency_penalty must be between -2.0 and 2.0, got {}",
-                freq_penalty
-            );
+            anyhow::bail!("frequency_penalty must be between -2.0 and 2.0, got {freq_penalty}");
         }
 
         if let Some(pres_penalty) = self.presence_penalty
             && !(-2.0..=2.0).contains(&pres_penalty)
         {
-            anyhow::bail!(
-                "presence_penalty must be between -2.0 and 2.0, got {}",
-                pres_penalty
-            );
+            anyhow::bail!("presence_penalty must be between -2.0 and 2.0, got {pres_penalty}");
         }
 
         Ok(())
@@ -572,6 +582,7 @@ impl ChatRequest {
     /// # Returns
     ///
     /// `true` if tools are present and non-empty, `false` otherwise.
+    #[must_use]
     pub fn has_tools(&self) -> bool {
         self.tools.as_ref().is_some_and(|t| !t.is_empty())
     }
@@ -581,7 +592,8 @@ impl ChatRequest {
     /// # Returns
     ///
     /// `true` if streaming is enabled, `false` otherwise.
-    pub fn is_streaming(&self) -> bool {
+    #[must_use]
+    pub const fn is_streaming(&self) -> bool {
         self.stream
     }
 }
@@ -661,7 +673,7 @@ pub struct ChatChunk {
 impl fmt::Display for ChatResponse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match serde_json::to_string(self) {
-            Ok(json) => write!(f, "{}", json),
+            Ok(json) => write!(f, "{json}"),
             Err(_) => write!(f, "Error serializing ChatResponse to JSON"),
         }
     }
@@ -776,6 +788,7 @@ impl Config {
     /// # Arguments
     ///
     /// * `base_url` - The base URL for the API
+    #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = Some(base_url.into());
         self
@@ -788,6 +801,7 @@ impl Config {
     /// # Arguments
     ///
     /// * `api_key` - The API key
+    #[must_use]
     pub fn with_api_key(mut self, api_key: impl Into<String>) -> Self {
         self.api_key = Some(SecretString::new(api_key.into().into()));
         self
@@ -798,6 +812,7 @@ impl Config {
     /// # Arguments
     ///
     /// * `organization` - The organization ID
+    #[must_use]
     pub fn with_organization(mut self, organization: impl Into<String>) -> Self {
         self.organization = Some(organization.into());
         self
@@ -808,7 +823,8 @@ impl Config {
     /// # Arguments
     ///
     /// * `timeout_seconds` - Timeout in seconds
-    pub fn with_timeout(mut self, timeout_seconds: u64) -> Self {
+    #[must_use]
+    pub const fn with_timeout(mut self, timeout_seconds: u64) -> Self {
         self.timeout_seconds = Some(timeout_seconds);
         self
     }
@@ -818,7 +834,8 @@ impl Config {
     /// # Arguments
     ///
     /// * `temperature` - Value between 0.0 and 2.0
-    pub fn with_temperature(mut self, temperature: f32) -> Self {
+    #[must_use]
+    pub const fn with_temperature(mut self, temperature: f32) -> Self {
         self.temperature = Some(temperature);
         self
     }
@@ -828,7 +845,8 @@ impl Config {
     /// # Arguments
     ///
     /// * `max_tokens` - Maximum tokens in responses
-    pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
+    #[must_use]
+    pub const fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = Some(max_tokens);
         self
     }
@@ -838,7 +856,8 @@ impl Config {
     /// # Arguments
     ///
     /// * `top_p` - Value between 0.0 and 1.0
-    pub fn with_top_p(mut self, top_p: f32) -> Self {
+    #[must_use]
+    pub const fn with_top_p(mut self, top_p: f32) -> Self {
         self.top_p = Some(top_p);
         self
     }
@@ -848,7 +867,8 @@ impl Config {
     /// # Arguments
     ///
     /// * `frequency_penalty` - Value between -2.0 and 2.0
-    pub fn with_frequency_penalty(mut self, frequency_penalty: f32) -> Self {
+    #[must_use]
+    pub const fn with_frequency_penalty(mut self, frequency_penalty: f32) -> Self {
         self.frequency_penalty = Some(frequency_penalty);
         self
     }
@@ -858,7 +878,8 @@ impl Config {
     /// # Arguments
     ///
     /// * `presence_penalty` - Value between -2.0 and 2.0
-    pub fn with_presence_penalty(mut self, presence_penalty: f32) -> Self {
+    #[must_use]
+    pub const fn with_presence_penalty(mut self, presence_penalty: f32) -> Self {
         self.presence_penalty = Some(presence_penalty);
         self
     }
@@ -868,11 +889,12 @@ impl Config {
     /// # Arguments
     ///
     /// * `stop_sequences` - An iterable of stop sequences
+    #[must_use]
     pub fn with_stop_sequences(
         mut self,
         stop_sequences: impl IntoIterator<Item = impl Into<String>>,
     ) -> Self {
-        self.stop_sequences = Some(stop_sequences.into_iter().map(|s| s.into()).collect());
+        self.stop_sequences = Some(stop_sequences.into_iter().map(Into::into).collect());
         self
     }
 
@@ -881,6 +903,7 @@ impl Config {
     /// # Arguments
     ///
     /// * `metadata` - Key-value pairs of metadata
+    #[must_use]
     pub fn with_metadata(mut self, metadata: HashMap<String, serde_json::Value>) -> Self {
         self.metadata = metadata;
         self
@@ -891,7 +914,8 @@ impl Config {
     /// # Arguments
     ///
     /// * `retry_config` - The retry configuration
-    pub fn with_retry_config(mut self, retry_config: RetryConfig) -> Self {
+    #[must_use]
+    pub const fn with_retry_config(mut self, retry_config: RetryConfig) -> Self {
         self.retry_config = retry_config;
         self
     }
@@ -899,7 +923,7 @@ impl Config {
 
 impl From<(Config, Vec<Message>)> for ChatRequest {
     fn from((config, messages): (Config, Vec<Message>)) -> Self {
-        let mut request = ChatRequest::new(messages).with_model(&config.model);
+        let mut request = Self::new(messages).with_model(&config.model);
 
         if let Some(temperature) = config.temperature {
             request = request.with_temperature(temperature);
@@ -951,6 +975,7 @@ impl Config {
     /// let msg = Message::new(Uuid::new_v4(), MessageRole::User, "Hello!");
     /// let request = config.into_chat_request(vec![msg]);
     /// ```
+    #[must_use]
     pub fn into_chat_request(self, messages: Vec<Message>) -> ChatRequest {
         (self, messages).into()
     }
@@ -970,31 +995,25 @@ impl Config {
         if let Some(temp) = self.temperature
             && !(0.0..=2.0).contains(&temp)
         {
-            anyhow::bail!("Temperature must be between 0.0 and 2.0, got {}", temp);
+            anyhow::bail!("Temperature must be between 0.0 and 2.0, got {temp}");
         }
 
         if let Some(top_p) = self.top_p
             && !(0.0..=1.0).contains(&top_p)
         {
-            anyhow::bail!("top_p must be between 0.0 and 1.0, got {}", top_p);
+            anyhow::bail!("top_p must be between 0.0 and 1.0, got {top_p}");
         }
 
         if let Some(freq_penalty) = self.frequency_penalty
             && !(-2.0..=2.0).contains(&freq_penalty)
         {
-            anyhow::bail!(
-                "frequency_penalty must be between -2.0 and 2.0, got {}",
-                freq_penalty
-            );
+            anyhow::bail!("frequency_penalty must be between -2.0 and 2.0, got {freq_penalty}");
         }
 
         if let Some(pres_penalty) = self.presence_penalty
             && !(-2.0..=2.0).contains(&pres_penalty)
         {
-            anyhow::bail!(
-                "presence_penalty must be between -2.0 and 2.0, got {}",
-                pres_penalty
-            );
+            anyhow::bail!("presence_penalty must be between -2.0 and 2.0, got {pres_penalty}");
         }
 
         Ok(())
@@ -1003,6 +1022,9 @@ impl Config {
 
 #[cfg(test)]
 mod proptests {
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::expect_used)]
+
     use super::*;
     use proptest::prelude::*;
 

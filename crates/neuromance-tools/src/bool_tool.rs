@@ -51,7 +51,7 @@ impl ToolImplementation for BooleanTool {
 
         let result = obj
             .get("result")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .ok_or_else(|| anyhow::anyhow!("Missing or invalid 'result' parameter"))?;
 
         let reason = obj
@@ -74,6 +74,9 @@ impl ToolImplementation for BooleanTool {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::expect_used)]
+
     use super::*;
     use serde_json::json;
 

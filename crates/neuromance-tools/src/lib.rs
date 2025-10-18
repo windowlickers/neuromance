@@ -153,6 +153,7 @@ impl Default for ToolRegistry {
 }
 
 impl ToolRegistry {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             tools: Arc::new(DashMap::new()),
@@ -160,23 +161,25 @@ impl ToolRegistry {
     }
 
     pub fn register(&self, tool: Arc<dyn ToolImplementation>) {
-        let name = tool.get_definition().function.name.clone();
+        let name = tool.get_definition().function.name;
         self.tools.insert(name, tool);
     }
 
+    #[must_use]
     pub fn get(&self, name: &str) -> Option<Arc<dyn ToolImplementation>> {
         self.tools.get(name).map(|r| r.value().clone())
     }
 
+    #[must_use]
     pub fn get_all_definitions(&self) -> Vec<Tool> {
         self.tools.iter().map(|t| t.get_definition()).collect()
     }
 
+    #[must_use]
     pub fn is_tool_auto_approved(&self, name: &str) -> bool {
         self.tools
             .get(name)
-            .map(|t| t.is_auto_approved())
-            .unwrap_or(false)
+            .is_some_and(|t| t.is_auto_approved())
     }
 
     pub fn remove(&mut self, name: &str) -> Option<Arc<dyn ToolImplementation>> {
@@ -187,10 +190,12 @@ impl ToolRegistry {
         self.tools.clear();
     }
 
+    #[must_use]
     pub fn contains(&self, name: &str) -> bool {
         self.tools.contains_key(name)
     }
 
+    #[must_use]
     pub fn tool_names(&self) -> Vec<String> {
         self.tools.iter().map(|t| t.key().clone()).collect()
     }
@@ -201,6 +206,7 @@ pub struct ToolExecutor {
 }
 
 impl ToolExecutor {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             registry: ToolRegistry::new(),
@@ -215,27 +221,33 @@ impl ToolExecutor {
         self.registry.register(tool);
     }
 
-    pub async fn has_tool(&self, name: &str) -> Result<bool> {
-        Ok(self.registry.contains(name))
+    #[must_use]
+    pub fn has_tool(&self, name: &str) -> bool {
+        self.registry.contains(name)
     }
 
+    #[must_use]
     pub fn get_all_tools(&self) -> Vec<Tool> {
         self.registry.get_all_definitions()
     }
 
+    #[must_use]
     pub fn is_tool_auto_approved(&self, name: &str) -> bool {
         self.registry.is_tool_auto_approved(name)
     }
 
-    pub async fn remove_tool(&mut self, name: &str) -> Result<Option<Arc<dyn ToolImplementation>>> {
-        let tool = self.registry.remove(name);
-        Ok(tool)
+    pub fn remove_tool(&mut self, name: &str) -> Option<Arc<dyn ToolImplementation>> {
+        self.registry.remove(name)
     }
 
-    pub async fn reset_tools(&mut self) {
+    pub fn reset_tools(&mut self) {
         self.registry.clear();
     }
 
+    /// Execute a tool call.
+    ///
+    /// # Errors
+    /// Returns an error if the tool is not found or if execution fails.
     pub async fn execute_tool(&self, tool_call: &ToolCall) -> Result<String> {
         let function = &tool_call.function;
 
@@ -244,13 +256,13 @@ impl ToolExecutor {
             .get(&function.name)
             .ok_or_else(|| anyhow::anyhow!("Unknown tool: '{}'", function.name))?;
 
-        let args = self.parse_arguments(&function.arguments)?;
+        let args = Self::parse_arguments(&function.arguments)?;
 
         // Execute the tool
         tool.execute(&args).await
     }
 
-    fn parse_arguments(&self, arguments: &[String]) -> Result<Value> {
+    fn parse_arguments(arguments: &[String]) -> Result<Value> {
         match arguments.len() {
             // Returns empty JSON object {}
             0 => Ok(Value::Object(serde_json::Map::new())),
@@ -275,6 +287,9 @@ impl Default for ToolExecutor {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::expect_used)]
+
     use super::*;
     use serde_json::json;
 

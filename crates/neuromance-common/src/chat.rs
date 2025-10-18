@@ -55,7 +55,7 @@ use crate::tools::ToolCall;
 
 /// Represents the role of a message sender in a conversation.
 ///
-/// Roles are serialized to lowercase strings matching the OpenAI API format.
+/// Roles are serialized to lowercase strings matching the `OpenAI` API format.
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub enum MessageRole {
@@ -158,7 +158,7 @@ impl Message {
     ///
     /// # Errors
     ///
-    /// Returns an error if the tool_call_id is empty.
+    /// Returns an error if the `tool_call_id` is empty.
     pub fn tool(
         conversation_id: Uuid,
         content: impl Into<String>,
@@ -178,6 +178,7 @@ impl Message {
     }
 
     /// Adds a metadata key-value pair to this message.
+    #[must_use]
     pub fn with_metadata(mut self, key: impl Into<String>, value: serde_json::Value) -> Self {
         self.metadata.insert(key.into(), value);
         self
@@ -186,6 +187,10 @@ impl Message {
     /// Adds a metadata key-value pair to this message with automatic serialization.
     ///
     /// This is a convenience method that accepts any serializable type.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization fails.
     pub fn with_metadata_typed<T: serde::Serialize>(
         mut self,
         key: impl Into<String>,
@@ -288,6 +293,7 @@ pub struct Conversation {
 
 impl Conversation {
     /// Creates a new active conversation with a generated ID.
+    #[must_use]
     pub fn new() -> Self {
         let now = Utc::now();
         Self {
@@ -303,12 +309,14 @@ impl Conversation {
     }
 
     /// Sets the title of this conversation.
+    #[must_use]
     pub fn with_title(mut self, title: impl Into<String>) -> Self {
         self.title = Some(title.into());
         self
     }
 
     /// Sets the description of this conversation.
+    #[must_use]
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
         self.description = Some(description.into());
         self
@@ -326,6 +334,10 @@ impl Conversation {
     }
 
     /// Adds a message to this conversation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the message's conversation ID doesn't match.
     pub fn add_message(&mut self, message: Message) -> anyhow::Result<()> {
         if message.conversation_id != self.id {
             anyhow::bail!(
@@ -340,6 +352,7 @@ impl Conversation {
     }
 
     /// Returns a reference to the messages in this conversation.
+    #[must_use]
     pub fn get_messages(&self) -> &[Message] {
         &self.messages
     }
@@ -360,6 +373,10 @@ impl Conversation {
     }
 
     /// Creates a new tool result message for this conversation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if tool message creation fails.
     pub fn tool_message(
         &self,
         content: impl Into<String>,
@@ -378,6 +395,9 @@ impl Default for Conversation {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::expect_used)]
+
     use super::*;
 
     #[test]
@@ -519,6 +539,9 @@ mod tests {
 
 #[cfg(test)]
 mod proptests {
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::expect_used)]
+
     use super::*;
     use proptest::prelude::*;
 

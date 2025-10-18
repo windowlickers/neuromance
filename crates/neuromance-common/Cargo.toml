@@ -12,6 +12,9 @@ keywords.workspace = true
 categories.workspace = true
 description = "Common types and data structures for LLM conversation and tool management"
 
+[lints]
+workspace = true
+
 [dependencies]
 anyhow = { workspace = true }
 typed-builder = { workspace = true }
