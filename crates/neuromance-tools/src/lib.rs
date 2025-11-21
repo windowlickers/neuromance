@@ -293,64 +293,64 @@ mod tests {
 
     #[test]
     fn test_parse_arguments_empty() {
-        let executor = ToolExecutor::new();
-        let result = executor.parse_arguments(&[]).unwrap();
+        let _executor = ToolExecutor::new();
+        let result = ToolExecutor::parse_arguments(&[]).unwrap();
         assert_eq!(result, json!({}));
     }
 
     #[test]
     fn test_parse_arguments_single_json_object() {
-        let executor = ToolExecutor::new();
+        let _executor = ToolExecutor::new();
         let args = vec![r#"{"key": "value", "number": 42}"#.to_string()];
-        let result = executor.parse_arguments(&args).unwrap();
+        let result = ToolExecutor::parse_arguments(&args).unwrap();
         assert_eq!(result, json!({"key": "value", "number": 42}));
     }
 
     #[test]
     fn test_parse_arguments_single_json_array() {
-        let executor = ToolExecutor::new();
+        let _executor = ToolExecutor::new();
         let args = vec![r#"["item1", "item2", "item3"]"#.to_string()];
-        let result = executor.parse_arguments(&args).unwrap();
+        let result = ToolExecutor::parse_arguments(&args).unwrap();
         assert_eq!(result, json!(["item1", "item2", "item3"]));
     }
 
     #[test]
     fn test_parse_arguments_single_string_fallback() {
-        let executor = ToolExecutor::new();
+        let _executor = ToolExecutor::new();
         let args = vec!["plain text argument".to_string()];
-        let result = executor.parse_arguments(&args).unwrap();
+        let result = ToolExecutor::parse_arguments(&args).unwrap();
         assert_eq!(result, json!("plain text argument"));
     }
 
     #[test]
     fn test_parse_arguments_single_invalid_json_fallback() {
-        let executor = ToolExecutor::new();
+        let _executor = ToolExecutor::new();
         let args = vec![r#"{"incomplete json"#.to_string()];
-        let result = executor.parse_arguments(&args).unwrap();
+        let result = ToolExecutor::parse_arguments(&args).unwrap();
         assert_eq!(result, json!(r#"{"incomplete json"#));
     }
 
     #[test]
     fn test_parse_arguments_multiple_strings() {
-        let executor = ToolExecutor::new();
+        let _executor = ToolExecutor::new();
         let args = vec!["arg1".to_string(), "arg2".to_string(), "arg3".to_string()];
-        let result = executor.parse_arguments(&args).unwrap();
+        let result = ToolExecutor::parse_arguments(&args).unwrap();
         assert_eq!(result, json!(["arg1", "arg2", "arg3"]));
     }
 
     #[test]
     fn test_parse_arguments_single_number_string() {
-        let executor = ToolExecutor::new();
+        let _executor = ToolExecutor::new();
         let args = vec!["42".to_string()];
-        let result = executor.parse_arguments(&args).unwrap();
+        let result = ToolExecutor::parse_arguments(&args).unwrap();
         assert_eq!(result, json!(42));
     }
 
     #[test]
     fn test_parse_arguments_single_boolean_string() {
-        let executor = ToolExecutor::new();
+        let _executor = ToolExecutor::new();
         let args = vec!["true".to_string()];
-        let result = executor.parse_arguments(&args).unwrap();
+        let result = ToolExecutor::parse_arguments(&args).unwrap();
         assert_eq!(result, json!(true));
     }
 }

@@ -35,6 +35,7 @@ struct Args {
     turns: u32,
 }
 
+#[allow(clippy::unwrap_used)]
 fn strip_think_tags(content: &str) -> String {
     // Remove <think>...</think> tags and their content
     let re = regex::Regex::new(r"(?s)<think>.*?</think>").unwrap();

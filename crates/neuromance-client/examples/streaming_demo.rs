@@ -1,3 +1,5 @@
+use std::io::Write;
+
 use anyhow::Result;
 use clap::Parser;
 use futures::StreamExt;
@@ -76,10 +78,9 @@ async fn main() -> Result<()> {
 
         // Print the delta content if available
         if let Some(content) = chunk.delta_content {
-            print!("{}", content);
+            print!("{content}");
             full_content.push_str(&content);
             // Flush stdout to show content immediately
-            use std::io::Write;
             std::io::stdout().flush()?;
         }
 
@@ -87,7 +88,7 @@ async fn main() -> Result<()> {
         if let Some(reason) = chunk.finish_reason {
             info!("");
             info!("");
-            info!("Stream finished: {:?}", reason);
+            info!("Stream finished: {reason:?}");
         }
 
         // Log usage information if available

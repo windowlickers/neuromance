@@ -813,7 +813,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "id": "chatcmpl-123",
                 "object": "chat.completion",
-                "created": 1677652288,
+                "created": 1_677_652_288,
                 "model": "gpt-4",
                 "choices": [{
                     "index": 0,
@@ -868,7 +868,7 @@ mod tests {
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "id": "chatcmpl-123",
                     "object": "chat.completion",
-                    "created": 1677652288,
+                    "created": 1_677_652_288,
                     "model": "gpt-4",
                     "choices": [{
                         "index": 0,
@@ -902,7 +902,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "id": "chatcmpl-123",
                 "object": "chat.completion",
-                "created": 1677652288,
+                "created": 1_677_652_288,
                 "model": "gpt-4",
                 "choices": [{
                     "index": 0,
@@ -1018,7 +1018,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "id": "chatcmpl-123",
                 "object": "chat.completion",
-                "created": 1677652288,
+                "created": 1_677_652_288,
                 "model": "gpt-4",
                 "choices": []
             })))
@@ -1047,7 +1047,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "id": "chatcmpl-123",
                 "object": "chat.completion",
-                "created": 1677652288,
+                "created": 1_677_652_288,
                 "model": "gpt-4",
                 "choices": [{
                     "index": 0,
@@ -1104,7 +1104,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "id": "chatcmpl-123",
                 "object": "chat.completion",
-                "created": 1677652288,
+                "created": 1_677_652_288,
                 "model": "gpt-4",
                 "choices": [{
                     "index": 0,
@@ -1204,12 +1204,10 @@ mod fuzz_tests {
                 _ => "tool",
             };
 
-            let json = if let Some(c) = content {
+            let json = content.map_or_else(|| format!(r#"{{"role":"{role_str}"}}"#), |c| {
                 let escaped = c.replace('\\', "\\\\").replace('"', "\\\"");
-                format!(r#"{{"role":"{}","content":"{}"}}"#, role_str, escaped)
-            } else {
-                format!(r#"{{"role":"{}"}}"#, role_str)
-            };
+                format!(r#"{{"role":"{role_str}","content":"{escaped}"}}"#)
+            });
 
             let _ = serde_json::from_str::<OpenAIMessage>(&json);
         }
@@ -1221,8 +1219,7 @@ mod fuzz_tests {
             let mut tool_calls_json = Vec::new();
             for i in 0..num_tool_calls {
                 tool_calls_json.push(format!(
-                    r#"{{"id":"call_{}","type":"function","function":{{"name":"func_{}","arguments":"{{}}"}}}}"#,
-                    i, i
+                    r#"{{"id":"call_{i}","type":"function","function":{{"name":"func_{i}","arguments":"{{}}"}}}}"#
                 ));
             }
 
@@ -1249,8 +1246,7 @@ mod fuzz_tests {
         ) {
             let choices: Vec<String> = (0..num_choices)
                 .map(|i| format!(
-                    r#"{{"index":{},"message":{{"role":"assistant","content":"Response {}"}},"finish_reason":"stop"}}"#,
-                    i, i
+                    r#"{{"index":{i},"message":{{"role":"assistant","content":"Response {i}"}},"finish_reason":"stop"}}"#
                 ))
                 .collect();
 
@@ -1284,8 +1280,8 @@ mod fuzz_tests {
 
         #[test]
         fn fuzz_response_with_usage_details(
-            prompt_tokens in 0u32..100000,
-            completion_tokens in 0u32..100000,
+            prompt_tokens in 0u32..100_000,
+            completion_tokens in 0u32..100_000,
         ) {
             let total = prompt_tokens + completion_tokens;
             let json = format!(
@@ -1295,9 +1291,8 @@ mod fuzz_tests {
                     "created":1234567890,
                     "model":"gpt-4",
                     "choices":[{{"index":0,"message":{{"role":"assistant","content":"test"}},"finish_reason":"stop"}}],
-                    "usage":{{"prompt_tokens":{},"completion_tokens":{},"total_tokens":{}}}
-                }}"#,
-                prompt_tokens, completion_tokens, total
+                    "usage":{{"prompt_tokens":{prompt_tokens},"completion_tokens":{completion_tokens},"total_tokens":{total}}}
+                }}"#
             );
 
             let result = serde_json::from_str::<ChatCompletionResponse>(&json);

@@ -11,6 +11,7 @@ use neuromance_client::LLMClient;
 use neuromance_client::openai::client::OpenAIClient;
 use neuromance_common::client::Config;
 use neuromance_tools::generic::CurrentTimeTool;
+use neuromance_tools::mcp::{McpConfig, McpManager};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -62,9 +63,10 @@ async fn main() -> Result<()> {
 
     // Initialize MCP if config provided
     if let Some(mcp_config_path) = args.mcp_config {
-        info!("Loading MCP configuration from {:?}", mcp_config_path);
-
-        use neuromance_tools::mcp::{McpConfig, McpManager};
+        info!(
+            "Loading MCP configuration from {}",
+            mcp_config_path.display()
+        );
 
         // Load the MCP configuration
         let mcp_config = McpConfig::from_file(&mcp_config_path)?;
@@ -78,7 +80,7 @@ async fn main() -> Result<()> {
         info!("Connected to MCP servers and loaded {} tools", tools.len());
 
         // Register each MCP tool with the core
-        for tool in tools.iter() {
+        for tool in &tools {
             task.add_tool_arc(Arc::clone(tool));
         }
 
@@ -121,7 +123,7 @@ async fn main() -> Result<()> {
         }
     );
     if let Some(reasoning) = &verify_response.reasoning {
-        info!("Reasoning: {}", reasoning);
+        info!("Reasoning: {reasoning}");
     }
 
     let total_duration = start_time.elapsed();

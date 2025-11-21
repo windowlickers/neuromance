@@ -619,7 +619,7 @@ mod proptests {
             assert_eq!(tc1.function.arguments, args);
 
             // Test with &[&str]
-            let str_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+            let str_refs: Vec<&str> = args.iter().map(std::string::String::as_str).collect();
             let tc2 = ToolCall::new(func_name.as_str(), str_refs);
             assert_eq!(tc2.function.name, func_name);
             assert_eq!(tc2.function.arguments, args);
@@ -628,7 +628,7 @@ mod proptests {
         #[test]
         fn message_metadata_operations(
             key in ".*",
-            value_num in 0i64..1000000,
+            value_num in 0i64..1_000_000,
         ) {
             let conv_id = Uuid::new_v4();
             let msg = Message::user(conv_id, "test")
@@ -643,7 +643,6 @@ mod proptests {
             status_idx in 0usize..4,
         ) {
             let status = match status_idx {
-                0 => ConversationStatus::Active,
                 1 => ConversationStatus::Archived,
                 2 => ConversationStatus::Deleted,
                 _ => ConversationStatus::Active,
@@ -684,8 +683,7 @@ mod proptests {
             // Escape content for JSON
             let escaped_content = content.replace('\\', "\\\\").replace('"', "\\\"");
             let json = format!(
-                r#"{{"id":"{}","conversation_id":"{}","role":"{}","content":"{}","metadata":{{}},"timestamp":"2024-01-01T00:00:00Z","tool_calls":[],"tool_call_id":null,"name":null}}"#,
-                msg_id, conv_id, role_str, escaped_content
+                r#"{{"id":"{msg_id}","conversation_id":"{conv_id}","role":"{role_str}","content":"{escaped_content}","metadata":{{}},"timestamp":"2024-01-01T00:00:00Z","tool_calls":[],"tool_call_id":null,"name":null}}"#
             );
             // Should handle invalid roles gracefully (will fail deserialization for unknown roles)
             let _ = serde_json::from_str::<Message>(&json);
@@ -698,7 +696,7 @@ mod proptests {
             let conv_id = Uuid::new_v4();
             // Generate large content string
             let content: String = "a".repeat(content_len);
-            let msg = Message::user(conv_id, content.clone());
+            let msg = Message::user(conv_id, content);
 
             // Should serialize and deserialize large content
             let json = serde_json::to_string(&msg).unwrap();
@@ -753,16 +751,16 @@ mod proptests {
             num_messages in 0usize..20,
         ) {
             let mut conv = Conversation::new();
-            if let Some(t) = title.clone() {
+            if let Some(t) = title {
                 conv = conv.with_title(t);
             }
-            if let Some(d) = description.clone() {
+            if let Some(d) = description {
                 conv = conv.with_description(d);
             }
 
             // Add random messages
             for i in 0..num_messages {
-                let msg = conv.user_message(format!("Message {}", i));
+                let msg = conv.user_message(format!("Message {i}"));
                 let _ = conv.add_message(msg);
             }
 

@@ -418,7 +418,7 @@ mod tests {
                 call_type: "function".to_string(),
                 function: FunctionCall {
                     name: "test_function".to_string(),
-                    arguments: vec![r#"123}"#.to_string()],
+                    arguments: vec![r"123}".to_string()],
                 },
             },
         ];
@@ -476,7 +476,7 @@ mod tests {
                 call_type: "function".to_string(),
                 function: FunctionCall {
                     name: "func1".to_string(),
-                    arguments: vec![r#"1}"#.to_string()],
+                    arguments: vec![r"1}".to_string()],
                 },
             },
             // Second tool call continues
@@ -485,7 +485,7 @@ mod tests {
                 call_type: "function".to_string(),
                 function: FunctionCall {
                     name: "func2".to_string(),
-                    arguments: vec![r#"2}"#.to_string()],
+                    arguments: vec![r"2}".to_string()],
                 },
             },
         ];
@@ -538,8 +538,8 @@ mod proptests {
             args in prop::collection::vec(".*", 0..10),
         ) {
             let call = FunctionCall {
-                name: name.clone(),
-                arguments: args.clone(),
+                name,
+                arguments: args,
             };
 
             // Should serialize and deserialize
@@ -551,8 +551,8 @@ mod proptests {
 
         #[test]
         fn fuzz_tool_call_new_with_special_chars(
-            func_name in r#"[a-zA-Z0-9_\-\.]{1,50}"#,
-            args in prop::collection::vec(r#"[\\x00-\\x7F]*"#, 0..5),
+            func_name in r"[a-zA-Z0-9_\-\.]{1,50}",
+            args in prop::collection::vec(r"[\\x00-\\x7F]*", 0..5),
         ) {
             let call = ToolCall::new(func_name.clone(), args.clone());
 
@@ -606,10 +606,10 @@ mod proptests {
 
             for i in 0..num_props {
                 properties.insert(
-                    format!("prop_{}", i),
+                    format!("prop_{i}"),
                     Property {
                         prop_type: format!("type_{}", i % 3),
-                        description: format!("desc_{}", i),
+                        description: format!("desc_{i}"),
                     },
                 );
             }
@@ -617,7 +617,7 @@ mod proptests {
             let params = Parameters {
                 param_type: "object".to_string(),
                 properties: properties.clone(),
-                required: (0..num_props).map(|i| format!("prop_{}", i)).collect(),
+                required: (0..num_props).map(|i| format!("prop_{i}")).collect(),
             };
 
             // Should serialize and deserialize

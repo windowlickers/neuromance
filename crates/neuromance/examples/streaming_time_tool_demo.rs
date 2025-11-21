@@ -78,18 +78,18 @@ async fn main() -> Result<()> {
         .with_event_callback(|event| async move {
             match event {
                 CoreEvent::Streaming(chunk) => {
-                    print!("{}", chunk);
-                    std::io::stdout().flush().unwrap();
+                    print!("{chunk}");
+                    #[allow(clippy::unwrap_used)]
+                    {
+                        std::io::stdout().flush().unwrap();
+                    }
                 }
                 CoreEvent::ToolResult {
                     name,
                     result,
                     success,
                 } => {
-                    info!(
-                        "Tool '{}' completed with success={}: {}",
-                        name, success, result
-                    );
+                    info!("Tool '{name}' completed with success={success}: {result}");
                 }
                 CoreEvent::Usage(usage) => {
                     info!("Token usage: {} total tokens", usage.total_tokens);

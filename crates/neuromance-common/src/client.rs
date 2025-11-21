@@ -1058,7 +1058,7 @@ mod proptests {
         }
 
         #[test]
-        fn max_tokens_validation(tokens in 0u32..1000000u32) {
+        fn max_tokens_validation(tokens in 0u32..1_000_000_u32) {
             let config = Config::new("openai", "gpt-4").with_max_tokens(tokens);
             // max_tokens can be 0 (infinite) or any positive value
             assert!(config.validate().is_ok());
@@ -1101,14 +1101,14 @@ mod proptests {
             assert_eq!(config1.stop_sequences, Some(sequences.clone()));
 
             // Test with Vec<&str>
-            let str_refs: Vec<&str> = sequences.iter().map(|s| s.as_str()).collect();
+            let str_refs: Vec<&str> = sequences.iter().map(std::string::String::as_str).collect();
             let config2 = Config::new("openai", "gpt-4")
                 .with_stop_sequences(str_refs);
             assert_eq!(config2.stop_sequences, Some(sequences.clone()));
 
             // Test with array of &str
             if sequences.len() <= 3 {
-                let arr: Vec<&str> = sequences.iter().map(|s| s.as_str()).collect();
+                let arr: Vec<&str> = sequences.iter().map(std::string::String::as_str).collect();
                 let config3 = Config::new("openai", "gpt-4")
                     .with_stop_sequences(arr);
                 assert_eq!(config3.stop_sequences, Some(sequences));
@@ -1120,7 +1120,7 @@ mod proptests {
             provider in ".*",
             model in ".*",
             temp in 0.0f32..2.0f32,
-            max_tokens in 0u32..100000u32,
+            max_tokens in 0u32..100_000_u32,
         ) {
             let config = Config::new(provider.as_str(), model.as_str())
                 .with_temperature(temp)
@@ -1143,7 +1143,7 @@ mod proptests {
             use uuid::Uuid;
 
             let messages: Vec<Message> = (0..msg_count)
-                .map(|i| Message::new(Uuid::new_v4(), MessageRole::User, format!("message {}", i)))
+                .map(|i| Message::new(Uuid::new_v4(), MessageRole::User, format!("message {i}")))
                 .collect();
 
             let request = ChatRequest::new(messages).with_temperature(temp);
@@ -1186,7 +1186,7 @@ mod proptests {
             assert_eq!(request1.stop, Some(sequences.clone()));
 
             // Test with &[&str]
-            let str_refs: Vec<&str> = sequences.iter().map(|s| s.as_str()).collect();
+            let str_refs: Vec<&str> = sequences.iter().map(std::string::String::as_str).collect();
             let request2 = ChatRequest::new(vec![msg])
                 .with_stop_sequences(str_refs);
             assert_eq!(request2.stop, Some(sequences));
@@ -1196,7 +1196,7 @@ mod proptests {
         fn chat_request_builder_chain(
             model in ".*",
             temp in 0.0f32..2.0f32,
-            max_tokens in 0u32..100000u32,
+            max_tokens in 0u32..100_000_u32,
             top_p in 0.0f32..1.0f32,
         ) {
             use crate::chat::{Message, MessageRole};

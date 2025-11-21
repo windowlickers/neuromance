@@ -486,9 +486,8 @@ mod tests {
             async move {
                 let mut count = counter.lock().await;
                 *count += 1;
-                if *count == 2 {
-                    panic!("Intentional panic in event callback");
-                }
+                assert!(*count != 2, "Intentional panic in event callback");
+                drop(count);
                 drop(event);
             }
         });
@@ -573,5 +572,6 @@ mod tests {
         assert_eq!(captured.len(), 2);
         assert_eq!(captured[0], "streaming");
         assert_eq!(captured[1], "tool");
+        drop(captured);
     }
 }

@@ -5,7 +5,6 @@ use anyhow::{Context, Result};
 use chrono_tz::Tz;
 use clap::Parser;
 use log::{debug, info};
-use once_cell::sync::Lazy;
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -34,7 +33,7 @@ struct Args {
     message: String,
 }
 
-/// Arguments for the get_current_time tool.
+/// Arguments for the `get_current_time` tool.
 #[derive(Debug, Deserialize)]
 struct GetCurrentTimeArgs {
     #[serde(default = "default_timezone")]
@@ -80,8 +79,10 @@ fn create_get_current_time_tool() -> Tool {
 }
 
 /// Lazily initialized tool definition.
-static TIME_TOOL: Lazy<Tool> = Lazy::new(create_get_current_time_tool);
+static TIME_TOOL: std::sync::LazyLock<Tool> =
+    std::sync::LazyLock::new(create_get_current_time_tool);
 
+#[allow(clippy::unnecessary_wraps)]
 fn tool_execution(tool_name: &str, arguments: &str) -> Result<String> {
     match tool_name {
         "get_current_time" => {
@@ -112,17 +113,15 @@ fn tool_execution(tool_name: &str, arguments: &str) -> Result<String> {
                 }
             }
         }
-        _ => Ok(format!("Unknown tool: {}", tool_name)),
+        _ => Ok(format!("Unknown tool: {tool_name}")),
     }
 }
 
-fn print_usage(u: Usage) -> Result<()> {
+fn print_usage(u: &Usage) {
     info!("Usage:");
     info!("Prompt tokens: {}", u.prompt_tokens);
     info!("Completion tokens: {}", u.completion_tokens);
     info!("Total tokens: {}", u.total_tokens);
-
-    Ok(())
 }
 
 #[tokio::main]
@@ -173,7 +172,7 @@ async fn main() -> Result<()> {
 
     info!("Sending chat request...");
     let pretty_request = serde_json::to_string_pretty(&request.clone())?;
-    debug!("\n{}", pretty_request);
+    debug!("\n{pretty_request}");
 
     // Start timing the request
     let start_time = Instant::now();
@@ -185,12 +184,14 @@ async fn main() -> Result<()> {
     info!("Model: {}", response.model);
     info!("Content: {}", response.message.content);
     if let Some(usage) = response.usage.clone() {
-        print_usage(usage)?;
+        print_usage(&usage);
     }
 
     // Check if the model made any tool calls
     let mut tool_responses: Vec<Message> = Vec::new();
-    if !response.message.tool_calls.is_empty() {
+    if response.message.tool_calls.is_empty() {
+        info!("No tool calls were made by the model.");
+    } else {
         info!("Tool calls made:");
         for tool_call in &response.message.tool_calls {
             info!("Tool: {}", tool_call.function.name);
@@ -201,7 +202,7 @@ async fn main() -> Result<()> {
                 &tool_call.function.name,
                 &tool_call.function.arguments.join(""),
             )?;
-            info!("Result: {}", tool_result);
+            info!("Result: {tool_result}");
 
             let tool_response = Message::tool(
                 conversation_id,
@@ -232,16 +233,14 @@ async fn main() -> Result<()> {
 
         info!("Sending chat request...");
         let pretty_request = serde_json::to_string_pretty(&follow_up_request.clone())?;
-        debug!("\n{}", pretty_request);
+        debug!("\n{pretty_request}");
 
         let final_response = client.chat(&follow_up_request).await?;
         info!("Final response:\n\n {}", final_response.message.content);
 
         if let Some(final_usage) = final_response.usage {
-            print_usage(final_usage)?;
+            print_usage(&final_usage);
         }
-    } else {
-        info!("No tool calls were made by the model.");
     }
 
     // Calculate total time
