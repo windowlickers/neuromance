@@ -269,7 +269,7 @@ impl OpenAIMessageBuilder<builder_states::HasRole> {
     #[must_use]
     pub fn build(self) -> OpenAIMessage {
         OpenAIMessage {
-            role: self.role.expect("Role must be set"),
+            role: self.role.unwrap_or_else(|| unreachable!("Role must be set in HasRole state")),
             content: self.content,
             name: self.name,
             tool_calls: self.tool_calls,

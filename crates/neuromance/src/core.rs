@@ -187,7 +187,7 @@ impl<C: LLMClient> Core<C> {
             }
         }
 
-        Err(last_error.unwrap())
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("No response received after retries")))
     }
 
     /// Send a streaming chat request and accumulate the response

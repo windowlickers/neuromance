@@ -67,7 +67,7 @@ impl ToolImplementation for TodoReadTool {
     }
 
     async fn execute(&self, _args: &Value) -> Result<String> {
-        let todos = self.storage.read().unwrap();
+        let todos = self.storage.read().map_err(|e| anyhow::anyhow!("Failed to read todo storage: {e}"))?;
 
         if todos.is_empty() {
             return Ok("TODO LIST: (empty)".to_string());
@@ -161,7 +161,10 @@ impl ToolImplementation for TodoWriteTool {
         }
 
         // Update the stored todos
-        self.storage.write().unwrap().clone_from(&todos);
+        self.storage
+            .write()
+            .map_err(|e| anyhow::anyhow!("Failed to write to todo storage: {e}"))?
+            .clone_from(&todos);
 
         // Format the response
         let mut response = String::from("TODO LIST UPDATED:\n");
