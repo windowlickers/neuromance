@@ -58,6 +58,7 @@ impl<C: LLMClient> AgentBuilder<C> {
     ///
     /// # Arguments
     /// * `prompt` - System prompt text
+    #[must_use]
     pub fn system_prompt(mut self, prompt: impl Into<String>) -> Self {
         self.system_prompt = Some(prompt.into());
         self
@@ -67,6 +68,7 @@ impl<C: LLMClient> AgentBuilder<C> {
     ///
     /// # Arguments
     /// * `prompt` - User prompt text
+    #[must_use]
     pub fn user_prompt(mut self, prompt: impl Into<String>) -> Self {
         self.user_prompt = Some(prompt.into());
         self
@@ -76,6 +78,7 @@ impl<C: LLMClient> AgentBuilder<C> {
     ///
     /// # Arguments
     /// * `tool` - Tool implementation to register
+    #[must_use]
     pub fn add_tool<T: ToolImplementation + 'static>(mut self, tool: T) -> Self {
         self.core.tool_executor.add_tool(tool);
         self
@@ -85,7 +88,8 @@ impl<C: LLMClient> AgentBuilder<C> {
     ///
     /// # Arguments
     /// * `max_turns` - Maximum number of turns before the loop exits
-    pub fn max_turns(mut self, max_turns: u32) -> Self {
+    #[must_use]
+    pub const fn max_turns(mut self, max_turns: u32) -> Self {
         self.core.max_turns = Some(max_turns);
         self
     }
@@ -94,7 +98,8 @@ impl<C: LLMClient> AgentBuilder<C> {
     ///
     /// # Arguments
     /// * `auto_approve` - Whether to auto-approve all tools
-    pub fn auto_approve_tools(mut self, auto_approve: bool) -> Self {
+    #[must_use]
+    pub const fn auto_approve_tools(mut self, auto_approve: bool) -> Self {
         self.core.auto_approve_tools = auto_approve;
         self
     }
@@ -103,6 +108,7 @@ impl<C: LLMClient> AgentBuilder<C> {
     ///
     /// # Arguments
     /// * `tool_choice` - Tool choice strategy (Auto, None, Required, or specific function)
+    #[must_use]
     pub fn with_tool_choice(mut self, tool_choice: ToolChoice) -> Self {
         self.tool_choice = tool_choice;
         self

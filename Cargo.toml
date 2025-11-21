@@ -59,11 +59,7 @@ rmcp = { version = "0.8.0", features = [
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
-# missing_docs = "warn"
 unused_must_use = "warn"
-# dead_code = "warn"
-# unused_variables = "warn"
-# unused_imports = "warn"
 
 [workspace.lints.clippy]
  all = { level = "warn", priority = -1 }

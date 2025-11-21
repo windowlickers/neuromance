@@ -15,9 +15,9 @@ pub struct ContextAgent<C: LLMClient> {
 }
 
 impl<C: LLMClient + Send + Sync> ContextAgent<C> {
-    pub fn new(id: String, client: C) -> Self {
+    pub fn new(id: &str, client: C) -> Self {
         Self {
-            agent: BaseAgent::builder(format!("{}-context", id), client)
+            agent: BaseAgent::builder(format!("{id}-context"), client)
                 .system_prompt(
                     "You are the assistant. Your job is to analyze what tools, \
                     information, and approach would be needed to complete a task. Be concise, \
@@ -30,7 +30,7 @@ impl<C: LLMClient + Send + Sync> ContextAgent<C> {
         }
     }
 
-    /// Add tool to ContextAgent
+    /// Add tool to `ContextAgent`
     pub fn add_tool<T: ToolImplementation + 'static>(&mut self, tool: T) {
         self.agent.core.tool_executor.add_tool(tool);
     }
@@ -46,10 +46,9 @@ impl<C: LLMClient + Send + Sync> ContextAgent<C> {
                 self.agent.conversation_id,
                 MessageRole::User,
                 format!(
-                    "Analyze what would be required to complete this task: {}\n\n\
+                    "Analyze what would be required to complete this task: {task_description}\n\n\
                     Consider: What tools are needed? What information must be gathered? \
                     What approach should be taken?",
-                    task_description
                 ),
             ),
         ];
@@ -79,14 +78,13 @@ impl<C: LLMClient + Send + Sync> ContextAgent<C> {
                 self.agent.conversation_id,
                 MessageRole::User,
                 format!(
-                    "Analyze what would be required to complete this task: {}\n\n\
+                    "Analyze what would be required to complete this task: {task_description}\n\n\
                     Based on the available tools listed in the system message, create a step by step plan:\n\
                     - Which tools need to be used?\n\
                     - What context is critical?\n\
                     - What steps should be taken?\n\n\
                     Please provide your concise analysis specifying what tools and instructions \
                     are critical to accomplishing the task.",
-                    task_description
                 ),
             ),
         ];
@@ -101,10 +99,10 @@ pub struct ActionAgent<C: LLMClient> {
 }
 
 impl<C: LLMClient + Send + Sync> ActionAgent<C> {
-    pub fn new(id: String, client: C) -> Self {
+    pub fn new(id: &str, client: C) -> Self {
         let (todo_read, todo_write) = create_todo_tools();
         Self {
-            agent: BaseAgent::builder(format!("{}-action", id), client)
+            agent: BaseAgent::builder(format!("{id}-action"), client)
                 .system_prompt(
                     "You are an the assistant. Based on task analysis, you execute the \
                     required actions to complete tasks. Be precise and follow the recommended \
@@ -133,9 +131,8 @@ impl<C: LLMClient + Send + Sync> ActionAgent<C> {
                 self.agent.conversation_id,
                 MessageRole::User,
                 format!(
-                    r#"Task: {}\n\n\Task Analysis:\n{}\n\n
-                    Now execute the task based on the context analysis."#,
-                    context, task_description
+                    r"Task: {context}\n\n\Task Analysis:\n{task_description}\n\n
+                    Now execute the task based on the context analysis.",
                 ),
             ),
         ];
@@ -150,9 +147,9 @@ pub struct VerifierAgent<C: LLMClient> {
 }
 
 impl<C: LLMClient + Send + Sync> VerifierAgent<C> {
-    pub fn new(id: String, client: C) -> Self {
+    pub fn new(id: &str, client: C) -> Self {
         Self {
-            agent: BaseAgent::builder(format!("{}-verifier", id), client)
+            agent: BaseAgent::builder(format!("{id}-verifier"), client)
                 .system_prompt(
                     "You are a verification agent. You check if tasks were completed successfully \
                     and correctly. Use the return_bool tool to indicate success (true) or failure (false) \
@@ -166,7 +163,7 @@ impl<C: LLMClient + Send + Sync> VerifierAgent<C> {
     }
 
     pub async fn verify(
-        &mut self,
+        &self,
         task_description: String,
         action_result: String,
     ) -> Result<(bool, AgentResponse)> {
@@ -180,10 +177,9 @@ impl<C: LLMClient + Send + Sync> VerifierAgent<C> {
                 self.agent.conversation_id,
                 MessageRole::User,
                 format!(
-                    "Original Task: {}\n\nResult:\n{}\n\n\
+                    "Original Task: {task_description}\n\nResult:\n{action_result}\n\n\
                     Did the agent successfully complete the task? Use the return_bool tool \
                     to provide your verification result.",
-                    task_description, action_result
                 ),
             ),
         ];
@@ -220,7 +216,7 @@ impl<C: LLMClient + Send + Sync> VerifierAgent<C> {
             // Arguments is a Vec<String>, typically with a single JSON string
             if let Some(args_str) = tool_call.function.arguments.first()
                 && let Ok(args) = serde_json::from_str::<serde_json::Value>(args_str)
-                && let Some(result) = args.get("result").and_then(|v| v.as_bool())
+                && let Some(result) = args.get("result").and_then(serde_json::Value::as_bool)
             {
                 let agent_response = AgentResponse {
                     content: response.message.clone(),

@@ -1,3 +1,4 @@
+use std::fmt::Write;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -13,10 +14,10 @@ use crate::Agent;
 mod agents;
 use agents::{ActionAgent, ContextAgent, VerifierAgent};
 
-/// /// Represents a complete agent task composed of three specialized agents:
-/// - ContextAgent: Gathers and analyzes context
-/// - ActionAgent: Takes actions based on context
-/// - VerifierAgent: Verifies actions were successful
+/// Represents a complete agent task composed of three specialized agents:
+/// - `ContextAgent`: Gathers and analyzes context
+/// - `ActionAgent`: Takes actions based on context
+/// - `VerifierAgent`: Verifies actions were successful
 pub struct AgentTask<C: LLMClient> {
     pub id: String,
     pub conversation_id: Uuid,
@@ -60,15 +61,15 @@ impl<C: LLMClient + Send + Sync> AgentTask<C> {
             id: id.clone(),
             conversation_id,
             task_description,
-            context_agent: ContextAgent::new(id.clone(), client.clone()),
-            action_agent: ActionAgent::new(id.clone(), client.clone()),
-            verifier_agent: VerifierAgent::new(id, client),
+            context_agent: ContextAgent::new(&id, client.clone()),
+            action_agent: ActionAgent::new(&id, client.clone()),
+            verifier_agent: VerifierAgent::new(&id, client),
             state: TaskState::default(),
             tool_registry: ToolRegistry::new(),
         }
     }
 
-    /// Add tool to AgentTask ToolRegistry for ActionAgent
+    /// Add tool to `AgentTask` `ToolRegistry` for `ActionAgent`
     pub fn add_tool<T: ToolImplementation + 'static>(&self, tool: T) {
         self.tool_registry.register(Arc::new(tool));
     }
@@ -78,19 +79,18 @@ impl<C: LLMClient + Send + Sync> AgentTask<C> {
         self.tool_registry.register(tool);
     }
 
-    /// Remove Tool from AgentTask ToolRegistry
-    pub async fn remove_tool(&mut self, name: &str) -> Result<Option<Arc<dyn ToolImplementation>>> {
-        let tool = self.tool_registry.remove(name);
-        Ok(tool)
+    /// Remove Tool from `AgentTask` `ToolRegistry`
+    pub fn remove_tool(&mut self, name: &str) -> Option<Arc<dyn ToolImplementation>> {
+        self.tool_registry.remove(name)
     }
 
-    /// Get all Tools from AgentTask ToolRegistry
+    /// Get all Tools from `AgentTask` `ToolRegistry`
     pub fn get_all_tools(&self) -> Vec<Tool> {
         self.tool_registry.get_all_definitions()
     }
 
     /// Format tools for inclusion in system prompt
-    fn format_tools_for_prompt(&self, tools: &[Tool]) -> String {
+    fn format_tools_for_prompt(tools: &[Tool]) -> String {
         if tools.is_empty() {
             return String::from("\n\nNo tools are currently available.");
         }
@@ -98,10 +98,11 @@ impl<C: LLMClient + Send + Sync> AgentTask<C> {
         let mut description = String::from("\n\nAvailable tools for the ActionAgent:\n");
 
         for tool in tools {
-            description.push_str(&format!(
+            let _ = write!(
+                description,
                 "\n- {}: {}\n",
                 tool.function.name, tool.function.description
-            ));
+            );
 
             // NOTE parameters seem excessive and context wasting, revisit later
             //
@@ -115,12 +116,15 @@ impl<C: LLMClient + Send + Sync> AgentTask<C> {
     }
 
     /// Execute the context gathering phase
+    ///
+    /// # Errors
+    /// Returns an error if context analysis fails
     pub async fn gather_context(&mut self) -> Result<AgentResponse> {
         // Get all available tools from the registry
         let available_tools = self.get_all_tools();
 
         // Format tools for the context agent's system prompt
-        let tools_description = self.format_tools_for_prompt(&available_tools);
+        let tools_description = Self::format_tools_for_prompt(&available_tools);
 
         // Pass tools information to context agent
         let response = self
@@ -133,6 +137,9 @@ impl<C: LLMClient + Send + Sync> AgentTask<C> {
     }
 
     /// Execute the action phase using context from previous phase
+    ///
+    /// # Errors
+    /// Returns an error if context was not gathered first or action execution fails
     pub async fn take_action(&mut self) -> Result<AgentResponse> {
         if !self.state.context_gathered {
             return Err(anyhow::anyhow!(
@@ -170,6 +177,9 @@ impl<C: LLMClient + Send + Sync> AgentTask<C> {
     }
 
     /// Execute the verification phase
+    ///
+    /// # Errors
+    /// Returns an error if action was not taken first or verification fails
     pub async fn verify(&mut self) -> Result<AgentResponse> {
         if !self.state.action_taken {
             return Err(anyhow::anyhow!("Cannot verify before action is taken"));
@@ -193,6 +203,9 @@ impl<C: LLMClient + Send + Sync> AgentTask<C> {
     }
 
     /// Execute the full task pipeline: context -> action -> verify
+    ///
+    /// # Errors
+    /// Returns an error if any phase of the task pipeline fails
     pub async fn execute_full(&mut self) -> Result<TaskResponse> {
         // Phase 1: Gather context
         let context_response = self.gather_context().await?;
@@ -212,6 +225,9 @@ impl<C: LLMClient + Send + Sync> AgentTask<C> {
     }
 
     /// Reset the task to initial state
+    ///
+    /// # Errors
+    /// Returns an error if any agent reset fails
     pub async fn reset(&mut self) -> Result<()> {
         self.context_agent.agent.reset().await?;
         self.action_agent.agent.reset().await?;

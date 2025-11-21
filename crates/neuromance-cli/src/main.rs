@@ -43,6 +43,7 @@ struct Args {
 }
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
     // cli & config
     let args = Args::parse();
@@ -243,7 +244,7 @@ async fn main() -> Result<()> {
 
                 // handle commands
                 if line.starts_with('/') {
-                    if handle_command(line, &mut conversation, &mut rl, &mut core, &total_usage)
+                    if handle_command(line, &mut conversation, &mut rl, &core, &total_usage)
                         .await?
                     {
                         break; // exit if command returns true
@@ -272,7 +273,6 @@ async fn main() -> Result<()> {
             }
             Err(ReadlineError::Interrupted) => {
                 println!("CTRL-C");
-                continue;
             }
             Err(ReadlineError::Eof) => {
                 println!("CTRL-D");
@@ -297,7 +297,7 @@ async fn handle_command(
     command: &str,
     conversation: &mut Conversation,
     rl: &mut DefaultEditor,
-    core: &mut Core<OpenAIClient>,
+    core: &Core<OpenAIClient>,
     total_usage: &Arc<Mutex<Usage>>,
 ) -> Result<bool> {
     let parts: Vec<&str> = command.split_whitespace().collect();
