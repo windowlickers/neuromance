@@ -2,6 +2,8 @@
 //!
 //! Provides formatted output for messages, tool calls, and tool results
 
+use std::io::Write;
+
 use colored::Colorize;
 use neuromance::ToolCall;
 
@@ -40,7 +42,7 @@ pub fn display_tool_result(tool_name: &str, result: &str, success: bool) {
 
     if success {
         println!("○ {} {}", "Result:".bright_green(), tool_name.bright_cyan());
-        println!("  {}", display_result);
+        println!("  {display_result}");
     } else {
         println!("○ {} {}", "Failed:".bright_red(), tool_name.bright_cyan());
         println!("  {}", display_result.bright_red());
@@ -51,7 +53,6 @@ pub fn display_tool_result(tool_name: &str, result: &str, success: bool) {
 pub fn display_assistant_header() {
     println!("\n╭─● {}", "Assistant".bright_magenta().bold());
     println!("╰───────────○");
-    use std::io::Write;
     let _ = std::io::stdout().flush();
 }
 

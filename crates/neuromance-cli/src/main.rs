@@ -27,7 +27,7 @@ struct Args {
     #[arg(long, default_value = "https://127.0.0.1:11434/v1")]
     base_url: String,
 
-    /// API key for authentication (or set OPENAI_API_KEY env var)
+    /// API key for authentication (or set `OPENAI_API_KEY` env var)
     #[arg(long)]
     api_key: Option<String>,
 
@@ -37,7 +37,7 @@ struct Args {
 
     /// Path to MCP (Model Context Protocol) configuration file
     /// Supports .toml, .yaml, .yml, and .json formats
-    /// See mcp_config.toml.example for configuration examples
+    /// See `mcp_config.toml.example` for configuration examples
     #[arg(long)]
     mcp_config: Option<String>,
 }
@@ -96,7 +96,7 @@ async fn main() -> Result<()> {
                 async move {
                     match event {
                         CoreEvent::Streaming(chunk) => {
-                            print!("{}", chunk);
+                            print!("{chunk}");
                             std::io::stdout().flush().ok();
                         }
                         CoreEvent::ToolResult {
@@ -139,7 +139,7 @@ async fn main() -> Result<()> {
         use neuromance_tools::mcp::McpManager;
         use std::path::Path;
 
-        println!("Loading MCP configuration from: {}", mcp_config_path);
+        println!("Loading MCP configuration from: {mcp_config_path}");
         match McpManager::from_config_file(Path::new(mcp_config_path)).await {
             Ok(mcp_manager) => match mcp_manager.get_all_tools().await {
                 Ok(mcp_tools) => {
@@ -158,16 +158,15 @@ async fn main() -> Result<()> {
                         .count();
 
                     println!(
-                        "Successfully loaded {} MCP tool(s) from {} server(s)",
-                        mcp_tool_count, server_count
+                        "Successfully loaded {mcp_tool_count} MCP tool(s) from {server_count} server(s)"
                     );
                 }
                 Err(e) => {
-                    eprintln!("Warning: Failed to load MCP tools: {}", e);
+                    eprintln!("Warning: Failed to load MCP tools: {e}");
                 }
             },
             Err(e) => {
-                eprintln!("Warning: Failed to load MCP configuration: {}", e);
+                eprintln!("Warning: Failed to load MCP configuration: {e}");
                 eprintln!("Continuing without MCP tools...");
             }
         }
@@ -262,7 +261,7 @@ async fn main() -> Result<()> {
                 conversation.add_message(user_msg)?;
 
                 // send conversation using neuromance core
-                match execute_conversation(&mut core, &mut conversation).await {
+                match execute_conversation(&core, &mut conversation).await {
                     Ok(()) => {
                         // Successfully completed - messages already in conversation
                     }
@@ -280,7 +279,7 @@ async fn main() -> Result<()> {
                 break;
             }
             Err(err) => {
-                eprintln!("Error: {:?}", err);
+                eprintln!("Error: {err:?}");
                 break;
             }
         }
@@ -304,7 +303,7 @@ async fn handle_command(
     let parts: Vec<&str> = command.split_whitespace().collect();
 
     match parts.first().copied() {
-        Some("/quit") | Some("/exit") => {
+        Some("/quit" | "/exit") => {
             return Ok(true);
         }
         Some("/list") => {
@@ -392,7 +391,7 @@ async fn edit_message(
     index: usize,
     conversation: &mut Conversation,
     rl: &mut DefaultEditor,
-    core: &mut Core<OpenAIClient>,
+    core: &Core<OpenAIClient>,
 ) -> Result<()> {
     let messages = conversation.get_messages();
 
@@ -412,10 +411,7 @@ async fn edit_message(
     let current_content = &msg.content;
 
     // Pre-fill the editor with current content
-    println!(
-        "Editing message [{}]. Press Enter to accept or modify:",
-        index
-    );
+    println!("Editing message [{index}]. Press Enter to accept or modify:");
     let edited = rl.readline_with_initial(">> ", (current_content, ""))?;
     let edited = edited.trim();
 
@@ -492,13 +488,11 @@ async fn prompt_for_tool_approval(
     );
 
     // Acquire lock with timeout as defensive measure
-    let mut ed = match tokio::time::timeout(std::time::Duration::from_secs(30), editor.lock()).await
-    {
-        Ok(guard) => guard,
-        Err(_) => {
-            eprintln!("{} Editor lock timeout", "!".red().bold());
-            return ToolApproval::Denied("Editor lock timeout".to_string());
-        }
+    let Ok(mut ed) =
+        tokio::time::timeout(std::time::Duration::from_secs(30), editor.lock()).await
+    else {
+        eprintln!("{} Editor lock timeout", "!".red().bold());
+        return ToolApproval::Denied("Editor lock timeout".to_string());
     };
 
     loop {
@@ -526,7 +520,6 @@ async fn prompt_for_tool_approval(
                             "{} Invalid response. Use /yes, /no, or /quit",
                             "!".yellow().bold()
                         );
-                        continue;
                     }
                 }
             }
@@ -539,8 +532,8 @@ async fn prompt_for_tool_approval(
                 return ToolApproval::Quit;
             }
             Err(e) => {
-                eprintln!("Error reading input: {}", e);
-                return ToolApproval::Denied(format!("Error reading input: {}", e));
+                eprintln!("Error reading input: {e}");
+                return ToolApproval::Denied(format!("Error reading input: {e}"));
             }
         }
     }
@@ -548,7 +541,7 @@ async fn prompt_for_tool_approval(
 
 /// Execute conversation using Core's built-in tool loop with streaming
 async fn execute_conversation(
-    core: &mut Core<OpenAIClient>,
+    core: &Core<OpenAIClient>,
     conversation: &mut Conversation,
 ) -> Result<()> {
     // Display assistant header before streaming starts
