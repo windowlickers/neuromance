@@ -244,8 +244,7 @@ async fn main() -> Result<()> {
 
                 // handle commands
                 if line.starts_with('/') {
-                    if handle_command(line, &mut conversation, &mut rl, &core, &total_usage)
-                        .await?
+                    if handle_command(line, &mut conversation, &mut rl, &core, &total_usage).await?
                     {
                         break; // exit if command returns true
                     }
@@ -488,8 +487,7 @@ async fn prompt_for_tool_approval(
     );
 
     // Acquire lock with timeout as defensive measure
-    let Ok(mut ed) =
-        tokio::time::timeout(std::time::Duration::from_secs(30), editor.lock()).await
+    let Ok(mut ed) = tokio::time::timeout(std::time::Duration::from_secs(30), editor.lock()).await
     else {
         eprintln!("{} Editor lock timeout", "!".red().bold());
         return ToolApproval::Denied("Editor lock timeout".to_string());

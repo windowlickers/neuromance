@@ -67,7 +67,10 @@ impl ToolImplementation for TodoReadTool {
     }
 
     async fn execute(&self, _args: &Value) -> Result<String> {
-        let todos = self.storage.read().map_err(|e| anyhow::anyhow!("Failed to read todo storage: {e}"))?;
+        let todos = self
+            .storage
+            .read()
+            .map_err(|e| anyhow::anyhow!("Failed to read todo storage: {e}"))?;
 
         if todos.is_empty() {
             return Ok("TODO LIST: (empty)".to_string());

@@ -191,9 +191,7 @@ impl McpManager {
             .read()
             .await
             .get(tool_name)
-            .ok_or_else(|| {
-                anyhow::anyhow!("Tool '{tool_name}' not found on server '{server_id}'")
-            })?
+            .ok_or_else(|| anyhow::anyhow!("Tool '{tool_name}' not found on server '{server_id}'"))?
             .clone();
 
         let adapter = McpToolAdapter::new(server_id.to_string(), client, mcp_tool);
@@ -221,10 +219,10 @@ impl McpManager {
         for server_config in &self.config.servers {
             let status = if let Some(client) = self.clients.read().await.get(&server_config.id) {
                 let tools_count = client.get_tools().await.len();
-                let server_info = client
-                    .service
-                    .peer_info()
-                    .map_or_else(|| "Unknown".to_string(), |info| info.server_info.name.clone());
+                let server_info = client.service.peer_info().map_or_else(
+                    || "Unknown".to_string(),
+                    |info| info.server_info.name.clone(),
+                );
                 ServerStatus::Connected {
                     tools_count,
                     server_name: server_info,

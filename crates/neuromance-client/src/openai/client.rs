@@ -269,7 +269,9 @@ impl OpenAIMessageBuilder<builder_states::HasRole> {
     #[must_use]
     pub fn build(self) -> OpenAIMessage {
         OpenAIMessage {
-            role: self.role.unwrap_or_else(|| unreachable!("Role must be set in HasRole state")),
+            role: self
+                .role
+                .unwrap_or_else(|| unreachable!("Role must be set in HasRole state")),
             content: self.content,
             name: self.name,
             tool_calls: self.tool_calls,
@@ -487,9 +489,8 @@ impl OpenAIClient {
         let url = format!("{}/{}", self.base_url, endpoint);
 
         // Validate URL construction
-        reqwest::Url::parse(&url).map_err(|e| {
-            ClientError::ConfigurationError(format!("Invalid URL '{url}': {e}"))
-        })?;
+        reqwest::Url::parse(&url)
+            .map_err(|e| ClientError::ConfigurationError(format!("Invalid URL '{url}': {e}")))?;
 
         let response = self
             .client
@@ -698,9 +699,8 @@ impl LLMClient for OpenAIClient {
         let url = format!("{}/{}", self.base_url, "chat/completions");
 
         // Validate URL construction
-        reqwest::Url::parse(&url).map_err(|e| {
-            ClientError::ConfigurationError(format!("Invalid URL '{url}': {e}"))
-        })?;
+        reqwest::Url::parse(&url)
+            .map_err(|e| ClientError::ConfigurationError(format!("Invalid URL '{url}': {e}")))?;
 
         // Build the request with SSE headers
         // Use the reusable streaming_client (without retry middleware to avoid interfering with SSE)

@@ -177,9 +177,7 @@ impl ToolRegistry {
 
     #[must_use]
     pub fn is_tool_auto_approved(&self, name: &str) -> bool {
-        self.tools
-            .get(name)
-            .is_some_and(|t| t.is_auto_approved())
+        self.tools.get(name).is_some_and(|t| t.is_auto_approved())
     }
 
     pub fn remove(&mut self, name: &str) -> Option<Arc<dyn ToolImplementation>> {

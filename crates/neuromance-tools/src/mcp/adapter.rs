@@ -92,19 +92,15 @@ impl ToolImplementation for McpToolAdapter {
             r#type: "function".to_string(),
             function: Function {
                 name: self.full_name(),
-                description: self
-                    .mcp_tool
-                    .description
-                    .as_ref()
-                    .map_or_else(
-                        || {
-                            format!(
-                                "MCP tool '{}' from server '{}'",
-                                self.tool_name, self.server_id
-                            )
-                        },
-                        std::string::ToString::to_string,
-                    ),
+                description: self.mcp_tool.description.as_ref().map_or_else(
+                    || {
+                        format!(
+                            "MCP tool '{}' from server '{}'",
+                            self.tool_name, self.server_id
+                        )
+                    },
+                    std::string::ToString::to_string,
+                ),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": properties,
