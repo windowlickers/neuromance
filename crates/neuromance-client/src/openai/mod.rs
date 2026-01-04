@@ -56,6 +56,10 @@ pub struct OpenAIMessage {
     #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Reasoning content from thinking models (o1, o3, etc.)
+    #[builder(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 impl From<&Message> for OpenAIMessage {
@@ -85,6 +89,7 @@ impl From<&Message> for OpenAIMessage {
             .name(message.name.clone())
             .tool_calls(tool_calls)
             .tool_call_id(message.tool_call_id.clone())
+            .reasoning_content(message.reasoning_content.clone())
             .build()
     }
 }
@@ -336,6 +341,9 @@ pub struct OpenAIMessageDelta {
     /// Incremental tool calls (for function calling).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<SmallVec<[OpenAIToolCallDelta; 2]>>,
+    /// Reasoning content delta (for streaming from thinking models).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 /// Delta representing incremental changes to a tool call.

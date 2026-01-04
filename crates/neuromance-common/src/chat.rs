@@ -114,6 +114,10 @@ pub struct Message {
     /// Function name (required for tool messages).
     #[builder(default)]
     pub name: Option<String>,
+
+    /// Reasoning content from thinking models (optional, separate from main content).
+    #[builder(default)]
+    pub reasoning_content: Option<String>,
 }
 
 impl Message {
@@ -129,6 +133,7 @@ impl Message {
             tool_calls: SmallVec::new(),
             tool_call_id: None,
             name: None,
+            reasoning_content: None,
         }
     }
 

@@ -276,6 +276,7 @@ impl OpenAIMessageBuilder<builder_states::HasRole> {
             name: self.name,
             tool_calls: self.tool_calls,
             tool_call_id: self.tool_call_id,
+            reasoning_content: None,
         }
     }
 }
@@ -539,6 +540,10 @@ impl OpenAIClient {
         }
 
         let response_text = response.text().await?;
+        debug!(
+            "Raw API response: {}",
+            &response_text.chars().collect::<String>()
+        );
         let parsed_response: T =
             serde_json::from_str(&response_text).map_err(ClientError::SerializationError)?;
 
@@ -609,6 +614,7 @@ impl OpenAIClient {
             name: openai_msg.name.clone(),
             timestamp: Utc::now(),
             metadata: HashMap::new(),
+            reasoning_content: openai_msg.reasoning_content.clone(),
         }
     }
 }
@@ -799,6 +805,7 @@ mod tests {
             name: None,
             timestamp: Utc::now(),
             metadata: HashMap::new(),
+            reasoning_content: None,
         }
     }
 
