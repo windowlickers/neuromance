@@ -14,6 +14,8 @@ use neuromance_common::chat::{Message, MessageRole};
 use neuromance_common::client::{ChatRequest, Config, Usage};
 use neuromance_common::tools::{FunctionCall, Tool, ToolCall};
 
+pub use neuromance_common::client::ReasoningEffort;
+
 pub mod client;
 pub use client::{OpenAIClient, convert_chunk_to_chat_chunk};
 
@@ -60,6 +62,10 @@ pub struct OpenAIMessage {
     #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// Refusal message when the model declines to respond (for Structured Outputs).
+    #[builder(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
 }
 
 impl From<&Message> for OpenAIMessage {
@@ -175,10 +181,23 @@ pub struct ChatCompletionRequest {
     pub model: String,
     /// The conversation messages in `OpenAI` format.
     pub messages: Vec<OpenAIMessage>,
-    /// Maximum tokens to generate (optional).
+    /// Maximum tokens to generate (optional, deprecated for reasoning models).
     #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    /// Maximum completion tokens including reasoning tokens (for o-series/reasoning models).
+    ///
+    /// This replaces `max_tokens` for reasoning models and includes both visible
+    /// output tokens and internal reasoning tokens.
+    #[builder(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_completion_tokens: Option<u32>,
+    /// Reasoning effort level for thinking models (o1, o3, GPT-5+).
+    ///
+    /// Controls how much compute the model spends on reasoning before responding.
+    #[builder(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
     /// Sampling temperature 0.0 to 2.0 (optional).
     #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -253,6 +272,8 @@ impl From<(&ChatRequest, &Config)> for ChatCompletionRequest {
             )
             .messages(openai_messages)
             .max_tokens(request.max_tokens)
+            .max_completion_tokens(request.max_completion_tokens)
+            .reasoning_effort(request.reasoning_effort)
             .temperature(request.temperature)
             .top_p(request.top_p)
             .stop(request.stop.clone())

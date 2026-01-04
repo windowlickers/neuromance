@@ -277,6 +277,7 @@ impl OpenAIMessageBuilder<builder_states::HasRole> {
             tool_calls: self.tool_calls,
             tool_call_id: self.tool_call_id,
             reasoning_content: None,
+            refusal: None,
         }
     }
 }
@@ -324,6 +325,7 @@ pub fn convert_chunk_to_chat_chunk(chunk: &ChatCompletionChunk) -> ChatChunk {
     let choice = chunk.choices.first();
 
     let delta_content = choice.and_then(|c| c.delta.content.clone());
+    let delta_reasoning_content = choice.and_then(|c| c.delta.reasoning_content.clone());
     let delta_role = choice.and_then(|c| c.delta.role);
     let finish_reason = choice
         .and_then(|c| c.finish_reason.as_ref())
@@ -369,6 +371,7 @@ pub fn convert_chunk_to_chat_chunk(chunk: &ChatCompletionChunk) -> ChatChunk {
     ChatChunk {
         model: chunk.model.clone(),
         delta_content,
+        delta_reasoning_content,
         delta_role,
         delta_tool_calls,
         finish_reason,

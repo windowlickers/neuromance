@@ -253,6 +253,7 @@ impl<C: LLMClient> Core<C> {
             name: None,
             timestamp: Utc::now(),
             metadata: last_chunk.metadata,
+            reasoning_content: None,
         };
 
         Ok(ChatResponse {

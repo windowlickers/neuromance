@@ -79,6 +79,29 @@ impl From<ToolChoice> for serde_json::Value {
     }
 }
 
+/// Reasoning effort level for thinking models (with support).
+///
+/// Controls how much compute the model spends on reasoning before responding.
+/// Higher effort levels may produce better results for complex problems but
+/// use more tokens and take longer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    /// No reasoning (GPT-5.1+ only).
+    None,
+    /// Minimal reasoning effort.
+    Minimal,
+    /// Low reasoning effort.
+    Low,
+    /// Medium reasoning effort (default for most models).
+    Medium,
+    /// High reasoning effort.
+    High,
+    /// Extra-high reasoning effort (GPT-5.2+).
+    #[serde(rename = "xhigh")]
+    XHigh,
+}
+
 /// Indicates why the model stopped generating tokens.
 ///
 /// This enum provides information about whether generation completed naturally,
@@ -267,7 +290,19 @@ pub struct ChatRequest {
     /// Lower values make output more focused and deterministic.
     pub temperature: Option<f32>,
     /// Maximum number of tokens to generate in the response.
+    ///
+    /// For reasoning models (o1, o3, GPT-5+), use [`max_completion_tokens`](Self::max_completion_tokens)
+    /// instead, which includes both output and reasoning tokens.
     pub max_tokens: Option<u32>,
+    /// Maximum completion tokens including reasoning tokens (for reasoning models).
+    ///
+    /// This replaces `max_tokens` for reasoning models (o1, o3, GPT-5+) and includes
+    /// both visible output tokens and internal reasoning tokens.
+    pub max_completion_tokens: Option<u32>,
+    /// Reasoning effort level for thinking models.
+    ///
+    /// Controls how much compute the model spends on reasoning before responding.
+    pub reasoning_effort: Option<ReasoningEffort>,
     /// Nucleus sampling threshold (0.0 to 1.0).
     ///
     /// Only tokens comprising the top `top_p` probability mass are considered.
@@ -330,6 +365,8 @@ impl ChatRequest {
             model: None,
             temperature: None,
             max_tokens: None,
+            max_completion_tokens: None,
+            reasoning_effort: None,
             top_p: None,
             frequency_penalty: None,
             presence_penalty: None,
@@ -351,6 +388,8 @@ impl From<(&Config, Vec<Message>)> for ChatRequest {
             model: Some(config.model.clone()),
             temperature: config.temperature,
             max_tokens: config.max_tokens,
+            max_completion_tokens: None,
+            reasoning_effort: None,
             top_p: config.top_p,
             frequency_penalty: config.frequency_penalty,
             presence_penalty: config.presence_penalty,
@@ -372,6 +411,8 @@ impl From<(&Config, Arc<[Message]>)> for ChatRequest {
             model: Some(config.model.clone()),
             temperature: config.temperature,
             max_tokens: config.max_tokens,
+            max_completion_tokens: None,
+            reasoning_effort: None,
             top_p: config.top_p,
             frequency_penalty: config.frequency_penalty,
             presence_penalty: config.presence_penalty,
@@ -413,12 +454,43 @@ impl ChatRequest {
 
     /// Sets the maximum number of tokens to generate.
     ///
+    /// For reasoning models (o1, o3, GPT-5+), use [`with_max_completion_tokens`](Self::with_max_completion_tokens)
+    /// instead, which includes both output and reasoning tokens.
+    ///
     /// # Arguments
     ///
     /// * `max_tokens` - Maximum tokens in the response
     #[must_use]
     pub const fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = Some(max_tokens);
+        self
+    }
+
+    /// Sets the maximum completion tokens for reasoning models.
+    ///
+    /// This includes both visible output tokens and internal reasoning tokens.
+    /// Use this instead of `max_tokens` for reasoning models (o1, o3, GPT-5+).
+    ///
+    /// # Arguments
+    ///
+    /// * `max_completion_tokens` - Maximum tokens including reasoning
+    #[must_use]
+    pub const fn with_max_completion_tokens(mut self, max_completion_tokens: u32) -> Self {
+        self.max_completion_tokens = Some(max_completion_tokens);
+        self
+    }
+
+    /// Sets the reasoning effort level for thinking models.
+    ///
+    /// Controls how much compute the model spends on reasoning before responding.
+    /// Higher effort levels may produce better results for complex problems.
+    ///
+    /// # Arguments
+    ///
+    /// * `reasoning_effort` - The reasoning effort level
+    #[must_use]
+    pub const fn with_reasoning_effort(mut self, reasoning_effort: ReasoningEffort) -> Self {
+        self.reasoning_effort = Some(reasoning_effort);
         self
     }
 
@@ -654,6 +726,8 @@ pub struct ChatChunk {
     pub model: String,
     /// Incremental content added in this chunk.
     pub delta_content: Option<String>,
+    /// Incremental reasoning content from thinking models (o1, o3, etc.).
+    pub delta_reasoning_content: Option<String>,
     /// The role of the message (only present in first chunk).
     pub delta_role: Option<crate::chat::MessageRole>,
     /// Tool calls being built incrementally.
