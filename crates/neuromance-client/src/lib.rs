@@ -14,9 +14,11 @@ use futures::Stream;
 use neuromance_common::client::ChatChunk;
 use neuromance_common::{ChatRequest, ChatResponse, Config};
 
+pub mod anthropic;
 mod error;
 pub mod openai;
 
+pub use anthropic::AnthropicClient;
 pub use error::ClientError;
 pub use openai::OpenAIClient;
 
@@ -265,6 +267,8 @@ mod tests {
             stream: false,
             user: None,
             enable_thinking: None,
+            thinking_budget: None,
+            interleaved_thinking: None,
             metadata: HashMap::new(),
         };
 
@@ -294,6 +298,8 @@ mod tests {
             stream: false,
             user: None,
             enable_thinking: None,
+            thinking_budget: None,
+            interleaved_thinking: None,
             metadata: HashMap::new(),
         };
 
@@ -320,6 +326,8 @@ mod tests {
             stream: false,
             user: None,
             enable_thinking: None,
+            thinking_budget: None,
+            interleaved_thinking: None,
             metadata: HashMap::new(),
         };
 
@@ -349,6 +357,8 @@ mod tests {
             stream: false,
             user: None,
             enable_thinking: None,
+            thinking_budget: None,
+            interleaved_thinking: None,
             metadata: HashMap::new(),
         };
 
@@ -375,6 +385,8 @@ mod tests {
             stream: true,
             user: None,
             enable_thinking: None,
+            thinking_budget: None,
+            interleaved_thinking: None,
             metadata: HashMap::new(),
         };
 
@@ -404,6 +416,8 @@ mod tests {
             stream: true,
             user: None,
             enable_thinking: None,
+            thinking_budget: None,
+            interleaved_thinking: None,
             metadata: HashMap::new(),
         };
 
@@ -456,6 +470,8 @@ mod tests {
             stream: false,
             user: None,
             enable_thinking: None,
+            thinking_budget: None,
+            interleaved_thinking: None,
             metadata: HashMap::new(),
         };
 

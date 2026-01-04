@@ -118,6 +118,10 @@ pub struct Message {
     /// Reasoning content from thinking models (optional, separate from main content).
     #[builder(default)]
     pub reasoning_content: Option<String>,
+
+    /// Signature for reasoning content (required by some providers like Anthropic).
+    #[builder(default)]
+    pub reasoning_signature: Option<String>,
 }
 
 impl Message {
@@ -134,6 +138,7 @@ impl Message {
             tool_call_id: None,
             name: None,
             reasoning_content: None,
+            reasoning_signature: None,
         }
     }
 

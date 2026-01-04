@@ -38,6 +38,10 @@ pub struct Core<C: LLMClient> {
     pub tool_approval_callback: Option<ToolApprovalCallback>,
     /// Optional event callback for all Core events
     pub event_callback: Option<EventCallback>,
+    /// Budget for extended thinking tokens (Anthropic Claude models)
+    pub thinking_budget: Option<u32>,
+    /// Enable interleaved thinking between tool calls (Anthropic Claude 4+ models)
+    pub interleaved_thinking: bool,
 }
 
 impl<C: LLMClient> Core<C> {
@@ -51,6 +55,8 @@ impl<C: LLMClient> Core<C> {
             tool_executor: ToolExecutor::new(),
             tool_approval_callback: None,
             event_callback: None,
+            thinking_budget: None,
+            interleaved_thinking: false,
         }
     }
 
@@ -127,6 +133,27 @@ impl<C: LLMClient> Core<C> {
     #[must_use]
     pub const fn with_streaming(mut self) -> Self {
         self.streaming = true;
+        self
+    }
+
+    /// Set extended thinking budget (Anthropic Claude models)
+    ///
+    /// When set, enables Claude's extended thinking capability with the specified
+    /// token budget for reasoning. The model will use up to this many tokens for
+    /// internal reasoning before responding.
+    #[must_use]
+    pub const fn with_thinking_budget(mut self, budget: u32) -> Self {
+        self.thinking_budget = Some(budget);
+        self
+    }
+
+    /// Enable interleaved thinking between tool calls (Anthropic Claude 4+ models)
+    ///
+    /// When enabled, Claude can think between tool calls, allowing more sophisticated
+    /// reasoning after receiving tool results.
+    #[must_use]
+    pub const fn with_interleaved_thinking(mut self) -> Self {
+        self.interleaved_thinking = true;
         self
     }
 
@@ -254,6 +281,7 @@ impl<C: LLMClient> Core<C> {
             timestamp: Utc::now(),
             metadata: last_chunk.metadata,
             reasoning_content: None,
+            reasoning_signature: None,
         };
 
         Ok(ChatResponse {
@@ -280,9 +308,17 @@ impl<C: LLMClient> Core<C> {
 
         loop {
             // Create chat request
-            let request = ChatRequest::from((self.client.config(), messages_arc.clone()))
+            let mut request = ChatRequest::from((self.client.config(), messages_arc.clone()))
                 .with_tools(self.tool_executor.get_all_tools())
                 .with_tool_choice(self.tool_choice.clone());
+
+            // Apply thinking configuration if set
+            if let Some(budget) = self.thinking_budget {
+                request = request.with_thinking_budget(budget);
+            }
+            if self.interleaved_thinking {
+                request = request.with_interleaved_thinking(true);
+            }
 
             info!(
                 "Executing chat turn ({}/{})",

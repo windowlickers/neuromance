@@ -9,6 +9,9 @@ members = [
   "crates/neuromance-tools",
 ]
 
+[workspace.metadata.crane]
+name = "neuromance"
+
 [workspace.package]
 version = "0.0.6"
 edition = "2024"

@@ -5,7 +5,7 @@ use std::io::Write;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use colored::Colorize;
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
@@ -13,27 +13,81 @@ use secrecy::SecretString;
 use tokio::sync::Mutex;
 
 use neuromance::{
-    Config, Conversation, Core, CoreEvent, Message, MessageRole, OpenAIClient, ToolApproval,
-    ToolCall, Usage,
+    AnthropicClient, Config, Conversation, Core, CoreEvent, LLMClient, Message, MessageRole,
+    OpenAIClient, ToolApproval, ToolCall, Usage,
 };
 use neuromance_tools::{ThinkTool, ToolImplementation, create_todo_tools};
 
 mod display;
 
+/// Supported LLM providers
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+enum Provider {
+    /// `OpenAI` API
+    #[default]
+    Openai,
+    /// Anthropic Messages API
+    Anthropic,
+}
+
+impl Provider {
+    const fn default_base_url(self) -> &'static str {
+        match self {
+            Self::Openai => "https://api.openai.com/v1",
+            Self::Anthropic => "https://api.anthropic.com/v1",
+        }
+    }
+
+    const fn default_model(self) -> &'static str {
+        match self {
+            Self::Openai => "gpt-4o",
+            Self::Anthropic => "claude-sonnet-4-5-20250929",
+        }
+    }
+
+    const fn api_key_env_var(self) -> &'static str {
+        match self {
+            Self::Openai => "OPENAI_API_KEY",
+            Self::Anthropic => "ANTHROPIC_API_KEY",
+        }
+    }
+
+    const fn config_name(self) -> &'static str {
+        match self {
+            Self::Openai => "openai",
+            Self::Anthropic => "anthropic",
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Base URL for the API endpoint
-    #[arg(long, default_value = "https://127.0.0.1:11434/v1")]
-    base_url: String,
+    /// LLM provider to use
+    #[arg(long, short, value_enum, default_value_t = Provider::Openai)]
+    provider: Provider,
 
-    /// API key for authentication (or set `OPENAI_API_KEY` env var)
+    /// Base URL for the API endpoint
+    #[arg(long)]
+    base_url: Option<String>,
+
+    /// API key for authentication (or set via provider-specific env var)
     #[arg(long)]
     api_key: Option<String>,
 
     /// Model to use for chat completion
-    #[arg(long, default_value = "gpt-oss:20b")]
-    model: String,
+    #[arg(long)]
+    model: Option<String>,
+
+    /// Extended thinking budget in tokens (Anthropic Claude models only)
+    /// Enables Claude's extended thinking capability with the specified token budget
+    #[arg(long)]
+    thinking_budget: Option<u32>,
+
+    /// Enable interleaved thinking between tool calls (Anthropic Claude 4+ models)
+    /// Allows Claude to reason after receiving tool results
+    #[arg(long)]
+    interleaved_thinking: bool,
 
     /// Path to MCP (Model Context Protocol) configuration file
     /// Supports .toml, .yaml, .yml, and .json formats
@@ -45,22 +99,50 @@ struct Args {
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
-    // cli & config
     let args = Args::parse();
+    let provider = args.provider;
 
+    // Build configuration from provider defaults and CLI overrides
     let api_key = args
         .api_key
-        .or_else(|| std::env::var("OPENAI_API_KEY").ok())
-        .context("API key must be provided via --api-key or OPENAI_API_KEY env var")?;
+        .clone()
+        .or_else(|| std::env::var(provider.api_key_env_var()).ok())
+        .with_context(|| {
+            format!(
+                "API key must be provided via --api-key or {} env var",
+                provider.api_key_env_var()
+            )
+        })?;
     let api_key = SecretString::new(api_key.into());
 
-    let mut config = Config::new("openai", &args.model);
+    let model = args
+        .model
+        .clone()
+        .unwrap_or_else(|| provider.default_model().to_string());
+    let base_url = args
+        .base_url
+        .clone()
+        .unwrap_or_else(|| provider.default_base_url().to_string());
+
+    let mut config = Config::new(provider.config_name(), &model);
     config.api_key = Some(api_key);
-    config.base_url = Some(args.base_url.clone());
+    config.base_url = Some(base_url);
 
-    // declare LLM client
-    let client = OpenAIClient::new(config)?;
+    match provider {
+        Provider::Anthropic => {
+            let client = AnthropicClient::new(config)?;
+            run_cli(client, &args).await
+        }
+        Provider::Openai => {
+            let client = OpenAIClient::new(config)?;
+            run_cli(client, &args).await
+        }
+    }
+}
 
+/// Run the CLI with the given LLM client
+#[allow(clippy::too_many_lines)]
+async fn run_cli<C: LLMClient>(client: C, args: &Args) -> Result<()> {
     // tool approval editor, locks when prompting user to approve/deny tools
     let approval_editor = Arc::new(Mutex::new(DefaultEditor::new()?));
 
@@ -118,6 +200,14 @@ async fn main() -> Result<()> {
                 }
             }
         });
+
+    // Apply thinking configuration from CLI args
+    if let Some(budget) = args.thinking_budget {
+        core = core.with_thinking_budget(budget);
+    }
+    if args.interleaved_thinking {
+        core = core.with_interleaved_thinking();
+    }
 
     core.auto_approve_tools = false;
     core.max_turns = Some(10);
@@ -292,11 +382,11 @@ async fn main() -> Result<()> {
 }
 
 /// Handle CLI commands
-async fn handle_command(
+async fn handle_command<C: LLMClient>(
     command: &str,
     conversation: &mut Conversation,
     rl: &mut DefaultEditor,
-    core: &Core<OpenAIClient>,
+    core: &Core<C>,
     total_usage: &Arc<Mutex<Usage>>,
 ) -> Result<bool> {
     let parts: Vec<&str> = command.split_whitespace().collect();
@@ -386,11 +476,11 @@ fn clear_conversation(conversation: &mut Conversation) -> Result<()> {
 }
 
 /// Edit a message and resubmit from that point
-async fn edit_message(
+async fn edit_message<C: LLMClient>(
     index: usize,
     conversation: &mut Conversation,
     rl: &mut DefaultEditor,
-    core: &Core<OpenAIClient>,
+    core: &Core<C>,
 ) -> Result<()> {
     let messages = conversation.get_messages();
 
@@ -538,8 +628,8 @@ async fn prompt_for_tool_approval(
 }
 
 /// Execute conversation using Core's built-in tool loop with streaming
-async fn execute_conversation(
-    core: &Core<OpenAIClient>,
+async fn execute_conversation<C: LLMClient>(
+    core: &Core<C>,
     conversation: &mut Conversation,
 ) -> Result<()> {
     // Display assistant header before streaming starts

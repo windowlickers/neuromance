@@ -327,6 +327,18 @@ pub struct ChatRequest {
     pub user: Option<String>,
     /// Whether to enable thinking mode (vendor-specific, e.g., Qwen models).
     pub enable_thinking: Option<bool>,
+    /// Token budget for extended thinking (Anthropic-specific).
+    ///
+    /// When set, enables extended thinking with the specified budget.
+    /// The budget determines the maximum tokens Claude can use for internal reasoning.
+    /// Minimum is 1024 tokens.
+    pub thinking_budget: Option<u32>,
+    /// Whether to enable interleaved thinking (Anthropic-specific, Claude 4+ models).
+    ///
+    /// When enabled, Claude can think between tool calls, allowing more sophisticated
+    /// reasoning after receiving tool results. Requires the beta header
+    /// `interleaved-thinking-2025-05-14`.
+    pub interleaved_thinking: Option<bool>,
     /// Additional metadata to attach to this request.
     pub metadata: HashMap<String, serde_json::Value>,
 }
@@ -376,6 +388,8 @@ impl ChatRequest {
             stream: false,
             user: None,
             enable_thinking: None,
+            thinking_budget: None,
+            interleaved_thinking: None,
             metadata: HashMap::new(),
         }
     }
@@ -399,6 +413,8 @@ impl From<(&Config, Vec<Message>)> for ChatRequest {
             stream: false,
             user: None,
             enable_thinking: None,
+            thinking_budget: None,
+            interleaved_thinking: None,
             metadata: HashMap::new(),
         }
     }
@@ -422,6 +438,8 @@ impl From<(&Config, Arc<[Message]>)> for ChatRequest {
             stream: false,
             user: None,
             enable_thinking: None,
+            thinking_budget: None,
+            interleaved_thinking: None,
             metadata: HashMap::new(),
         }
     }
@@ -599,6 +617,36 @@ impl ChatRequest {
     #[must_use]
     pub const fn with_thinking(mut self, enable_thinking: bool) -> Self {
         self.enable_thinking = Some(enable_thinking);
+        self
+    }
+
+    /// Sets the token budget for extended thinking (Anthropic-specific).
+    ///
+    /// When set, enables extended thinking with the specified budget.
+    /// The budget determines the maximum tokens Claude can use for internal reasoning.
+    /// Minimum is 1024 tokens.
+    ///
+    /// # Arguments
+    ///
+    /// * `budget` - The thinking budget in tokens (minimum 1024)
+    #[must_use]
+    pub const fn with_thinking_budget(mut self, budget: u32) -> Self {
+        self.thinking_budget = Some(budget);
+        self
+    }
+
+    /// Enables interleaved thinking (Anthropic-specific, Claude 4+ models).
+    ///
+    /// When enabled, Claude can think between tool calls, allowing more sophisticated
+    /// reasoning after receiving tool results. This requires the beta header
+    /// `interleaved-thinking-2025-05-14` which is automatically added.
+    ///
+    /// # Arguments
+    ///
+    /// * `enabled` - Whether to enable interleaved thinking
+    #[must_use]
+    pub const fn with_interleaved_thinking(mut self, enabled: bool) -> Self {
+        self.interleaved_thinking = Some(enabled);
         self
     }
 
