@@ -6,33 +6,16 @@ on:
   pull_request:
     branches: [main]
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
   ci:
     name: Rust CI
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        rust: ['1.91']
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: cachix/install-nix-action@v31.9
         with:
-          toolchain: ${{ matrix.rust }}
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+          nix_path: nixpkgs=channel:nixos-unstable
+      - uses: cachix/cachix-action@v16
         with:
-          shared-key: "rust-ci-${{ matrix.rust }}"
-          cache-on-failure: true
-      - name: Check formatting
-        run: cargo fmt -- --check
-      - name: Run clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-      - name: Run tests
-        run: cargo test --all-features
-      - name: Build release
-        run: cargo build --release --all-features
-      - name: Check benchmarks compile
-        run: cargo bench --no-run
+          name: nix-community
+      - run: nix flake check

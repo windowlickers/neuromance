@@ -245,8 +245,7 @@ impl<C: LLMClient + Send + Sync> Agent for BaseAgent<C> {
         // Extract the final assistant message and tool responses
         let content = messages
             .iter()
-            .filter(|m| m.role == MessageRole::Assistant)
-            .next_back()
+            .rfind(|m| m.role == MessageRole::Assistant)
             .cloned()
             .unwrap_or_else(|| {
                 Message::new(
