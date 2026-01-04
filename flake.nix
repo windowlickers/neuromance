@@ -37,7 +37,9 @@
 
         src = craneLib.cleanCargoSource ./.;
 
-        commonBuildInputs = with pkgs; [ openssl ];
+        python = pkgs.python3;
+
+        commonBuildInputs = with pkgs; [ openssl python ];
         commonNativeBuildInputs = with pkgs; [ pkg-config ];
 
         commonArgs = {
@@ -213,9 +215,11 @@
             just
             skopeo
             dive
+            python
           ];
 
           RUST_BACKTRACE = "1";
+          PYO3_PYTHON = "${python}/bin/python3";
         };
 
         formatter = pkgs.nixpkgs-fmt;

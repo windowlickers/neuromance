@@ -5,6 +5,7 @@ members = [
   "crates/neuromance-agent",
   "crates/neuromance-common",
   "crates/neuromance-client",
+  "crates/neuromance-repl",
   "crates/neuromance-runtime",
   "crates/neuromance-tools",
 ]
