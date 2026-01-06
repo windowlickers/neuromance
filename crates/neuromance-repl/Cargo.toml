@@ -18,6 +18,7 @@ workspace = true
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
@@ -42,6 +43,9 @@ neuromance = { workspace = true }
 neuromance-client = { workspace = true }
 neuromance-common = { workspace = true }
 neuromance-tools = { workspace = true }
+# Benchmarking
+criterion = { version = "0.5", features = ["async_tokio", "html_reports"] }
+sysinfo = "0.33"  # For tracking memory/CPU usage
 
 [features]
 default = []
@@ -49,3 +53,8 @@ python = ["pyo3"]
 sandbox = ["landlock"]
 tools = ["neuromance-common", "neuromance-tools"]
 full = ["python", "sandbox", "tools"]
+
+[[bench]]
+name = "repl_resources"
+harness = false
+required-features = ["python"]

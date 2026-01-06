@@ -16,9 +16,11 @@
 //!
 //! let repl = PythonRepl::with_config(config)?;
 //!
-//! // Inject callback for LLM integration (receives args and kwargs)
+//! // Inject async callback for LLM integration (receives args and kwargs)
 //! repl.inject_function("llm_query", Box::new(|args, _kwargs: HashMap<String, String>| {
-//!     Ok(format!("Response to: {}", args[0]))
+//!     Box::pin(async move {
+//!         Ok(format!("Response to: {}", args[0]))
+//!     })
 //! })).await?;
 //!
 //! repl.execute("result = llm_query('summarize')").await?;

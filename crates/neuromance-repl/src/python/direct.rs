@@ -9,6 +9,7 @@
 
 use crate::{ReplConfig, ReplEnvironment, ReplError, ReplResult};
 use async_trait::async_trait;
+use futures::future::BoxFuture;
 use pyo3::prelude::*;
 use pyo3::types::{PyCFunction, PyDict, PyTuple};
 use std::collections::{HashMap, HashSet};
@@ -22,8 +23,14 @@ use tokio::sync::RwLock;
 /// Receives:
 /// - `args`: Positional arguments as strings
 /// - `kwargs`: Keyword arguments as a string-to-string map
-pub type PythonCallback =
-    Box<dyn Fn(Vec<String>, HashMap<String, String>) -> Result<String, String> + Send + Sync>;
+///
+/// Returns a `BoxFuture` to allow async operations within the callback.
+/// Use `Box::pin(async move { ... })` when creating callbacks.
+pub type PythonCallback = Box<
+    dyn Fn(Vec<String>, HashMap<String, String>) -> BoxFuture<'static, Result<String, String>>
+        + Send
+        + Sync,
+>;
 
 /// Python REPL environment with sandboxing and state persistence.
 pub struct PythonRepl {
@@ -244,7 +251,10 @@ impl PythonRepl {
                     // Release the GIL before calling the callback, as it may do blocking
                     // operations (e.g., waiting for a response from the agent loop)
                     let cb_clone = Arc::clone(&cb);
-                    let result = args.py().detach(move || cb_clone(args_vec, kwargs_map));
+                    let result = args.py().detach(move || {
+                        // Block on the async callback future
+                        tokio::runtime::Handle::current().block_on(cb_clone(args_vec, kwargs_map))
+                    });
 
                     match result {
                         Ok(result) => Ok(result),
@@ -550,12 +560,14 @@ mod tests {
         repl.inject_function(
             "double",
             Box::new(|args: Vec<String>, _kwargs: HashMap<String, String>| {
-                if let Some(arg) = args.first()
-                    && let Ok(num) = arg.parse::<i32>()
-                {
-                    return Ok((num * 2).to_string());
-                }
-                Err("Invalid argument".to_string())
+                Box::pin(async move {
+                    if let Some(arg) = args.first()
+                        && let Ok(num) = arg.parse::<i32>()
+                    {
+                        return Ok((num * 2).to_string());
+                    }
+                    Err("Invalid argument".to_string())
+                })
             }),
         )
         .await
@@ -723,12 +735,14 @@ for i in range(1, 11):
         repl.inject_function(
             "add",
             Box::new(|args: Vec<String>, _kwargs: HashMap<String, String>| {
-                if args.len() < 2 {
-                    return Err("Need 2 arguments".to_string());
-                }
-                let a: i32 = args[0].parse().map_err(|_| "Invalid number".to_string())?;
-                let b: i32 = args[1].parse().map_err(|_| "Invalid number".to_string())?;
-                Ok((a + b).to_string())
+                Box::pin(async move {
+                    if args.len() < 2 {
+                        return Err("Need 2 arguments".to_string());
+                    }
+                    let a: i32 = args[0].parse().map_err(|_| "Invalid number".to_string())?;
+                    let b: i32 = args[1].parse().map_err(|_| "Invalid number".to_string())?;
+                    Ok((a + b).to_string())
+                })
             }),
         )
         .await
@@ -737,12 +751,14 @@ for i in range(1, 11):
         repl.inject_function(
             "multiply",
             Box::new(|args: Vec<String>, _kwargs: HashMap<String, String>| {
-                if args.len() < 2 {
-                    return Err("Need 2 arguments".to_string());
-                }
-                let a: i32 = args[0].parse().map_err(|_| "Invalid number".to_string())?;
-                let b: i32 = args[1].parse().map_err(|_| "Invalid number".to_string())?;
-                Ok((a * b).to_string())
+                Box::pin(async move {
+                    if args.len() < 2 {
+                        return Err("Need 2 arguments".to_string());
+                    }
+                    let a: i32 = args[0].parse().map_err(|_| "Invalid number".to_string())?;
+                    let b: i32 = args[1].parse().map_err(|_| "Invalid number".to_string())?;
+                    Ok((a * b).to_string())
+                })
             }),
         )
         .await
@@ -769,12 +785,14 @@ for i in range(1, 11):
         repl.inject_function(
             "greet",
             Box::new(|args: Vec<String>, kwargs: HashMap<String, String>| {
-                let name = args.first().cloned().unwrap_or_else(|| "World".to_string());
-                let greeting = kwargs
-                    .get("greeting")
-                    .cloned()
-                    .unwrap_or_else(|| "Hello".to_string());
-                Ok(format!("{greeting}, {name}!"))
+                Box::pin(async move {
+                    let name = args.first().cloned().unwrap_or_else(|| "World".to_string());
+                    let greeting = kwargs
+                        .get("greeting")
+                        .cloned()
+                        .unwrap_or_else(|| "Hello".to_string());
+                    Ok(format!("{greeting}, {name}!"))
+                })
             }),
         )
         .await
@@ -840,8 +858,11 @@ for i in range(1, 11):
         repl.inject_function(
             "track_calls",
             Box::new(move |args: Vec<String>, _kwargs: HashMap<String, String>| {
-                call_count_clone.fetch_add(1, Ordering::SeqCst);
-                Ok(format!("Called with: {args:?}"))
+                let call_count = Arc::clone(&call_count_clone);
+                Box::pin(async move {
+                    call_count.fetch_add(1, Ordering::SeqCst);
+                    Ok(format!("Called with: {args:?}"))
+                })
             }),
         )
         .await

@@ -167,7 +167,14 @@ impl ReplEnvironment for InteractivePythonRepl {
                                     })
                                     .unwrap_or_default();
 
-                                match cb(args_vec, kwargs_map) {
+                                // Release the GIL and block on the async callback
+                                let cb_clone = Arc::clone(&cb);
+                                let result = args.py().detach(move || {
+                                    tokio::runtime::Handle::current()
+                                        .block_on(cb_clone(args_vec, kwargs_map))
+                                });
+
+                                match result {
                                     Ok(result) => Ok(result),
                                     Err(e) => {
                                         Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))

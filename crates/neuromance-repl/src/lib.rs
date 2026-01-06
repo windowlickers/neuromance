@@ -34,6 +34,7 @@
 //! ```
 
 use async_trait::async_trait;
+use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -222,6 +223,9 @@ pub trait ReplEnvironment: Send + Sync {
     /// - `args`: Positional arguments as strings
     /// - `kwargs`: Keyword arguments as a string-to-string map
     ///
+    /// Returns a `BoxFuture` to allow async operations within the callback.
+    /// Use `Box::new(|args, kwargs| Box::pin(async move { ... }))` when creating callbacks.
+    ///
     /// # Errors
     ///
     /// Returns `ReplError` if function injection fails.
@@ -229,7 +233,9 @@ pub trait ReplEnvironment: Send + Sync {
         &self,
         name: &str,
         callback: Box<
-            dyn Fn(Vec<String>, HashMap<String, String>) -> Result<String, String> + Send + Sync,
+            dyn Fn(Vec<String>, HashMap<String, String>) -> BoxFuture<'static, Result<String, String>>
+                + Send
+                + Sync,
         >,
     ) -> Result<(), ReplError>;
 
