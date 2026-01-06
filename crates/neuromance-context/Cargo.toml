@@ -1,0 +1,49 @@
+[package]
+name = "neuromance-context"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Token counting and context management for LLM conversations using Candle"
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+neuromance-common = { workspace = true }
+neuromance-client = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+# Candle and tokenizer dependencies (using fork with mxfp4 support)
+candle-core = { git = "https://github.com/ecdobry/candle.git", rev = "1cba3b35f10ba9aca33777ded5487a47a5148112" }
+
+hf-hub = { version = "0.3", features = ["tokio"] }
+tokenizers = "0.21"
+
+# HTTP client for downloading chat templates
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+# Filesystem utilities
+dirs = "5.0"
+
+# Text processing
+regex = { workspace = true }
+
+# Template rendering for chat templates
+minijinja = "2.13"
+
+# Hash map compatible with tokenizers crate
+ahash = "0.8"
+
+[dev-dependencies]
+tokio = { workspace = true }
+tracing-subscriber = { workspace = true }

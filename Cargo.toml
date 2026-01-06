@@ -8,6 +8,7 @@ members = [
   "crates/neuromance-db",
   "crates/neuromance-repl",
   "crates/neuromance-runtime",
+  "crates/neuromance-context",
   "crates/neuromance-tools",
 ]
 
@@ -39,6 +40,7 @@ categories = ["api-bindings", "asynchronous", "web-programming"]
 # Internal crates
 neuromance-common = { version = "0.1.0", path = "crates/neuromance-common" }
 neuromance-client = { version = "0.1.0", path = "crates/neuromance-client" }
+neuromance-context = { version = "0.1.0", path = "crates/neuromance-context" }
 neuromance-tools = { version = "0.1.0", path = "crates/neuromance-tools" }
 neuromance-agent = { version = "0.1.0", path = "crates/neuromance-agent" }
 neuromance = { version = "0.1.0", path = "crates/neuromance" }
