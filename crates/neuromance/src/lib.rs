@@ -27,6 +27,18 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! ## Features
+//!
+//! - **Conversation Management**: Track multi-turn conversations with metadata and status
+//! - **Message Handling**: Support for system, user, assistant, and tool messages
+//! - **Tool Calling**: Define and execute function calls from LLM responses
+//! - **Serialization**: Full serde support for all types
+//!
+//! ## Optional Features
+//!
+//! - **`context`**: Token counting and context management using Candle tokenizers.
+//!   Enable with `neuromance = { features = ["context"] }`
 
 pub mod core;
 pub mod error;
@@ -83,9 +95,12 @@ pub mod mcp {
 pub mod proxy {
     pub use neuromance_tools::proxy::{ProxyAwareClient, ToolProxyConfig};
 }
-
 // --- Postgres conversation persistence ---
 #[cfg(feature = "db")]
 pub mod db {
     pub use neuromance_db::{ConversationSink, ConversationSummary, DbError, PgConversationStore};
 }
+
+// --- Context management (optional) ---
+#[cfg(feature = "context")]
+pub use neuromance_context as context;
