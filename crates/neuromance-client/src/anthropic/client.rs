@@ -527,7 +527,7 @@ impl LLMClient for AnthropicClient {
         anthropic_request.stream = Some(false);
 
         // Determine if interleaved thinking beta should be enabled
-        let beta_features = if request.interleaved_thinking == Some(true) {
+        let beta_features = if request.thinking.is_interleaved() {
             Some(INTERLEAVED_THINKING_BETA)
         } else {
             None
@@ -584,7 +584,7 @@ impl LLMClient for AnthropicClient {
             .header("Content-Type", "application/json");
 
         // Add beta header for interleaved thinking if enabled
-        if request.interleaved_thinking == Some(true) {
+        if request.thinking.is_interleaved() {
             request_builder = request_builder.header("anthropic-beta", INTERLEAVED_THINKING_BETA);
         }
 
@@ -1010,8 +1010,7 @@ mod tests {
         let message = create_test_message();
         let request = ChatRequest::new(vec![message])
             .with_max_tokens(16000)
-            .with_thinking_budget(10000)
-            .with_interleaved_thinking(true);
+            .with_interleaved_thinking(10000); // Use interleaved thinking with budget
 
         let response = client.chat(&request).await.unwrap();
 
@@ -1054,10 +1053,10 @@ mod tests {
         let client = AnthropicClient::new(config).unwrap();
 
         let message = create_test_message();
-        // No interleaved_thinking set, so no beta header should be sent
+        // Using Extended thinking (not Interleaved), so no beta header should be sent
         let request = ChatRequest::new(vec![message])
             .with_max_tokens(1024)
-            .with_thinking_budget(5000);
+            .with_thinking_budget(5000); // Extended thinking, not interleaved
 
         let response = client.chat(&request).await.unwrap();
 

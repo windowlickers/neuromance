@@ -90,8 +90,8 @@ async fn main() -> Result<()> {
         );
 
         // Get assistant response
-        // Disable thinking to avoid conflicts with response prefill
-        let request = ChatRequest::new(messages.clone()).with_thinking(false);
+        // Default is no thinking mode, which avoids conflicts with response prefill
+        let request = ChatRequest::new(messages.clone());
 
         let response = client.chat(&request).await?;
 
@@ -105,7 +105,7 @@ async fn main() -> Result<()> {
         messages.push(Message::assistant(conversation_id, &cleaned_content));
 
         // Get user response (feeding assistant's message as the latest context)
-        let user_request = ChatRequest::new(messages.clone()).with_thinking(false);
+        let user_request = ChatRequest::new(messages.clone());
 
         let user_response = client.chat(&user_request).await?;
 

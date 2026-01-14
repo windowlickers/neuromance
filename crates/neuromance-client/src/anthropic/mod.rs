@@ -803,18 +803,18 @@ impl From<(&ChatRequest, &Config)> for CreateMessageRequest {
         let tool_choice: Option<AnthropicToolChoice> =
             request.tool_choice.as_ref().map(AnthropicToolChoice::from);
 
-        // Create thinking config if budget is specified
-        let thinking = request.thinking_budget.map(ThinkingConfig::new);
+        // Create thinking config from ThinkingMode
+        let thinking = request.thinking.budget().map(ThinkingConfig::new);
 
         // Determine max_tokens - Anthropic requires this, default to 4096
         // When thinking is enabled, max_tokens must be > budget_tokens
-        let max_tokens = request.thinking_budget.map_or_else(
+        let max_tokens = request.thinking.budget().map_or_else(
             || request.max_tokens.unwrap_or(4096),
             |budget| request.max_tokens.unwrap_or(budget + 8192).max(budget + 1024),
         );
 
         // When thinking is enabled, temperature and top_p must not be set
-        let (temperature, top_p) = if thinking.is_some() {
+        let (temperature, top_p) = if request.thinking.is_enabled() {
             (None, None)
         } else {
             (request.temperature, request.top_p)

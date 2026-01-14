@@ -64,6 +64,11 @@ pub mod client;
 ///
 /// Provides types for defining and executing functions/tools that LLMs can call.
 pub mod tools;
+/// Feature abstractions for cross-provider capabilities.
+///
+/// Provides types like `ThinkingMode` and `ReasoningLevel` that abstract
+/// provider-specific features into a common interface.
+pub mod features;
 
 pub mod agents;
 
@@ -73,4 +78,5 @@ pub use client::{
     ChatRequest, ChatResponse, Config, FinishReason, ReasoningEffort, RetryConfig, ToolChoice,
     Usage,
 };
+pub use features::{ReasoningLevel, ThinkingMode};
 pub use tools::{Function, FunctionCall, Parameters, Property, Tool, ToolApproval, ToolCall};

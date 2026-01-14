@@ -130,6 +130,7 @@ mod tests {
     use super::*;
     use neuromance_common::chat::Message;
     use neuromance_common::client::{ChatResponse, ToolChoice};
+    use neuromance_common::features::{ReasoningLevel, ThinkingMode};
     use neuromance_common::tools::Tool;
     use std::collections::HashMap;
     use uuid::Uuid;
@@ -259,16 +260,14 @@ mod tests {
             temperature: None,
             max_tokens: None,
             max_completion_tokens: None,
-            reasoning_effort: None,
             top_p: None,
             frequency_penalty: None,
             presence_penalty: None,
             stop: None,
             stream: false,
             user: None,
-            enable_thinking: None,
-            thinking_budget: None,
-            interleaved_thinking: None,
+            thinking: ThinkingMode::Default,
+            reasoning_level: ReasoningLevel::Default,
             metadata: HashMap::new(),
         };
 
@@ -290,16 +289,14 @@ mod tests {
             temperature: None,
             max_tokens: None,
             max_completion_tokens: None,
-            reasoning_effort: None,
             top_p: None,
             frequency_penalty: None,
             presence_penalty: None,
             stop: None,
             stream: false,
             user: None,
-            enable_thinking: None,
-            thinking_budget: None,
-            interleaved_thinking: None,
+            thinking: ThinkingMode::Default,
+            reasoning_level: ReasoningLevel::Default,
             metadata: HashMap::new(),
         };
 
@@ -318,16 +315,14 @@ mod tests {
             temperature: None,
             max_tokens: None,
             max_completion_tokens: None,
-            reasoning_effort: None,
             top_p: None,
             frequency_penalty: None,
             presence_penalty: None,
             stop: None,
             stream: false,
             user: None,
-            enable_thinking: None,
-            thinking_budget: None,
-            interleaved_thinking: None,
+            thinking: ThinkingMode::Default,
+            reasoning_level: ReasoningLevel::Default,
             metadata: HashMap::new(),
         };
 
@@ -349,16 +344,14 @@ mod tests {
             temperature: None,
             max_tokens: None,
             max_completion_tokens: None,
-            reasoning_effort: None,
             top_p: None,
             frequency_penalty: None,
             presence_penalty: None,
             stop: None,
             stream: false,
             user: None,
-            enable_thinking: None,
-            thinking_budget: None,
-            interleaved_thinking: None,
+            thinking: ThinkingMode::Default,
+            reasoning_level: ReasoningLevel::Default,
             metadata: HashMap::new(),
         };
 
@@ -377,16 +370,14 @@ mod tests {
             temperature: None,
             max_tokens: None,
             max_completion_tokens: None,
-            reasoning_effort: None,
             top_p: None,
             frequency_penalty: None,
             presence_penalty: None,
             stop: None,
             stream: true,
             user: None,
-            enable_thinking: None,
-            thinking_budget: None,
-            interleaved_thinking: None,
+            thinking: ThinkingMode::Default,
+            reasoning_level: ReasoningLevel::Default,
             metadata: HashMap::new(),
         };
 
@@ -408,16 +399,14 @@ mod tests {
             temperature: None,
             max_tokens: None,
             max_completion_tokens: None,
-            reasoning_effort: None,
             top_p: None,
             frequency_penalty: None,
             presence_penalty: None,
             stop: None,
             stream: true,
             user: None,
-            enable_thinking: None,
-            thinking_budget: None,
-            interleaved_thinking: None,
+            thinking: ThinkingMode::Default,
+            reasoning_level: ReasoningLevel::Default,
             metadata: HashMap::new(),
         };
 
@@ -462,16 +451,14 @@ mod tests {
             temperature: None,
             max_tokens: None,
             max_completion_tokens: None,
-            reasoning_effort: None,
             top_p: None,
             frequency_penalty: None,
             presence_penalty: None,
             stop: None,
             stream: false,
             user: None,
-            enable_thinking: None,
-            thinking_budget: None,
-            interleaved_thinking: None,
+            thinking: ThinkingMode::Default,
+            reasoning_level: ReasoningLevel::Default,
             metadata: HashMap::new(),
         };
 

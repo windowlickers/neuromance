@@ -11,6 +11,7 @@ use log::{debug, info, warn};
 use neuromance_client::{ClientError, LLMClient};
 use neuromance_common::chat::{Message, MessageRole};
 use neuromance_common::client::{ChatRequest, ChatResponse, ToolChoice};
+use neuromance_common::features::ThinkingMode;
 use neuromance_common::tools::{ToolApproval, ToolCall};
 use neuromance_tools::ToolExecutor;
 
@@ -38,10 +39,12 @@ pub struct Core<C: LLMClient> {
     pub tool_approval_callback: Option<ToolApprovalCallback>,
     /// Optional event callback for all Core events
     pub event_callback: Option<EventCallback>,
-    /// Budget for extended thinking tokens (Anthropic Claude models)
-    pub thinking_budget: Option<u32>,
-    /// Enable interleaved thinking between tool calls (Anthropic Claude 4+ models)
-    pub interleaved_thinking: bool,
+    /// Thinking/reasoning mode configuration.
+    ///
+    /// Controls extended thinking capabilities across providers:
+    /// - **Anthropic**: Maps to thinking.budget_tokens and interleaved-thinking beta
+    /// - **OpenAI**: Maps to max_completion_tokens for reasoning models
+    pub thinking: ThinkingMode,
 }
 
 impl<C: LLMClient> Core<C> {
@@ -55,8 +58,7 @@ impl<C: LLMClient> Core<C> {
             tool_executor: ToolExecutor::new(),
             tool_approval_callback: None,
             event_callback: None,
-            thinking_budget: None,
-            interleaved_thinking: false,
+            thinking: ThinkingMode::Default,
         }
     }
 
@@ -143,17 +145,29 @@ impl<C: LLMClient> Core<C> {
     /// internal reasoning before responding.
     #[must_use]
     pub const fn with_thinking_budget(mut self, budget: u32) -> Self {
-        self.thinking_budget = Some(budget);
+        self.thinking = ThinkingMode::Extended { budget_tokens: budget };
         self
     }
 
-    /// Enable interleaved thinking between tool calls (Anthropic Claude 4+ models)
+    /// Enable interleaved thinking between tool calls with the given budget.
     ///
-    /// When enabled, Claude can think between tool calls, allowing more sophisticated
+    /// When enabled, the model can think between tool calls, allowing more sophisticated
     /// reasoning after receiving tool results.
+    /// - **Anthropic**: Enables the interleaved-thinking beta feature
+    /// - **OpenAI**: Falls back to extended thinking behavior
     #[must_use]
-    pub const fn with_interleaved_thinking(mut self) -> Self {
-        self.interleaved_thinking = true;
+    pub const fn with_interleaved_thinking(mut self, budget: u32) -> Self {
+        self.thinking = ThinkingMode::Interleaved { budget_tokens: budget };
+        self
+    }
+
+    /// Set the thinking mode directly.
+    ///
+    /// This is the most flexible way to configure extended thinking capabilities.
+    /// See [`ThinkingMode`] for available options.
+    #[must_use]
+    pub const fn with_thinking_mode(mut self, mode: ThinkingMode) -> Self {
+        self.thinking = mode;
         self
     }
 
@@ -313,12 +327,7 @@ impl<C: LLMClient> Core<C> {
                 .with_tool_choice(self.tool_choice.clone());
 
             // Apply thinking configuration if set
-            if let Some(budget) = self.thinking_budget {
-                request = request.with_thinking_budget(budget);
-            }
-            if self.interleaved_thinking {
-                request = request.with_interleaved_thinking(true);
-            }
+            request = request.with_thinking_mode(self.thinking);
 
             info!(
                 "Executing chat turn ({}/{})",

@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use neuromance_client::LLMClient;
 use neuromance_client::OpenAIClient;
-use neuromance_common::{ChatRequest, Config, Message, ReasoningEffort};
+use neuromance_common::{ChatRequest, Config, Message, ReasoningLevel};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -50,15 +50,15 @@ struct Args {
     message: String,
 }
 
-fn parse_reasoning_effort(s: &str) -> Option<ReasoningEffort> {
+fn parse_reasoning_level(s: &str) -> ReasoningLevel {
     match s.to_lowercase().as_str() {
-        "none" => Some(ReasoningEffort::None),
-        "minimal" => Some(ReasoningEffort::Minimal),
-        "low" => Some(ReasoningEffort::Low),
-        "medium" => Some(ReasoningEffort::Medium),
-        "high" => Some(ReasoningEffort::High),
-        "xhigh" => Some(ReasoningEffort::XHigh),
-        _ => None,
+        "default" | "none" => ReasoningLevel::Default,
+        "minimal" => ReasoningLevel::Minimal,
+        "low" => ReasoningLevel::Low,
+        "medium" => ReasoningLevel::Medium,
+        "high" => ReasoningLevel::High,
+        "max" | "maximum" | "xhigh" => ReasoningLevel::Maximum,
+        _ => ReasoningLevel::Default,
     }
 }
 
@@ -89,15 +89,12 @@ async fn main() -> Result<()> {
     let conversation_id = Uuid::new_v4();
     let messages = vec![Message::user(conversation_id, &args.message)];
 
-    let reasoning_effort = parse_reasoning_effort(&args.reasoning_effort);
+    let reasoning_level = parse_reasoning_level(&args.reasoning_effort);
 
     let mut request = ChatRequest::new(messages)
         .with_model(&args.model)
-        .with_max_completion_tokens(args.max_completion_tokens);
-
-    if let Some(effort) = reasoning_effort {
-        request = request.with_reasoning_effort(effort);
-    }
+        .with_max_completion_tokens(args.max_completion_tokens)
+        .with_reasoning_level(reasoning_level);
 
     // Enable streaming
     request.stream = true;

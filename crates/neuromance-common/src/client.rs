@@ -9,6 +9,7 @@ use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 
 use crate::chat::Message;
+use crate::features::{ReasoningLevel, ThinkingMode};
 use crate::tools::Tool;
 
 /// Controls how the model selects which tool to call, if any.
@@ -299,10 +300,6 @@ pub struct ChatRequest {
     /// This replaces `max_tokens` for reasoning models (o1, o3, GPT-5+) and includes
     /// both visible output tokens and internal reasoning tokens.
     pub max_completion_tokens: Option<u32>,
-    /// Reasoning effort level for thinking models.
-    ///
-    /// Controls how much compute the model spends on reasoning before responding.
-    pub reasoning_effort: Option<ReasoningEffort>,
     /// Nucleus sampling threshold (0.0 to 1.0).
     ///
     /// Only tokens comprising the top `top_p` probability mass are considered.
@@ -325,20 +322,22 @@ pub struct ChatRequest {
     pub stream: bool,
     /// End-user identifier for tracking and abuse prevention.
     pub user: Option<String>,
-    /// Whether to enable thinking mode (vendor-specific, e.g., Qwen models).
-    pub enable_thinking: Option<bool>,
-    /// Token budget for extended thinking (Anthropic-specific).
+    /// Thinking/reasoning mode configuration.
     ///
-    /// When set, enables extended thinking with the specified budget.
-    /// The budget determines the maximum tokens Claude can use for internal reasoning.
-    /// Minimum is 1024 tokens.
-    pub thinking_budget: Option<u32>,
-    /// Whether to enable interleaved thinking (Anthropic-specific, Claude 4+ models).
+    /// Controls extended thinking capabilities across providers:
+    /// - **Anthropic**: Maps to thinking.budget_tokens and interleaved-thinking beta
+    /// - **OpenAI**: Maps to max_completion_tokens for reasoning models
     ///
-    /// When enabled, Claude can think between tool calls, allowing more sophisticated
-    /// reasoning after receiving tool results. Requires the beta header
-    /// `interleaved-thinking-2025-05-14`.
-    pub interleaved_thinking: Option<bool>,
+    /// See [`ThinkingMode`] for available options.
+    #[serde(default)]
+    pub thinking: ThinkingMode,
+    /// Reasoning effort level for models that support it.
+    ///
+    /// Controls how much compute the model spends on reasoning:
+    /// - **OpenAI**: Maps to reasoning_effort parameter (o1, o3 models)
+    /// - **Anthropic**: Can influence thinking budget heuristics
+    #[serde(default)]
+    pub reasoning_level: ReasoningLevel,
     /// Additional metadata to attach to this request.
     pub metadata: HashMap<String, serde_json::Value>,
 }
@@ -378,7 +377,6 @@ impl ChatRequest {
             temperature: None,
             max_tokens: None,
             max_completion_tokens: None,
-            reasoning_effort: None,
             top_p: None,
             frequency_penalty: None,
             presence_penalty: None,
@@ -387,9 +385,8 @@ impl ChatRequest {
             tool_choice: None,
             stream: false,
             user: None,
-            enable_thinking: None,
-            thinking_budget: None,
-            interleaved_thinking: None,
+            thinking: ThinkingMode::Default,
+            reasoning_level: ReasoningLevel::Default,
             metadata: HashMap::new(),
         }
     }
@@ -403,7 +400,6 @@ impl From<(&Config, Vec<Message>)> for ChatRequest {
             temperature: config.temperature,
             max_tokens: config.max_tokens,
             max_completion_tokens: None,
-            reasoning_effort: None,
             top_p: config.top_p,
             frequency_penalty: config.frequency_penalty,
             presence_penalty: config.presence_penalty,
@@ -412,9 +408,8 @@ impl From<(&Config, Vec<Message>)> for ChatRequest {
             tool_choice: None,
             stream: false,
             user: None,
-            enable_thinking: None,
-            thinking_budget: None,
-            interleaved_thinking: None,
+            thinking: ThinkingMode::Default,
+            reasoning_level: ReasoningLevel::Default,
             metadata: HashMap::new(),
         }
     }
@@ -428,7 +423,6 @@ impl From<(&Config, Arc<[Message]>)> for ChatRequest {
             temperature: config.temperature,
             max_tokens: config.max_tokens,
             max_completion_tokens: None,
-            reasoning_effort: None,
             top_p: config.top_p,
             frequency_penalty: config.frequency_penalty,
             presence_penalty: config.presence_penalty,
@@ -437,9 +431,8 @@ impl From<(&Config, Arc<[Message]>)> for ChatRequest {
             tool_choice: None,
             stream: false,
             user: None,
-            enable_thinking: None,
-            thinking_budget: None,
-            interleaved_thinking: None,
+            thinking: ThinkingMode::Default,
+            reasoning_level: ReasoningLevel::Default,
             metadata: HashMap::new(),
         }
     }
@@ -498,17 +491,17 @@ impl ChatRequest {
         self
     }
 
-    /// Sets the reasoning effort level for thinking models.
+    /// Sets the reasoning effort level for models that support it.
     ///
     /// Controls how much compute the model spends on reasoning before responding.
     /// Higher effort levels may produce better results for complex problems.
     ///
     /// # Arguments
     ///
-    /// * `reasoning_effort` - The reasoning effort level
+    /// * `level` - The reasoning effort level
     #[must_use]
-    pub const fn with_reasoning_effort(mut self, reasoning_effort: ReasoningEffort) -> Self {
-        self.reasoning_effort = Some(reasoning_effort);
+    pub const fn with_reasoning_level(mut self, level: ReasoningLevel) -> Self {
+        self.reasoning_level = level;
         self
     }
 
@@ -609,44 +602,64 @@ impl ChatRequest {
         self
     }
 
-    /// Enables or disables thinking mode (vendor-specific).
+    /// Sets the thinking/reasoning mode.
+    ///
+    /// This is the primary way to configure extended thinking capabilities.
+    /// See [`ThinkingMode`] for available options.
     ///
     /// # Arguments
     ///
-    /// * `enable_thinking` - Whether to enable thinking mode
+    /// * `mode` - The thinking mode configuration
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use neuromance_common::{ChatRequest, ThinkingMode, Message, MessageRole};
+    /// use uuid::Uuid;
+    ///
+    /// let msg = Message::new(Uuid::new_v4(), MessageRole::User, "Hello!");
+    /// let request = ChatRequest::new(vec![msg])
+    ///     .with_thinking_mode(ThinkingMode::Extended { budget_tokens: 10000 });
+    /// ```
     #[must_use]
-    pub const fn with_thinking(mut self, enable_thinking: bool) -> Self {
-        self.enable_thinking = Some(enable_thinking);
+    pub const fn with_thinking_mode(mut self, mode: ThinkingMode) -> Self {
+        self.thinking = mode;
         self
     }
 
-    /// Sets the token budget for extended thinking (Anthropic-specific).
+    /// Sets the token budget for extended thinking.
+    ///
+    /// This is a convenience method for `with_thinking_mode(ThinkingMode::Extended { budget_tokens })`.
     ///
     /// When set, enables extended thinking with the specified budget.
-    /// The budget determines the maximum tokens Claude can use for internal reasoning.
-    /// Minimum is 1024 tokens.
+    /// The budget determines the maximum tokens the model can use for internal reasoning.
+    /// - **Anthropic**: Minimum is 1024 tokens
+    /// - **OpenAI**: Maps to max_completion_tokens for reasoning models
     ///
     /// # Arguments
     ///
-    /// * `budget` - The thinking budget in tokens (minimum 1024)
+    /// * `budget` - The thinking budget in tokens
     #[must_use]
     pub const fn with_thinking_budget(mut self, budget: u32) -> Self {
-        self.thinking_budget = Some(budget);
+        self.thinking = ThinkingMode::Extended { budget_tokens: budget };
         self
     }
 
-    /// Enables interleaved thinking (Anthropic-specific, Claude 4+ models).
+    /// Enables interleaved thinking with the given budget.
     ///
-    /// When enabled, Claude can think between tool calls, allowing more sophisticated
-    /// reasoning after receiving tool results. This requires the beta header
-    /// `interleaved-thinking-2025-05-14` which is automatically added.
+    /// This is a convenience method for `with_thinking_mode(ThinkingMode::Interleaved { budget_tokens })`.
+    ///
+    /// When enabled, the model can think between tool calls, allowing more sophisticated
+    /// reasoning after receiving tool results.
+    /// - **Anthropic**: Enables the interleaved-thinking beta feature
+    /// - **OpenAI**: Falls back to extended thinking behavior
     ///
     /// # Arguments
     ///
-    /// * `enabled` - Whether to enable interleaved thinking
+    /// * `budget` - The thinking budget in tokens
     #[must_use]
-    pub const fn with_interleaved_thinking(mut self, enabled: bool) -> Self {
-        self.interleaved_thinking = Some(enabled);
+    pub const fn with_interleaved_thinking(mut self, budget: u32) -> Self {
+        self.thinking = ThinkingMode::Interleaved { budget_tokens: budget };
         self
     }
 

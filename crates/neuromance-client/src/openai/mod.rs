@@ -12,9 +12,24 @@ use typed_builder::TypedBuilder;
 
 use neuromance_common::chat::{Message, MessageRole};
 use neuromance_common::client::{ChatRequest, Config, Usage};
+use neuromance_common::features::ReasoningLevel;
 use neuromance_common::tools::{FunctionCall, Tool, ToolCall};
 
 pub use neuromance_common::client::ReasoningEffort;
+
+/// Convert from the abstract `ReasoningLevel` to OpenAI's `ReasoningEffort`.
+fn reasoning_level_to_effort(level: ReasoningLevel) -> Option<ReasoningEffort> {
+    match level {
+        ReasoningLevel::Default => None,
+        ReasoningLevel::Minimal => Some(ReasoningEffort::Minimal),
+        ReasoningLevel::Low => Some(ReasoningEffort::Low),
+        ReasoningLevel::Medium => Some(ReasoningEffort::Medium),
+        ReasoningLevel::High => Some(ReasoningEffort::High),
+        ReasoningLevel::Maximum => Some(ReasoningEffort::XHigh),
+        // Handle future variants gracefully
+        _ => None,
+    }
+}
 
 pub mod client;
 pub use client::{OpenAIClient, convert_chunk_to_chat_chunk};
@@ -263,6 +278,20 @@ impl From<(&ChatRequest, &Config)> for ChatCompletionRequest {
 
         let tools: Option<Vec<Tool>> = request.tools.clone();
 
+        // Map ReasoningLevel to OpenAI's ReasoningEffort
+        let reasoning_effort = reasoning_level_to_effort(request.reasoning_level);
+
+        // Map ThinkingMode - for OpenAI, thinking budget maps to max_completion_tokens
+        // and enable_thinking is set if any thinking mode is enabled
+        let max_completion_tokens = request
+            .max_completion_tokens
+            .or_else(|| request.thinking.budget());
+        let enable_thinking = if request.thinking.is_enabled() {
+            Some(true)
+        } else {
+            None
+        };
+
         Self::builder()
             .model(
                 request
@@ -272,8 +301,8 @@ impl From<(&ChatRequest, &Config)> for ChatCompletionRequest {
             )
             .messages(openai_messages)
             .max_tokens(request.max_tokens)
-            .max_completion_tokens(request.max_completion_tokens)
-            .reasoning_effort(request.reasoning_effort)
+            .max_completion_tokens(max_completion_tokens)
+            .reasoning_effort(reasoning_effort)
             .temperature(request.temperature)
             .top_p(request.top_p)
             .stop(request.stop.clone())
@@ -283,7 +312,7 @@ impl From<(&ChatRequest, &Config)> for ChatCompletionRequest {
             .stream(Some(request.stream))
             .tools(tools)
             .tool_choice(request.tool_choice.as_ref().map(|tc| tc.clone().into()))
-            .enable_thinking(request.enable_thinking)
+            .enable_thinking(enable_thinking)
             .build()
     }
 }

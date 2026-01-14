@@ -202,11 +202,16 @@ async fn run_cli<C: LLMClient>(client: C, args: &Args) -> Result<()> {
         });
 
     // Apply thinking configuration from CLI args
+    // Interleaved thinking takes precedence over extended thinking
     if let Some(budget) = args.thinking_budget {
-        core = core.with_thinking_budget(budget);
-    }
-    if args.interleaved_thinking {
-        core = core.with_interleaved_thinking();
+        if args.interleaved_thinking {
+            core = core.with_interleaved_thinking(budget);
+        } else {
+            core = core.with_thinking_budget(budget);
+        }
+    } else if args.interleaved_thinking {
+        // Interleaved thinking requires a budget, use a sensible default
+        core = core.with_interleaved_thinking(10000);
     }
 
     core.auto_approve_tools = false;
