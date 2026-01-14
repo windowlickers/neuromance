@@ -243,12 +243,28 @@ pub struct Usage {
 ///
 /// Provides additional information about how input tokens were processed,
 /// including cache utilization.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InputTokensDetails {
     /// Number of tokens served from cache rather than processed fresh.
     ///
     /// Cached tokens are typically cheaper and faster to process.
+    /// For `OpenAI`: automatic prefix caching.
+    /// For Anthropic: prompt caching (`cache_read_input_tokens`).
+    #[serde(default)]
     pub cached_tokens: u32,
+
+    /// Number of tokens written to cache (Anthropic-specific).
+    ///
+    /// These tokens incur a +25% cost for cache creation but enable
+    /// future cache reads at -90% cost.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_creation_tokens: u32,
+}
+
+/// Helper for serde `skip_serializing_if`.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_zero(val: &u32) -> bool {
+    *val == 0
 }
 
 /// Detailed breakdown of output token usage.

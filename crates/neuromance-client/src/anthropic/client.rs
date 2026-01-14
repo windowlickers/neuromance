@@ -1452,4 +1452,142 @@ mod tests {
             _ => panic!("Expected Blocks content"),
         }
     }
+
+    // ========================================================================
+    // Cache Control Tests
+    // ========================================================================
+
+    #[test]
+    fn test_anthropic_usage_preserves_cache_stats() {
+        use crate::anthropic::AnthropicUsage;
+
+        let usage = AnthropicUsage {
+            input_tokens: 1000,
+            output_tokens: 500,
+            cache_creation_input_tokens: 200,
+            cache_read_input_tokens: 800,
+        };
+
+        let common_usage = Usage::from(usage);
+
+        assert_eq!(common_usage.prompt_tokens, 1000);
+        assert_eq!(common_usage.completion_tokens, 500);
+
+        let details = common_usage
+            .input_tokens_details
+            .expect("Should have input_tokens_details");
+        assert_eq!(details.cached_tokens, 800);
+        assert_eq!(details.cache_creation_tokens, 200);
+    }
+
+    #[test]
+    fn test_system_blocks_last_gets_cache_control() {
+        use crate::anthropic::{CreateMessageRequest, SystemContentBlock, SystemPrompt};
+
+        let mut messages = vec![
+            Message {
+                id: uuid::Uuid::new_v4(),
+                conversation_id: uuid::Uuid::new_v4(),
+                role: MessageRole::System,
+                content: "First system message".to_string(),
+                tool_calls: SmallVec::new(),
+                tool_call_id: None,
+                name: None,
+                timestamp: Utc::now(),
+                metadata: HashMap::new(),
+                reasoning_content: None,
+                reasoning_signature: None,
+            },
+            Message {
+                id: uuid::Uuid::new_v4(),
+                conversation_id: uuid::Uuid::new_v4(),
+                role: MessageRole::System,
+                content: "Second system message".to_string(),
+                tool_calls: SmallVec::new(),
+                tool_call_id: None,
+                name: None,
+                timestamp: Utc::now(),
+                metadata: HashMap::new(),
+                reasoning_content: None,
+                reasoning_signature: None,
+            },
+        ];
+        messages.push(create_test_message()); // Add a user message
+
+        let config = Config::new("anthropic", "claude-sonnet-4-5-20250929")
+            .with_api_key("test-key");
+        let request = ChatRequest::new(messages);
+
+        let anthropic_request = CreateMessageRequest::from((&request, &config));
+
+        // Verify system prompt exists and has cache control on last block only
+        let system = anthropic_request.system.expect("Should have system prompt");
+        match system {
+            SystemPrompt::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 2);
+
+                // First block should NOT have cache_control
+                match &blocks[0] {
+                    SystemContentBlock::Text { cache_control, .. } => {
+                        assert!(cache_control.is_none(), "First block should not have cache_control");
+                    }
+                }
+
+                // Last block SHOULD have cache_control
+                match &blocks[1] {
+                    SystemContentBlock::Text { cache_control, .. } => {
+                        assert!(cache_control.is_some(), "Last block should have cache_control");
+                    }
+                }
+            }
+            _ => panic!("Expected Blocks variant"),
+        }
+    }
+
+    #[test]
+    fn test_tools_last_gets_cache_control() {
+        use crate::anthropic::CreateMessageRequest;
+        use neuromance_common::tools::{Function, Tool};
+
+        let message = create_test_message();
+        let config = Config::new("anthropic", "claude-sonnet-4-5-20250929")
+            .with_api_key("test-key");
+
+        let tools = vec![
+            Tool {
+                r#type: "function".to_string(),
+                function: Function {
+                    name: "tool_one".to_string(),
+                    description: "First tool".to_string(),
+                    parameters: serde_json::json!({"type": "object"}),
+                },
+            },
+            Tool {
+                r#type: "function".to_string(),
+                function: Function {
+                    name: "tool_two".to_string(),
+                    description: "Second tool".to_string(),
+                    parameters: serde_json::json!({"type": "object"}),
+                },
+            },
+        ];
+
+        let request = ChatRequest::new(vec![message]).with_tools(tools);
+        let anthropic_request = CreateMessageRequest::from((&request, &config));
+
+        let tools = anthropic_request.tools.expect("Should have tools");
+        assert_eq!(tools.len(), 2);
+
+        // First tool should NOT have cache_control
+        assert!(
+            tools[0].cache_control.is_none(),
+            "First tool should not have cache_control"
+        );
+
+        // Last tool SHOULD have cache_control
+        assert!(
+            tools[1].cache_control.is_some(),
+            "Last tool should have cache_control"
+        );
+    }
 }

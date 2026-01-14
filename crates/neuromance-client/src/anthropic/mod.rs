@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use typed_builder::TypedBuilder;
 
 use neuromance_common::chat::{Message, MessageRole};
-use neuromance_common::client::{ChatRequest, Config, Usage};
+use neuromance_common::client::{ChatRequest, Config, InputTokensDetails, Usage};
 use neuromance_common::tools::{FunctionCall, Tool, ToolCall};
 
 pub mod client;
@@ -491,7 +491,10 @@ impl From<AnthropicUsage> for Usage {
             completion_tokens: usage.output_tokens,
             total_tokens: usage.input_tokens + usage.output_tokens,
             cost: None,
-            input_tokens_details: None,
+            input_tokens_details: Some(InputTokensDetails {
+                cached_tokens: usage.cache_read_input_tokens,
+                cache_creation_tokens: usage.cache_creation_input_tokens,
+            }),
             output_tokens_details: None,
         }
     }
@@ -765,6 +768,22 @@ impl From<&Message> for AnthropicMessage {
     }
 }
 
+/// Converts tools to Anthropic format with cache control on the last tool.
+///
+/// Anthropic's prompt caching caches everything up to and including the
+/// content block marked with `cache_control`. By marking the last tool,
+/// we ensure all tool definitions are cached together.
+fn convert_tools_with_caching(tools: &[Tool]) -> Vec<AnthropicTool> {
+    let mut anthropic_tools: Vec<AnthropicTool> = tools.iter().map(AnthropicTool::from).collect();
+
+    // Apply cache control to the last tool for prompt caching
+    if let Some(last) = anthropic_tools.last_mut() {
+        last.cache_control = Some(CacheControl::ephemeral());
+    }
+
+    anthropic_tools
+}
+
 /// Conversion from `ChatRequest` to Anthropic request format.
 impl From<(&ChatRequest, &Config)> for CreateMessageRequest {
     fn from((request, config): (&ChatRequest, &Config)) -> Self {
@@ -786,6 +805,11 @@ impl From<(&ChatRequest, &Config)> for CreateMessageRequest {
             }
         }
 
+        // Apply cache control to the last system block for prompt caching
+        if let Some(SystemContentBlock::Text { cache_control, .. }) = system_blocks.last_mut() {
+            *cache_control = Some(CacheControl::ephemeral());
+        }
+
         // Convert collected system blocks to SystemPrompt
         let system = if system_blocks.is_empty() {
             None
@@ -793,11 +817,11 @@ impl From<(&ChatRequest, &Config)> for CreateMessageRequest {
             Some(SystemPrompt::Blocks(system_blocks))
         };
 
-        // Convert tools if present
+        // Convert tools if present, with cache control on the last tool
         let tools: Option<Vec<AnthropicTool>> = request
             .tools
             .as_ref()
-            .map(|t| t.iter().map(AnthropicTool::from).collect());
+            .map(|t| convert_tools_with_caching(t));
 
         // Convert tool choice if present
         let tool_choice: Option<AnthropicToolChoice> =
