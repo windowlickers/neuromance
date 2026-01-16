@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Different providers implement thinking differently:
 /// - **Anthropic**: Extended thinking with token budget, interleaved thinking between tool calls
-/// - **OpenAI**: Reasoning effort levels (o1, o3 models), max_completion_tokens
+/// - **`OpenAI`**: Reasoning effort levels (o1, o3 models), `max_completion_tokens`
 /// - **Other providers**: May use temperature/sampling adjustments
 ///
 /// # Examples
@@ -36,7 +36,7 @@ pub enum ThinkingMode {
     /// Extended thinking with a token budget.
     ///
     /// - **Anthropic**: Maps to `thinking.budget_tokens`
-    /// - **OpenAI**: Maps to `max_completion_tokens` (for reasoning models)
+    /// - **`OpenAI`**: Maps to `max_completion_tokens` (for reasoning models)
     Extended {
         /// Maximum tokens the model can use for thinking/reasoning.
         /// Anthropic minimum is 1024 tokens.
@@ -49,7 +49,7 @@ pub enum ThinkingMode {
     /// enabling more sophisticated multi-step reasoning.
     ///
     /// - **Anthropic**: Enables the interleaved-thinking beta feature
-    /// - **OpenAI**: Falls back to `Extended` behavior (not directly supported)
+    /// - **`OpenAI`**: Falls back to `Extended` behavior (not directly supported)
     Interleaved {
         /// Maximum tokens the model can use for thinking/reasoning.
         budget_tokens: u32,
@@ -100,7 +100,7 @@ impl ThinkingMode {
 /// Reasoning effort level for models that support it.
 ///
 /// This is an abstraction over provider-specific reasoning controls:
-/// - **OpenAI**: Direct mapping to `reasoning_effort` parameter (o1, o3 models)
+/// - **`OpenAI`**: Direct mapping to the `reasoning_effort` parameter (o1, o3 models)
 /// - **Anthropic**: Can influence thinking budget selection heuristics
 ///
 /// # Examples
@@ -147,28 +147,70 @@ mod tests {
     #[test]
     fn test_thinking_mode_budget() {
         assert_eq!(ThinkingMode::Default.budget(), None);
-        assert_eq!(ThinkingMode::Extended { budget_tokens: 5000 }.budget(), Some(5000));
-        assert_eq!(ThinkingMode::Interleaved { budget_tokens: 8000 }.budget(), Some(8000));
+        assert_eq!(
+            ThinkingMode::Extended {
+                budget_tokens: 5000
+            }
+            .budget(),
+            Some(5000)
+        );
+        assert_eq!(
+            ThinkingMode::Interleaved {
+                budget_tokens: 8000
+            }
+            .budget(),
+            Some(8000)
+        );
     }
 
     #[test]
     fn test_thinking_mode_is_interleaved() {
         assert!(!ThinkingMode::Default.is_interleaved());
-        assert!(!ThinkingMode::Extended { budget_tokens: 5000 }.is_interleaved());
-        assert!(ThinkingMode::Interleaved { budget_tokens: 8000 }.is_interleaved());
+        assert!(
+            !ThinkingMode::Extended {
+                budget_tokens: 5000
+            }
+            .is_interleaved()
+        );
+        assert!(
+            ThinkingMode::Interleaved {
+                budget_tokens: 8000
+            }
+            .is_interleaved()
+        );
     }
 
     #[test]
     fn test_thinking_mode_is_enabled() {
         assert!(!ThinkingMode::Default.is_enabled());
-        assert!(ThinkingMode::Extended { budget_tokens: 5000 }.is_enabled());
-        assert!(ThinkingMode::Interleaved { budget_tokens: 8000 }.is_enabled());
+        assert!(
+            ThinkingMode::Extended {
+                budget_tokens: 5000
+            }
+            .is_enabled()
+        );
+        assert!(
+            ThinkingMode::Interleaved {
+                budget_tokens: 8000
+            }
+            .is_enabled()
+        );
     }
 
     #[test]
     fn test_thinking_mode_constructors() {
-        assert_eq!(ThinkingMode::extended(1000), ThinkingMode::Extended { budget_tokens: 1000 });
-        assert_eq!(ThinkingMode::interleaved(2000), ThinkingMode::Interleaved { budget_tokens: 2000 });
+        assert_eq!(
+            ThinkingMode::extended(1000),
+            ThinkingMode::Extended {
+                budget_tokens: 1000
+            }
+        );
+        assert_eq!(
+            ThinkingMode::interleaved(2000),
+            ThinkingMode::Interleaved {
+                budget_tokens: 2000
+            }
+        );
     }
 
     #[test]
@@ -188,7 +230,9 @@ mod tests {
 
     #[test]
     fn test_thinking_mode_serde() {
-        let mode = ThinkingMode::Extended { budget_tokens: 5000 };
+        let mode = ThinkingMode::Extended {
+            budget_tokens: 5000,
+        };
         let json = serde_json::to_string(&mode).unwrap();
         assert!(json.contains("extended"));
         assert!(json.contains("5000"));

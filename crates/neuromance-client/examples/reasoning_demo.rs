@@ -52,12 +52,12 @@ struct Args {
 
 fn parse_reasoning_level(s: &str) -> ReasoningLevel {
     match s.to_lowercase().as_str() {
-        "default" | "none" => ReasoningLevel::Default,
         "minimal" => ReasoningLevel::Minimal,
         "low" => ReasoningLevel::Low,
         "medium" => ReasoningLevel::Medium,
         "high" => ReasoningLevel::High,
         "max" | "maximum" | "xhigh" => ReasoningLevel::Maximum,
+        // "default", "none", and unknown values all map to Default
         _ => ReasoningLevel::Default,
     }
 }

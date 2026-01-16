@@ -17,16 +17,15 @@ use neuromance_common::tools::{FunctionCall, Tool, ToolCall};
 
 pub use neuromance_common::client::ReasoningEffort;
 
-/// Convert from the abstract `ReasoningLevel` to OpenAI's `ReasoningEffort`.
-fn reasoning_level_to_effort(level: ReasoningLevel) -> Option<ReasoningEffort> {
+/// Convert from the abstract `ReasoningLevel` to `OpenAI`'s `ReasoningEffort`.
+const fn reasoning_level_to_effort(level: ReasoningLevel) -> Option<ReasoningEffort> {
     match level {
-        ReasoningLevel::Default => None,
         ReasoningLevel::Minimal => Some(ReasoningEffort::Minimal),
         ReasoningLevel::Low => Some(ReasoningEffort::Low),
         ReasoningLevel::Medium => Some(ReasoningEffort::Medium),
         ReasoningLevel::High => Some(ReasoningEffort::High),
         ReasoningLevel::Maximum => Some(ReasoningEffort::XHigh),
-        // Handle future variants gracefully
+        // Handle Default and future variants gracefully
         _ => None,
     }
 }

@@ -341,8 +341,8 @@ pub struct ChatRequest {
     /// Thinking/reasoning mode configuration.
     ///
     /// Controls extended thinking capabilities across providers:
-    /// - **Anthropic**: Maps to thinking.budget_tokens and interleaved-thinking beta
-    /// - **OpenAI**: Maps to max_completion_tokens for reasoning models
+    /// - **Anthropic**: Maps to `thinking.budget_tokens` and interleaved-thinking beta
+    /// - **`OpenAI`**: Maps to `max_completion_tokens` for reasoning models
     ///
     /// See [`ThinkingMode`] for available options.
     #[serde(default)]
@@ -350,7 +350,7 @@ pub struct ChatRequest {
     /// Reasoning effort level for models that support it.
     ///
     /// Controls how much compute the model spends on reasoning:
-    /// - **OpenAI**: Maps to reasoning_effort parameter (o1, o3 models)
+    /// - **`OpenAI`**: Maps to `reasoning_effort` parameter (o1, o3 models)
     /// - **Anthropic**: Can influence thinking budget heuristics
     #[serde(default)]
     pub reasoning_level: ReasoningLevel,
@@ -650,14 +650,16 @@ impl ChatRequest {
     /// When set, enables extended thinking with the specified budget.
     /// The budget determines the maximum tokens the model can use for internal reasoning.
     /// - **Anthropic**: Minimum is 1024 tokens
-    /// - **OpenAI**: Maps to max_completion_tokens for reasoning models
+    /// - **`OpenAI`**: Maps to `max_completion_tokens` for reasoning models
     ///
     /// # Arguments
     ///
     /// * `budget` - The thinking budget in tokens
     #[must_use]
     pub const fn with_thinking_budget(mut self, budget: u32) -> Self {
-        self.thinking = ThinkingMode::Extended { budget_tokens: budget };
+        self.thinking = ThinkingMode::Extended {
+            budget_tokens: budget,
+        };
         self
     }
 
@@ -668,14 +670,16 @@ impl ChatRequest {
     /// When enabled, the model can think between tool calls, allowing more sophisticated
     /// reasoning after receiving tool results.
     /// - **Anthropic**: Enables the interleaved-thinking beta feature
-    /// - **OpenAI**: Falls back to extended thinking behavior
+    /// - **`OpenAI`**: Falls back to extended thinking behavior (not directly supported)
     ///
     /// # Arguments
     ///
     /// * `budget` - The thinking budget in tokens
     #[must_use]
     pub const fn with_interleaved_thinking(mut self, budget: u32) -> Self {
-        self.thinking = ThinkingMode::Interleaved { budget_tokens: budget };
+        self.thinking = ThinkingMode::Interleaved {
+            budget_tokens: budget,
+        };
         self
     }
 

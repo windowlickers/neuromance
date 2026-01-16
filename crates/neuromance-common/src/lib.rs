@@ -60,15 +60,15 @@ pub mod chat;
 ///
 /// Contains types for configuring LLM clients and making chat completion requests.
 pub mod client;
-/// Tool calling and function execution types.
-///
-/// Provides types for defining and executing functions/tools that LLMs can call.
-pub mod tools;
 /// Feature abstractions for cross-provider capabilities.
 ///
 /// Provides types like `ThinkingMode` and `ReasoningLevel` that abstract
 /// provider-specific features into a common interface.
 pub mod features;
+/// Tool calling and function execution types.
+///
+/// Provides types for defining and executing functions/tools that LLMs can call.
+pub mod tools;
 
 pub mod agents;
 

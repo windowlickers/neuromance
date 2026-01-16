@@ -834,7 +834,12 @@ impl From<(&ChatRequest, &Config)> for CreateMessageRequest {
         // When thinking is enabled, max_tokens must be > budget_tokens
         let max_tokens = request.thinking.budget().map_or_else(
             || request.max_tokens.unwrap_or(4096),
-            |budget| request.max_tokens.unwrap_or(budget + 8192).max(budget + 1024),
+            |budget| {
+                request
+                    .max_tokens
+                    .unwrap_or(budget + 8192)
+                    .max(budget + 1024)
+            },
         );
 
         // When thinking is enabled, temperature and top_p must not be set

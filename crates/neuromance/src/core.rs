@@ -42,8 +42,8 @@ pub struct Core<C: LLMClient> {
     /// Thinking/reasoning mode configuration.
     ///
     /// Controls extended thinking capabilities across providers:
-    /// - **Anthropic**: Maps to thinking.budget_tokens and interleaved-thinking beta
-    /// - **OpenAI**: Maps to max_completion_tokens for reasoning models
+    /// - **Anthropic**: Maps to `thinking.budget_tokens` and interleaved-thinking beta
+    /// - **`OpenAI`**: Maps to `max_completion_tokens` for reasoning models
     pub thinking: ThinkingMode,
 }
 
@@ -145,7 +145,9 @@ impl<C: LLMClient> Core<C> {
     /// internal reasoning before responding.
     #[must_use]
     pub const fn with_thinking_budget(mut self, budget: u32) -> Self {
-        self.thinking = ThinkingMode::Extended { budget_tokens: budget };
+        self.thinking = ThinkingMode::Extended {
+            budget_tokens: budget,
+        };
         self
     }
 
@@ -154,10 +156,12 @@ impl<C: LLMClient> Core<C> {
     /// When enabled, the model can think between tool calls, allowing more sophisticated
     /// reasoning after receiving tool results.
     /// - **Anthropic**: Enables the interleaved-thinking beta feature
-    /// - **OpenAI**: Falls back to extended thinking behavior
+    /// - **`OpenAI`**: Falls back to extended thinking behavior (not directly supported)
     #[must_use]
     pub const fn with_interleaved_thinking(mut self, budget: u32) -> Self {
-        self.thinking = ThinkingMode::Interleaved { budget_tokens: budget };
+        self.thinking = ThinkingMode::Interleaved {
+            budget_tokens: budget,
+        };
         self
     }
 

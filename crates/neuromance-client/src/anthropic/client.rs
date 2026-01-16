@@ -1514,8 +1514,8 @@ mod tests {
         ];
         messages.push(create_test_message()); // Add a user message
 
-        let config = Config::new("anthropic", "claude-sonnet-4-5-20250929")
-            .with_api_key("test-key");
+        let config =
+            Config::new("anthropic", "claude-sonnet-4-5-20250929").with_api_key("test-key");
         let request = ChatRequest::new(messages);
 
         let anthropic_request = CreateMessageRequest::from((&request, &config));
@@ -1529,14 +1529,20 @@ mod tests {
                 // First block should NOT have cache_control
                 match &blocks[0] {
                     SystemContentBlock::Text { cache_control, .. } => {
-                        assert!(cache_control.is_none(), "First block should not have cache_control");
+                        assert!(
+                            cache_control.is_none(),
+                            "First block should not have cache_control"
+                        );
                     }
                 }
 
                 // Last block SHOULD have cache_control
                 match &blocks[1] {
                     SystemContentBlock::Text { cache_control, .. } => {
-                        assert!(cache_control.is_some(), "Last block should have cache_control");
+                        assert!(
+                            cache_control.is_some(),
+                            "Last block should have cache_control"
+                        );
                     }
                 }
             }
@@ -1550,8 +1556,8 @@ mod tests {
         use neuromance_common::tools::{Function, Tool};
 
         let message = create_test_message();
-        let config = Config::new("anthropic", "claude-sonnet-4-5-20250929")
-            .with_api_key("test-key");
+        let config =
+            Config::new("anthropic", "claude-sonnet-4-5-20250929").with_api_key("test-key");
 
         let tools = vec![
             Tool {
