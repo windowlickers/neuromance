@@ -53,6 +53,42 @@ use uuid::Uuid;
 
 use crate::tools::ToolCall;
 
+/// Reasoning/thinking content from models that support extended thinking.
+///
+/// This struct groups the model's chain-of-thought reasoning with any
+/// provider-specific verification data. For example, Anthropic requires
+/// a signature to verify thinking content hasn't been tampered with when
+/// re-submitting it in conversation history.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct ReasoningContent {
+    /// The model's chain-of-thought reasoning content.
+    pub content: String,
+
+    /// Provider-specific signature for verification (e.g., Anthropic uses this
+    /// to verify thinking content integrity when re-submitting in conversations).
+    pub signature: Option<String>,
+}
+
+impl ReasoningContent {
+    /// Creates new reasoning content without a signature.
+    #[must_use]
+    pub fn new(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            signature: None,
+        }
+    }
+
+    /// Creates new reasoning content with a signature.
+    #[must_use]
+    pub fn with_signature(content: impl Into<String>, signature: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            signature: Some(signature.into()),
+        }
+    }
+}
+
 /// Represents the role of a message sender in a conversation.
 ///
 /// Roles are serialized to lowercase strings matching the `OpenAI` API format.
@@ -115,13 +151,9 @@ pub struct Message {
     #[builder(default)]
     pub name: Option<String>,
 
-    /// Reasoning content from thinking models (optional, separate from main content).
+    /// Reasoning/thinking content from models that support extended thinking.
     #[builder(default)]
-    pub reasoning_content: Option<String>,
-
-    /// Signature for reasoning content (required by some providers like Anthropic).
-    #[builder(default)]
-    pub reasoning_signature: Option<String>,
+    pub reasoning: Option<ReasoningContent>,
 }
 
 impl Message {
@@ -137,8 +169,7 @@ impl Message {
             tool_calls: SmallVec::new(),
             tool_call_id: None,
             name: None,
-            reasoning_content: None,
-            reasoning_signature: None,
+            reasoning: None,
         }
     }
 

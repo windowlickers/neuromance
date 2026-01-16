@@ -109,7 +109,7 @@ impl From<&Message> for OpenAIMessage {
             .name(message.name.clone())
             .tool_calls(tool_calls)
             .tool_call_id(message.tool_call_id.clone())
-            .reasoning_content(message.reasoning_content.clone())
+            .reasoning_content(message.reasoning.as_ref().map(|r| r.content.clone()))
             .build()
     }
 }

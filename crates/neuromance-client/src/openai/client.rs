@@ -617,8 +617,10 @@ impl OpenAIClient {
             name: openai_msg.name.clone(),
             timestamp: Utc::now(),
             metadata: HashMap::new(),
-            reasoning_content: openai_msg.reasoning_content.clone(),
-            reasoning_signature: None, // OpenAI doesn't use signatures for reasoning
+            reasoning: openai_msg
+                .reasoning_content
+                .clone()
+                .map(neuromance_common::ReasoningContent::new),
         }
     }
 }
@@ -809,8 +811,7 @@ mod tests {
             name: None,
             timestamp: Utc::now(),
             metadata: HashMap::new(),
-            reasoning_content: None,
-            reasoning_signature: None,
+            reasoning: None,
         }
     }
 

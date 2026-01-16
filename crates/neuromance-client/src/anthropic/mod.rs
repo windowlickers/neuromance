@@ -694,11 +694,11 @@ impl From<&Message> for AnthropicMessage {
                 let mut blocks = Vec::new();
 
                 // Add thinking block if present (must come first for Anthropic)
-                if let (Some(thinking), Some(signature)) =
-                    (&message.reasoning_content, &message.reasoning_signature)
+                if let Some(reasoning) = &message.reasoning
+                    && let Some(signature) = &reasoning.signature
                 {
                     blocks.push(RequestContentBlock::Thinking {
-                        thinking: thinking.clone(),
+                        thinking: reasoning.content.clone(),
                         signature: signature.clone(),
                     });
                 }
@@ -731,16 +731,19 @@ impl From<&Message> for AnthropicMessage {
                 MessageContent::Blocks(blocks)
             }
             MessageRole::Assistant
-                if message.reasoning_content.is_some() && message.reasoning_signature.is_some() =>
+                if message
+                    .reasoning
+                    .as_ref()
+                    .is_some_and(|r| r.signature.is_some()) =>
             {
                 // Assistant message with thinking but no tool calls
                 let mut blocks = Vec::new();
 
-                if let (Some(thinking), Some(signature)) =
-                    (&message.reasoning_content, &message.reasoning_signature)
+                if let Some(reasoning) = &message.reasoning
+                    && let Some(signature) = &reasoning.signature
                 {
                     blocks.push(RequestContentBlock::Thinking {
-                        thinking: thinking.clone(),
+                        thinking: reasoning.content.clone(),
                         signature: signature.clone(),
                     });
                 }

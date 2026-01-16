@@ -312,6 +312,12 @@ impl AnthropicClient {
             }
         }
 
+        // Build reasoning content if we have thinking
+        let reasoning = reasoning_content.map(|content| neuromance_common::ReasoningContent {
+            content,
+            signature: reasoning_signature,
+        });
+
         Message {
             id: uuid::Uuid::new_v4(),
             conversation_id,
@@ -322,8 +328,7 @@ impl AnthropicClient {
             name: None,
             timestamp: Utc::now(),
             metadata: HashMap::new(),
-            reasoning_content,
-            reasoning_signature,
+            reasoning,
         }
     }
 }
@@ -709,8 +714,7 @@ mod tests {
             name: None,
             timestamp: Utc::now(),
             metadata: HashMap::new(),
-            reasoning_content: None,
-            reasoning_signature: None,
+            reasoning: None,
         }
     }
 
@@ -971,8 +975,12 @@ mod tests {
 
         assert_eq!(response.message.content, "Here's my response.");
         assert_eq!(
-            response.message.reasoning_content,
-            Some("Let me think about this...".to_string())
+            response
+                .message
+                .reasoning
+                .as_ref()
+                .map(|r| r.content.as_str()),
+            Some("Let me think about this...")
         );
     }
 
@@ -1325,8 +1333,12 @@ mod tests {
 
         // All three content types should be extracted
         assert_eq!(
-            response.message.reasoning_content,
-            Some("I need to analyze this request carefully...".to_string())
+            response
+                .message
+                .reasoning
+                .as_ref()
+                .map(|r| r.content.as_str()),
+            Some("I need to analyze this request carefully...")
         );
         assert_eq!(
             response.message.content,
@@ -1356,8 +1368,7 @@ mod tests {
             name: None,
             timestamp: Utc::now(),
             metadata: HashMap::new(),
-            reasoning_content: None,
-            reasoning_signature: None,
+            reasoning: None,
         };
 
         let anthropic_msg = AnthropicMessage::from(&tool_message);
@@ -1418,8 +1429,7 @@ mod tests {
             name: None,
             timestamp: Utc::now(),
             metadata: HashMap::new(),
-            reasoning_content: None,
-            reasoning_signature: None,
+            reasoning: None,
         };
 
         let anthropic_msg = AnthropicMessage::from(&assistant_message);
@@ -1495,8 +1505,7 @@ mod tests {
                 name: None,
                 timestamp: Utc::now(),
                 metadata: HashMap::new(),
-                reasoning_content: None,
-                reasoning_signature: None,
+                reasoning: None,
             },
             Message {
                 id: uuid::Uuid::new_v4(),
@@ -1508,8 +1517,7 @@ mod tests {
                 name: None,
                 timestamp: Utc::now(),
                 metadata: HashMap::new(),
-                reasoning_content: None,
-                reasoning_signature: None,
+                reasoning: None,
             },
         ];
         messages.push(create_test_message()); // Add a user message

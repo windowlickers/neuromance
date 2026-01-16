@@ -73,7 +73,7 @@ pub mod tools;
 pub mod agents;
 
 pub use agents::{AgentContext, AgentMemory, AgentMessage, AgentResponse, AgentState, AgentStats};
-pub use chat::{Conversation, ConversationStatus, Message, MessageRole};
+pub use chat::{Conversation, ConversationStatus, Message, MessageRole, ReasoningContent};
 pub use client::{
     ChatRequest, ChatResponse, Config, FinishReason, ReasoningEffort, RetryConfig, ToolChoice,
     Usage,
