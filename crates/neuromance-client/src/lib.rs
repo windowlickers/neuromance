@@ -22,6 +22,7 @@ pub mod anthropic;
 pub mod embedding;
 mod error;
 pub mod openai;
+pub mod responses;
 
 pub use anthropic::AnthropicClient;
 pub use embedding::{
@@ -29,6 +30,7 @@ pub use embedding::{
 };
 pub use error::ClientError;
 pub use openai::{OpenAIClient, OpenAIEmbedding};
+pub use responses::ResponsesClient;
 
 /// A retry policy for SSE streams that never retries.
 ///

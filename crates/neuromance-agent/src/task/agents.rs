@@ -214,8 +214,8 @@ impl<C: LLMClient + Send + Sync> VerifierAgent<C> {
         {
             // Parse the boolean result from the tool call arguments
             // Arguments is a Vec<String>, typically with a single JSON string
-            if let Some(args_str) = tool_call.function.arguments.first()
-                && let Ok(args) = serde_json::from_str::<serde_json::Value>(args_str)
+            let args_str = tool_call.function.arguments_json();
+            if let Ok(args) = serde_json::from_str::<serde_json::Value>(&args_str)
                 && let Some(result) = args.get("result").and_then(serde_json::Value::as_bool)
             {
                 let agent_response = AgentResponse {

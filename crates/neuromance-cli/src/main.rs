@@ -14,7 +14,7 @@ use tokio::sync::Mutex;
 
 use neuromance::{
     AnthropicClient, Config, Conversation, Core, CoreEvent, LLMClient, Message, MessageRole,
-    OpenAIClient, ToolApproval, ToolCall, Usage,
+    OpenAIClient, ResponsesClient, ToolApproval, ToolCall, Usage,
 };
 use neuromance_tools::{ThinkTool, ToolImplementation, create_todo_tools};
 
@@ -23,31 +23,33 @@ mod display;
 /// Supported LLM providers
 #[derive(Debug, Clone, Copy, Default, ValueEnum)]
 enum Provider {
-    /// `OpenAI` API
+    /// `OpenAI` Chat Completions API
     #[default]
     Openai,
     /// Anthropic Messages API
     Anthropic,
+    /// `OpenAI` Responses API (openresponses.org spec)
+    Responses,
 }
 
 impl Provider {
     const fn default_base_url(self) -> &'static str {
         match self {
-            Self::Openai => "https://api.openai.com/v1",
+            Self::Openai | Self::Responses => "https://api.openai.com/v1",
             Self::Anthropic => "https://api.anthropic.com/v1",
         }
     }
 
     const fn default_model(self) -> &'static str {
         match self {
-            Self::Openai => "gpt-4o",
+            Self::Openai | Self::Responses => "gpt-4o",
             Self::Anthropic => "claude-sonnet-4-5-20250929",
         }
     }
 
     const fn api_key_env_var(self) -> &'static str {
         match self {
-            Self::Openai => "OPENAI_API_KEY",
+            Self::Openai | Self::Responses => "OPENAI_API_KEY",
             Self::Anthropic => "ANTHROPIC_API_KEY",
         }
     }
@@ -56,6 +58,7 @@ impl Provider {
         match self {
             Self::Openai => "openai",
             Self::Anthropic => "anthropic",
+            Self::Responses => "responses",
         }
     }
 }
@@ -99,6 +102,9 @@ struct Args {
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
+    // Initialize logger for RUST_LOG support
+    env_logger::init();
+
     let args = Args::parse();
     let provider = args.provider;
 
@@ -135,6 +141,10 @@ async fn main() -> Result<()> {
         }
         Provider::Openai => {
             let client = OpenAIClient::new(config)?;
+            run_cli(client, &args).await
+        }
+        Provider::Responses => {
+            let client = ResponsesClient::new(config)?;
             run_cli(client, &args).await
         }
     }
@@ -562,13 +572,7 @@ async fn prompt_for_tool_approval(
     display::display_tool_call_request(tool_call);
 
     // Parse arguments for display
-    let args_display = if tool_call.function.arguments.is_empty() {
-        "{}".to_string()
-    } else if tool_call.function.arguments.len() == 1 {
-        tool_call.function.arguments[0].clone()
-    } else {
-        format!("[{}]", tool_call.function.arguments.join(", "))
-    };
+    let args_display = tool_call.function.arguments_json();
 
     println!(
         "\n{} Execute tool '{}' with arguments: {}",

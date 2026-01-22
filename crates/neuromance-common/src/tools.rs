@@ -70,6 +70,21 @@ pub struct FunctionCall {
     pub arguments: Vec<String>,
 }
 
+impl FunctionCall {
+    /// Returns the arguments as a single JSON string.
+    ///
+    /// Joins all argument fragments (from streaming deltas) into one string.
+    /// Returns `"{}"` if no arguments are present.
+    #[must_use]
+    pub fn arguments_json(&self) -> String {
+        if self.arguments.is_empty() {
+            "{}".to_string()
+        } else {
+            self.arguments.join("")
+        }
+    }
+}
+
 /// Represents a complete tool call from an LLM, including ID and function details.
 ///
 /// Arguments in `function.arguments` are passed through as-is from API responses.

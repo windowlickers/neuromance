@@ -195,12 +195,12 @@ async fn main() -> Result<()> {
         info!("Tool calls made:");
         for tool_call in &response.message.tool_calls {
             info!("Tool: {}", tool_call.function.name);
-            info!("Arguments: {}", tool_call.function.arguments.join(", "));
+            info!("Arguments: {}", tool_call.function.arguments_json());
 
             // executing the tool
             let tool_result = tool_execution(
                 &tool_call.function.name,
-                &tool_call.function.arguments.join(""),
+                &tool_call.function.arguments_json(),
             )?;
             info!("Result: {tool_result}");
 

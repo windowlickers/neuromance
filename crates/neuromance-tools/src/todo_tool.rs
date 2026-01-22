@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fmt::Write;
 use std::sync::{Arc, RwLock};
 
@@ -8,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::ToolImplementation;
-use neuromance_common::tools::{Function, Property, Tool};
+use neuromance_common::tools::{Function, Tool};
 
 /// Status of a todo item
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -117,15 +116,6 @@ impl Default for TodoWriteTool {
 #[async_trait]
 impl ToolImplementation for TodoWriteTool {
     fn get_definition(&self) -> Tool {
-        let mut properties = HashMap::new();
-        properties.insert(
-            "todos".to_string(),
-            Property {
-                prop_type: "array".to_string(),
-                description: "Array of todo items with content, status (pending/in_progress/completed), and active_form (present continuous form of the task)".to_string(),
-            },
-        );
-
         Tool {
             r#type: "function".to_string(),
             function: Function {
@@ -133,8 +123,32 @@ impl ToolImplementation for TodoWriteTool {
                 description: "Update the todo list to track task progress. Each todo should have 'content' (imperative form like 'Fix bug'), 'status' (pending/in_progress/completed), and 'active_form' (present continuous like 'Fixing bug'). Exactly one task must be in_progress.".to_string(),
                 parameters: serde_json::json!({
                     "type": "object",
-                    "properties": properties,
-                    "required": vec!["todos".to_string()],
+                    "properties": {
+                        "todos": {
+                            "type": "array",
+                            "description": "Array of todo items",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "content": {
+                                        "type": "string",
+                                        "description": "The task description in imperative form (e.g., 'Fix bug')"
+                                    },
+                                    "status": {
+                                        "type": "string",
+                                        "enum": ["pending", "in_progress", "completed"],
+                                        "description": "Current status of the task"
+                                    },
+                                    "active_form": {
+                                        "type": "string",
+                                        "description": "Present continuous form of the task (e.g., 'Fixing bug')"
+                                    }
+                                },
+                                "required": ["content", "status", "active_form"]
+                            }
+                        }
+                    },
+                    "required": ["todos"]
                 }),
             },
         }

@@ -1354,6 +1354,7 @@ dependencies = [
  "anyhow",
  "clap",
  "colored",
+ "env_logger",
  "futures",
  "neuromance",
  "neuromance-tools",

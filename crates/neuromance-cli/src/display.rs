@@ -16,8 +16,8 @@ pub fn display_tool_call_request(tool_call: &ToolCall) {
     );
 
     // Parse and display arguments
-    if let Some(args_str) = tool_call.function.arguments.first()
-        && let Ok(args) = serde_json::from_str::<serde_json::Value>(args_str)
+    let args_str = tool_call.function.arguments_json();
+    if let Ok(args) = serde_json::from_str::<serde_json::Value>(&args_str)
         && let Some(obj) = args.as_object()
     {
         for (key, value) in obj {
