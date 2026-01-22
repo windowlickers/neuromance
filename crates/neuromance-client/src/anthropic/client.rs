@@ -142,7 +142,7 @@ impl AnthropicClient {
                 config.retry_config.initial_delay,
                 config.retry_config.max_delay,
             )
-            .build_with_max_retries(u32::try_from(config.retry_config.max_retries).unwrap_or(3));
+            .build_with_max_retries(config.retry_config.max_retries);
 
         // Create reqwest client with timeout configuration
         let reqwest_client = match config.timeout_seconds {

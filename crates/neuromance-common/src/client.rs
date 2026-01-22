@@ -187,7 +187,7 @@ impl FromStr for FinishReason {
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
     /// Maximum number of retry attempts before failing.
-    pub max_retries: usize,
+    pub max_retries: u32,
     /// Initial delay before the first retry attempt.
     pub initial_delay: Duration,
     /// Maximum delay between retry attempts (caps exponential growth).
