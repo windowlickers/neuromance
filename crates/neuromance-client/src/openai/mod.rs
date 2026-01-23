@@ -31,7 +31,10 @@ const fn reasoning_level_to_effort(level: ReasoningLevel) -> Option<ReasoningEff
 }
 
 pub mod client;
+pub mod embedding;
+
 pub use client::{OpenAIClient, convert_chunk_to_chat_chunk};
+pub use embedding::OpenAIEmbedding;
 
 /// A single choice from a chat completion response.
 ///

@@ -5,6 +5,10 @@
 //! Provides a unified `LLMClient` trait for various LLM providers. Currently supports
 //! OpenAI-compatible APIs with tool/function calling and streaming.
 
+// ClientError contains EventSourceError (~176 bytes), but this is acceptable
+// for network-bound code where HTTP latency dwarfs any stack size concerns.
+#![allow(clippy::result_large_err)]
+
 use std::pin::Pin;
 
 use anyhow::Result;
@@ -15,12 +19,16 @@ use neuromance_common::client::ChatChunk;
 use neuromance_common::{ChatRequest, ChatResponse, Config};
 
 pub mod anthropic;
+pub mod embedding;
 mod error;
 pub mod openai;
 
 pub use anthropic::AnthropicClient;
+pub use embedding::{
+    EmbeddingClient, EmbeddingConfig, EmbeddingInput, EmbeddingRequest, EmbeddingResponse,
+};
 pub use error::ClientError;
-pub use openai::OpenAIClient;
+pub use openai::{OpenAIClient, OpenAIEmbedding};
 
 /// A retry policy for SSE streams that never retries.
 ///

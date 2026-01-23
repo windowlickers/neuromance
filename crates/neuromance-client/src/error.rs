@@ -154,6 +154,18 @@ pub enum ClientError {
     /// `frequency_penalty` must be between -2.0 and 2.0.
     #[error("FrequencyPenalty must be between -2.0 & 2.0")]
     InvalidFrequencyPenalty,
+
+    /// Embedding operation error.
+    ///
+    /// An error occurred during embedding generation.
+    #[error("Embedding error: {0}")]
+    EmbeddingError(String),
+
+    /// Embeddings not supported by this provider.
+    ///
+    /// The provider or model doesn't support embedding generation.
+    #[error("Embeddings not supported")]
+    EmbeddingsNotSupported,
 }
 
 impl ClientError {
