@@ -25,6 +25,7 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 secrecy = { workspace = true }
 smallvec = { workspace = true }
+url.workspace = true
 
 [dev-dependencies]
 proptest = "1.4"

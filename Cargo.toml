@@ -59,6 +59,7 @@ rmcp = { version = "0.14.0", features = [
     "transport-child-process",
     "transport-streamable-http-client-reqwest",
 ]}
+url = "2.5"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

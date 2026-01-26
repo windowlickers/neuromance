@@ -122,14 +122,14 @@ use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
 use neuromance_common::chat::Message;
-use neuromance_common::client::{ChatChunk, ChatRequest, ChatResponse, Config, Usage};
+use neuromance_common::client::{ChatChunk, ChatRequest, ChatResponse, Config, ProxyConfig, Usage};
 use neuromance_common::tools::{FunctionCall, ToolCall};
 
 use crate::error::{ClientError, ErrorResponse};
 use crate::openai::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, OpenAIMessage,
 };
-use crate::{LLMClient, NoRetryPolicy};
+use crate::{LLMClient, NoRetryPolicy, add_proxy_headers};
 
 /// Type-state marker types for compile-time validation.
 ///
@@ -298,6 +298,12 @@ impl Default for OpenAIMessageBuilder<builder_states::NoRole> {
 /// The API key is stored using the `secrecy` crate to prevent accidental
 /// exposure through debug logs or memory dumps. `SecretString` automatically
 /// zeroes memory when dropped via zeroize.
+///
+/// # Proxy Support
+///
+/// When a [`ProxyConfig`] is provided in the [`Config`], requests are routed
+/// through a tokenizer proxy. The proxy intercepts requests and injects real
+/// credentials, allowing agents to use sealed tokens instead of raw API keys.
 #[derive(Clone)]
 pub struct OpenAIClient {
     client: ClientWithMiddleware,
@@ -305,6 +311,9 @@ pub struct OpenAIClient {
     api_key: Arc<SecretString>,
     base_url: String,
     config: Arc<Config>,
+    proxy_config: Option<ProxyConfig>,
+    /// Target host for proxy routing (derived from `base_url`)
+    target_host: String,
 }
 
 // Custom Debug implementation to avoid exposing API key
@@ -314,6 +323,8 @@ impl std::fmt::Debug for OpenAIClient {
             .field("api_key", &"[REDACTED]")
             .field("base_url", &self.base_url)
             .field("config", &self.config)
+            .field("proxy_config", &self.proxy_config)
+            .field("target_host", &self.target_host)
             .finish_non_exhaustive()
     }
 }
@@ -411,6 +422,27 @@ impl OpenAIClient {
     /// # Ok::<(), anyhow::Error>(())
     /// ```
     ///
+    /// # Proxy Configuration
+    ///
+    /// When a [`ProxyConfig`] is provided, requests are routed through the proxy.
+    /// The `api_key` should contain a sealed token instead of the real API key.
+    ///
+    /// ```no_run
+    /// use neuromance_client::OpenAIClient;
+    /// use neuromance_common::client::{Config, ProxyConfig};
+    ///
+    /// let config = Config::new("openai", "gpt-4")
+    ///     .with_api_key("sealed.abc123xyz...")  // Sealed token
+    ///     .with_proxy(ProxyConfig {
+    ///         proxy_url: "http://tokenizer.internal:8080".to_string(),
+    ///         token_header: "X-Tokenizer-Token".to_string(),
+    ///         target_host_header: Some("X-Target-Host".to_string()),
+    ///     });
+    ///
+    /// let client = OpenAIClient::new(config)?;
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns an error if the API key is missing or HTTP client creation fails.
@@ -419,10 +451,28 @@ impl OpenAIClient {
             .api_key
             .clone()
             .ok_or_else(|| ClientError::ConfigurationError("API key is required".to_string()))?;
-        let base_url = config
+
+        // Determine the original target URL (before any proxy override)
+        let original_url = config
             .base_url
             .clone()
             .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+
+        // Extract the host from the original URL for proxy routing
+        let target_host = url::Url::parse(&original_url)
+            .ok()
+            .and_then(|u| u.host_str().map(String::from))
+            .ok_or_else(|| {
+                ClientError::ConfigurationError(format!(
+                    "cannot extract host from base URL: {original_url}"
+                ))
+            })?;
+
+        // If proxy configured, use proxy URL; otherwise use the original URL
+        let (base_url, proxy_config) =
+            config.proxy.as_ref().map_or((original_url, None), |proxy| {
+                (proxy.proxy_url.clone(), Some(proxy.clone()))
+            });
 
         // Build retry policy from config
         let retry_policy = ExponentialBackoff::builder()
@@ -455,6 +505,8 @@ impl OpenAIClient {
             api_key: Arc::new(api_key),
             base_url,
             config: Arc::new(config),
+            proxy_config,
+            target_host,
         })
     }
 
@@ -496,14 +548,24 @@ impl OpenAIClient {
         reqwest::Url::parse(&url)
             .map_err(|e| ClientError::ConfigurationError(format!("Invalid URL '{url}': {e}")))?;
 
-        let response = self
+        let mut request_builder = self
             .client
             .post(&url)
             .header(
                 "Authorization",
                 format!("Bearer {}", self.api_key.expose_secret()),
             )
-            .header("Content-Type", "application/json")
+            .header("Content-Type", "application/json");
+
+        // Add proxy headers if configured
+        request_builder = add_proxy_headers(
+            request_builder,
+            self.proxy_config.as_ref(),
+            &self.api_key,
+            &self.target_host,
+        );
+
+        let response = request_builder
             .body(serde_json::to_string(body).map_err(ClientError::SerializationError)?)
             .send()
             .await?;
@@ -716,15 +778,24 @@ impl LLMClient for OpenAIClient {
 
         // Build the request with SSE headers
         // Use the reusable streaming_client (without retry middleware to avoid interfering with SSE)
-        let request_builder = self
+        let mut request_builder = self
             .streaming_client
             .post(&url)
             .header(
                 "Authorization",
                 format!("Bearer {}", self.api_key.expose_secret()),
             )
-            .header("Content-Type", "application/json")
-            .json(&openai_request);
+            .header("Content-Type", "application/json");
+
+        // Add proxy headers if configured
+        request_builder = add_proxy_headers(
+            request_builder,
+            self.proxy_config.as_ref(),
+            &self.api_key,
+            &self.target_host,
+        );
+
+        let request_builder = request_builder.json(&openai_request);
 
         // Create the EventSource
         // We handle retries at a higher level in Core
@@ -1160,6 +1231,154 @@ mod tests {
 
         let output_details = usage.output_tokens_details.unwrap();
         assert_eq!(output_details.reasoning_tokens, 3);
+    }
+
+    // ==================== Proxy Header Tests ====================
+
+    fn create_successful_response() -> serde_json::Value {
+        serde_json::json!({
+            "id": "chatcmpl-proxy",
+            "object": "chat.completion",
+            "created": 1_677_652_288,
+            "model": "gpt-4",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Response via proxy"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn test_proxy_headers_sent() {
+        let mock_server = MockServer::start().await;
+
+        // Verify proxy headers are sent with correct values
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header("X-Tokenizer-Token", "sealed.test-token"))
+            .and(header("X-Target-Host", "api.openai.com"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(create_successful_response()))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = Config::new("openai", "gpt-4")
+            .with_api_key("sealed.test-token")
+            .with_proxy(ProxyConfig {
+                proxy_url: mock_server.uri(),
+                token_header: "X-Tokenizer-Token".to_string(),
+                target_host_header: Some("X-Target-Host".to_string()),
+            });
+
+        let client = OpenAIClient::new(config).unwrap();
+
+        let message = create_test_message();
+        let request = ChatRequest::new(vec![message]);
+
+        let response = client.chat(&request).await.unwrap();
+        assert_eq!(response.message.content, "Response via proxy");
+    }
+
+    #[tokio::test]
+    async fn test_proxy_with_custom_headers() {
+        let mock_server = MockServer::start().await;
+
+        // Use custom header names
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header("X-Custom-Token", "sealed.custom-token"))
+            .and(header("X-Custom-Target", "api.openai.com"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(create_successful_response()))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = Config::new("openai", "gpt-4")
+            .with_api_key("sealed.custom-token")
+            .with_proxy(ProxyConfig {
+                proxy_url: mock_server.uri(),
+                token_header: "X-Custom-Token".to_string(),
+                target_host_header: Some("X-Custom-Target".to_string()),
+            });
+
+        let client = OpenAIClient::new(config).unwrap();
+
+        let message = create_test_message();
+        let request = ChatRequest::new(vec![message]);
+
+        let response = client.chat(&request).await.unwrap();
+        assert_eq!(response.message.content, "Response via proxy");
+    }
+
+    #[tokio::test]
+    async fn test_proxy_without_target_host_header() {
+        let mock_server = MockServer::start().await;
+
+        // Target host header is optional - verify request works without it
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header("X-Tokenizer-Token", "sealed.no-target"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(create_successful_response()))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = Config::new("openai", "gpt-4")
+            .with_api_key("sealed.no-target")
+            .with_proxy(ProxyConfig {
+                proxy_url: mock_server.uri(),
+                token_header: "X-Tokenizer-Token".to_string(),
+                target_host_header: None, // No target host header
+            });
+
+        let client = OpenAIClient::new(config).unwrap();
+
+        let message = create_test_message();
+        let request = ChatRequest::new(vec![message]);
+
+        let response = client.chat(&request).await.unwrap();
+        assert_eq!(response.message.content, "Response via proxy");
+    }
+
+    #[tokio::test]
+    async fn test_proxy_extracts_target_host_from_custom_base_url() {
+        let mock_server = MockServer::start().await;
+
+        // When using a custom base URL, the target host should be extracted from it
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header("X-Tokenizer-Token", "sealed.custom-base"))
+            .and(header("X-Target-Host", "custom.api.example.com"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(create_successful_response()))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = Config::new("openai", "gpt-4")
+            .with_api_key("sealed.custom-base")
+            .with_base_url("https://custom.api.example.com/v1")
+            .with_proxy(ProxyConfig {
+                proxy_url: mock_server.uri(),
+                token_header: "X-Tokenizer-Token".to_string(),
+                target_host_header: Some("X-Target-Host".to_string()),
+            });
+
+        let client = OpenAIClient::new(config).unwrap();
+
+        let message = create_test_message();
+        let request = ChatRequest::new(vec![message]);
+
+        let response = client.chat(&request).await.unwrap();
+        assert_eq!(response.message.content, "Response via proxy");
     }
 }
 

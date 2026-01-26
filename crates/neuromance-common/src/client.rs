@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use log::warn;
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 
@@ -208,6 +209,189 @@ impl Default for RetryConfig {
             jitter: true,
         }
     }
+}
+
+/// Configuration for routing requests through a tokenizer proxy.
+///
+/// A tokenizer proxy intercepts requests and injects real credentials,
+/// allowing agents to use sealed tokens instead of raw API keys.
+/// This provides an additional security layer where real credentials
+/// never leave the proxy.
+///
+/// # Examples
+///
+/// Using the validated constructor:
+///
+/// ```
+/// use neuromance_common::ProxyConfig;
+///
+/// let proxy = ProxyConfig::new("http://tokenizer.internal:8080")
+///     .expect("Invalid proxy URL");
+/// ```
+///
+/// Or with all options:
+///
+/// ```
+/// use neuromance_common::ProxyConfig;
+///
+/// let proxy = ProxyConfig::with_options(
+///     "http://tokenizer.internal:8080",
+///     "X-Tokenizer-Token",
+///     Some("X-Target-Host"),
+/// ).expect("Invalid proxy URL");
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyConfig {
+    /// URL of the tokenizer proxy (e.g., `"http://localhost:5000"`).
+    pub proxy_url: String,
+
+    /// Header name for the sealed token.
+    ///
+    /// Defaults to `"X-Tokenizer-Token"` when deserialized.
+    #[serde(default = "default_token_header")]
+    pub token_header: String,
+
+    /// Optional header name for forwarding the original target host.
+    ///
+    /// When set, the proxy can use this to route requests to the correct
+    /// backend API (e.g., `"X-Target-Host"` with value `"api.anthropic.com"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_host_header: Option<String>,
+}
+
+impl ProxyConfig {
+    /// Creates a new proxy configuration with the given URL.
+    ///
+    /// Uses the default token header (`X-Tokenizer-Token`) and no target host header.
+    ///
+    /// # Arguments
+    ///
+    /// * `proxy_url` - URL of the tokenizer proxy
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the proxy URL is invalid.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use neuromance_common::ProxyConfig;
+    ///
+    /// let proxy = ProxyConfig::new("http://localhost:8080").unwrap();
+    /// assert_eq!(proxy.token_header, "X-Tokenizer-Token");
+    /// ```
+    pub fn new(proxy_url: impl Into<String>) -> anyhow::Result<Self> {
+        let proxy_url = proxy_url.into();
+        Self::validate_url(&proxy_url)?;
+        Ok(Self {
+            proxy_url,
+            token_header: default_token_header(),
+            target_host_header: None,
+        })
+    }
+
+    /// Creates a new proxy configuration with all options.
+    ///
+    /// # Arguments
+    ///
+    /// * `proxy_url` - URL of the tokenizer proxy
+    /// * `token_header` - Header name for the sealed token
+    /// * `target_host_header` - Optional header name for the target host
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the proxy URL is invalid.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use neuromance_common::ProxyConfig;
+    ///
+    /// let proxy = ProxyConfig::with_options(
+    ///     "http://tokenizer.internal:8080",
+    ///     "X-My-Token",
+    ///     Some("X-Target-Host"),
+    /// ).unwrap();
+    /// ```
+    pub fn with_options(
+        proxy_url: impl Into<String>,
+        token_header: impl Into<String>,
+        target_host_header: Option<impl Into<String>>,
+    ) -> anyhow::Result<Self> {
+        let proxy_url = proxy_url.into();
+        Self::validate_url(&proxy_url)?;
+        Ok(Self {
+            proxy_url,
+            token_header: token_header.into(),
+            target_host_header: target_host_header.map(Into::into),
+        })
+    }
+
+    /// Validates this proxy configuration.
+    ///
+    /// Checks that the `proxy_url` is a valid URL with a scheme (http/https)
+    /// and a host.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the proxy URL is invalid.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use neuromance_common::ProxyConfig;
+    ///
+    /// // Valid configuration
+    /// let valid = ProxyConfig {
+    ///     proxy_url: "http://localhost:8080".to_string(),
+    ///     token_header: "X-Token".to_string(),
+    ///     target_host_header: None,
+    /// };
+    /// assert!(valid.validate().is_ok());
+    ///
+    /// // Invalid configuration
+    /// let invalid = ProxyConfig {
+    ///     proxy_url: "not-a-valid-url".to_string(),
+    ///     token_header: "X-Token".to_string(),
+    ///     target_host_header: None,
+    /// };
+    /// assert!(invalid.validate().is_err());
+    /// ```
+    pub fn validate(&self) -> anyhow::Result<()> {
+        Self::validate_url(&self.proxy_url)
+    }
+
+    /// Validates that a URL string is a valid proxy URL.
+    fn validate_url(url: &str) -> anyhow::Result<()> {
+        let parsed: url::Url = url
+            .parse()
+            .map_err(|e: url::ParseError| anyhow::anyhow!("Invalid proxy URL '{url}': {e}"))?;
+
+        // Ensure the URL has a valid scheme
+        let scheme = parsed.scheme();
+        if scheme != "http" && scheme != "https" {
+            anyhow::bail!("Proxy URL must use http or https scheme, got '{scheme}' in '{url}'");
+        }
+
+        // Warn about non-HTTPS proxy URLs (sealed tokens will be transmitted in plain text)
+        if scheme == "http" {
+            warn!(
+                "Proxy URL '{url}' uses plain HTTP. Sealed tokens will be transmitted unencrypted. \
+                 Consider using HTTPS in production."
+            );
+        }
+
+        // Ensure the URL has a host
+        if parsed.host_str().is_none() {
+            anyhow::bail!("Proxy URL must have a host: '{url}'");
+        }
+
+        Ok(())
+    }
+}
+
+fn default_token_header() -> String {
+    "X-Tokenizer-Token".to_string()
 }
 
 /// Token usage statistics for a completion request.
@@ -867,6 +1051,8 @@ pub struct Config {
     /// API key for authentication (stored securely).
     ///
     /// Will not be serialized to prevent accidental exposure.
+    /// When using a tokenizer proxy, this should contain the sealed token
+    /// instead of the real API key.
     #[serde(skip_serializing, default)]
     pub api_key: Option<SecretString>,
     /// Optional organization identifier.
@@ -890,6 +1076,17 @@ pub struct Config {
     pub stop_sequences: Option<Vec<String>>,
     /// Additional metadata to attach to all requests.
     pub metadata: HashMap<String, serde_json::Value>,
+    /// Tokenizer proxy configuration (optional).
+    ///
+    /// When configured, requests are routed through the proxy which
+    /// injects real credentials. The `api_key` field should contain
+    /// a sealed token instead of the real API key.
+    ///
+    /// Note: This field is serialized (unlike `api_key`) because it contains
+    /// only URLs and header names, not secrets. The actual sealed token
+    /// is stored in `api_key`.
+    #[serde(default)]
+    pub proxy: Option<ProxyConfig>,
 }
 
 impl Default for Config {
@@ -909,6 +1106,7 @@ impl Default for Config {
             presence_penalty: None,
             stop_sequences: None,
             metadata: HashMap::new(),
+            proxy: None,
         }
     }
 }
@@ -1074,6 +1272,50 @@ impl Config {
         self.retry_config = retry_config;
         self
     }
+
+    /// Sets the tokenizer proxy configuration.
+    ///
+    /// When configured, requests are routed through the proxy which
+    /// injects real credentials. The `api_key` field should contain
+    /// a sealed token instead of the real API key.
+    ///
+    /// # Arguments
+    ///
+    /// * `proxy` - The proxy configuration
+    ///
+    /// # Examples
+    ///
+    /// Using the validated constructor (recommended):
+    ///
+    /// ```
+    /// use neuromance_common::{Config, ProxyConfig};
+    ///
+    /// let proxy = ProxyConfig::new("http://tokenizer.internal:8080").unwrap();
+    /// let config = Config::new("anthropic", "claude-sonnet-4-20250514")
+    ///     .with_api_key("sealed.abc123xyz...")
+    ///     .with_proxy(proxy);
+    /// ```
+    ///
+    /// Or with struct literal (validation via `Config::validate()`):
+    ///
+    /// ```
+    /// use neuromance_common::{Config, ProxyConfig};
+    ///
+    /// let config = Config::new("anthropic", "claude-sonnet-4-20250514")
+    ///     .with_api_key("sealed.abc123xyz...")
+    ///     .with_proxy(ProxyConfig {
+    ///         proxy_url: "http://tokenizer.internal:8080".to_string(),
+    ///         token_header: "X-Tokenizer-Token".to_string(),
+    ///         target_host_header: Some("X-Target-Host".to_string()),
+    ///     });
+    /// // Validation will fail later if proxy_url is invalid
+    /// config.validate().unwrap();
+    /// ```
+    #[must_use]
+    pub fn with_proxy(mut self, proxy: ProxyConfig) -> Self {
+        self.proxy = Some(proxy);
+        self
+    }
 }
 
 impl From<(Config, Vec<Message>)> for ChatRequest {
@@ -1137,7 +1379,8 @@ impl Config {
 
     /// Validates the configuration parameters.
     ///
-    /// Checks that all numeric parameters are within their valid ranges.
+    /// Checks that all numeric parameters are within their valid ranges
+    /// and that the proxy configuration (if present) is valid.
     ///
     /// # Errors
     ///
@@ -1146,6 +1389,7 @@ impl Config {
     /// - `top_p` must be between 0.0 and 1.0
     /// - `frequency_penalty` must be between -2.0 and 2.0
     /// - `presence_penalty` must be between -2.0 and 2.0
+    /// - `proxy.proxy_url` must be a valid http/https URL
     pub fn validate(&self) -> anyhow::Result<()> {
         if let Some(temp) = self.temperature
             && !(0.0..=2.0).contains(&temp)
@@ -1169,6 +1413,10 @@ impl Config {
             && !(-2.0..=2.0).contains(&pres_penalty)
         {
             anyhow::bail!("presence_penalty must be between -2.0 and 2.0, got {pres_penalty}");
+        }
+
+        if let Some(ref proxy) = self.proxy {
+            proxy.validate()?;
         }
 
         Ok(())

@@ -125,6 +125,7 @@ use neuromance_common::tools::{FunctionCall, Tool, ToolCall};
 mod bool_tool;
 pub mod generic;
 pub mod mcp;
+pub mod proxy;
 mod think_tool;
 mod todo_tool;
 pub use bool_tool::BooleanTool;

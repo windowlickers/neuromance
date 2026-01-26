@@ -36,6 +36,7 @@ typed-builder.workspace = true
 log.workspace = true
 secrecy.workspace = true
 smallvec.workspace = true
+url.workspace = true
 
 neuromance-common = { version = "0.0.6", path = "../neuromance-common" }
 
