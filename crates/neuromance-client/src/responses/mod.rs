@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 
+use log::warn;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use typed_builder::TypedBuilder;
@@ -375,6 +376,10 @@ impl From<(&ChatRequest, &Config)> for ResponsesRequest {
                             call_id: call_id.clone(),
                             output: message.content.clone(),
                         });
+                    } else {
+                        warn!(
+                            "Tool message without tool_call_id was skipped; this likely indicates a bug in the calling code"
+                        );
                     }
                 }
                 MessageRole::Assistant if !message.tool_calls.is_empty() => {

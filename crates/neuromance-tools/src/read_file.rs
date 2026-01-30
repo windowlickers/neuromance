@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::ToolImplementation;
-use common::{Function, Property, Tool};
+use common::{Function, Parameters, Property, Tool};
 
 pub struct ReadFileTool {
     root_directory: PathBuf,
@@ -128,26 +128,17 @@ impl ToolImplementation for ReadFileTool {
 
         properties.insert(
             "path".to_string(),
-            Property {
-                prop_type: "string".to_string(),
-                description: "The path to the file to read. Can be absolute (e.g., '/home/user/project/file.txt') or relative to the current working directory (e.g., 'file.txt', 'src/main.rs').".to_string(),
-            },
+            Property::string("The path to the file to read. Can be absolute (e.g., '/home/user/project/file.txt') or relative to the current working directory (e.g., 'file.txt', 'src/main.rs')."),
         );
 
         properties.insert(
             "offset".to_string(),
-            Property {
-                prop_type: "number".to_string(),
-                description: "Optional: For text files, the 0-based line number to start reading from. Requires 'limit' to be set. Use for paginating through large files.".to_string(),
-            },
+            Property::number("Optional: For text files, the 0-based line number to start reading from. Requires 'limit' to be set. Use for paginating through large files."),
         );
 
         properties.insert(
             "limit".to_string(),
-            Property {
-                prop_type: "number".to_string(),
-                description: "Optional: For text files, maximum number of lines to read. Use with 'offset' to paginate through large files. If omitted, reads the entire file (up to 2000 lines).".to_string(),
-            },
+            Property::number("Optional: For text files, maximum number of lines to read. Use with 'offset' to paginate through large files. If omitted, reads the entire file (up to 2000 lines)."),
         );
 
         Tool {
@@ -155,11 +146,7 @@ impl ToolImplementation for ReadFileTool {
             function: Function {
                 name: "read_file".to_string(),
                 description: "Reads and returns the content of a specified file from the local filesystem. Handles text, images (PNG, JPG, GIF, WEBP, SVG, BMP), and PDF files. For text files, it can read specific line ranges.".to_string(),
-                parameters: serde_json::json!({
-                    "type": "object",
-                    "properties": properties,
-                    "required": vec!["path".to_string()],
-                }),
+                parameters: Parameters::new(properties, vec!["path".into()]).into(),
             },
         }
     }

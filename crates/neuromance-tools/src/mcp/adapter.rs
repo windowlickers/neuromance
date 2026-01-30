@@ -1,10 +1,11 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::ToolImplementation;
-use neuromance_common::{Function, Property, Tool};
+use neuromance_common::{Function, ObjectSchema, Parameters, Property, Tool};
 use rmcp::model::Tool as McpTool;
 
 use super::client::McpClientWrapper;
@@ -40,53 +41,79 @@ impl McpToolAdapter {
     }
 }
 
+/// Extract a list of string-keyed `Property` values from a JSON schema object.
+fn extract_properties(schema: &Value) -> HashMap<String, Property> {
+    schema
+        .get("properties")
+        .and_then(|p| p.as_object())
+        .map(|p| {
+            p.iter()
+                .map(|(k, v)| (k.clone(), convert_json_schema_property(v)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Extract the `required` array from a JSON schema object.
+fn extract_required(schema: &Value) -> Vec<String> {
+    schema
+        .get("required")
+        .and_then(|r| r.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Convert a single JSON schema property value into a `Property`.
+fn convert_json_schema_property(value: &Value) -> Property {
+    let prop_type = value
+        .get("type")
+        .and_then(|t| t.as_str())
+        .unwrap_or("string")
+        .to_string();
+
+    let description = value
+        .get("description")
+        .and_then(|d| d.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    match prop_type.as_str() {
+        "number" | "integer" => Property::number(description),
+        "boolean" => Property::boolean(description),
+        "array" => {
+            let items_schema = value.get("items").map_or_else(
+                || ObjectSchema::new(HashMap::new(), vec![]),
+                |items| ObjectSchema::new(extract_properties(items), extract_required(items)),
+            );
+            Property::array(description, items_schema)
+        }
+        "object" => Property::object(
+            description,
+            extract_properties(value),
+            extract_required(value),
+        ),
+        // Preserve the original type string for unknown types
+        _ => Property {
+            prop_type,
+            description,
+            enum_values: None,
+            items: None,
+            properties: None,
+            required: None,
+        },
+    }
+}
+
 #[async_trait]
 impl ToolImplementation for McpToolAdapter {
     fn get_definition(&self) -> Tool {
-        // Convert MCP tool definition to neuromancer Tool
-        let mut properties = std::collections::HashMap::new();
-
-        // Parse the MCP tool's input schema
-        if let Some(props) = self
-            .mcp_tool
-            .input_schema
-            .get("properties")
-            .and_then(|p| p.as_object())
-        {
-            for (key, value) in props {
-                let prop_type = value
-                    .get("type")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("string")
-                    .to_string();
-
-                let description = value
-                    .get("description")
-                    .and_then(|d| d.as_str())
-                    .unwrap_or("")
-                    .to_string();
-
-                properties.insert(
-                    key.clone(),
-                    Property {
-                        prop_type,
-                        description,
-                    },
-                );
-            }
-        }
-
-        let required: Vec<String> = self
-            .mcp_tool
-            .input_schema
-            .get("required")
-            .and_then(|r| r.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let schema = serde_json::Value::Object(self.mcp_tool.input_schema.as_ref().clone());
+        let properties = extract_properties(&schema);
+        let required = extract_required(&schema);
 
         Tool {
             r#type: "function".to_string(),
@@ -101,11 +128,7 @@ impl ToolImplementation for McpToolAdapter {
                     },
                     std::string::ToString::to_string,
                 ),
-                parameters: serde_json::json!({
-                    "type": "object",
-                    "properties": properties,
-                    "required": required,
-                }),
+                parameters: Parameters::new(properties, required).into(),
             },
         }
     }

@@ -68,11 +68,12 @@ pub enum ClientError {
         retry_after: Option<Duration>,
     },
 
-    /// Model-specific error from the API.
+    /// API request rejected by the server.
     ///
-    /// The model encountered an error during generation.
-    #[error("Model error: {0}")]
-    ModelError(String),
+    /// The server returned an error status (e.g., 400, 403) that isn't covered
+    /// by a more specific variant. Not retryable.
+    #[error("Request error: {0}")]
+    RequestError(String),
 
     /// Client configuration issue.
     ///

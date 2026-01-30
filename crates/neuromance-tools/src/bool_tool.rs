@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::ToolImplementation;
-use neuromance_common::tools::{Function, Property, Tool};
+use neuromance_common::tools::{Function, Parameters, Property, Tool};
 
 /// A tool that returns a boolean result based on the agent's analysis
 /// Used for binary decisions like goal verification
@@ -17,17 +17,11 @@ impl ToolImplementation for BooleanTool {
         let mut properties = HashMap::new();
         properties.insert(
             "result".to_string(),
-            Property {
-                prop_type: "boolean".to_string(),
-                description: "The boolean result (true or false)".to_string(),
-            },
+            Property::boolean("The boolean result (true or false)"),
         );
         properties.insert(
             "reason".to_string(),
-            Property {
-                prop_type: "string".to_string(),
-                description: "A brief explanation for the boolean result".to_string(),
-            },
+            Property::string("A brief explanation for the boolean result"),
         );
 
         Tool {
@@ -35,11 +29,7 @@ impl ToolImplementation for BooleanTool {
             function: Function {
                 name: "return_bool".to_string(),
                 description: "Return a boolean result (true/false) with an explanation. Use this to provide definitive yes/no answers.".to_string(),
-                parameters: serde_json::json!({
-                    "type": "object",
-                    "properties": properties,
-                    "required": vec!["result".to_string(), "reason".to_string()],
-                }),
+                parameters: Parameters::new(properties, vec!["result".into(), "reason".into()]).into(),
             },
         }
     }

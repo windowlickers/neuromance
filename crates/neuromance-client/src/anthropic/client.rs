@@ -248,7 +248,7 @@ impl AnthropicClient {
                 401 => ClientError::AuthenticationError(error_message),
                 429 => ClientError::RateLimitError { retry_after: None },
                 529 => ClientError::ServiceUnavailable(error_message), // Anthropic-specific overload
-                _ => ClientError::ModelError(error_message),
+                _ => ClientError::RequestError(error_message),
             });
         }
 

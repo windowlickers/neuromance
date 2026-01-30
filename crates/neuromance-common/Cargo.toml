@@ -19,6 +19,7 @@ workspace = true
 anyhow = { workspace = true }
 typed-builder = { workspace = true }
 chrono = { workspace = true }
+log = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }

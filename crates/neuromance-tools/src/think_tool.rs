@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::ToolImplementation;
-use neuromance_common::tools::{Function, Property, Tool};
+use neuromance_common::tools::{Function, Parameters, Property, Tool};
 
 /// A tool that allows the agent to record thoughts and reasoning
 /// Used for making the agent's thinking process visible in the context
@@ -17,10 +17,7 @@ impl ToolImplementation for ThinkTool {
         let mut properties = HashMap::new();
         properties.insert(
             "thought".to_string(),
-            Property {
-                prop_type: "string".to_string(),
-                description: "The agent's internal thought or reasoning process".to_string(),
-            },
+            Property::string("The agent's internal thought or reasoning process"),
         );
 
         Tool {
@@ -28,11 +25,7 @@ impl ToolImplementation for ThinkTool {
             function: Function {
                 name: "think".to_string(),
                 description: "Record your internal thoughts and reasoning. Use this to make your thinking process visible and preserve it in the conversation context.".to_string(),
-                parameters: serde_json::json!({
-                    "type": "object",
-                    "properties": properties,
-                    "required": vec!["thought".to_string()],
-                }),
+                parameters: Parameters::new(properties, vec!["thought".into()]).into(),
             },
         }
     }

@@ -79,4 +79,6 @@ pub use client::{
     Usage,
 };
 pub use features::{ReasoningLevel, ThinkingMode};
-pub use tools::{Function, FunctionCall, Parameters, Property, Tool, ToolApproval, ToolCall};
+pub use tools::{
+    Function, FunctionCall, ObjectSchema, Parameters, Property, Tool, ToolApproval, ToolCall,
+};

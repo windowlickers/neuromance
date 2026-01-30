@@ -189,7 +189,7 @@ impl ResponsesClient {
             return Err(match status.as_u16() {
                 401 => ClientError::AuthenticationError(error_message),
                 429 => ClientError::RateLimitError { retry_after: None },
-                _ => ClientError::ModelError(error_message),
+                _ => ClientError::RequestError(error_message),
             });
         }
 
@@ -387,7 +387,7 @@ async fn extract_error_from_response(
         401 => ClientError::AuthenticationError(error_message),
         429 => ClientError::RateLimitError { retry_after: None },
         500..=599 => ClientError::ServiceUnavailable(error_message),
-        _ => ClientError::ModelError(error_message),
+        _ => ClientError::RequestError(error_message),
     }
 }
 
@@ -457,7 +457,7 @@ fn convert_stream_event_to_chunk(
                 .error
                 .map_or_else(|| "Unknown error".to_string(), |e| e.message);
             warn!("Response failed: {error_msg}");
-            Some(Err(ClientError::ModelError(error_msg).into()))
+            Some(Err(ClientError::RequestError(error_msg).into()))
         }
 
         StreamEvent::OutputTextDelta { delta, .. } => {
@@ -519,7 +519,10 @@ fn convert_stream_event_to_chunk(
             delta,
             ..
         } => {
-            // Accumulate arguments
+            // Accumulate arguments as a fallback for OutputItemDone.
+            // The primary path (FunctionCallArgumentsDone) uses the complete arguments
+            // from that event directly, so these deltas only matter if the API sends
+            // OutputItemDone without a preceding FunctionCallArgumentsDone.
             if let Ok(mut guard) = streaming_function_calls.lock()
                 && let Some(fc) = guard.get_mut(&output_index)
             {
@@ -612,7 +615,7 @@ fn convert_stream_event_to_chunk(
                 "Stream error from API: {} - {}",
                 error.error_type, error.message
             );
-            Some(Err(ClientError::ModelError(error.message).into()))
+            Some(Err(ClientError::RequestError(error.message).into()))
         }
 
         // Events we don't need to emit chunks for
@@ -628,6 +631,7 @@ fn convert_stream_event_to_chunk(
 mod tests {
     #![allow(clippy::unwrap_used)]
     #![allow(clippy::expect_used)]
+    #![allow(clippy::panic)]
 
     use super::*;
     use neuromance_common::chat::Message;
@@ -1194,10 +1198,7 @@ mod tests {
         let request = ChatRequest::new(vec![message]);
 
         let stream = client.chat_stream(&request).await.unwrap();
-        let chunks: Vec<ChatChunk> = stream
-            .filter_map(|r| async { r.ok() })
-            .collect()
-            .await;
+        let chunks: Vec<ChatChunk> = stream.filter_map(|r| async { r.ok() }).collect().await;
 
         // Should have: ResponseCreated chunk, two text deltas, ResponseCompleted chunk
         assert!(
@@ -1282,5 +1283,147 @@ mod tests {
 
         let usage = response.usage.unwrap();
         assert_eq!(usage.output_tokens_details.unwrap().reasoning_tokens, 30);
+    }
+
+    // ========================================================================
+    // ChatRequest -> ResponsesRequest conversion tests
+    // ========================================================================
+
+    fn make_message(role: MessageRole, content: &str) -> Message {
+        Message {
+            id: uuid::Uuid::new_v4(),
+            conversation_id: uuid::Uuid::new_v4(),
+            role,
+            content: content.to_string(),
+            tool_calls: SmallVec::new(),
+            tool_call_id: None,
+            name: None,
+            timestamp: Utc::now(),
+            metadata: HashMap::new(),
+            reasoning: None,
+        }
+    }
+
+    fn default_config() -> Config {
+        Config::new("responses", "gpt-4o").with_api_key("test-key")
+    }
+
+    #[test]
+    fn test_conversion_tool_message_becomes_function_call_output() {
+        let user_msg = make_message(MessageRole::User, "Hello");
+        let mut tool_msg = make_message(MessageRole::Tool, r#"{"temp": 72}"#);
+        tool_msg.tool_call_id = Some("call_abc".to_string());
+
+        let request = ChatRequest::new(vec![user_msg, tool_msg]);
+        let config = default_config();
+        let responses_req = super::super::ResponsesRequest::from((&request, &config));
+
+        // Should have 2 input items: user message + function call output
+        assert_eq!(responses_req.input.len(), 2);
+
+        match &responses_req.input[1] {
+            super::super::InputItem::FunctionCallOutput { call_id, output } => {
+                assert_eq!(call_id, "call_abc");
+                assert_eq!(output, r#"{"temp": 72}"#);
+            }
+            other => panic!("Expected FunctionCallOutput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_conversion_tool_message_without_call_id_is_skipped() {
+        let user_msg = make_message(MessageRole::User, "Hello");
+        let tool_msg = make_message(MessageRole::Tool, "some output");
+        // tool_call_id is None
+
+        let request = ChatRequest::new(vec![user_msg, tool_msg]);
+        let config = default_config();
+        let responses_req = super::super::ResponsesRequest::from((&request, &config));
+
+        // Only the user message should be present; tool message without call_id is skipped
+        assert_eq!(responses_req.input.len(), 1);
+        assert!(matches!(
+            &responses_req.input[0],
+            super::super::InputItem::Message {
+                role: super::super::ResponsesRole::User,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_conversion_multiple_system_messages_concatenated() {
+        let sys1 = make_message(MessageRole::System, "You are helpful.");
+        let sys2 = make_message(MessageRole::System, "Be concise.");
+        let user_msg = make_message(MessageRole::User, "Hi");
+
+        let request = ChatRequest::new(vec![sys1, sys2, user_msg]);
+        let config = default_config();
+        let responses_req = super::super::ResponsesRequest::from((&request, &config));
+
+        assert_eq!(
+            responses_req.instructions.as_deref(),
+            Some("You are helpful.\n\nBe concise.")
+        );
+
+        // System messages should not appear as input items
+        assert_eq!(responses_req.input.len(), 1);
+    }
+
+    #[test]
+    fn test_conversion_previous_response_id_from_metadata() {
+        let user_msg = make_message(MessageRole::User, "Continue");
+
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "previous_response_id".to_string(),
+            serde_json::json!("resp_prev_123"),
+        );
+
+        let request = ChatRequest::new(vec![user_msg]).with_metadata(metadata);
+        let config = default_config();
+        let responses_req = super::super::ResponsesRequest::from((&request, &config));
+
+        assert_eq!(
+            responses_req.previous_response_id.as_deref(),
+            Some("resp_prev_123")
+        );
+    }
+
+    #[test]
+    fn test_conversion_reasoning_level_to_config() {
+        use neuromance_common::features::ReasoningLevel;
+
+        let user_msg = make_message(MessageRole::User, "Think hard");
+
+        // High reasoning level
+        let request =
+            ChatRequest::new(vec![user_msg.clone()]).with_reasoning_level(ReasoningLevel::High);
+        let config = default_config();
+        let responses_req = super::super::ResponsesRequest::from((&request, &config));
+
+        let reasoning = responses_req.reasoning.unwrap();
+        assert_eq!(reasoning.effort, super::super::ReasoningEffort::High);
+        assert_eq!(reasoning.summary, Some(super::super::ReasoningSummary::Concise));
+
+        // Low reasoning level
+        let request =
+            ChatRequest::new(vec![user_msg.clone()]).with_reasoning_level(ReasoningLevel::Low);
+        let responses_req = super::super::ResponsesRequest::from((&request, &config));
+        let reasoning = responses_req.reasoning.unwrap();
+        assert_eq!(reasoning.effort, super::super::ReasoningEffort::Low);
+
+        // Medium reasoning level
+        let request =
+            ChatRequest::new(vec![user_msg.clone()]).with_reasoning_level(ReasoningLevel::Medium);
+        let responses_req = super::super::ResponsesRequest::from((&request, &config));
+        let reasoning = responses_req.reasoning.unwrap();
+        assert_eq!(reasoning.effort, super::super::ReasoningEffort::Medium);
+
+        // Default reasoning level -> no reasoning config
+        let request =
+            ChatRequest::new(vec![user_msg]).with_reasoning_level(ReasoningLevel::Default);
+        let responses_req = super::super::ResponsesRequest::from((&request, &config));
+        assert!(responses_req.reasoning.is_none());
     }
 }

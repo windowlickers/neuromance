@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use neuromance_client::{LLMClient, OpenAIClient};
 use neuromance_common::{
-    ChatRequest, Config, Function, Message, Property, Tool, ToolChoice, Usage,
+    ChatRequest, Config, Function, Message, Parameters, Property, Tool, ToolChoice, Usage,
 };
 
 #[derive(Parser, Debug)]
@@ -56,11 +56,7 @@ fn create_get_current_time_tool() -> Tool {
     // but we'll include an optional timezone parameter
     properties.insert(
         "timezone".to_string(),
-        Property {
-            prop_type: "string".to_string(),
-            description: "Optional timezone (e.g., 'UTC', 'America/New_York'). Defaults to UTC."
-                .to_string(),
-        },
+        Property::string("Optional timezone (e.g., 'UTC', 'America/New_York'). Defaults to UTC."),
     );
 
     Tool {
@@ -69,11 +65,7 @@ fn create_get_current_time_tool() -> Tool {
             name: "get_current_time".to_string(),
             description: "Get the current date and time. Optionally specify a timezone."
                 .to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": properties,
-                "required": []
-            }),
+            parameters: Parameters::new(properties, vec![]).into(),
         },
     }
 }

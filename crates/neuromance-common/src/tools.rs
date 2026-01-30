@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use log::warn;
 use serde::{Deserialize, Serialize};
 use typed_builder::TypedBuilder;
 use uuid::Uuid;
@@ -17,6 +18,30 @@ pub enum ToolApproval {
     Quit,
 }
 
+/// Represents an object schema used as array items or nested objects.
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ObjectSchema {
+    /// The JSON type, always "object".
+    #[serde(rename = "type")]
+    pub schema_type: String,
+    /// Map of property names to their definitions.
+    pub properties: HashMap<String, Property>,
+    /// List of required property names.
+    pub required: Vec<String>,
+}
+
+impl ObjectSchema {
+    /// Creates a new `ObjectSchema` with the given properties and required fields.
+    #[must_use]
+    pub fn new(properties: HashMap<String, Property>, required: Vec<String>) -> Self {
+        Self {
+            schema_type: "object".to_string(),
+            properties,
+            required,
+        }
+    }
+}
+
 /// Describes a single property in a function parameter schema.
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct Property {
@@ -25,6 +50,102 @@ pub struct Property {
     pub prop_type: String,
     /// Human-readable description of this property.
     pub description: String,
+    /// Allowed enum values for this property.
+    #[serde(rename = "enum", skip_serializing_if = "Option::is_none")]
+    pub enum_values: Option<Vec<String>>,
+    /// Schema for array items.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub items: Option<Box<ObjectSchema>>,
+    /// Nested object properties.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub properties: Option<HashMap<String, Self>>,
+    /// Required fields for nested objects.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required: Option<Vec<String>>,
+}
+
+impl Property {
+    /// Creates a string property.
+    #[must_use]
+    pub fn string(description: impl Into<String>) -> Self {
+        Self {
+            prop_type: "string".to_string(),
+            description: description.into(),
+            enum_values: None,
+            items: None,
+            properties: None,
+            required: None,
+        }
+    }
+
+    /// Creates a number property.
+    #[must_use]
+    pub fn number(description: impl Into<String>) -> Self {
+        Self {
+            prop_type: "number".to_string(),
+            description: description.into(),
+            enum_values: None,
+            items: None,
+            properties: None,
+            required: None,
+        }
+    }
+
+    /// Creates a boolean property.
+    #[must_use]
+    pub fn boolean(description: impl Into<String>) -> Self {
+        Self {
+            prop_type: "boolean".to_string(),
+            description: description.into(),
+            enum_values: None,
+            items: None,
+            properties: None,
+            required: None,
+        }
+    }
+
+    /// Creates a string property with allowed enum values.
+    #[must_use]
+    pub fn string_enum(description: impl Into<String>, values: Vec<&str>) -> Self {
+        Self {
+            prop_type: "string".to_string(),
+            description: description.into(),
+            enum_values: Some(values.into_iter().map(String::from).collect()),
+            items: None,
+            properties: None,
+            required: None,
+        }
+    }
+
+    /// Creates an array property with the given item schema.
+    #[must_use]
+    pub fn array(description: impl Into<String>, items: ObjectSchema) -> Self {
+        Self {
+            prop_type: "array".to_string(),
+            description: description.into(),
+            enum_values: None,
+            items: Some(Box::new(items)),
+            properties: None,
+            required: None,
+        }
+    }
+
+    /// Creates an object property with nested properties.
+    #[must_use]
+    pub fn object(
+        description: impl Into<String>,
+        properties: HashMap<String, Self>,
+        required: Vec<String>,
+    ) -> Self {
+        Self {
+            prop_type: "object".to_string(),
+            description: description.into(),
+            enum_values: None,
+            items: None,
+            properties: Some(properties),
+            required: Some(required),
+        }
+    }
 }
 
 /// Defines the parameter schema for a function using JSON Schema conventions.
@@ -37,6 +158,45 @@ pub struct Parameters {
     pub properties: HashMap<String, Property>,
     /// List of required parameter names.
     pub required: Vec<String>,
+}
+
+impl Parameters {
+    /// Creates a new `Parameters` with type "object".
+    #[must_use]
+    pub fn new(properties: HashMap<String, Property>, required: Vec<String>) -> Self {
+        Self {
+            param_type: "object".to_string(),
+            properties,
+            required,
+        }
+    }
+}
+
+impl Parameters {
+    /// Fallible conversion to `serde_json::Value` for contexts that can propagate errors.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `serde_json::Error` if serialization fails (should not happen in practice,
+    /// since all fields are infallibly serializable).
+    pub fn to_value(&self) -> Result<serde_json::Value, serde_json::Error> {
+        serde_json::to_value(self)
+    }
+}
+
+impl From<Parameters> for serde_json::Value {
+    fn from(params: Parameters) -> Self {
+        // Parameters is composed entirely of String, HashMap<String, Property>,
+        // and Vec<String> — all of which serialize infallibly to JSON. The Err arm
+        // is unreachable in practice but we log rather than silently returning Null.
+        match serde_json::to_value(params) {
+            Ok(value) => value,
+            Err(e) => {
+                warn!("Parameters serialization unexpectedly failed: {e}");
+                Self::Null
+            }
+        }
+    }
 }
 
 /// Describes a function that can be called by an LLM.
@@ -179,25 +339,72 @@ mod tests {
 
     #[test]
     fn test_property_creation() {
-        let prop = Property {
-            prop_type: "string".to_string(),
-            description: "The user's name".to_string(),
-        };
+        let prop = Property::string("The user's name");
 
         assert_eq!(prop.prop_type, "string");
         assert_eq!(prop.description, "The user's name");
+        assert!(prop.enum_values.is_none());
+        assert!(prop.items.is_none());
+        assert!(prop.properties.is_none());
+        assert!(prop.required.is_none());
     }
 
     #[test]
     fn test_property_serialization() {
-        let prop = Property {
-            prop_type: "number".to_string(),
-            description: "Age in years".to_string(),
-        };
+        let prop = Property::number("Age in years");
 
         let json = serde_json::to_value(&prop).expect("Failed to serialize");
         assert_eq!(json["type"], "number");
         assert_eq!(json["description"], "Age in years");
+        // Optional fields should not appear
+        assert!(json.get("enum").is_none());
+        assert!(json.get("items").is_none());
+        assert!(json.get("properties").is_none());
+        assert!(json.get("required").is_none());
+
+        let deserialized: Property = serde_json::from_value(json).expect("Failed to deserialize");
+        assert_eq!(prop, deserialized);
+    }
+
+    #[test]
+    fn test_property_string_enum() {
+        let prop = Property::string_enum("Status", vec!["active", "inactive"]);
+
+        let json = serde_json::to_value(&prop).expect("Failed to serialize");
+        assert_eq!(json["type"], "string");
+        assert_eq!(json["enum"], serde_json::json!(["active", "inactive"]));
+
+        let deserialized: Property = serde_json::from_value(json).expect("Failed to deserialize");
+        assert_eq!(prop, deserialized);
+    }
+
+    #[test]
+    fn test_property_array() {
+        let mut item_props = HashMap::new();
+        item_props.insert("name".into(), Property::string("Item name"));
+        let items = ObjectSchema::new(item_props, vec!["name".into()]);
+
+        let prop = Property::array("List of items", items);
+
+        let json = serde_json::to_value(&prop).expect("Failed to serialize");
+        assert_eq!(json["type"], "array");
+        assert_eq!(json["items"]["type"], "object");
+        assert!(json["items"]["properties"]["name"].is_object());
+
+        let deserialized: Property = serde_json::from_value(json).expect("Failed to deserialize");
+        assert_eq!(prop, deserialized);
+    }
+
+    #[test]
+    fn test_property_object() {
+        let mut nested_props = HashMap::new();
+        nested_props.insert("field".into(), Property::string("A field"));
+        let prop = Property::object("Nested object", nested_props, vec!["field".into()]);
+
+        let json = serde_json::to_value(&prop).expect("Failed to serialize");
+        assert_eq!(json["type"], "object");
+        assert!(json["properties"]["field"].is_object());
+        assert_eq!(json["required"], serde_json::json!(["field"]));
 
         let deserialized: Property = serde_json::from_value(json).expect("Failed to deserialize");
         assert_eq!(prop, deserialized);
@@ -206,19 +413,9 @@ mod tests {
     #[test]
     fn test_parameters_creation() {
         let mut properties = HashMap::new();
-        properties.insert(
-            "location".to_string(),
-            Property {
-                prop_type: "string".to_string(),
-                description: "City name".to_string(),
-            },
-        );
+        properties.insert("location".to_string(), Property::string("City name"));
 
-        let params = Parameters {
-            param_type: "object".to_string(),
-            properties,
-            required: vec!["location".to_string()],
-        };
+        let params = Parameters::new(properties, vec!["location".to_string()]);
 
         assert_eq!(params.param_type, "object");
         assert_eq!(params.properties.len(), 1);
@@ -228,19 +425,9 @@ mod tests {
     #[test]
     fn test_parameters_serialization() {
         let mut properties = HashMap::new();
-        properties.insert(
-            "name".to_string(),
-            Property {
-                prop_type: "string".to_string(),
-                description: "Name".to_string(),
-            },
-        );
+        properties.insert("name".to_string(), Property::string("Name"));
 
-        let params = Parameters {
-            param_type: "object".to_string(),
-            properties,
-            required: vec!["name".to_string()],
-        };
+        let params = Parameters::new(properties, vec!["name".to_string()]);
 
         let json = serde_json::to_value(&params).expect("Failed to serialize");
         assert_eq!(json["type"], "object");
@@ -249,6 +436,17 @@ mod tests {
 
         let deserialized: Parameters = serde_json::from_value(json).expect("Failed to deserialize");
         assert_eq!(params, deserialized);
+    }
+
+    #[test]
+    fn test_parameters_into_value() {
+        let mut properties = HashMap::new();
+        properties.insert("x".to_string(), Property::number("A number"));
+        let params = Parameters::new(properties, vec!["x".to_string()]);
+
+        let value: serde_json::Value = params.into();
+        assert_eq!(value["type"], "object");
+        assert_eq!(value["properties"]["x"]["type"], "number");
     }
 
     #[test]
@@ -622,18 +820,14 @@ mod proptests {
             for i in 0..num_props {
                 properties.insert(
                     format!("prop_{i}"),
-                    Property {
-                        prop_type: format!("type_{}", i % 3),
-                        description: format!("desc_{i}"),
-                    },
+                    Property::string(format!("desc_{i}")),
                 );
             }
 
-            let params = Parameters {
-                param_type: "object".to_string(),
-                properties: properties.clone(),
-                required: (0..num_props).map(|i| format!("prop_{i}")).collect(),
-            };
+            let params = Parameters::new(
+                properties.clone(),
+                (0..num_props).map(|i| format!("prop_{i}")).collect(),
+            );
 
             // Should serialize and deserialize
             let json = serde_json::to_string(&params).unwrap();

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt::Write;
 use std::sync::{Arc, RwLock};
 
@@ -7,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::ToolImplementation;
-use neuromance_common::tools::{Function, Tool};
+use neuromance_common::tools::{Function, ObjectSchema, Parameters, Property, Tool};
 
 /// Status of a todo item
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -57,10 +58,7 @@ impl ToolImplementation for TodoReadTool {
                 name: "read_todos".to_string(),
                 description: "Read the current todo list to see task progress and what's planned."
                     .to_string(),
-                parameters: serde_json::json!({
-                    "type": "object",
-                    "properties": {},
-                }),
+                parameters: Parameters::new(HashMap::new(), vec![]).into(),
             },
         }
     }
@@ -116,40 +114,41 @@ impl Default for TodoWriteTool {
 #[async_trait]
 impl ToolImplementation for TodoWriteTool {
     fn get_definition(&self) -> Tool {
+        let mut todo_props = HashMap::new();
+        todo_props.insert(
+            "content".into(),
+            Property::string("The task description in imperative form (e.g., 'Fix bug')"),
+        );
+        todo_props.insert(
+            "status".into(),
+            Property::string_enum(
+                "Current status of the task",
+                vec!["pending", "in_progress", "completed"],
+            ),
+        );
+        todo_props.insert(
+            "active_form".into(),
+            Property::string("Present continuous form of the task (e.g., 'Fixing bug')"),
+        );
+
+        let mut props = HashMap::new();
+        props.insert(
+            "todos".into(),
+            Property::array(
+                "Array of todo items",
+                ObjectSchema::new(
+                    todo_props,
+                    vec!["content".into(), "status".into(), "active_form".into()],
+                ),
+            ),
+        );
+
         Tool {
             r#type: "function".to_string(),
             function: Function {
                 name: "write_todos".to_string(),
                 description: "Update the todo list to track task progress. Each todo should have 'content' (imperative form like 'Fix bug'), 'status' (pending/in_progress/completed), and 'active_form' (present continuous like 'Fixing bug'). Exactly one task must be in_progress.".to_string(),
-                parameters: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "todos": {
-                            "type": "array",
-                            "description": "Array of todo items",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "content": {
-                                        "type": "string",
-                                        "description": "The task description in imperative form (e.g., 'Fix bug')"
-                                    },
-                                    "status": {
-                                        "type": "string",
-                                        "enum": ["pending", "in_progress", "completed"],
-                                        "description": "Current status of the task"
-                                    },
-                                    "active_form": {
-                                        "type": "string",
-                                        "description": "Present continuous form of the task (e.g., 'Fixing bug')"
-                                    }
-                                },
-                                "required": ["content", "status", "active_form"]
-                            }
-                        }
-                    },
-                    "required": ["todos"]
-                }),
+                parameters: Parameters::new(props, vec!["todos".into()]).into(),
             },
         }
     }

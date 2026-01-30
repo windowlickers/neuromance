@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use crate::ToolImplementation;
-use neuromance_common::{Function, Property, Tool};
+use neuromance_common::{Function, Parameters, Property, Tool};
 
 pub struct CurrentTimeTool;
 #[async_trait]
@@ -18,11 +18,7 @@ impl ToolImplementation for CurrentTimeTool {
                 name: "get_current_time".to_string(),
                 description: "Get the current date and time in UTC format. Takes no parameters."
                     .to_string(),
-                parameters: serde_json::json!({
-                    "type": "object",
-                    "properties": {},
-                    "required": [],
-                }),
+                parameters: Parameters::new(HashMap::new(), vec![]).into(),
             },
         }
     }
@@ -47,11 +43,7 @@ impl ToolImplementation for CalculatorTool {
         let mut properties = HashMap::new();
         properties.insert(
             "expression".to_string(),
-            Property {
-                prop_type: "string".to_string(),
-                description: "Mathematical expression to evaluate (e.g., '2 + 2', '10 * 5')"
-                    .to_string(),
-            },
+            Property::string("Mathematical expression to evaluate (e.g., '2 + 2', '10 * 5')"),
         );
 
         Tool {
@@ -59,11 +51,7 @@ impl ToolImplementation for CalculatorTool {
             function: Function {
                 name: "calculate".to_string(),
                 description: "Evaluate a mathematical expression and return the result".to_string(),
-                parameters: serde_json::json!({
-                    "type": "object",
-                    "properties": properties,
-                    "required": vec!["expression".to_string()],
-                }),
+                parameters: Parameters::new(properties, vec!["expression".into()]).into(),
             },
         }
     }

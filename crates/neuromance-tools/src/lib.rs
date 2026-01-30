@@ -327,10 +327,7 @@ mod tests {
 
     #[test]
     fn test_parse_arguments_multiple_fragments_joined() {
-        let f = fc(vec![
-            r#"{"key":"#.to_string(),
-            r#""value"}"#.to_string(),
-        ]);
+        let f = fc(vec![r#"{"key":"#.to_string(), r#""value"}"#.to_string()]);
         let result = ToolExecutor::parse_arguments(&f).unwrap();
         assert_eq!(result, json!({"key": "value"}));
     }

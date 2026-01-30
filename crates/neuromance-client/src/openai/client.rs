@@ -538,7 +538,7 @@ impl OpenAIClient {
             return Err(match status.as_u16() {
                 401 => ClientError::AuthenticationError(error_message),
                 429 => ClientError::RateLimitError { retry_after: None },
-                _ => ClientError::ModelError(error_message),
+                _ => ClientError::RequestError(error_message),
             });
         }
 

@@ -233,28 +233,18 @@ mod tests {
     }
 
     fn create_test_tool() -> Tool {
-        use neuromance_common::tools::{Function, Property};
+        use neuromance_common::tools::{Function, Parameters, Property};
         use std::collections::HashMap;
 
         let mut properties = HashMap::new();
-        properties.insert(
-            "arg".to_string(),
-            Property {
-                prop_type: "string".to_string(),
-                description: "A test argument".to_string(),
-            },
-        );
+        properties.insert("arg".to_string(), Property::string("A test argument"));
 
         Tool {
             r#type: "function".to_string(),
             function: Function {
                 name: "test_function".to_string(),
                 description: "A test function".to_string(),
-                parameters: serde_json::json!({
-                    "type": "object",
-                    "properties": properties,
-                    "required": ["arg"]
-                }),
+                parameters: Parameters::new(properties, vec!["arg".into()]).into(),
             },
         }
     }
