@@ -1,11 +1,9 @@
 use anyhow::Result;
 use rmcp::{
     RoleClient, ServiceExt,
-    model::{CallToolRequestParam, CallToolResult, Tool as McpTool},
+    model::{CallToolRequestParams, CallToolResult, Tool as McpTool},
     service::{RunningService, ServerSink},
-    transport::{
-        ConfigureCommandExt, SseClientTransport, StreamableHttpClientTransport, TokioChildProcess,
-    },
+    transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess},
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -43,11 +41,7 @@ impl McpClientWrapper {
                 let transport = TokioChildProcess::new(cmd)?;
                 ().serve(transport).await?
             }
-            McpTransportConfig::Sse { url } => {
-                let transport = SseClientTransport::start(url.clone()).await?;
-                ().serve(transport).await?
-            }
-            McpTransportConfig::Http { url } => {
+            McpTransportConfig::Sse { url } | McpTransportConfig::Http { url } => {
                 let transport = StreamableHttpClientTransport::from_uri(url.clone());
                 ().serve(transport).await?
             }
@@ -106,9 +100,11 @@ impl McpClientWrapper {
             _ => None,
         };
 
-        let request = CallToolRequestParam {
+        let request = CallToolRequestParams {
+            meta: None,
             name: name.to_owned().into(),
             arguments,
+            task: None,
         };
 
         let result = self.service.peer().call_tool(request).await?;

@@ -1404,7 +1404,10 @@ mod tests {
 
         let reasoning = responses_req.reasoning.unwrap();
         assert_eq!(reasoning.effort, super::super::ReasoningEffort::High);
-        assert_eq!(reasoning.summary, Some(super::super::ReasoningSummary::Concise));
+        assert_eq!(
+            reasoning.summary,
+            Some(super::super::ReasoningSummary::Concise)
+        );
 
         // Low reasoning level
         let request =
