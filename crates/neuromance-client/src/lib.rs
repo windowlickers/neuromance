@@ -10,10 +10,15 @@
 #![allow(clippy::result_large_err)]
 
 use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::Stream;
+use reqwest_middleware::ClientWithMiddleware;
+use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
+use reqwest_retry_after::RetryAfterMiddleware;
 
 use neuromance_common::client::{ChatChunk, ProxyConfig};
 use neuromance_common::{ChatRequest, ChatResponse, Config};
@@ -68,6 +73,98 @@ pub(crate) fn add_proxy_headers<B: WithHeader>(
         }
     }
     builder
+}
+
+/// Shared resources produced by client constructor logic.
+///
+/// All provider clients need the same set of HTTP plumbing: a retry-aware
+/// middleware client, a raw streaming client, the resolved base URL, API key,
+/// and optional proxy configuration. This struct bundles them so each provider
+/// only needs to call [`build_client_resources`] instead of duplicating the
+/// setup.
+pub(crate) struct ClientResources {
+    pub client: ClientWithMiddleware,
+    pub streaming_client: reqwest::Client,
+    pub api_key: Arc<SecretString>,
+    pub base_url: String,
+    pub config: Arc<Config>,
+    pub proxy_config: Option<ProxyConfig>,
+    pub target_host: String,
+}
+
+/// Build the shared HTTP client resources from a [`Config`].
+///
+/// Extracts the API key, resolves the base URL (with proxy override),
+/// parses the target host, builds the retry policy, and constructs both
+/// the middleware-wrapped and raw reqwest clients.
+///
+/// # Errors
+///
+/// Returns `ClientError::ConfigurationError` if the API key is missing or the
+/// base URL cannot be parsed into a valid host.
+pub(crate) fn build_client_resources(
+    config: Config,
+    default_base_url: &str,
+) -> Result<ClientResources> {
+    let api_key = config
+        .api_key
+        .clone()
+        .ok_or_else(|| ClientError::ConfigurationError("API key is required".to_string()))?;
+
+    // Determine the original target URL (before any proxy override)
+    let original_url = config
+        .base_url
+        .clone()
+        .unwrap_or_else(|| default_base_url.to_string());
+
+    // Extract the host from the original URL for proxy routing
+    let target_host = url::Url::parse(&original_url)
+        .ok()
+        .and_then(|u| u.host_str().map(String::from))
+        .ok_or_else(|| {
+            ClientError::ConfigurationError(format!(
+                "cannot extract host from base URL: {original_url}"
+            ))
+        })?;
+
+    // If proxy configured, use proxy URL; otherwise use the original URL
+    let (base_url, proxy_config) = config.proxy.as_ref().map_or((original_url, None), |proxy| {
+        (proxy.proxy_url.clone(), Some(proxy.clone()))
+    });
+
+    // Build retry policy from config
+    let retry_policy = ExponentialBackoff::builder()
+        .retry_bounds(
+            config.retry_config.initial_delay,
+            config.retry_config.max_delay,
+        )
+        .build_with_max_retries(config.retry_config.max_retries);
+
+    // Create reqwest client with timeout configuration
+    let reqwest_client = match config.timeout_seconds {
+        Some(timeout) => reqwest::Client::builder()
+            .timeout(Duration::from_secs(timeout))
+            .build()?,
+        None => reqwest::Client::builder().build()?,
+    };
+
+    // Create client with retry middleware
+    // RetryAfterMiddleware is added before RetryTransientMiddleware
+    // so that Retry-After headers are respected before falling back to exponential backoff
+    let client = reqwest_middleware::ClientBuilder::new(reqwest_client.clone())
+        .with(RetryAfterMiddleware::new())
+        .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+        .build();
+
+    Ok(ClientResources {
+        client,
+        streaming_client: reqwest_client,
+        api_key: Arc::new(api_key),
+        base_url,
+        config: Arc::new(config),
+        proxy_config,
+        target_host,
+    })
 }
 
 /// A retry policy for SSE streams that never retries.

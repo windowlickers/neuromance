@@ -2,11 +2,6 @@
 //!
 //! This module provides a client for interacting with the `OpenAI` Responses API.
 
-use std::collections::HashMap;
-use std::pin::Pin;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -14,17 +9,18 @@ use futures::stream::{Stream, StreamExt};
 use log::{debug, error, warn};
 use reqwest_eventsource::{Event, EventSource};
 use reqwest_middleware::ClientWithMiddleware;
-use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
-use reqwest_retry_after::RetryAfterMiddleware;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
+use std::collections::HashMap;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 
 use neuromance_common::chat::MessageRole;
 use neuromance_common::client::{ChatChunk, ChatRequest, ChatResponse, Config, Usage};
 use neuromance_common::tools::{FunctionCall, ToolCall};
 
 use crate::error::{ClientError, ErrorResponse};
-use crate::{LLMClient, NoRetryPolicy};
+use crate::{LLMClient, NoRetryPolicy, build_client_resources};
 
 use super::{
     OutputItem, ResponsesRequest, ResponsesResponse, StreamEvent, StreamingFunctionCall,
@@ -72,43 +68,14 @@ impl ResponsesClient {
     ///
     /// Returns an error if the API key is missing or HTTP client creation fails.
     pub fn new(config: Config) -> Result<Self> {
-        let api_key = config
-            .api_key
-            .clone()
-            .ok_or_else(|| ClientError::ConfigurationError("API key is required".to_string()))?;
-        let base_url = config
-            .base_url
-            .clone()
-            .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
-
-        // Build retry policy from config
-        let retry_policy = ExponentialBackoff::builder()
-            .retry_bounds(
-                config.retry_config.initial_delay,
-                config.retry_config.max_delay,
-            )
-            .build_with_max_retries(config.retry_config.max_retries);
-
-        // Create reqwest client with timeout configuration
-        let reqwest_client = match config.timeout_seconds {
-            Some(timeout) => reqwest::Client::builder()
-                .timeout(Duration::from_secs(timeout))
-                .build()?,
-            None => reqwest::Client::builder().build()?,
-        };
-
-        // Create client with retry middleware
-        let client = reqwest_middleware::ClientBuilder::new(reqwest_client.clone())
-            .with(RetryAfterMiddleware::new())
-            .with(RetryTransientMiddleware::new_with_policy(retry_policy))
-            .build();
+        let r = build_client_resources(config, DEFAULT_BASE_URL)?;
 
         Ok(Self {
-            client,
-            streaming_client: reqwest_client,
-            api_key: Arc::new(api_key),
-            base_url,
-            config: Arc::new(config),
+            client: r.client,
+            streaming_client: r.streaming_client,
+            api_key: r.api_key,
+            base_url: r.base_url,
+            config: r.config,
         })
     }
 

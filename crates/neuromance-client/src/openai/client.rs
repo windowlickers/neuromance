@@ -102,12 +102,6 @@
 //! - Zeros memory on drop to minimize exposure window
 //! - Requires explicit `expose_secret()` calls for access
 
-use std::collections::HashMap;
-use std::marker::PhantomData;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::time::Duration;
-
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -115,11 +109,13 @@ use futures::stream::{Stream, StreamExt};
 use log::{debug, error, warn};
 use reqwest_eventsource::{Event, EventSource};
 use reqwest_middleware::ClientWithMiddleware;
-use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
-use reqwest_retry_after::RetryAfterMiddleware;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
+use std::collections::HashMap;
+use std::marker::PhantomData;
+use std::pin::Pin;
+use std::sync::Arc;
 
 use neuromance_common::chat::Message;
 use neuromance_common::client::{ChatChunk, ChatRequest, ChatResponse, Config, ProxyConfig, Usage};
@@ -129,7 +125,7 @@ use crate::error::{ClientError, ErrorResponse};
 use crate::openai::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, OpenAIMessage,
 };
-use crate::{LLMClient, NoRetryPolicy, add_proxy_headers};
+use crate::{LLMClient, NoRetryPolicy, add_proxy_headers, build_client_resources};
 
 /// Type-state marker types for compile-time validation.
 ///
@@ -447,66 +443,16 @@ impl OpenAIClient {
     ///
     /// Returns an error if the API key is missing or HTTP client creation fails.
     pub fn new(config: Config) -> Result<Self> {
-        let api_key = config
-            .api_key
-            .clone()
-            .ok_or_else(|| ClientError::ConfigurationError("API key is required".to_string()))?;
-
-        // Determine the original target URL (before any proxy override)
-        let original_url = config
-            .base_url
-            .clone()
-            .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-
-        // Extract the host from the original URL for proxy routing
-        let target_host = url::Url::parse(&original_url)
-            .ok()
-            .and_then(|u| u.host_str().map(String::from))
-            .ok_or_else(|| {
-                ClientError::ConfigurationError(format!(
-                    "cannot extract host from base URL: {original_url}"
-                ))
-            })?;
-
-        // If proxy configured, use proxy URL; otherwise use the original URL
-        let (base_url, proxy_config) =
-            config.proxy.as_ref().map_or((original_url, None), |proxy| {
-                (proxy.proxy_url.clone(), Some(proxy.clone()))
-            });
-
-        // Build retry policy from config
-        let retry_policy = ExponentialBackoff::builder()
-            .retry_bounds(
-                config.retry_config.initial_delay,
-                config.retry_config.max_delay,
-            )
-            .build_with_max_retries(config.retry_config.max_retries);
-
-        // Create reqwest client with timeout configuration
-        // None means no timeout (useful for slow hardware/long-running requests)
-        let reqwest_client = match config.timeout_seconds {
-            Some(timeout) => reqwest::Client::builder()
-                .timeout(Duration::from_secs(timeout))
-                .build()?,
-            None => reqwest::Client::builder().build()?,
-        };
-
-        // Create client with retry middleware
-        // NOTE: RetryAfterMiddleware should be added before RetryTransientMiddleware
-        // so that Retry-After headers are respected before falling back to exponential backoff
-        let client = reqwest_middleware::ClientBuilder::new(reqwest_client.clone())
-            .with(RetryAfterMiddleware::new())
-            .with(RetryTransientMiddleware::new_with_policy(retry_policy))
-            .build();
+        let r = build_client_resources(config, "https://api.openai.com/v1")?;
 
         Ok(Self {
-            client,
-            streaming_client: reqwest_client,
-            api_key: Arc::new(api_key),
-            base_url,
-            config: Arc::new(config),
-            proxy_config,
-            target_host,
+            client: r.client,
+            streaming_client: r.streaming_client,
+            api_key: r.api_key,
+            base_url: r.base_url,
+            config: r.config,
+            proxy_config: r.proxy_config,
+            target_host: r.target_host,
         })
     }
 
@@ -1347,6 +1293,85 @@ mod tests {
 
         let response = client.chat(&request).await.unwrap();
         assert_eq!(response.message.content, "Response via proxy");
+    }
+
+    #[tokio::test]
+    async fn test_proxy_headers_sent_streaming() {
+        let mock_server = MockServer::start().await;
+
+        // Minimal SSE event sequence for OpenAI streaming
+        let sse_body = [
+            &format!(
+                "data: {}",
+                serde_json::json!({
+                    "id": "chatcmpl-proxy-stream",
+                    "object": "chat.completion.chunk",
+                    "created": 1_677_652_288,
+                    "model": "gpt-4",
+                    "choices": [{
+                        "index": 0,
+                        "delta": { "role": "assistant", "content": "Streamed via proxy" },
+                        "finish_reason": null
+                    }]
+                })
+            ),
+            "",
+            &format!(
+                "data: {}",
+                serde_json::json!({
+                    "id": "chatcmpl-proxy-stream",
+                    "object": "chat.completion.chunk",
+                    "created": 1_677_652_288,
+                    "model": "gpt-4",
+                    "choices": [{
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "stop"
+                    }]
+                })
+            ),
+            "",
+            "data: [DONE]",
+            "",
+        ]
+        .join("\n");
+
+        // Verify proxy headers are sent on the streaming path
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header("X-Tokenizer-Token", "sealed.test-token"))
+            .and(header("X-Target-Host", "api.openai.com"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = Config::new("openai", "gpt-4")
+            .with_api_key("sealed.test-token")
+            .with_proxy(ProxyConfig {
+                proxy_url: mock_server.uri(),
+                token_header: "X-Tokenizer-Token".to_string(),
+                target_host_header: Some("X-Target-Host".to_string()),
+            });
+
+        let client = OpenAIClient::new(config).unwrap();
+
+        let message = create_test_message();
+        let request = ChatRequest::new(vec![message]);
+
+        let mut stream = client.chat_stream(&request).await.unwrap();
+
+        let mut got_content = false;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.unwrap();
+            if chunk.delta_content.as_deref() == Some("Streamed via proxy") {
+                got_content = true;
+            }
+        }
+        assert!(
+            got_content,
+            "expected to receive streamed content via proxy"
+        );
     }
 
     #[tokio::test]
