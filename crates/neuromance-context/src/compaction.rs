@@ -641,6 +641,58 @@ Summary:"#,
         Ok(tokens > threshold)
     }
 
+    /// Compacts a `Vec<Message>` directly, bridging to the `Conversation`-based API.
+    ///
+    /// This is designed to be used with `Core::with_turn_callback` for transparent
+    /// context compaction during the tool loop. It handles conversation ID remapping
+    /// so that messages from any conversation can be compacted.
+    ///
+    /// Returns the original messages unchanged if compaction is not needed.
+    pub async fn compact_messages(&self, messages: Vec<Message>) -> Result<Vec<Message>> {
+        if messages.is_empty() {
+            return Ok(messages);
+        }
+
+        // Build a temporary Conversation, remapping conversation_ids to satisfy add_message validation
+        let mut conversation = Conversation::new();
+        let conv_id = conversation.id;
+        let remapped: Vec<Message> = messages
+            .iter()
+            .map(|msg| {
+                let mut m = msg.clone();
+                m.conversation_id = conv_id;
+                m
+            })
+            .collect();
+        conversation.messages = Arc::new(remapped);
+
+        if !self.needs_compaction(&conversation)? {
+            return Ok(messages);
+        }
+
+        let result = self.compact(&conversation).await?;
+
+        if result.was_compacted {
+            // Restore original conversation_id from input messages
+            let original_id = messages
+                .first()
+                .map(|m| m.conversation_id)
+                .unwrap_or(conv_id);
+            Ok(result
+                .conversation
+                .get_messages()
+                .iter()
+                .map(|msg| {
+                    let mut m = msg.clone();
+                    m.conversation_id = original_id;
+                    m
+                })
+                .collect())
+        } else {
+            Ok(messages)
+        }
+    }
+
     /// Returns the current token count for a conversation.
     pub fn count_tokens(&self, conversation: &Conversation) -> Result<usize> {
         self.token_counter
@@ -651,6 +703,9 @@ Summary:"#,
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::expect_used)]
+
     use super::*;
 
     #[test]
@@ -677,5 +732,78 @@ mod tests {
         assert_eq!(config.preserve_recent_turns, 2);
         assert_eq!(config.strategy, CompactionStrategy::OneShot);
         assert!(config.custom_prompt.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_compact_messages_empty() {
+        use neuromance_client::openai::OpenAIClient;
+        use neuromance_common::client::Config;
+
+        let config = Config::new("test", "test-model").with_api_key("test-key");
+        let client = OpenAIClient::new(config).expect("Failed to create client");
+
+        // Create a minimal tokenizer for testing
+        let tokenizer_json = serde_json::json!({
+            "version": "1.0",
+            "model": {
+                "type": "WordLevel",
+                "vocab": { "[UNK]": 0, "hello": 1, "world": 2 },
+                "unk_token": "[UNK]"
+            },
+            "pre_tokenizer": { "type": "Whitespace" }
+        });
+        let tokenizer =
+            tokenizers::Tokenizer::from_bytes(tokenizer_json.to_string()).expect("tokenizer");
+        let counter = crate::TokenCounter::from_tokenizer(tokenizer);
+
+        let compactor = Compactor::new(client, counter);
+        let result = compactor
+            .compact_messages(vec![])
+            .await
+            .expect("should succeed");
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_compact_messages_below_threshold() {
+        use neuromance_client::openai::OpenAIClient;
+        use neuromance_common::client::Config;
+
+        let config = Config::new("test", "test-model").with_api_key("test-key");
+        let client = OpenAIClient::new(config).expect("Failed to create client");
+
+        let tokenizer_json = serde_json::json!({
+            "version": "1.0",
+            "model": {
+                "type": "WordLevel",
+                "vocab": { "[UNK]": 0, "hello": 1, "world": 2 },
+                "unk_token": "[UNK]"
+            },
+            "pre_tokenizer": { "type": "Whitespace" }
+        });
+        let tokenizer =
+            tokenizers::Tokenizer::from_bytes(tokenizer_json.to_string()).expect("tokenizer");
+        let counter = crate::TokenCounter::from_tokenizer(tokenizer);
+
+        // Default target is 4000 tokens, so a tiny message should be below threshold
+        let compactor = Compactor::new(client, counter);
+        let conv_id = uuid::Uuid::new_v4();
+        let messages = vec![
+            Message::user(conv_id, "hello"),
+            Message::assistant(conv_id, "world"),
+        ];
+
+        let result = compactor
+            .compact_messages(messages.clone())
+            .await
+            .expect("should succeed");
+
+        // Messages below threshold should be returned unchanged
+        assert_eq!(result.len(), messages.len());
+        assert_eq!(result[0].content, "hello");
+        assert_eq!(result[1].content, "world");
+        // conversation_ids should be preserved
+        assert_eq!(result[0].conversation_id, conv_id);
+        assert_eq!(result[1].conversation_id, conv_id);
     }
 }

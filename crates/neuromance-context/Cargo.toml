@@ -12,6 +12,11 @@ keywords.workspace = true
 categories.workspace = true
 description = "Token counting and context management for LLM conversations using Candle"
 
+[features]
+default = []
+gguf = ["dep:candle-core", "dep:ahash"]
+online-tests = []
+
 [dependencies]
 anyhow = { workspace = true }
 thiserror = { workspace = true }
@@ -23,8 +28,8 @@ neuromance-client = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 
-# Candle and tokenizer dependencies (using fork with mxfp4 support)
-candle-core = { git = "https://github.com/ecdobry/candle.git", rev = "1cba3b35f10ba9aca33777ded5487a47a5148112" }
+# Candle dependency for GGUF support (optional)
+candle-core = { git = "https://github.com/ecdobry/candle.git", rev = "1cba3b35f10ba9aca33777ded5487a47a5148112", optional = true }
 
 hf-hub = { version = "0.3", features = ["tokio"] }
 tokenizers = "0.21"
@@ -41,9 +46,17 @@ regex = { workspace = true }
 # Template rendering for chat templates
 minijinja = "2.13"
 
-# Hash map compatible with tokenizers crate
-ahash = "0.8"
+# Hash map compatible with tokenizers crate (needed for GGUF tokenizer building)
+ahash = { version = "0.8", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[[example]]
+name = "gguf_metadata"
+required-features = ["gguf"]
+
+[[example]]
+name = "gguf_tokenizer"
+required-features = ["gguf"]

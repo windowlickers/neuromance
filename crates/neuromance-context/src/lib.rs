@@ -47,6 +47,7 @@ pub use error::TokenCounterError;
 
 pub mod compaction;
 pub mod context;
+#[cfg(feature = "gguf")]
 pub mod gguf;
 mod jinja_compat;
 pub mod metadata;
@@ -82,7 +83,7 @@ impl ModelConfig {
         }
     }
 
-    /// Creates a configuration for the GPT-OSS-20B model.
+    /// Creates a configuration for the GPT-OSS-120B model.
     pub fn gpt_oss_120b() -> Self {
         Self {
             model_repo: "openai/gpt-oss-120b".to_string(),
@@ -92,7 +93,7 @@ impl ModelConfig {
         }
     }
 
-    /// Creates a conf for Qwen/Qwen3-30B-A3B-Instruct-2507
+    /// Creates a configuration for Qwen/Qwen3-30B-A3B-Instruct-2507
     pub fn qwen3_30b_a3b_instruct() -> Self {
         Self {
             model_repo: "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
@@ -120,6 +121,7 @@ impl ModelConfig {
     /// # Errors
     ///
     /// Returns an error if the GGUF file cannot be read or parsed.
+    #[cfg(feature = "gguf")]
     pub fn from_gguf(gguf_path: impl Into<PathBuf>) -> Result<Self> {
         let path = gguf_path.into();
         let info = gguf::GGUFModelInfo::from_file(&path)?;
@@ -297,6 +299,18 @@ pub struct TokenCounter {
 }
 
 impl TokenCounter {
+    /// Creates a token counter directly from a pre-loaded tokenizer.
+    ///
+    /// This is useful for testing or when you have already loaded a tokenizer
+    /// through other means.
+    pub fn from_tokenizer(tokenizer: Tokenizer) -> Self {
+        Self {
+            tokenizer,
+            config: ModelConfig::custom("local"),
+            chat_template: None,
+        }
+    }
+
     /// Creates a new token counter with the specified model configuration.
     ///
     /// This will download the tokenizer from Hugging Face if a local path is not provided.
@@ -324,19 +338,20 @@ impl TokenCounter {
 
     /// Loads a tokenizer from a local file path.
     ///
-    /// If the path ends with .gguf, attempts to extract the tokenizer from GGUF metadata.
-    /// Otherwise, loads a standard tokenizer.json file.
+    /// If the `gguf` feature is enabled and the path ends with .gguf, attempts to
+    /// extract the tokenizer from GGUF metadata. Otherwise, loads a standard
+    /// tokenizer.json file.
     fn load_local_tokenizer(path: &PathBuf) -> Result<Tokenizer> {
-        // Check if this is a GGUF file
+        #[cfg(feature = "gguf")]
         if path.extension().and_then(|s| s.to_str()) == Some("gguf") {
             debug!("Detected GGUF file, attempting to extract tokenizer");
-            gguf::GGUFModelInfo::extract_tokenizer(path)
-                .map_err(|e| TokenCounterError::GGUFTokenizerExtraction(e.to_string()).into())
-        } else {
-            debug!("Loading standard tokenizer.json");
-            Tokenizer::from_file(path)
-                .map_err(|e| TokenCounterError::TokenizerLoad(e.to_string()).into())
+            return gguf::GGUFModelInfo::extract_tokenizer(path)
+                .map_err(|e| TokenCounterError::GGUFTokenizerExtraction(e.to_string()).into());
         }
+
+        debug!("Loading standard tokenizer.json");
+        Tokenizer::from_file(path)
+            .map_err(|e| TokenCounterError::TokenizerLoad(e.to_string()).into())
     }
 
     /// Downloads and loads a tokenizer from Hugging Face.
@@ -391,6 +406,7 @@ impl TokenCounter {
     /// 3. Separate chat_template.jinja file from HuggingFace
     async fn load_chat_template(config: &ModelConfig, tokenizer: &Tokenizer) -> Option<String> {
         // First try to extract from GGUF if using a GGUF file
+        #[cfg(feature = "gguf")]
         if let Some(path) = &config.local_tokenizer_path
             && path.extension().and_then(|s| s.to_str()) == Some("gguf")
             && let Ok(info) = gguf::GGUFModelInfo::from_file(path)
@@ -446,7 +462,7 @@ impl TokenCounter {
 
         // Build HTTP client
         let client = match reqwest::Client::builder()
-            .user_agent("neuromance-context/0.0.5")
+            .user_agent(concat!("neuromance-context/", env!("CARGO_PKG_VERSION")))
             .build()
         {
             Ok(client) => client,
@@ -880,11 +896,132 @@ impl TokenCounter {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    /// Creates a simple test tokenizer that doesn't require network access.
+    fn create_test_tokenizer() -> Tokenizer {
+        // Construct a minimal WordLevel tokenizer from JSON
+        let tokenizer_json = serde_json::json!({
+            "version": "1.0",
+            "model": {
+                "type": "WordLevel",
+                "vocab": {
+                    "[UNK]": 0,
+                    "hello": 1,
+                    ",": 2,
+                    "world": 3,
+                    "!": 4,
+                    "how": 5,
+                    "are": 6,
+                    "you": 7,
+                    "?": 8,
+                    "the": 9,
+                    "weather": 10,
+                    "is": 11,
+                    "sunny": 12,
+                    "today": 13,
+                    "what": 14
+                },
+                "unk_token": "[UNK]"
+            },
+            "pre_tokenizer": {
+                "type": "Whitespace"
+            }
+        });
 
+        Tokenizer::from_bytes(tokenizer_json.to_string()).unwrap()
+    }
+
+    #[test]
+    fn test_count_tokens_offline() {
+        let tokenizer = create_test_tokenizer();
+        let counter = TokenCounter::from_tokenizer(tokenizer);
+
+        let count = counter.count_tokens("hello world").unwrap();
+        assert!(count > 0, "Expected at least 1 token");
+    }
+
+    #[test]
+    fn test_count_tokens_empty_string() {
+        let tokenizer = create_test_tokenizer();
+        let counter = TokenCounter::from_tokenizer(tokenizer);
+
+        let count = counter.count_tokens("").unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_conversation_token_counting_offline() {
+        let tokenizer = create_test_tokenizer();
+        let counter = TokenCounter::from_tokenizer(tokenizer);
+
+        let mut conv = Conversation::new();
+        conv.add_message(conv.user_message("hello world")).unwrap();
+        conv.add_message(conv.assistant_message("hello")).unwrap();
+
+        let count = counter.count_conversation_tokens(&conv).unwrap();
+        // Each message has content tokens + 4 role overhead
+        assert!(count > 0, "Expected positive token count");
+    }
+
+    #[test]
+    fn test_message_token_counting_offline() {
+        let tokenizer = create_test_tokenizer();
+        let counter = TokenCounter::from_tokenizer(tokenizer);
+
+        let msg = Message::new(uuid::Uuid::new_v4(), MessageRole::User, "hello world");
+        let count = counter.count_message_tokens(&msg).unwrap();
+
+        // Should be content tokens + 4 overhead
+        let content_tokens = counter.count_tokens("hello world").unwrap();
+        assert_eq!(count, content_tokens + 4);
+    }
+
+    #[test]
+    fn test_tokenize_with_positions_offline() {
+        let tokenizer = create_test_tokenizer();
+        let counter = TokenCounter::from_tokenizer(tokenizer);
+
+        let result = counter.tokenize_with_positions("hello world").unwrap();
+        assert!(!result.tokens.is_empty());
+        assert_eq!(result.text, "hello world");
+        assert_eq!(result.token_count(), result.tokens.len());
+    }
+
+    #[test]
+    fn test_model_config_constructors() {
+        let config = ModelConfig::gpt_oss_20b();
+        assert_eq!(config.model_repo, "openai/gpt-oss-20b");
+        assert!(config.hf_token.is_none());
+
+        let config = ModelConfig::custom("test/model").with_hf_token("token123");
+        assert_eq!(config.model_repo, "test/model");
+        assert_eq!(config.hf_token.as_deref(), Some("token123"));
+    }
+
+    #[test]
+    fn test_from_tokenizer_constructor() {
+        let tokenizer = create_test_tokenizer();
+        let counter = TokenCounter::from_tokenizer(tokenizer);
+        assert_eq!(counter.config().model_repo, "local");
+        assert!(counter.get_chat_template().is_none());
+    }
+
+    #[test]
+    fn test_tokenized_text_helpers() {
+        let tokenizer = create_test_tokenizer();
+        let counter = TokenCounter::from_tokenizer(tokenizer);
+
+        let result = counter.tokenize_with_positions("hello world").unwrap();
+
+        // Test get_token
+        assert!(result.get_token(0).is_some());
+        assert!(result.get_token(999).is_none());
+    }
+
+    #[cfg(feature = "online-tests")]
     #[tokio::test]
-    #[ignore] // Requires HF_TOKEN environment variable
     async fn test_token_counter_creation() {
         let token = std::env::var("HF_TOKEN").expect("HF_TOKEN not set");
         let config = ModelConfig::gpt_oss_20b().with_hf_token(token);
@@ -892,15 +1029,14 @@ mod tests {
             .await
             .expect("Failed to create counter");
 
-        // Test basic counting
         let count = counter
             .count_tokens("Hello, world!")
             .expect("Failed to count tokens");
         assert!(count > 0);
     }
 
+    #[cfg(feature = "online-tests")]
     #[tokio::test]
-    #[ignore] // Requires HF_TOKEN environment variable
     async fn test_conversation_token_counting() {
         let token = std::env::var("HF_TOKEN").expect("HF_TOKEN not set");
         let config = ModelConfig::gpt_oss_20b().with_hf_token(token);
