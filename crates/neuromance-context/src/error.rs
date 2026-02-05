@@ -18,10 +18,12 @@ pub enum TokenCounterError {
     HuggingFaceDownload(String),
 
     /// Failed to read GGUF file
+    #[cfg(feature = "gguf")]
     #[error("Failed to read GGUF file: {0}")]
     GGUFRead(String),
 
     /// Failed to extract tokenizer from GGUF
+    #[cfg(feature = "gguf")]
     #[error("Failed to extract tokenizer from GGUF: {0}")]
     GGUFTokenizerExtraction(String),
 }

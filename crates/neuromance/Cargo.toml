@@ -16,6 +16,7 @@ description = "A Rust library for controlling and orchestrating LLM interactions
 default = []
 db = ["dep:neuromance-db"]
 context = ["dep:neuromance-context"]
+gguf = ["context", "neuromance-context/gguf"]
 
 [lints]
 workspace = true
