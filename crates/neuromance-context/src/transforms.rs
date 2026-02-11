@@ -374,18 +374,7 @@ pub fn apply_filter(conversation: Conversation, criteria: FilterCriteria) -> Con
         filtered_messages.truncate(limit);
     }
 
-    // Create new conversation with filtered messages
-    let mut new_conversation = Conversation::new();
-    new_conversation.id = conversation.id;
-    new_conversation.title = conversation.title;
-    new_conversation.description = conversation.description;
-    new_conversation.created_at = conversation.created_at;
-    new_conversation.updated_at = Utc::now();
-    new_conversation.metadata = conversation.metadata;
-    new_conversation.status = conversation.status;
-    new_conversation.messages = Arc::new(filtered_messages);
-
-    new_conversation
+    rebuild_conversation(conversation, filtered_messages)
 }
 
 /// Applies default transformation operations to a conversation.

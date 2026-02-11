@@ -404,7 +404,7 @@ impl<C: LLMClient> Compactor<C> {
             });
         }
 
-        let (system_msg, _middle_msgs, recent_msgs) = self.split_conversation(messages);
+        let (system_msg, middle_msgs, recent_msgs) = self.split_conversation(messages);
 
         // For truncation, we just keep system + recent, with a note about truncation
         let truncation_note =
@@ -426,7 +426,7 @@ impl<C: LLMClient> Compactor<C> {
             conversation: compacted_conversation,
             original_tokens,
             compacted_tokens,
-            messages_summarized: _middle_msgs.len(),
+            messages_summarized: middle_msgs.len(),
             summary: Some(truncation_note),
             was_compacted: true,
         })
