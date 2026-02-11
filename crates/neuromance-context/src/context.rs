@@ -10,7 +10,7 @@ use neuromance_common::Conversation;
 pub use crate::compaction::{CompactionConfig, CompactionResult, Compactor};
 pub use crate::metadata::ContextMetadata;
 pub use crate::state::{ContextState, Filtered, Raw, Ready, Transformed, Validated};
-pub use crate::transforms::FilterCriteria;
+pub use crate::transforms::{FilterCriteria, TransformPipeline};
 
 /// Main context container that tracks a conversation through state transitions.
 ///
@@ -69,16 +69,50 @@ impl Context<Raw> {
             state: PhantomData,
         }
     }
+
+    /// Skips filtering and moves directly to the filtered state.
+    pub fn skip_filter(mut self) -> Context<Filtered> {
+        self.metadata.add_transformation("skip_filter", &());
+        self.updated_at = Utc::now();
+
+        Context {
+            id: self.id,
+            conversation: self.conversation,
+            metadata: self.metadata,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            state: PhantomData,
+        }
+    }
 }
 
 impl Context<Filtered> {
-    /// Transitions to the transformed state by applying transformation operations.
+    /// Transitions to the transformed state by applying default transformation operations.
     pub fn transform(mut self) -> Context<Transformed> {
         self.metadata.add_transformation("transform", &());
         self.updated_at = Utc::now();
 
         // Apply transformation logic (to be implemented in transforms module)
         let transformed_conversation = crate::transforms::apply_transform(self.conversation);
+
+        Context {
+            id: self.id,
+            conversation: transformed_conversation,
+            metadata: self.metadata,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            state: PhantomData,
+        }
+    }
+
+    /// Transitions to the transformed state by applying a custom transform pipeline.
+    pub fn transform_with(mut self, pipeline: &TransformPipeline) -> Context<Transformed> {
+        self.metadata
+            .add_transformation("transform_with_pipeline", &());
+        self.updated_at = Utc::now();
+
+        let transformed_conversation =
+            crate::transforms::apply_transform_pipeline(self.conversation, pipeline);
 
         Context {
             id: self.id,

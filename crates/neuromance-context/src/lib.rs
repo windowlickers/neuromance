@@ -39,7 +39,7 @@ use neuromance_common::{Conversation, Message, MessageRole};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
 
 mod error;
@@ -341,7 +341,7 @@ impl TokenCounter {
     /// If the `gguf` feature is enabled and the path ends with .gguf, attempts to
     /// extract the tokenizer from GGUF metadata. Otherwise, loads a standard
     /// tokenizer.json file.
-    fn load_local_tokenizer(path: &PathBuf) -> Result<Tokenizer> {
+    fn load_local_tokenizer(path: &Path) -> Result<Tokenizer> {
         #[cfg(feature = "gguf")]
         if path.extension().and_then(|s| s.to_str()) == Some("gguf") {
             debug!("Detected GGUF file, attempting to extract tokenizer");
@@ -696,8 +696,8 @@ impl TokenCounter {
     /// Extracts the chat template from the tokenizer configuration.
     ///
     /// Returns None if no chat template is defined in the tokenizer.
-    pub fn get_chat_template(&self) -> Option<String> {
-        self.chat_template.clone()
+    pub fn get_chat_template(&self) -> Option<&str> {
+        self.chat_template.as_deref()
     }
 
     /// Formats a conversation using the tokenizer's chat template.

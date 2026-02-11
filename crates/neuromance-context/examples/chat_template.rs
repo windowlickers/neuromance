@@ -35,7 +35,7 @@ async fn main() -> anyhow::Result<()> {
         let preview = if template.len() > 200 {
             format!("{}...", &template[..200])
         } else {
-            template.clone()
+            template.to_string()
         };
         println!("{}", preview);
     } else {
