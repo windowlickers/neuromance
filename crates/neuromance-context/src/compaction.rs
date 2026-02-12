@@ -736,11 +736,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_compact_messages_empty() {
-        use neuromance_client::openai::OpenAIClient;
+        use neuromance_client::ChatCompletionsClient;
         use neuromance_common::client::Config;
 
         let config = Config::new("test", "test-model").with_api_key("test-key");
-        let client = OpenAIClient::new(config).expect("Failed to create client");
+        let client = ChatCompletionsClient::new(config).expect("Failed to create client");
 
         // Create a minimal tokenizer for testing
         let tokenizer_json = serde_json::json!({
@@ -766,11 +766,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_compact_messages_below_threshold() {
-        use neuromance_client::openai::OpenAIClient;
+        use neuromance_client::ChatCompletionsClient;
         use neuromance_common::client::Config;
 
         let config = Config::new("test", "test-model").with_api_key("test-key");
-        let client = OpenAIClient::new(config).expect("Failed to create client");
+        let client = ChatCompletionsClient::new(config).expect("Failed to create client");
 
         let tokenizer_json = serde_json::json!({
             "version": "1.0",

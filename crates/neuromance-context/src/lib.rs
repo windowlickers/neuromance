@@ -729,7 +729,7 @@ impl TokenCounter {
             now.format(&format).to_string()
         });
 
-        env.add_template("chat", &template_str)
+        env.add_template("chat", template_str)
             .context("Failed to add chat template")?;
 
         // Convert messages to the format expected by chat templates
