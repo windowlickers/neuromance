@@ -40,6 +40,8 @@
 //! - **`context`**: Token counting and context management using Candle tokenizers.
 //!   Enable with `neuromance = { features = ["context"] }`
 
+#[cfg(feature = "context")]
+pub mod context_management;
 pub mod core;
 pub mod error;
 pub mod events;

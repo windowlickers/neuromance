@@ -127,6 +127,13 @@ async fn main() -> Result<()> {
             CoreEvent::Usage(usage) => {
                 info!("Token usage: {} total tokens", usage.total_tokens);
             }
+            CoreEvent::Compaction {
+                original_tokens,
+                compacted_tokens,
+                ..
+            } => {
+                info!("Context compacted: {original_tokens} -> {compacted_tokens} tokens");
+            }
             CoreEvent::ApprovalRequest { .. } => {
                 // Auto-approve is on, so this shouldn't fire in this example.
             }

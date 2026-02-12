@@ -36,7 +36,10 @@ impl RunStats {
             CoreEvent::Usage(usage) => self.cache_metrics.record(usage),
             CoreEvent::ToolResult { success: true, .. } => self.successful_tool_calls += 1,
             CoreEvent::ToolResult { success: false, .. } => self.failed_tool_calls += 1,
-            CoreEvent::Delta(_) | CoreEvent::ApprovalRequest { .. } | CoreEvent::Completed(_) => {}
+            CoreEvent::Delta(_)
+            | CoreEvent::ApprovalRequest { .. }
+            | CoreEvent::Completed(_)
+            | CoreEvent::Compaction { .. } => {}
         }
     }
 }

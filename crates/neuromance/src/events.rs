@@ -47,6 +47,18 @@ pub enum CoreEvent {
     /// Token usage reported by the LLM for a single turn.
     Usage(Usage),
 
+    /// Context compaction was performed on the conversation history.
+    Compaction {
+        /// Token count before compaction.
+        original_tokens: usize,
+        /// Token count after compaction.
+        compacted_tokens: usize,
+        /// Number of messages that were summarized.
+        messages_summarized: usize,
+        /// Whether compaction was actually performed.
+        was_compacted: bool,
+    },
+
     /// The model requested a tool call that is not auto-approved.
     ///
     /// Answer by sending a [`ToolApproval`] on `responder`. If the sender is

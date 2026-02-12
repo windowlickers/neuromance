@@ -30,4 +30,10 @@ pub enum CoreError {
 
     #[error("Turn callback error: {0}")]
     TurnCallback(Box<dyn std::error::Error + Send + Sync>),
+
+    #[error("Context compaction error: {0}")]
+    CompactionError(String),
+
+    #[error("Other error: {0}")]
+    Other(#[from] anyhow::Error),
 }

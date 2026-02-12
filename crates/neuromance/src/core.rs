@@ -62,6 +62,9 @@ pub struct Core<C: LLMClient> {
     /// [`Self::parent_conversation_id`].
     #[cfg(feature = "db")]
     pub parent_task_id: Option<uuid::Uuid>,
+    /// Optional context manager for automatic compaction between turns.
+    #[cfg(feature = "context")]
+    context_manager: Option<crate::context_management::ContextManager<C>>,
 }
 
 impl<C: LLMClient> Core<C> {
@@ -83,6 +86,8 @@ impl<C: LLMClient> Core<C> {
             parent_conversation_id: None,
             #[cfg(feature = "db")]
             parent_task_id: None,
+            #[cfg(feature = "context")]
+            context_manager: None,
         }
     }
 
@@ -172,6 +177,44 @@ impl<C: LLMClient> Core<C> {
     #[must_use]
     pub const fn with_thinking_mode(mut self, mode: ThinkingMode) -> Self {
         self.thinking = mode;
+        self
+    }
+
+    /// Enable automatic context compaction between conversation turns.
+    ///
+    /// When configured, compaction runs before each turn callback, keeping the
+    /// conversation within the configured token budget.
+    ///
+    /// Requires the `context` feature and `C: Clone` (all built-in clients implement `Clone`).
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use std::sync::Arc;
+    /// # use neuromance::Core;
+    /// # use neuromance::context_management::ContextConfig;
+    /// # use neuromance_context::TokenCounter;
+    /// # use neuromance_client::ChatCompletionsClient;
+    /// # let client: ChatCompletionsClient = unimplemented!();
+    /// # let token_counter: Arc<TokenCounter> = unimplemented!();
+    /// let config = ContextConfig::new(128_000, token_counter);
+    /// let core = Core::new(client)
+    ///     .with_context_management(config);
+    /// ```
+    #[cfg(feature = "context")]
+    #[must_use]
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn with_context_management(
+        mut self,
+        config: crate::context_management::ContextConfig,
+    ) -> Self
+    where
+        C: Clone,
+    {
+        self.context_manager = Some(crate::context_management::ContextManager::new(
+            self.client.clone(),
+            &config,
+        ));
         self
     }
 
@@ -709,6 +752,22 @@ impl<C: LLMClient> Core<C> {
                     persist_new_messages(sink.as_ref(), &messages, &mut persisted_ids).await;
                 }
 
+                // Run context compaction (if configured) before the turn callback.
+                #[cfg(feature = "context")]
+                if let Some(ref ctx) = self.context_manager {
+                    let (compacted, result) = ctx.maybe_compact(messages).await;
+                    messages = compacted;
+                    if let Some(r) = result {
+                        yield CoreEvent::Compaction {
+                            original_tokens: r.original_tokens,
+                            compacted_tokens: r.compacted_tokens,
+                            messages_summarized: r.messages_summarized,
+                            was_compacted: r.was_compacted,
+                        };
+                    }
+                }
+
+
                 if let Some(ref callback) = self.turn_callback {
                     let outcome: Result<Result<Vec<Message>, anyhow::Error>, CoreError> = tokio::select! {
                         biased;
@@ -761,7 +820,10 @@ impl<C: LLMClient> Core<C> {
                         "No approval mechanism configured".into(),
                     ));
                 }
-                CoreEvent::Delta(_) | CoreEvent::ToolResult { .. } | CoreEvent::Usage(_) => {}
+                CoreEvent::Delta(_)
+                | CoreEvent::ToolResult { .. }
+                | CoreEvent::Usage(_)
+                | CoreEvent::Compaction { .. } => {}
             }
         }
         Err(CoreError::NoResponse(
