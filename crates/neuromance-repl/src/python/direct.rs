@@ -275,9 +275,7 @@ impl PythonRepl {
     }
 
     /// Execute code with output capture.
-    #[allow(clippy::unused_self)] // Keeps method signature consistent for future extensions
     fn execute_with_capture(
-        &self,
         py: Python,
         code: &str,
         globals: &Bound<PyDict>,
@@ -385,15 +383,7 @@ impl ReplEnvironment for PythonRepl {
                     drop(injected_guard);
 
                     // Execute code with output capture
-                    let repl = Self {
-                        config: ReplConfig::default(),
-                        globals: Arc::clone(&globals),
-                        locals: Arc::clone(&locals),
-                        callbacks: Arc::clone(&callbacks),
-                        injected_callbacks: Arc::clone(&injected_callbacks),
-                    };
-
-                    match repl.execute_with_capture(py, &code, globals_ref, locals_ref) {
+                    match Self::execute_with_capture(py, &code, globals_ref, locals_ref) {
                         Ok((stdout, stderr)) => {
                             // Note: The changes are made to the PyDict that locals_ref points to,
                             // which is the same PyDict stored in locals_dict (our Py<PyDict>)
