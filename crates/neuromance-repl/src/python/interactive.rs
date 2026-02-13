@@ -23,6 +23,82 @@ use crate::{ReplConfig, ReplEnvironment, ReplError, ReplResult};
 
 use super::PythonCallback;
 
+/// Captured stream state for stdout/stderr redirection.
+struct CapturedStreams<'py> {
+    stdout_capture: Bound<'py, PyAny>,
+    stderr_capture: Bound<'py, PyAny>,
+    old_stdout: Bound<'py, PyAny>,
+    old_stderr: Bound<'py, PyAny>,
+}
+
+/// Redirect `sys.stdout` and `sys.stderr` to `StringIO` captures, returning the old streams.
+fn redirect_streams(py: Python<'_>) -> Result<CapturedStreams<'_>, ReplError> {
+    let io_module = py
+        .import("io")
+        .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
+    let string_io = io_module
+        .getattr("StringIO")
+        .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
+
+    let stdout_capture = string_io
+        .call0()
+        .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
+    let stderr_capture = string_io
+        .call0()
+        .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
+
+    let sys_module = py
+        .import("sys")
+        .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
+    let old_stdout = sys_module
+        .getattr("stdout")
+        .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
+    let old_stderr = sys_module
+        .getattr("stderr")
+        .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
+
+    sys_module
+        .setattr("stdout", &stdout_capture)
+        .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
+    sys_module
+        .setattr("stderr", &stderr_capture)
+        .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
+
+    Ok(CapturedStreams {
+        stdout_capture,
+        stderr_capture,
+        old_stdout,
+        old_stderr,
+    })
+}
+
+impl CapturedStreams<'_> {
+    /// Restore `sys.stdout` and `sys.stderr` and extract captured strings.
+    fn restore(self, py: Python<'_>) -> Result<(String, String), ReplError> {
+        let sys_module = py
+            .import("sys")
+            .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
+        let _ = sys_module.setattr("stdout", &self.old_stdout);
+        let _ = sys_module.setattr("stderr", &self.old_stderr);
+
+        let stdout = self
+            .stdout_capture
+            .call_method0("getvalue")
+            .map_err(|e| ReplError::ExecutionError(e.to_string()))?
+            .extract::<String>()
+            .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
+
+        let stderr = self
+            .stderr_capture
+            .call_method0("getvalue")
+            .map_err(|e| ReplError::ExecutionError(e.to_string()))?
+            .extract::<String>()
+            .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
+
+        Ok((stdout, stderr))
+    }
+}
+
 /// Python REPL using `InteractiveConsole` for multi-line support.
 pub struct InteractivePythonRepl {
     /// Configuration
@@ -191,23 +267,44 @@ impl ReplEnvironment for InteractivePythonRepl {
                         drop(callbacks);
                         drop(locals_guard);
 
+                        // Redirect stdout/stderr to capture output
+                        let streams = redirect_streams(py)?;
+
                         // Push each line to the console
                         let console = console_arc.blocking_read();
                         let console_ref = console.bind(py);
 
+                        let mut exec_error = None;
                         for line in code.lines() {
-                            console_ref
-                                .call_method1("push", (line,))
-                                .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
+                            if let Err(e) = console_ref.call_method1("push", (line,)) {
+                                exec_error = Some(e);
+                                break;
+                            }
                         }
 
                         // Push empty line to finalize any incomplete statement
-                        console_ref
-                            .call_method1("push", ("",))
-                            .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
+                        if exec_error.is_none()
+                            && let Err(e) = console_ref.call_method1("push", ("",))
+                        {
+                            exec_error = Some(e);
+                        }
 
-                        Ok(ReplResult::success(String::new())
-                            .with_execution_time(start.elapsed().as_millis() as u64))
+                        // Restore streams and get captured output
+                        let (stdout, stderr) = streams.restore(py)?;
+
+                        if let Some(e) = exec_error {
+                            return Err(ReplError::ExecutionError(e.to_string()));
+                        }
+
+                        // InteractiveConsole writes tracebacks to stderr
+                        let success = stderr.is_empty();
+                        Ok(ReplResult {
+                            stdout,
+                            stderr,
+                            success,
+                            return_value: None,
+                            execution_time_ms: start.elapsed().as_millis() as u64,
+                        })
                     })
                 }),
             )
@@ -377,6 +474,35 @@ result = factorial(5)
         // Empty line finalizes
         let needs_more = repl.push("").await.unwrap();
         assert!(!needs_more);
+    }
+
+    #[tokio::test]
+    async fn test_interactive_stdout_capture() {
+        let repl = InteractivePythonRepl::new().unwrap();
+        let result = repl.execute("print('hello world')").await.unwrap();
+        assert!(result.success);
+        assert_eq!(result.stdout.trim(), "hello world");
+    }
+
+    #[tokio::test]
+    async fn test_interactive_stderr_capture() {
+        let repl = InteractivePythonRepl::new().unwrap();
+        let result = repl.execute("1 / 0").await.unwrap();
+        assert!(!result.success);
+        assert!(result.stderr.contains("ZeroDivisionError"));
+    }
+
+    #[tokio::test]
+    async fn test_interactive_multiple_prints() {
+        let repl = InteractivePythonRepl::new().unwrap();
+        let result = repl
+            .execute("print('line1')\nprint('line2')\nprint('line3')")
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.stdout.contains("line1"));
+        assert!(result.stdout.contains("line2"));
+        assert!(result.stdout.contains("line3"));
     }
 
     #[tokio::test]
