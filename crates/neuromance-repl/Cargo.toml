@@ -23,6 +23,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
+log = { workspace = true }
 
 # Optional Python support
 pyo3 = { version = "0.27.2", features = ["auto-initialize"], optional = true }

@@ -188,7 +188,7 @@ impl PythonRepl {
                         .map_err(|e| ReplError::InitializationError(e.to_string()))?;
                 }
                 Err(e) => {
-                    eprintln!("Warning: Failed to import Python module '{module_name}': {e}");
+                    log::warn!("Failed to import Python module '{module_name}': {e}");
                 }
             }
         }

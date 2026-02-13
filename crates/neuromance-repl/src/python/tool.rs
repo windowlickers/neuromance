@@ -87,33 +87,25 @@ impl ToolImplementation for PythonReplTool {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing 'code' argument"))?;
 
-        println!(">>> Executing Python code:");
-        println!("```python");
-        println!("{code}");
-        println!("```\n");
+        log::debug!("Executing Python code:\n```python\n{code}\n```");
 
         // Execute in REPL
         let result = self.repl.execute(code).await?;
 
-        println!("Result:");
         if result.success {
-            println!("✓ Success");
+            log::debug!("Python execution succeeded in {}ms", result.execution_time_ms);
             if !result.stdout.is_empty() {
-                let stdout = &result.stdout;
-                println!("Output:\n{stdout}");
+                log::debug!("stdout:\n{}", result.stdout);
             }
             if let Some(ref return_value) = result.return_value {
-                println!("Return value: {return_value}");
+                log::debug!("Return value: {return_value}");
             }
         } else {
-            println!("✗ Error");
+            log::warn!("Python execution failed in {}ms", result.execution_time_ms);
             if !result.stderr.is_empty() {
-                let stderr = &result.stderr;
-                println!("Error:\n{stderr}");
+                log::warn!("stderr:\n{}", result.stderr);
             }
         }
-        let ms = result.execution_time_ms;
-        println!("Execution time: {ms}ms\n");
 
         // Format tool response
         let response = if result.success {
