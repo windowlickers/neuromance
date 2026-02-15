@@ -7,8 +7,8 @@ use std::env;
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use log::warn;
 use neuromance::Core;
+use tracing::{debug, info, instrument, warn};
 use neuromance_client::{AnthropicClient, LLMClient, OpenAIClient, ResponsesClient};
 use neuromance_common::protocol::{ConversationSummary, DaemonResponse};
 use neuromance_common::{Config, Conversation, Message, MessageRole, ToolApproval};
@@ -73,6 +73,7 @@ impl ConversationManager {
     /// Returns an error if:
     /// - Model is not found
     /// - Storage operations fail
+    #[instrument(skip(self, system_message), fields(model = ?model, has_system = system_message.is_some()))]
     pub async fn create_conversation(
         &self,
         model: Option<String>,
@@ -104,6 +105,12 @@ impl ConversationManager {
         self.conversation_models
             .insert(conversation.id, model_nickname.clone());
 
+        info!(
+            conversation_id = %conversation.id,
+            model = %model_nickname,
+            "Created new conversation"
+        );
+
         let bookmarks = self.storage.get_conversation_bookmarks(&conversation.id)?;
         Ok(ConversationSummary::from_conversation(
             &conversation,
@@ -128,6 +135,7 @@ impl ConversationManager {
     /// - Conversation not found
     /// - Core creation fails
     /// - Message sending fails
+    #[instrument(skip(self, content, response_tx), fields(conversation_id = ?conversation_id, message_length = content.len()))]
     pub async fn send_message(
         &self,
         conversation_id: Option<String>,
@@ -143,8 +151,15 @@ impl ConversationManager {
                 .ok_or(DaemonError::NoActiveConversation)?
         };
 
+        debug!(conversation_id = %id, "Resolved conversation ID");
+
         // Load conversation
         let mut conversation = self.storage.load_conversation(&id)?;
+        debug!(
+            conversation_id = %id,
+            message_count = conversation.messages.len(),
+            "Loaded conversation"
+        );
 
         // Add user message
         let user_msg = conversation.user_message(&content);
@@ -208,6 +223,12 @@ impl ConversationManager {
         }
         .map_err(|e| DaemonError::Core(e.to_string()))?;
 
+        debug!(
+            conversation_id = %id,
+            message_count = updated_messages.len(),
+            "Chat loop completed"
+        );
+
         // Update conversation with new messages
         for msg in &updated_messages {
             if conversation.messages.iter().all(|m| m.id != msg.id) {
@@ -219,6 +240,7 @@ impl ConversationManager {
 
         // Save updated conversation
         self.storage.save_conversation(&conversation)?;
+        debug!(conversation_id = %id, "Saved conversation");
 
         // Send completion notification
         if let Some(last_msg) = updated_messages.last() {
@@ -332,6 +354,7 @@ impl ConversationManager {
     /// # Errors
     ///
     /// Returns an error if the approval request is not found.
+    #[instrument(skip(self), fields(conversation_id = %conversation_id, tool_call_id = %tool_call_id, approval = ?approval))]
     pub fn approve_tool(
         &self,
         conversation_id: String,
@@ -341,9 +364,11 @@ impl ConversationManager {
         let key = (conversation_id.clone(), tool_call_id.clone());
 
         if let Some((_, tx)) = self.pending_approvals.remove(&key) {
-            let _ = tx.send(approval);
+            let _ = tx.send(approval.clone());
+            debug!("Tool approval sent");
             Ok(())
         } else {
+            warn!("No pending approval found");
             Err(DaemonError::Other(format!(
                 "No pending approval for conversation {conversation_id}, tool call {tool_call_id}"
             )))
@@ -351,9 +376,11 @@ impl ConversationManager {
     }
 
     /// Gets or creates a client for a conversation.
+    #[instrument(skip(self), fields(conversation_id = %conversation_id))]
     async fn get_or_create_client(&self, conversation_id: &Uuid) -> Result<ClientType> {
         // Check if client already exists
         if let Some(entry) = self.clients.get(conversation_id) {
+            debug!("Using existing client");
             return Ok(entry.value().clone());
         }
 
@@ -366,6 +393,12 @@ impl ConversationManager {
 
         // Get model profile
         let model_profile = self.config.get_model(&model_nickname)?;
+
+        debug!(
+            model = %model_nickname,
+            provider = %model_profile.provider,
+            "Creating new client"
+        );
 
         // Get API key from environment
         let api_key = env::var(&model_profile.api_key_env).map_err(|_| {
@@ -411,6 +444,12 @@ impl ConversationManager {
 
         // Insert and return cloned client
         self.clients.insert(*conversation_id, client.clone());
+        info!(
+            conversation_id = %conversation_id,
+            model = %model_nickname,
+            provider = %model_profile.provider,
+            "Client created and cached"
+        );
         Ok(client)
     }
 

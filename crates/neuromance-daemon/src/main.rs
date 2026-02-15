@@ -11,10 +11,10 @@ mod storage;
 
 use std::sync::Arc;
 
-use log::{error, info};
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook_tokio::Signals;
 use tokio::sync::broadcast;
+use tracing::{error, info};
 
 use crate::config::DaemonConfig;
 use crate::conversation_manager::ConversationManager;
@@ -22,10 +22,50 @@ use crate::error::Result;
 use crate::server::Server;
 use crate::storage::Storage;
 
+/// Initializes structured logging with tracing.
+///
+/// Supports two output formats via `NEUROMANCE_LOG_FORMAT` environment variable:
+/// - `json`: Machine-readable JSON logs (default for production)
+/// - `pretty`: Human-readable formatted logs (default for development)
+///
+/// Log level is controlled via `RUST_LOG` environment variable.
+fn init_tracing() {
+    use tracing_subscriber::{fmt, EnvFilter};
+
+    let format = std::env::var("NEUROMANCE_LOG_FORMAT")
+        .unwrap_or_else(|_| "pretty".to_string())
+        .to_lowercase();
+
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("neuromance_daemon=info,neuromance=info"));
+
+    match format.as_str() {
+        "json" => {
+            fmt()
+                .json()
+                .with_env_filter(filter)
+                .with_target(true)
+                .with_thread_ids(true)
+                .with_file(true)
+                .with_line_number(true)
+                .init();
+        }
+        _ => {
+            fmt()
+                .with_env_filter(filter)
+                .with_target(true)
+                .with_thread_ids(false)
+                .with_file(false)
+                .with_line_number(false)
+                .init();
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logger
-    env_logger::init();
+    // Initialize structured logging
+    init_tracing();
 
     info!("Starting Neuromance daemon");
 

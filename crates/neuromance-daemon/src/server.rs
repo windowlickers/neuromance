@@ -6,12 +6,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use log::{debug, error, info, warn};
 use neuromance_common::protocol::{DaemonRequest, DaemonResponse};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{RwLock, mpsc, broadcast};
 use tokio::time::Instant;
+use tracing::{debug, error, info, warn, instrument};
 
 use crate::config::DaemonConfig;
 use crate::conversation_manager::ConversationManager;
@@ -69,6 +69,11 @@ impl Server {
     pub async fn run(self: Arc<Self>) -> Result<()> {
         let socket_path = self.storage.socket_path();
 
+        // Write PID file
+        let pid = std::process::id();
+        self.storage.write_pid(pid)?;
+        info!(pid = %pid, "Daemon started");
+
         // Remove existing socket file
         if socket_path.exists() {
             std::fs::remove_file(socket_path)?;
@@ -76,7 +81,7 @@ impl Server {
 
         // Bind Unix socket
         let listener = UnixListener::bind(socket_path)?;
-        info!("Daemon listening on {}", socket_path.display());
+        info!(socket_path = %socket_path.display(), "Daemon listening");
 
         // Subscribe to shutdown signal
         let mut shutdown_rx = self.shutdown_tx.subscribe();
@@ -94,14 +99,15 @@ impl Server {
                     match result {
                         Ok((stream, _addr)) => {
                             let server = Arc::clone(&self);
+                            debug!("Client connected");
                             tokio::spawn(async move {
                                 if let Err(e) = server.handle_connection(stream).await {
-                                    error!("Connection handling error: {e}");
+                                    error!(error = %e, "Connection handling error");
                                 }
                             });
                         }
                         Err(e) => {
-                            error!("Accept error: {e}");
+                            error!(error = %e, "Accept error");
                         }
                     }
                 }
@@ -119,6 +125,13 @@ impl Server {
             } else {
                 info!("Cleaned up socket file");
             }
+        }
+
+        // Clean up PID file
+        if let Err(e) = self.storage.remove_pid() {
+            warn!("Failed to remove PID file: {e}");
+        } else {
+            info!("Cleaned up PID file");
         }
 
         Ok(())
@@ -147,7 +160,7 @@ impl Server {
                     // Parse request
                     match serde_json::from_str::<DaemonRequest>(&line) {
                         Ok(request) => {
-                            debug!("Received request: {request:?}");
+                            debug!(request = ?request, "Received request");
 
                             // Handle request
                             match self.handle_request(request).await {
@@ -157,13 +170,13 @@ impl Server {
                                         if let Err(e) =
                                             Self::write_response(&mut writer, &response).await
                                         {
-                                            error!("Failed to write response: {e}");
+                                            error!(error = %e, "Failed to write response");
                                             break;
                                         }
                                     }
                                 }
                                 Err(e) => {
-                                    error!("Request handling error: {e}");
+                                    error!(error = %e, "Request handling error");
                                     let response = DaemonResponse::Error {
                                         message: e.to_string(),
                                     };
@@ -172,7 +185,7 @@ impl Server {
                             }
                         }
                         Err(e) => {
-                            warn!("Invalid request JSON: {e}");
+                            warn!(error = %e, "Invalid request JSON");
                             let response = DaemonResponse::Error {
                                 message: format!("Invalid JSON: {e}"),
                             };
@@ -181,7 +194,7 @@ impl Server {
                     }
                 }
                 Err(e) => {
-                    error!("Read error: {e}");
+                    error!(error = %e, "Read error");
                     break;
                 }
             }
@@ -193,6 +206,7 @@ impl Server {
     /// Handles a daemon request.
     ///
     /// Returns a vector of responses (for streaming, multiple responses may be sent).
+    #[instrument(skip(self), fields(request_type = ?request))]
     async fn handle_request(&self, request: DaemonRequest) -> Result<Vec<DaemonResponse>> {
         match request {
             DaemonRequest::SendMessage {
@@ -400,9 +414,11 @@ impl Server {
 
             let last_activity = *self.last_activity.read().await;
             if last_activity.elapsed() > timeout {
+                let inactive_secs = last_activity.elapsed().as_secs();
                 info!(
-                    "Shutting down due to inactivity ({}s)",
-                    last_activity.elapsed().as_secs()
+                    inactive_seconds = inactive_secs,
+                    timeout_seconds = timeout.as_secs(),
+                    "Shutting down due to inactivity"
                 );
                 let _ = self.shutdown_tx.send(());
                 break;

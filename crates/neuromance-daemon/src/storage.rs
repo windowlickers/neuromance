@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 
 use neuromance_common::Conversation;
 use serde::{Deserialize, Serialize};
+use tracing::{debug, instrument};
 use uuid::Uuid;
 
 use crate::error::{DaemonError, Result};
@@ -42,6 +43,9 @@ pub struct Storage {
 
     /// Socket file path
     socket_path: PathBuf,
+
+    /// PID file path
+    pid_file: PathBuf,
 }
 
 /// Bookmark mapping stored in `bookmarks.json`.
@@ -70,6 +74,7 @@ impl Storage {
         let current_file = data_dir.join("current");
         let bookmarks_file = data_dir.join("bookmarks.json");
         let socket_path = data_dir.join("neuromance.sock");
+        let pid_file = data_dir.join("neuromance.pid");
 
         // Create directories
         fs::create_dir_all(&conversations_dir).map_err(|e| {
@@ -82,6 +87,7 @@ impl Storage {
             current_file,
             bookmarks_file,
             socket_path,
+            pid_file,
         })
     }
 
@@ -91,6 +97,53 @@ impl Storage {
         &self.socket_path
     }
 
+    /// Returns the PID file path.
+    #[must_use]
+    pub fn pid_file(&self) -> &Path {
+        &self.pid_file
+    }
+
+    /// Writes the daemon PID to the PID file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if file writing fails.
+    pub fn write_pid(&self, pid: u32) -> Result<()> {
+        fs::write(&self.pid_file, pid.to_string())?;
+        Ok(())
+    }
+
+    /// Reads the daemon PID from the PID file.
+    ///
+    /// Returns `None` if the file doesn't exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading or parsing fails.
+    pub fn read_pid(&self) -> Result<Option<u32>> {
+        if !self.pid_file.exists() {
+            return Ok(None);
+        }
+
+        let content = fs::read_to_string(&self.pid_file)?;
+        let pid = content.trim().parse::<u32>()
+            .map_err(|e| DaemonError::Storage(format!("Invalid PID in file: {e}")))?;
+
+        Ok(Some(pid))
+    }
+
+    /// Removes the PID file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if file deletion fails (unless file doesn't exist).
+    pub fn remove_pid(&self) -> Result<()> {
+        if self.pid_file.exists() {
+            fs::remove_file(&self.pid_file)?;
+        }
+        Ok(())
+    }
+
     /// Saves a conversation to disk.
     ///
     /// Uses atomic write (write to temp file, then rename) for safety.
@@ -98,14 +151,22 @@ impl Storage {
     /// # Errors
     ///
     /// Returns an error if serialization or file I/O fails.
+    #[instrument(skip(self, conversation), fields(conversation_id = %conversation.id, message_count = conversation.messages.len()))]
     pub fn save_conversation(&self, conversation: &Conversation) -> Result<()> {
         let path = self.conversation_path(&conversation.id);
         let json = serde_json::to_string_pretty(conversation)?;
 
         // Atomic write: write to temp file, then rename
         let temp_path = path.with_extension("tmp");
-        fs::write(&temp_path, json)?;
+        fs::write(&temp_path, &json)?;
         fs::rename(&temp_path, &path)?;
+
+        debug!(
+            conversation_id = %conversation.id,
+            path = %path.display(),
+            size_bytes = json.len(),
+            "Saved conversation"
+        );
 
         Ok(())
     }
@@ -117,6 +178,7 @@ impl Storage {
     /// Returns an error if:
     /// - The file doesn't exist
     /// - Deserialization fails
+    #[instrument(skip(self), fields(conversation_id = %id))]
     pub fn load_conversation(&self, id: &Uuid) -> Result<Conversation> {
         let path = self.conversation_path(id);
 
@@ -125,7 +187,13 @@ impl Storage {
         }
 
         let json = fs::read_to_string(&path)?;
-        let conversation = serde_json::from_str(&json)?;
+        let conversation: Conversation = serde_json::from_str(&json)?;
+
+        debug!(
+            conversation_id = %id,
+            message_count = conversation.messages.len(),
+            "Loaded conversation"
+        );
 
         Ok(conversation)
     }
@@ -299,17 +367,21 @@ impl Storage {
     /// # Errors
     ///
     /// Returns an error if the conversation cannot be found.
+    #[instrument(skip(self), fields(input = %id_or_name))]
     pub fn resolve_conversation_id(&self, id_or_name: &str) -> Result<Uuid> {
         let bookmarks = self.load_bookmarks()?;
 
         // Try bookmark lookup first
         if let Some(id_str) = bookmarks.get(id_or_name) {
-            return Uuid::parse_str(id_str)
-                .map_err(|_| DaemonError::InvalidConversationId(id_or_name.to_string()));
+            let id = Uuid::parse_str(id_str)
+                .map_err(|_| DaemonError::InvalidConversationId(id_or_name.to_string()))?;
+            debug!(resolved_id = %id, method = "bookmark", "Resolved conversation ID");
+            return Ok(id);
         }
 
         // Try full UUID parse
         if let Ok(id) = Uuid::parse_str(id_or_name) {
+            debug!(resolved_id = %id, method = "full_uuid", "Resolved conversation ID");
             return Ok(id);
         }
 
@@ -323,7 +395,10 @@ impl Storage {
 
             match matches.len() {
                 0 => {}
-                1 => return Ok(matches[0]),
+                1 => {
+                    debug!(resolved_id = %matches[0], method = "short_hash", "Resolved conversation ID");
+                    return Ok(matches[0]);
+                }
                 _ => {
                     return Err(DaemonError::InvalidConversationId(format!(
                         "Ambiguous short hash: {id_or_name}"
@@ -385,6 +460,7 @@ mod tests {
             current_file: data_dir.join("current"),
             bookmarks_file: data_dir.join("bookmarks.json"),
             socket_path: data_dir.join("neuromance.sock"),
+            pid_file: data_dir.join("neuromance.pid"),
         };
 
         (storage, temp_dir)
