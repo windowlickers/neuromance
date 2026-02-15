@@ -71,8 +71,8 @@
           };
         });
 
-        # The CLI binary
-        neuromance-cli = craneLib.buildPackage (commonArgs // {
+        # The CLI binary (base package)
+        neuromance-cli-base = craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
           cargoExtraArgs = "--package neuromance-cli";
           meta = with pkgs.lib; {
@@ -89,6 +89,16 @@
             ];
           };
         });
+
+        # CLI with nx symlink
+        neuromance-cli = pkgs.symlinkJoin {
+          name = "neuromance-cli-${version}";
+          paths = [ neuromance-cli-base ];
+          postBuild = ''
+            ln -s $out/bin/neuromance $out/bin/nx
+          '';
+          meta = neuromance-cli-base.meta;
+        };
 
         # The daemon binary
         neuromance-daemon = craneLib.buildPackage (commonArgs // {
@@ -122,7 +132,8 @@
       {
         # `nix flake check` runs all of these
         checks = {
-          inherit neuromance neuromance-cli neuromance-daemon;
+          inherit neuromance neuromance-daemon;
+          neuromance-cli = neuromance-cli-base;
 
           fmt = craneLib.cargoFmt { inherit src; };
 
@@ -140,14 +151,17 @@
         packages = {
           inherit neuromance neuromance-cli neuromance-daemon neuromance-full;
           default = neuromance-full;  # Install both by default
-          nm = neuromance-cli;  # Alias for the nm binary
         };
 
         # Apps for `nix run`
         apps = {
-          nm = flake-utils.lib.mkApp {
+          neuromance = flake-utils.lib.mkApp {
             drv = neuromance-cli;
-            exePath = "/bin/nm";
+            exePath = "/bin/neuromance";
+          };
+          nx = flake-utils.lib.mkApp {
+            drv = neuromance-cli;
+            exePath = "/bin/nx";
           };
           daemon = flake-utils.lib.mkApp {
             drv = neuromance-daemon;
@@ -155,7 +169,7 @@
           };
           default = flake-utils.lib.mkApp {
             drv = neuromance-cli;
-            exePath = "/bin/nm";
+            exePath = "/bin/nx";
           };
         };
 

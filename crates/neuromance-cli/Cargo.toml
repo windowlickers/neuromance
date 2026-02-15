@@ -13,7 +13,7 @@ categories.workspace = true
 description = "Lightweight client for the Neuromance daemon"
 
 [[bin]]
-name = "nm"
+name = "neuromance"
 path = "src/main.rs"
 
 [lints]
