@@ -303,6 +303,49 @@ pub async fn daemon_status(client: &mut DaemonClient) -> Result<()> {
     Ok(())
 }
 
+/// Checks daemon health and version compatibility.
+pub async fn daemon_health(client: &mut DaemonClient) -> Result<()> {
+    let client_version = env!("CARGO_PKG_VERSION").to_string();
+    let request = DaemonRequest::Health { client_version };
+
+    client.send_request(&request).await?;
+
+    let response = client.read_response().await?;
+
+    match response {
+        DaemonResponse::Health {
+            daemon_version,
+            compatible,
+            warning,
+            uptime_seconds,
+        } => {
+            if compatible {
+                println!("{} Daemon is healthy", "✓".bright_green());
+            } else {
+                println!("{} Version compatibility issue", "⚠".bright_yellow());
+            }
+
+            println!("  Daemon version: {}", daemon_version.bright_cyan());
+            println!("  Client version: {}", env!("CARGO_PKG_VERSION").bright_cyan());
+            println!("  Compatible: {}", if compatible { "yes".bright_green() } else { "no".bright_red() });
+            println!("  Uptime: {}s", uptime_seconds);
+
+            if let Some(warning_msg) = warning {
+                println!();
+                println!("{} {}", "Warning:".bright_yellow(), warning_msg);
+            }
+        }
+        DaemonResponse::Error { message } => {
+            eprintln!("{} {message}", "Error:".bright_red());
+        }
+        _ => {
+            eprintln!("{} Unexpected response", "Error:".bright_red());
+        }
+    }
+
+    Ok(())
+}
+
 /// Shuts down the daemon.
 pub async fn shutdown_daemon(client: &mut DaemonClient) -> Result<()> {
     let request = DaemonRequest::Shutdown;

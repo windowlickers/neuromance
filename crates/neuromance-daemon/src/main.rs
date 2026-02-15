@@ -12,6 +12,9 @@ mod storage;
 use std::sync::Arc;
 
 use log::{error, info};
+use signal_hook::consts::signal::{SIGINT, SIGTERM};
+use signal_hook_tokio::Signals;
+use tokio::sync::broadcast;
 
 use crate::config::DaemonConfig;
 use crate::conversation_manager::ConversationManager;
@@ -55,12 +58,39 @@ async fn main() -> Result<()> {
         Arc::clone(&config),
     ));
 
+    // Create shutdown channel
+    let (shutdown_tx, _) = broadcast::channel(1);
+
+    // Set up signal handlers
+    let mut signals = Signals::new([SIGTERM, SIGINT])?;
+    let shutdown_tx_clone = shutdown_tx.clone();
+    tokio::spawn(async move {
+        use futures::stream::StreamExt;
+        while let Some(signal) = signals.next().await {
+            match signal {
+                SIGTERM => {
+                    info!("Received SIGTERM, initiating graceful shutdown");
+                    let _ = shutdown_tx_clone.send(());
+                    break;
+                }
+                SIGINT => {
+                    info!("Received SIGINT, initiating graceful shutdown");
+                    let _ = shutdown_tx_clone.send(());
+                    break;
+                }
+                _ => {}
+            }
+        }
+    });
+
     // Create and run server
-    let server = Arc::new(Server::new(manager, storage, config));
+    let server = Arc::new(Server::new(manager, storage, config, shutdown_tx));
 
     info!("Daemon ready");
 
     server.run().await?;
+
+    info!("Daemon shutdown complete");
 
     Ok(())
 }

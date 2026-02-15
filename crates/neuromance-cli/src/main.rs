@@ -112,6 +112,9 @@ enum DaemonAction {
     /// Show daemon status
     Status,
 
+    /// Check daemon health and version compatibility
+    Health,
+
     /// Shutdown the daemon
     Stop,
 }
@@ -184,6 +187,9 @@ async fn main() -> Result<()> {
             match action {
                 DaemonAction::Status => {
                     commands::daemon_status(&mut client).await?;
+                }
+                DaemonAction::Health => {
+                    commands::daemon_health(&mut client).await?;
                 }
                 DaemonAction::Stop => {
                     commands::shutdown_daemon(&mut client).await?;

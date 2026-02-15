@@ -111,6 +111,15 @@ pub enum DaemonRequest {
     /// Get daemon status (uptime, active conversations, etc.)
     Status,
 
+    /// Check daemon health and version compatibility.
+    ///
+    /// Returns health status and version information. The client should include
+    /// its own version in the request for compatibility checking.
+    Health {
+        /// Client version for compatibility checking
+        client_version: String,
+    },
+
     /// Request graceful daemon shutdown.
     Shutdown,
 }
@@ -205,6 +214,18 @@ pub enum DaemonResponse {
         uptime_seconds: u64,
         /// Number of currently active conversations
         active_conversations: usize,
+    },
+
+    /// Daemon health check response.
+    Health {
+        /// Daemon version
+        daemon_version: String,
+        /// Whether the client version is compatible
+        compatible: bool,
+        /// Optional compatibility warning message
+        warning: Option<String>,
+        /// Daemon uptime in seconds
+        uptime_seconds: u64,
     },
 
     /// A successful operation (generic success).
@@ -309,6 +330,7 @@ pub struct ModelProfile {
 mod tests {
     #![allow(clippy::unwrap_used)]
     #![allow(clippy::expect_used)]
+    #![allow(clippy::panic)]
 
     use super::*;
     use uuid::Uuid;
@@ -448,5 +470,81 @@ mod tests {
             parsed2,
             DaemonRequest::ListConversations { limit: Some(10) }
         ));
+    }
+
+    #[test]
+    fn test_health_request_serialization() {
+        let request = DaemonRequest::Health {
+            client_version: "0.0.6".to_string(),
+        };
+
+        let json = serde_json::to_string(&request).expect("Failed to serialize");
+        let deserialized: DaemonRequest =
+            serde_json::from_str(&json).expect("Failed to deserialize");
+
+        match deserialized {
+            DaemonRequest::Health { client_version } => {
+                assert_eq!(client_version, "0.0.6");
+            }
+            _ => panic!("Wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_health_response_serialization() {
+        let response = DaemonResponse::Health {
+            daemon_version: "0.0.6".to_string(),
+            compatible: true,
+            warning: None,
+            uptime_seconds: 3600,
+        };
+
+        let json = serde_json::to_string(&response).expect("Failed to serialize");
+        let deserialized: DaemonResponse =
+            serde_json::from_str(&json).expect("Failed to deserialize");
+
+        match deserialized {
+            DaemonResponse::Health {
+                daemon_version,
+                compatible,
+                warning,
+                uptime_seconds,
+            } => {
+                assert_eq!(daemon_version, "0.0.6");
+                assert!(compatible);
+                assert!(warning.is_none());
+                assert_eq!(uptime_seconds, 3600);
+            }
+            _ => panic!("Wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_health_response_with_warning() {
+        let response = DaemonResponse::Health {
+            daemon_version: "0.1.0".to_string(),
+            compatible: false,
+            warning: Some("Version mismatch".to_string()),
+            uptime_seconds: 1800,
+        };
+
+        let json = serde_json::to_string(&response).expect("Failed to serialize");
+        let deserialized: DaemonResponse =
+            serde_json::from_str(&json).expect("Failed to deserialize");
+
+        match deserialized {
+            DaemonResponse::Health {
+                daemon_version,
+                compatible,
+                warning,
+                uptime_seconds,
+            } => {
+                assert_eq!(daemon_version, "0.1.0");
+                assert!(!compatible);
+                assert_eq!(warning, Some("Version mismatch".to_string()));
+                assert_eq!(uptime_seconds, 1800);
+            }
+            _ => panic!("Wrong variant"),
+        }
     }
 }

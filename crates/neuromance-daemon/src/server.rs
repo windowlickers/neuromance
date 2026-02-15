@@ -10,7 +10,7 @@ use log::{debug, error, info, warn};
 use neuromance_common::protocol::{DaemonRequest, DaemonResponse};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{RwLock, mpsc, broadcast};
 use tokio::time::Instant;
 
 use crate::config::DaemonConfig;
@@ -34,6 +34,9 @@ pub struct Server {
 
     /// Server start time for uptime calculation
     start_time: Instant,
+
+    /// Shutdown signal broadcaster
+    shutdown_tx: broadcast::Sender<()>,
 }
 
 impl Server {
@@ -42,6 +45,7 @@ impl Server {
         manager: Arc<ConversationManager>,
         storage: Arc<Storage>,
         config: Arc<DaemonConfig>,
+        shutdown_tx: broadcast::Sender<()>,
     ) -> Self {
         Self {
             manager,
@@ -49,6 +53,7 @@ impl Server {
             config,
             last_activity: Arc::new(RwLock::new(Instant::now())),
             start_time: Instant::now(),
+            shutdown_tx,
         }
     }
 
@@ -73,28 +78,50 @@ impl Server {
         let listener = UnixListener::bind(socket_path)?;
         info!("Daemon listening on {}", socket_path.display());
 
-        // Spawn inactivity checker
+        // Subscribe to shutdown signal
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+
+        // Spawn inactivity checker with shutdown awareness
         let server_clone = Arc::clone(&self);
         tokio::spawn(async move {
             server_clone.check_inactivity().await;
         });
 
-        // Accept connections
+        // Accept connections until shutdown
         loop {
-            match listener.accept().await {
-                Ok((stream, _addr)) => {
-                    let server = Arc::clone(&self);
-                    tokio::spawn(async move {
-                        if let Err(e) = server.handle_connection(stream).await {
-                            error!("Connection handling error: {e}");
+            tokio::select! {
+                result = listener.accept() => {
+                    match result {
+                        Ok((stream, _addr)) => {
+                            let server = Arc::clone(&self);
+                            tokio::spawn(async move {
+                                if let Err(e) = server.handle_connection(stream).await {
+                                    error!("Connection handling error: {e}");
+                                }
+                            });
                         }
-                    });
+                        Err(e) => {
+                            error!("Accept error: {e}");
+                        }
+                    }
                 }
-                Err(e) => {
-                    error!("Accept error: {e}");
+                _ = shutdown_rx.recv() => {
+                    info!("Shutdown signal received, stopping accept loop");
+                    break;
                 }
             }
         }
+
+        // Clean up socket file
+        if socket_path.exists() {
+            if let Err(e) = std::fs::remove_file(socket_path) {
+                warn!("Failed to remove socket file: {e}");
+            } else {
+                info!("Cleaned up socket file");
+            }
+        }
+
+        Ok(())
     }
 
     /// Handles a single client connection.
@@ -289,9 +316,30 @@ impl Server {
                 }])
             }
 
+            DaemonRequest::Health { client_version } => {
+                let daemon_version = env!("CARGO_PKG_VERSION").to_string();
+                let uptime_seconds = self.start_time.elapsed().as_secs();
+
+                // Check version compatibility (same major.minor)
+                let (compatible, warning) = Self::check_version_compatibility(
+                    &daemon_version,
+                    &client_version,
+                );
+
+                Ok(vec![DaemonResponse::Health {
+                    daemon_version,
+                    compatible,
+                    warning,
+                    uptime_seconds,
+                }])
+            }
+
             DaemonRequest::Shutdown => {
                 info!("Shutdown requested by client");
-                std::process::exit(0);
+                let _ = self.shutdown_tx.send(());
+                Ok(vec![DaemonResponse::Success {
+                    message: "Shutdown initiated".to_string(),
+                }])
             }
 
             _ => {
@@ -315,6 +363,33 @@ impl Server {
         Ok(())
     }
 
+    /// Checks version compatibility between daemon and client.
+    ///
+    /// Returns (compatible, optional_warning). Compatible means same major.minor version.
+    fn check_version_compatibility(daemon_version: &str, client_version: &str) -> (bool, Option<String>) {
+        let daemon_parts: Vec<&str> = daemon_version.split('.').collect();
+        let client_parts: Vec<&str> = client_version.split('.').collect();
+
+        if daemon_parts.len() < 2 || client_parts.len() < 2 {
+            return (false, Some("Invalid version format".to_string()));
+        }
+
+        let daemon_major_minor = format!("{}.{}", daemon_parts[0], daemon_parts[1]);
+        let client_major_minor = format!("{}.{}", client_parts[0], client_parts[1]);
+
+        if daemon_major_minor == client_major_minor {
+            (true, None)
+        } else {
+            (
+                false,
+                Some(format!(
+                    "Version mismatch: daemon={daemon_version}, client={client_version}. \
+                     Please upgrade to matching versions."
+                )),
+            )
+        }
+    }
+
     /// Periodically checks for inactivity and shuts down if timeout exceeded.
     async fn check_inactivity(self: Arc<Self>) {
         let timeout = Duration::from_secs(self.config.settings.inactivity_timeout);
@@ -329,8 +404,62 @@ impl Server {
                     "Shutting down due to inactivity ({}s)",
                     last_activity.elapsed().as_secs()
                 );
-                std::process::exit(0);
+                let _ = self.shutdown_tx.send(());
+                break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+
+    #[test]
+    fn test_version_compatibility_same_version() {
+        let (compatible, warning) = Server::check_version_compatibility("0.0.6", "0.0.6");
+        assert!(compatible);
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn test_version_compatibility_same_major_minor() {
+        let (compatible, warning) = Server::check_version_compatibility("0.0.6", "0.0.7");
+        assert!(compatible);
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn test_version_compatibility_different_minor() {
+        let (compatible, warning) = Server::check_version_compatibility("0.1.0", "0.0.6");
+        assert!(!compatible);
+        assert!(warning.is_some());
+        assert!(warning.unwrap().contains("Version mismatch"));
+    }
+
+    #[test]
+    fn test_version_compatibility_different_major() {
+        let (compatible, warning) = Server::check_version_compatibility("1.0.0", "0.0.6");
+        assert!(!compatible);
+        assert!(warning.is_some());
+    }
+
+    #[test]
+    fn test_version_compatibility_invalid_format() {
+        let (compatible, warning) = Server::check_version_compatibility("invalid", "0.0.6");
+        assert!(!compatible);
+        assert!(warning.is_some());
+        assert!(warning.unwrap().contains("Invalid version format"));
+    }
+
+    #[test]
+    fn test_version_compatibility_short_version() {
+        let (compatible, warning) = Server::check_version_compatibility("0", "0.0.6");
+        assert!(!compatible);
+        assert!(warning.is_some());
+        assert!(warning.unwrap().contains("Invalid version format"));
     }
 }
