@@ -330,6 +330,42 @@ impl Server {
                 Ok(vec![DaemonResponse::Status {
                     uptime_seconds,
                     active_conversations,
+                    current_conversation: None,
+                }])
+            }
+
+            DaemonRequest::DetailedStatus => {
+                let uptime_seconds = self.start_time.elapsed().as_secs();
+                let active_conversations = self.manager.clients.len();
+
+                // Get current conversation details
+                let current_conversation = self
+                    .storage
+                    .get_active_conversation()
+                    .ok()
+                    .flatten()
+                    .and_then(|id| {
+                        // Load conversation
+                        let conv = self.storage.load_conversation(&id).ok()?;
+
+                        // Get model for this conversation
+                        let model = self.manager.get_conversation_model(&id);
+
+                        // Get bookmarks for this conversation
+                        let bookmarks = self
+                            .storage
+                            .get_conversation_bookmarks(&id)
+                            .unwrap_or_default();
+
+                        Some(neuromance_common::protocol::ConversationSummary::from_conversation(
+                            &conv, model, bookmarks,
+                        ))
+                    });
+
+                Ok(vec![DaemonResponse::Status {
+                    uptime_seconds,
+                    active_conversations,
+                    current_conversation,
                 }])
             }
 

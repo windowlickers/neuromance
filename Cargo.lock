@@ -1331,6 +1331,7 @@ name = "neuromance-cli"
 version = "0.0.6"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "colored",
  "dirs",

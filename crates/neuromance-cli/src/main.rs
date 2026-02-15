@@ -76,6 +76,13 @@ enum Command {
         action: ModelAction,
     },
 
+    /// Show current status (daemon + active conversation)
+    Status {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Daemon management
     Daemon {
         #[command(subcommand)]
@@ -187,6 +194,18 @@ async fn main() -> Result<()> {
                 }
                 ModelAction::Switch { model_nickname } => {
                     commands::switch_model(&mut client, cli.conversation, model_nickname).await?;
+                }
+            }
+        }
+
+        Some(Command::Status { json }) => {
+            match DaemonClient::connect().await {
+                Ok(mut client) => {
+                    commands::status(&mut client, json).await?;
+                }
+                Err(_) => {
+                    // Daemon not running
+                    commands::status_daemon_not_running(json)?;
                 }
             }
         }

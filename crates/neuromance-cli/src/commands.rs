@@ -3,8 +3,10 @@
 use std::io::Write;
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use colored::Colorize;
 use neuromance_common::protocol::{DaemonRequest, DaemonResponse};
+use serde_json::json;
 
 use crate::client::DaemonClient;
 use crate::display::{display_assistant_end, display_assistant_header, display_tool_result};
@@ -287,6 +289,7 @@ pub async fn daemon_status(client: &mut DaemonClient) -> Result<()> {
         DaemonResponse::Status {
             uptime_seconds,
             active_conversations,
+            ..
         } => {
             println!("{} Daemon is running", "✓".bright_green());
             println!("  Uptime: {}s", uptime_seconds);
@@ -434,4 +437,147 @@ pub async fn switch_model(
     }
 
     Ok(())
+}
+
+/// Shows comprehensive status (daemon + current conversation).
+pub async fn status(client: &mut DaemonClient, json: bool) -> Result<()> {
+    let request = DaemonRequest::DetailedStatus;
+    client.send_request(&request).await?;
+    let response = client.read_response().await?;
+
+    match response {
+        DaemonResponse::Status {
+            uptime_seconds,
+            active_conversations,
+            current_conversation,
+        } => {
+            if json {
+                print_status_json(true, Some(uptime_seconds), active_conversations, current_conversation)?;
+            } else {
+                print_status_human(uptime_seconds, active_conversations, current_conversation);
+            }
+        }
+        DaemonResponse::Error { message } => {
+            if json {
+                eprintln!(r#"{{"error":"{}"}}"#, message.replace('"', r#"\""#));
+            } else {
+                eprintln!("{} {message}", "Error:".bright_red());
+            }
+        }
+        _ => {
+            if json {
+                eprintln!(r#"{{"error":"Unexpected response"}}"#);
+            } else {
+                eprintln!("{} Unexpected response", "Error:".bright_red());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Handles status when daemon is not running.
+pub fn status_daemon_not_running(json: bool) -> Result<()> {
+    if json {
+        print_status_json(false, None, 0, None)?;
+    } else {
+        println!("{} Daemon is not running", "○".dimmed());
+        println!();
+        println!("Start a conversation with:");
+        println!("  {}", "nx \"your message\"".bright_cyan());
+    }
+    Ok(())
+}
+
+/// Formats human-readable status output.
+fn print_status_human(
+    uptime_seconds: u64,
+    active_conversations: usize,
+    current_conversation: Option<neuromance_common::protocol::ConversationSummary>,
+) {
+    println!("{} Daemon is running", "✓".bright_green());
+    println!("  Uptime: {}", format_duration(uptime_seconds));
+    println!("  Active conversations: {active_conversations}");
+
+    if let Some(conv) = current_conversation {
+        println!();
+        println!("{} Current conversation", "●".bright_cyan());
+        println!("  ID: {}", conv.short_id.bright_cyan());
+
+        if let Some(title) = conv.title {
+            println!("  Title: {title}");
+        }
+
+        println!("  Model: {}", conv.model.bright_yellow());
+        println!("  Messages: {}", conv.message_count);
+
+        if !conv.bookmarks.is_empty() {
+            println!("  Bookmarks: {}", conv.bookmarks.join(", ").bright_green());
+        }
+
+        println!("  Updated: {}", format_relative_time(conv.updated_at));
+    } else {
+        println!();
+        println!("{} No current conversation", "○".dimmed());
+    }
+}
+
+/// Formats JSON status output.
+fn print_status_json(
+    daemon_running: bool,
+    uptime_seconds: Option<u64>,
+    active_conversations: usize,
+    current_conversation: Option<neuromance_common::protocol::ConversationSummary>,
+) -> Result<()> {
+    let output = if daemon_running {
+        json!({
+            "daemon": {
+                "running": true,
+                "uptime_seconds": uptime_seconds,
+                "active_conversations": active_conversations
+            },
+            "current_conversation": current_conversation
+        })
+    } else {
+        json!({
+            "daemon": {
+                "running": false
+            },
+            "current_conversation": null
+        })
+    };
+
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
+
+/// Formats duration as human-readable string (e.g., "1h 5m 23s").
+fn format_duration(seconds: u64) -> String {
+    let hours = seconds / 3600;
+    let minutes = (seconds % 3600) / 60;
+    let secs = seconds % 60;
+
+    if hours > 0 {
+        format!("{hours}h {minutes}m {secs}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {secs}s")
+    } else {
+        format!("{secs}s")
+    }
+}
+
+/// Formats relative time (e.g., "5 minutes ago").
+fn format_relative_time(timestamp: DateTime<Utc>) -> String {
+    let now = Utc::now();
+    let diff = now.signed_duration_since(timestamp);
+
+    if diff.num_days() > 0 {
+        format!("{} days ago", diff.num_days())
+    } else if diff.num_hours() > 0 {
+        format!("{} hours ago", diff.num_hours())
+    } else if diff.num_minutes() > 0 {
+        format!("{} minutes ago", diff.num_minutes())
+    } else {
+        "just now".to_string()
+    }
 }

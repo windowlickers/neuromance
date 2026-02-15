@@ -529,6 +529,17 @@ impl ConversationManager {
         Ok((messages, total_count, id.to_string()))
     }
 
+    /// Gets the model nickname for a conversation.
+    ///
+    /// Returns the active model if no specific model is set for this conversation.
+    #[must_use]
+    pub fn get_conversation_model(&self, conversation_id: &Uuid) -> String {
+        self.conversation_models
+            .get(conversation_id)
+            .map(|e| e.value().clone())
+            .unwrap_or_else(|| self.config.active_model.clone())
+    }
+
     /// Switches the model for a conversation.
     ///
     /// Preserves conversation history but changes which model will be used

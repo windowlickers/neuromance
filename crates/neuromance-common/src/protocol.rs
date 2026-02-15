@@ -111,6 +111,9 @@ pub enum DaemonRequest {
     /// Get daemon status (uptime, active conversations, etc.)
     Status,
 
+    /// Request detailed status including current conversation.
+    DetailedStatus,
+
     /// Check daemon health and version compatibility.
     ///
     /// Returns health status and version information. The client should include
@@ -214,6 +217,9 @@ pub enum DaemonResponse {
         uptime_seconds: u64,
         /// Number of currently active conversations
         active_conversations: usize,
+        /// Current/active conversation details (if any)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        current_conversation: Option<ConversationSummary>,
     },
 
     /// Daemon health check response.

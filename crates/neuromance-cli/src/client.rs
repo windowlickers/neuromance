@@ -18,6 +18,31 @@ pub struct DaemonClient {
 }
 
 impl DaemonClient {
+    /// Waits for socket connection with exponential backoff.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the socket is unavailable after timeout.
+    async fn wait_for_socket(socket_path: &PathBuf, timeout_secs: u64) -> Result<UnixStream> {
+        let mut delay_ms = 50;
+        let max_attempts = timeout_secs * 10; // Rough estimate accounting for backoff
+
+        for attempt in 0..max_attempts {
+            if let Ok(stream) = UnixStream::connect(socket_path).await {
+                return Ok(stream);
+            }
+
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+
+            // Exponential backoff up to 500ms
+            if attempt < 5 {
+                delay_ms = (delay_ms * 2).min(500);
+            }
+        }
+
+        anyhow::bail!("Socket unavailable after {timeout_secs}s timeout")
+    }
+
     /// Connects to the daemon, auto-spawning if needed.
     ///
     /// This method handles race conditions by:
@@ -42,13 +67,10 @@ impl DaemonClient {
         if let Some(pid) = Self::read_pid(&pid_file)? {
             if Self::is_process_running(pid) {
                 // Daemon is running but socket not ready yet, wait for it
-                for _ in 0..50 {
-                    if let Ok(stream) = UnixStream::connect(&socket_path).await {
-                        return Ok(Self::from_stream(stream));
-                    }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-                anyhow::bail!("Daemon process exists (PID {pid}) but socket unavailable");
+                let stream = Self::wait_for_socket(&socket_path, 10)
+                    .await
+                    .context(format!("Daemon process exists (PID {pid}) but socket unavailable"))?;
+                return Ok(Self::from_stream(stream));
             }
             // Stale PID file, clean it up
             let _ = std::fs::remove_file(&pid_file);
@@ -67,23 +89,12 @@ impl DaemonClient {
         Self::spawn_daemon()?;
 
         // Wait for socket to appear (10 second timeout with backoff)
-        let mut delay_ms = 50;
-        for attempt in 0..20 {
-            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-
-            if let Ok(stream) = UnixStream::connect(&socket_path).await {
-                drop(lock); // Release lock
-                return Ok(Self::from_stream(stream));
-            }
-
-            // Exponential backoff up to 500ms
-            if attempt < 5 {
-                delay_ms = (delay_ms * 2).min(500);
-            }
-        }
+        let stream = Self::wait_for_socket(&socket_path, 10).await;
 
         drop(lock); // Release lock
-        anyhow::bail!("Failed to connect to daemon after spawn")
+
+        let stream = stream.context("Failed to connect to daemon after spawn")?;
+        Ok(Self::from_stream(stream))
     }
 
     /// Creates a client from an existing Unix stream.
