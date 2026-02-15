@@ -396,3 +396,42 @@ pub async fn list_models(client: &mut DaemonClient) -> Result<()> {
 
     Ok(())
 }
+
+/// Switches the model for a conversation.
+pub async fn switch_model(
+    client: &mut DaemonClient,
+    conversation_id: Option<String>,
+    model_nickname: String,
+) -> Result<()> {
+    let request = DaemonRequest::SwitchModel {
+        conversation_id,
+        model_nickname: model_nickname.clone(),
+    };
+
+    client.send_request(&request).await?;
+
+    let response = client.read_response().await?;
+
+    match response {
+        DaemonResponse::ConversationCreated { conversation } => {
+            println!(
+                "{} Switched to model {}",
+                "✓".bright_green(),
+                model_nickname.bright_yellow()
+            );
+            println!(
+                "  {} {}",
+                "Conversation:".dimmed(),
+                conversation.id.bright_cyan()
+            );
+        }
+        DaemonResponse::Error { message } => {
+            eprintln!("{} {message}", "Error:".bright_red());
+        }
+        _ => {
+            eprintln!("{} Unexpected response", "Error:".bright_red());
+        }
+    }
+
+    Ok(())
+}

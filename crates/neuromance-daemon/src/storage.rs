@@ -437,6 +437,24 @@ impl Storage {
     fn conversation_path(&self, id: &Uuid) -> PathBuf {
         self.conversations_dir.join(format!("{id}.json"))
     }
+
+    /// Creates a test storage instance with a temporary directory.
+    ///
+    /// Only available for testing within the crate.
+    #[cfg(test)]
+    pub(crate) fn new_test(data_dir: PathBuf) -> Self {
+        let conversations_dir = data_dir.join("conversations");
+        fs::create_dir_all(&conversations_dir).ok();
+
+        Self {
+            data_dir: data_dir.clone(),
+            conversations_dir,
+            current_file: data_dir.join("current"),
+            bookmarks_file: data_dir.join("bookmarks.json"),
+            socket_path: data_dir.join("neuromance.sock"),
+            pid_file: data_dir.join("neuromance.pid"),
+        }
+    }
 }
 
 #[cfg(test)]

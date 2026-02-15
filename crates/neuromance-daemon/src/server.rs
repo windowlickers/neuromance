@@ -291,12 +291,15 @@ impl Server {
             }
 
             DaemonRequest::SwitchModel {
-                conversation_id: _,
-                model_nickname: _,
+                conversation_id,
+                model_nickname,
             } => {
-                // TODO: Implement model switching
-                Ok(vec![DaemonResponse::Error {
-                    message: "Model switching not yet implemented".to_string(),
+                let summary = self
+                    .manager
+                    .switch_model(conversation_id, model_nickname)
+                    .await?;
+                Ok(vec![DaemonResponse::ConversationCreated {
+                    conversation: summary,
                 }])
             }
 

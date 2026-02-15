@@ -32,6 +32,39 @@ pub async fn run_repl(conversation_id: Option<String>) -> Result<()> {
                     continue;
                 }
 
+                // Handle REPL commands
+                if let Some(cmd) = line.strip_prefix(':') {
+                    let parts: Vec<&str> = cmd.split_whitespace().collect();
+                    match parts.as_slice() {
+                        ["switch", model_nickname] => {
+                            if let Err(e) = crate::commands::switch_model(
+                                &mut client,
+                                conversation_id.clone(),
+                                model_nickname.to_string(),
+                            )
+                            .await
+                            {
+                                eprintln!("{} {e}", "Error:".bright_red());
+                            }
+                        }
+                        ["help"] => {
+                            println!("{}", "REPL Commands:".bright_cyan().bold());
+                            println!("  {} - Switch to a different model", ":switch <model>".bright_yellow());
+                            println!("  {} - Show this help message", ":help".bright_yellow());
+                            println!("  {} - Exit the REPL", "Ctrl-D".bright_yellow());
+                            println!();
+                        }
+                        _ => {
+                            eprintln!(
+                                "{} Unknown command: :{}\nType :help for available commands",
+                                "Error:".bright_red(),
+                                parts.join(" ")
+                            );
+                        }
+                    }
+                    continue;
+                }
+
                 // Add to history
                 let _ = rl.add_history_entry(line);
 

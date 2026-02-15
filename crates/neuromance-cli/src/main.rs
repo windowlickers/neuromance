@@ -105,6 +105,12 @@ enum ModelAction {
     /// List available models
     #[command(alias = "ls")]
     List,
+
+    /// Switch to a different model for the current conversation
+    Switch {
+        /// Model nickname to switch to
+        model_nickname: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -178,6 +184,9 @@ async fn main() -> Result<()> {
             match action {
                 ModelAction::List => {
                     commands::list_models(&mut client).await?;
+                }
+                ModelAction::Switch { model_nickname } => {
+                    commands::switch_model(&mut client, cli.conversation, model_nickname).await?;
                 }
             }
         }

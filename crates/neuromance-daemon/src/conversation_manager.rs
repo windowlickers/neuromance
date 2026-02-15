@@ -528,4 +528,171 @@ impl ConversationManager {
 
         Ok((messages, total_count, id.to_string()))
     }
+
+    /// Switches the model for a conversation.
+    ///
+    /// Preserves conversation history but changes which model will be used
+    /// for future messages. The client cache is invalidated to force creation
+    /// of a new client with the updated model on the next message.
+    ///
+    /// # Arguments
+    ///
+    /// * `conversation_id` - The conversation ID (or None for active conversation)
+    /// * `model_nickname` - The new model nickname to use
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Conversation not found
+    /// - Model not found in configuration
+    /// - Storage operations fail
+    #[instrument(skip(self), fields(conversation_id = ?conversation_id, model_nickname = %model_nickname))]
+    pub async fn switch_model(
+        &self,
+        conversation_id: Option<String>,
+        model_nickname: String,
+    ) -> Result<ConversationSummary> {
+        // Resolve conversation ID
+        let id = if let Some(id_str) = conversation_id {
+            self.storage.resolve_conversation_id(&id_str)?
+        } else {
+            self.storage
+                .get_active_conversation()?
+                .ok_or(DaemonError::NoActiveConversation)?
+        };
+
+        // Validate model exists
+        self.config.get_model(&model_nickname)?;
+
+        // Update conversation model mapping
+        self.conversation_models
+            .insert(id, model_nickname.clone());
+
+        // Invalidate cached client to force recreation with new model
+        self.clients.remove(&id);
+
+        info!(
+            conversation_id = %id,
+            model = %model_nickname,
+            "Switched conversation model"
+        );
+
+        // Load conversation and return summary with new model
+        let conversation = self.storage.load_conversation(&id)?;
+        let bookmarks = self.storage.get_conversation_bookmarks(&id)?;
+        Ok(ConversationSummary::from_conversation(
+            &conversation,
+            model_nickname,
+            bookmarks,
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+    use crate::config::DaemonConfig;
+    use tempfile::TempDir;
+
+    /// Creates a test conversation manager with temporary storage.
+    async fn test_manager() -> (ConversationManager, TempDir) {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = Arc::new(Storage::new_test(temp_dir.path().to_path_buf()));
+
+        let config_toml = r#"
+active_model = "test-model"
+
+[[models]]
+nickname = "test-model"
+provider = "anthropic"
+model = "claude-3-5-sonnet-20241022"
+api_key_env = "ANTHROPIC_API_KEY"
+
+[[models]]
+nickname = "other-model"
+provider = "openai"
+model = "gpt-4o"
+api_key_env = "OPENAI_API_KEY"
+        "#;
+
+        let config: DaemonConfig = toml::from_str(config_toml).unwrap();
+        let manager = ConversationManager::new(storage, Arc::new(config));
+
+        (manager, temp_dir)
+    }
+
+    #[tokio::test]
+    async fn test_switch_model() {
+        let (manager, _temp) = test_manager().await;
+
+        // Create a conversation
+        let summary = manager
+            .create_conversation(None, Some("test system".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(summary.model, "test-model");
+
+        let conv_id = summary.id.clone();
+
+        // Switch model
+        let updated = manager
+            .switch_model(Some(conv_id.clone()), "other-model".to_string())
+            .await
+            .unwrap();
+        assert_eq!(updated.model, "other-model");
+        assert_eq!(updated.id, conv_id);
+
+        // Verify model mapping was updated
+        let uuid = uuid::Uuid::parse_str(&conv_id).unwrap();
+        assert_eq!(
+            manager
+                .conversation_models
+                .get(&uuid)
+                .unwrap()
+                .value(),
+            "other-model"
+        );
+
+        // Verify client cache was cleared
+        assert!(!manager.clients.contains_key(&uuid));
+    }
+
+    #[tokio::test]
+    async fn test_switch_model_invalid_model() {
+        let (manager, _temp) = test_manager().await;
+
+        // Create a conversation
+        let summary = manager
+            .create_conversation(None, None)
+            .await
+            .unwrap();
+
+        // Try to switch to non-existent model
+        let result = manager
+            .switch_model(Some(summary.id.clone()), "nonexistent".to_string())
+            .await;
+
+        assert!(result.is_err());
+        if let Err(DaemonError::ModelNotFound(name)) = result {
+            assert_eq!(name, "nonexistent");
+        } else {
+            panic!("Expected ModelNotFound error");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_switch_model_no_active() {
+        let (manager, _temp) = test_manager().await;
+
+        // Try to switch without active conversation
+        let result = manager
+            .switch_model(None, "other-model".to_string())
+            .await;
+
+        assert!(result.is_err());
+        assert!(matches!(result, Err(DaemonError::NoActiveConversation)));
+    }
 }
