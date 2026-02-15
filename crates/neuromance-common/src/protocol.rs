@@ -299,6 +299,10 @@ pub struct ModelProfile {
 
     /// Environment variable name for the API key (e.g., "ANTHROPIC_API_KEY")
     pub api_key_env: String,
+
+    /// Optional custom base URL (e.g., "https://openrouter.ai/api/v1")
+    #[serde(default)]
+    pub base_url: Option<String>,
 }
 
 #[cfg(test)]
@@ -380,6 +384,7 @@ mod tests {
             provider: "anthropic".to_string(),
             model: "claude-sonnet-4-5-20250929".to_string(),
             api_key_env: "ANTHROPIC_API_KEY".to_string(),
+            base_url: None,
         };
 
         let json = serde_json::to_value(&profile).expect("Failed to serialize");

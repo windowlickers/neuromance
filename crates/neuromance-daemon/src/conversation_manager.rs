@@ -377,8 +377,13 @@ impl ConversationManager {
             })?;
 
         // Create config
-        let config = Config::new(&model_profile.provider, &model_profile.model)
+        let mut config = Config::new(&model_profile.provider, &model_profile.model)
             .with_api_key(api_key);
+
+        // Set custom base URL if specified
+        if let Some(ref base_url) = model_profile.base_url {
+            config.base_url = Some(base_url.clone());
+        }
 
         // Create client based on provider
         let client = match model_profile.provider.as_str() {
