@@ -5,7 +5,7 @@
 use std::io::Write;
 
 use colored::Colorize;
-use neuromance::ToolCall;
+use neuromance_common::ToolCall;
 
 /// Display a tool call being requested by the assistant
 pub fn display_tool_call_request(tool_call: &ToolCall) {

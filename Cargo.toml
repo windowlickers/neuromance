@@ -7,6 +7,7 @@ members = [
   "crates/neuromance-common",
   "crates/neuromance-client",
   "crates/neuromance-tools",
+  "crates/neuromance-daemon",
 ]
 
 [workspace.metadata.crane]

@@ -90,11 +90,30 @@
           };
         });
 
+        # The daemon binary
+        neuromance-daemon = craneLib.buildPackage (commonArgs // {
+          inherit cargoArtifacts;
+          cargoExtraArgs = "--package neuromance-daemon";
+          meta = with pkgs.lib; {
+            description = "Long-running daemon for managing Neuromance conversations";
+            homepage = "https://github.com/windowlickers/neuromance";
+            license = licenses.asl20;
+            maintainers = [
+              {
+                name = "Evan Dobry";
+                email = "evandobry@gmail.com";
+                github = "ecdobry";
+                githubId = 16653165;
+              }
+            ];
+          };
+        });
+
       in
       {
         # `nix flake check` runs all of these
         checks = {
-          inherit neuromance neuromance-cli;
+          inherit neuromance neuromance-cli neuromance-daemon;
 
           fmt = craneLib.cargoFmt { inherit src; };
 
@@ -110,8 +129,9 @@
         };
 
         packages = {
-          inherit neuromance neuromance-cli;
+          inherit neuromance neuromance-cli neuromance-daemon;
           default = neuromance;
+          nm = neuromance-cli;  # Alias for the nm binary
         };
 
         devShells.default = craneLib.devShell {

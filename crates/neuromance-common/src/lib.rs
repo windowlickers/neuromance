@@ -70,6 +70,12 @@ pub mod features;
 /// Provides types for defining and executing functions/tools that LLMs can call.
 pub mod tools;
 
+/// Daemon/client communication protocol.
+///
+/// Defines the line-delimited JSON protocol for communication between
+/// the `nm` CLI client and the `neuromance-daemon` server.
+pub mod protocol;
+
 pub mod agents;
 
 pub use agents::{AgentContext, AgentMemory, AgentMessage, AgentResponse, AgentState, AgentStats};
@@ -82,3 +88,4 @@ pub use features::{ReasoningLevel, ThinkingMode};
 pub use tools::{
     Function, FunctionCall, ObjectSchema, Parameters, Property, Tool, ToolApproval, ToolCall,
 };
+pub use protocol::{ConversationSummary, DaemonRequest, DaemonResponse, ModelProfile};

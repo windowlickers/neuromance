@@ -1,0 +1,58 @@
+[package]
+name = "neuromance-daemon"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Long-running daemon for managing Neuromance conversations"
+readme = "README.md"
+rust-version.workspace = true
+
+[[bin]]
+name = "neuromance-daemon"
+path = "src/main.rs"
+
+[dependencies]
+# Workspace crates
+neuromance = { version = "0.0.6", path = "../neuromance" }
+neuromance-common = { version = "0.0.6", path = "../neuromance-common" }
+neuromance-client = { version = "0.0.6", path = "../neuromance-client" }
+neuromance-tools = { version = "0.0.6", path = "../neuromance-tools" }
+
+# Async runtime
+tokio = { workspace = true, features = ["full"] }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Concurrent collections
+dashmap = "6.0"
+
+# Utilities
+dirs = "5.0"
+log = { workspace = true }
+env_logger = "0.11"
+
+# Signal handling
+signal-hook = "0.3"
+signal-hook-tokio = { version = "0.3", features = ["futures-v0_3"] }
+
+# UUIDs
+uuid = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.24"
+
+[lints]
+workspace = true

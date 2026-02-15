@@ -1,0 +1,447 @@
+//! Daemon/client communication protocol for Neuromance.
+//!
+//! This module defines the line-delimited JSON protocol used for communication
+//! between the lightweight `nm` CLI client and the long-running `neuromance-daemon`.
+//! The protocol supports streaming responses, tool approval, and conversation management.
+//!
+//! # Wire Format
+//!
+//! Messages are sent as line-delimited JSON over a Unix socket. Each message is:
+//! 1. Serialized to JSON
+//! 2. Followed by a newline character (`\n`)
+//!
+//! # Example Flow
+//!
+//! ```text
+//! Client → Daemon: {"SendMessage":{"conversation_id":null,"content":"Hello"}}
+//! Daemon → Client: {"StreamChunk":{"conversation_id":"abc123","content":"Hi"}}
+//! Daemon → Client: {"StreamChunk":{"conversation_id":"abc123","content":" there"}}
+//! Daemon → Client: {"MessageCompleted":{"conversation_id":"abc123","message":{...}}}
+//! ```
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
+use crate::chat::Message;
+use crate::client::Usage;
+use crate::tools::{ToolApproval, ToolCall};
+
+/// Requests sent from the client to the daemon.
+///
+/// These represent user actions like sending messages, creating conversations,
+/// or managing daemon state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum DaemonRequest {
+    /// Send a message to a conversation and receive streaming response.
+    ///
+    /// If `conversation_id` is `None`, the active conversation is used.
+    SendMessage {
+        /// The conversation to send to (or None for active conversation)
+        conversation_id: Option<String>,
+        /// The message content
+        content: String,
+    },
+
+    /// Create a new conversation.
+    ///
+    /// Returns a `ConversationCreated` response with the new conversation details.
+    NewConversation {
+        /// Optional model nickname to use (defaults to active model)
+        model: Option<String>,
+        /// Optional system message to initialize the conversation
+        system_message: Option<String>,
+    },
+
+    /// List messages from a conversation.
+    ///
+    /// If `conversation_id` is `None`, the active conversation is used.
+    ListMessages {
+        /// The conversation to list from (or None for active conversation)
+        conversation_id: Option<String>,
+        /// Maximum number of messages to return (most recent first)
+        limit: Option<usize>,
+    },
+
+    /// List all conversations.
+    ListConversations {
+        /// Maximum number of conversations to return (most recent first)
+        limit: Option<usize>,
+    },
+
+    /// Set a bookmark (name) for a conversation.
+    SetBookmark {
+        /// The conversation ID (full UUID or short hash)
+        conversation_id: String,
+        /// The bookmark name
+        name: String,
+    },
+
+    /// Remove a bookmark.
+    RemoveBookmark {
+        /// The bookmark name to remove
+        name: String,
+    },
+
+    /// Switch the model for a conversation.
+    ///
+    /// If `conversation_id` is `None`, switches the active conversation's model.
+    SwitchModel {
+        /// The conversation to switch (or None for active conversation)
+        conversation_id: Option<String>,
+        /// The model nickname to switch to
+        model_nickname: String,
+    },
+
+    /// List available model profiles.
+    ListModels,
+
+    /// Respond to a tool approval request.
+    ///
+    /// This completes a pending tool approval operation.
+    ToolApproval {
+        /// The conversation ID
+        conversation_id: String,
+        /// The tool call ID being approved/denied
+        tool_call_id: String,
+        /// The approval decision
+        approval: ToolApproval,
+    },
+
+    /// Get daemon status (uptime, active conversations, etc.)
+    Status,
+
+    /// Request graceful daemon shutdown.
+    Shutdown,
+}
+
+/// Responses sent from the daemon to the client.
+///
+/// These include streaming content, tool results, conversation metadata,
+/// and success/error notifications. Multiple responses may be sent for a
+/// single request (e.g., streaming chunks followed by completion).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum DaemonResponse {
+    /// A chunk of streaming content from the assistant.
+    StreamChunk {
+        /// The conversation this chunk belongs to
+        conversation_id: String,
+        /// The incremental content
+        content: String,
+    },
+
+    /// Result of a tool execution.
+    ToolResult {
+        /// The conversation this result belongs to
+        conversation_id: String,
+        /// The tool that was executed
+        tool_name: String,
+        /// The result output
+        result: String,
+        /// Whether execution succeeded
+        success: bool,
+    },
+
+    /// Request for user approval of a tool call.
+    ///
+    /// The daemon will block waiting for a `ToolApproval` request in response.
+    ToolApprovalRequest {
+        /// The conversation requiring approval
+        conversation_id: String,
+        /// The tool call awaiting approval
+        tool_call: ToolCall,
+    },
+
+    /// Token usage statistics for a completed message.
+    Usage {
+        /// The conversation this usage belongs to
+        conversation_id: String,
+        /// Usage statistics
+        usage: Usage,
+    },
+
+    /// Indicates a message exchange is complete.
+    MessageCompleted {
+        /// The conversation this message belongs to
+        conversation_id: String,
+        /// The completed assistant message
+        message: Message,
+    },
+
+    /// A new conversation was created.
+    ConversationCreated {
+        /// Summary of the newly created conversation
+        conversation: ConversationSummary,
+    },
+
+    /// List of messages from a conversation.
+    Messages {
+        /// The conversation these messages belong to
+        conversation_id: String,
+        /// The messages (most recent first if limited)
+        messages: Vec<Message>,
+        /// Total message count in the conversation
+        total_count: usize,
+    },
+
+    /// List of conversations.
+    Conversations {
+        /// Conversation summaries (most recent first if limited)
+        conversations: Vec<ConversationSummary>,
+    },
+
+    /// List of available model profiles.
+    Models {
+        /// Available model profiles
+        models: Vec<ModelProfile>,
+        /// Nickname of the active model
+        active: String,
+    },
+
+    /// Daemon status information.
+    Status {
+        /// How long the daemon has been running (in seconds)
+        uptime_seconds: u64,
+        /// Number of currently active conversations
+        active_conversations: usize,
+    },
+
+    /// A successful operation (generic success).
+    Success {
+        /// Description of what succeeded
+        message: String,
+    },
+
+    /// An error occurred.
+    Error {
+        /// Error message
+        message: String,
+    },
+}
+
+/// Summary information about a conversation.
+///
+/// Used in conversation listings and creation responses. Provides enough
+/// information to identify and select conversations without loading full
+/// message history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationSummary {
+    /// Full conversation UUID
+    pub id: String,
+
+    /// Short ID (first 7 characters, git-style)
+    pub short_id: String,
+
+    /// Optional human-readable title
+    pub title: Option<String>,
+
+    /// Number of messages in the conversation
+    pub message_count: usize,
+
+    /// When the conversation was created
+    pub created_at: DateTime<Utc>,
+
+    /// When the conversation was last updated
+    pub updated_at: DateTime<Utc>,
+
+    /// Bookmark names for this conversation
+    pub bookmarks: Vec<String>,
+
+    /// Model nickname being used
+    pub model: String,
+}
+
+impl ConversationSummary {
+    /// Creates a conversation summary from a conversation and model.
+    ///
+    /// # Arguments
+    ///
+    /// * `conversation` - The conversation to summarize
+    /// * `model` - The model nickname
+    /// * `bookmarks` - Bookmark names for this conversation
+    #[must_use]
+    pub fn from_conversation(
+        conversation: &crate::chat::Conversation,
+        model: impl Into<String>,
+        bookmarks: Vec<String>,
+    ) -> Self {
+        let id = conversation.id.to_string();
+        let short_id = id.chars().take(7).collect();
+
+        Self {
+            id,
+            short_id,
+            title: conversation.title.clone(),
+            message_count: conversation.messages.len(),
+            created_at: conversation.created_at,
+            updated_at: conversation.updated_at,
+            bookmarks,
+            model: model.into(),
+        }
+    }
+}
+
+/// Configuration for an LLM model.
+///
+/// Represents a named model profile from the daemon's configuration file.
+/// Users can reference models by their nickname instead of full provider/model names.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelProfile {
+    /// User-friendly nickname for this model (e.g., "sonnet", "gpt4")
+    pub nickname: String,
+
+    /// Provider name (e.g., "anthropic", "openai")
+    pub provider: String,
+
+    /// Full model identifier (e.g., "claude-sonnet-4-5-20250929")
+    pub model: String,
+
+    /// Environment variable name for the API key (e.g., "ANTHROPIC_API_KEY")
+    pub api_key_env: String,
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+    use uuid::Uuid;
+
+    #[test]
+    fn test_daemon_request_serialization() {
+        let request = DaemonRequest::SendMessage {
+            conversation_id: None,
+            content: "Hello".to_string(),
+        };
+
+        let json = serde_json::to_string(&request).expect("Failed to serialize");
+        let deserialized: DaemonRequest =
+            serde_json::from_str(&json).expect("Failed to deserialize");
+
+        match deserialized {
+            DaemonRequest::SendMessage {
+                conversation_id,
+                content,
+            } => {
+                assert!(conversation_id.is_none());
+                assert_eq!(content, "Hello");
+            }
+            _ => panic!("Wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_daemon_response_serialization() {
+        let response = DaemonResponse::StreamChunk {
+            conversation_id: "abc123".to_string(),
+            content: "Hello".to_string(),
+        };
+
+        let json = serde_json::to_string(&response).expect("Failed to serialize");
+        let deserialized: DaemonResponse =
+            serde_json::from_str(&json).expect("Failed to deserialize");
+
+        match deserialized {
+            DaemonResponse::StreamChunk {
+                conversation_id,
+                content,
+            } => {
+                assert_eq!(conversation_id, "abc123");
+                assert_eq!(content, "Hello");
+            }
+            _ => panic!("Wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_conversation_summary_from_conversation() {
+        let conv = crate::chat::Conversation::new().with_title("Test Conversation");
+
+        let summary = ConversationSummary::from_conversation(
+            &conv,
+            "sonnet",
+            vec!["bookmark1".to_string(), "bookmark2".to_string()],
+        );
+
+        assert_eq!(summary.id, conv.id.to_string());
+        assert_eq!(summary.short_id.len(), 7);
+        assert_eq!(summary.title, Some("Test Conversation".to_string()));
+        assert_eq!(summary.message_count, 0);
+        assert_eq!(summary.model, "sonnet");
+        assert_eq!(summary.bookmarks.len(), 2);
+    }
+
+    #[test]
+    fn test_model_profile_serialization() {
+        let profile = ModelProfile {
+            nickname: "sonnet".to_string(),
+            provider: "anthropic".to_string(),
+            model: "claude-sonnet-4-5-20250929".to_string(),
+            api_key_env: "ANTHROPIC_API_KEY".to_string(),
+        };
+
+        let json = serde_json::to_value(&profile).expect("Failed to serialize");
+        assert_eq!(json["nickname"], "sonnet");
+        assert_eq!(json["provider"], "anthropic");
+        assert_eq!(json["model"], "claude-sonnet-4-5-20250929");
+        assert_eq!(json["api_key_env"], "ANTHROPIC_API_KEY");
+
+        let deserialized: ModelProfile =
+            serde_json::from_value(json).expect("Failed to deserialize");
+        assert_eq!(profile.nickname, deserialized.nickname);
+        assert_eq!(profile.provider, deserialized.provider);
+    }
+
+    #[test]
+    fn test_tool_approval_request_response() {
+        let tool_call = ToolCall::new("test_tool", vec!["arg1".to_string()]);
+        let conv_id = Uuid::new_v4().to_string();
+
+        let response = DaemonResponse::ToolApprovalRequest {
+            conversation_id: conv_id.clone(),
+            tool_call: tool_call.clone(),
+        };
+
+        let json = serde_json::to_string(&response).expect("Failed to serialize");
+        let deserialized: DaemonResponse =
+            serde_json::from_str(&json).expect("Failed to deserialize");
+
+        match deserialized {
+            DaemonResponse::ToolApprovalRequest {
+                conversation_id,
+                tool_call: tc,
+            } => {
+                assert_eq!(conversation_id, conv_id);
+                assert_eq!(tc.function.name, "test_tool");
+            }
+            _ => panic!("Wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_line_delimited_json_format() {
+        // Simulate line-delimited JSON wire format
+        let request1 = DaemonRequest::Status;
+        let request2 = DaemonRequest::ListConversations { limit: Some(10) };
+
+        let line1 = format!("{}\n", serde_json::to_string(&request1).unwrap());
+        let line2 = format!("{}\n", serde_json::to_string(&request2).unwrap());
+
+        let wire_data = format!("{line1}{line2}");
+
+        // Parse line by line
+        let lines: Vec<&str> = wire_data.lines().collect();
+        assert_eq!(lines.len(), 2);
+
+        let parsed1: DaemonRequest = serde_json::from_str(lines[0]).unwrap();
+        let parsed2: DaemonRequest = serde_json::from_str(lines[1]).unwrap();
+
+        assert!(matches!(parsed1, DaemonRequest::Status));
+        assert!(matches!(
+            parsed2,
+            DaemonRequest::ListConversations { limit: Some(10) }
+        ));
+    }
+}

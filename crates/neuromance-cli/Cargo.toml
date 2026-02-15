@@ -10,20 +10,24 @@ documentation.workspace = true
 readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "Interactive command-line interface for LLM interactions"
+description = "Lightweight client for the Neuromance daemon"
+
+[[bin]]
+name = "nm"
+path = "src/main.rs"
 
 [lints]
 workspace = true
 
 [dependencies]
-neuromance = { version = "0.0.6", path = "../neuromance" }
-neuromance-tools = { version = "0.0.6", path = "../neuromance-tools" }
+neuromance-common = { version = "0.0.6", path = "../neuromance-common" }
 rustyline = "17.0.1"
 anyhow = "1.0"
 tokio = { version = "1", features = ["full"] }
+serde = { workspace = true }
 serde_json = "1.0"
-secrecy = "0.10"
 clap = { version = "4.4", features = ["derive"] }
 colored = "3.0"
-futures = "0.3"
+dirs = "5.0"
+log = { workspace = true }
 env_logger = "0.11"
