@@ -112,9 +112,8 @@ impl DaemonConfig {
             )));
         }
 
-        let contents = fs::read_to_string(&path).map_err(|e| {
-            DaemonError::Config(format!("Failed to read config file: {e}"))
-        })?;
+        let contents = fs::read_to_string(&path)
+            .map_err(|e| DaemonError::Config(format!("Failed to read config file: {e}")))?;
 
         let config: Self = toml::from_str(&contents)?;
         config.validate()?;
@@ -129,9 +128,7 @@ impl DaemonConfig {
     /// Returns an error if the config directory cannot be determined.
     pub fn config_path() -> Result<PathBuf> {
         let config_dir = dirs::config_dir()
-            .ok_or_else(|| {
-                DaemonError::Config("Failed to determine config directory".to_string())
-            })?
+            .ok_or_else(|| DaemonError::Config("Failed to determine config directory".to_string()))?
             .join("neuromance");
 
         Ok(config_dir.join("config.toml"))

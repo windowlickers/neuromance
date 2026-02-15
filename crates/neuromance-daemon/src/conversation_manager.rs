@@ -368,17 +368,16 @@ impl ConversationManager {
         let model_profile = self.config.get_model(&model_nickname)?;
 
         // Get API key from environment
-        let api_key = env::var(&model_profile.api_key_env)
-            .map_err(|_| {
-                DaemonError::Config(format!(
-                    "Environment variable {} not set for model {}",
-                    model_profile.api_key_env, model_nickname
-                ))
-            })?;
+        let api_key = env::var(&model_profile.api_key_env).map_err(|_| {
+            DaemonError::Config(format!(
+                "Environment variable {} not set for model {}",
+                model_profile.api_key_env, model_nickname
+            ))
+        })?;
 
         // Create config
-        let mut config = Config::new(&model_profile.provider, &model_profile.model)
-            .with_api_key(api_key);
+        let mut config =
+            Config::new(&model_profile.provider, &model_profile.model).with_api_key(api_key);
 
         // Set custom base URL if specified
         if let Some(ref base_url) = model_profile.base_url {
@@ -388,8 +387,8 @@ impl ConversationManager {
         // Create client based on provider
         let client = match model_profile.provider.as_str() {
             "anthropic" => {
-                let client = AnthropicClient::new(config)
-                    .map_err(|e| DaemonError::Client(e.to_string()))?;
+                let client =
+                    AnthropicClient::new(config).map_err(|e| DaemonError::Client(e.to_string()))?;
                 ClientType::Anthropic(client)
             }
             "openai" => {
@@ -398,15 +397,15 @@ impl ConversationManager {
                 ClientType::OpenAI(client)
             }
             "responses" => {
-                let client = ResponsesClient::new(config)
-                    .map_err(|e| DaemonError::Client(e.to_string()))?;
+                let client =
+                    ResponsesClient::new(config).map_err(|e| DaemonError::Client(e.to_string()))?;
                 ClientType::Responses(client)
             }
             _ => {
                 return Err(DaemonError::Config(format!(
                     "Unsupported provider: {}",
                     model_profile.provider
-                )))
+                )));
             }
         };
 
@@ -420,7 +419,10 @@ impl ConversationManager {
     /// # Errors
     ///
     /// Returns an error if storage operations fail.
-    pub async fn list_conversations(&self, limit: Option<usize>) -> Result<Vec<ConversationSummary>> {
+    pub async fn list_conversations(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<Vec<ConversationSummary>> {
         let mut ids = self.storage.list_conversations()?;
 
         // Sort by updated_at (most recent first)
@@ -448,7 +450,9 @@ impl ConversationManager {
                     .unwrap_or_else(|| self.config.active_model.clone());
 
                 let bookmarks = self.storage.get_conversation_bookmarks(&id)?;
-                summaries.push(ConversationSummary::from_conversation(&conv, model, bookmarks));
+                summaries.push(ConversationSummary::from_conversation(
+                    &conv, model, bookmarks,
+                ));
             }
         }
 

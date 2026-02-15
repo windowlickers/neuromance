@@ -2,8 +2,8 @@
 
 use anyhow::Result;
 use colored::Colorize;
-use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
+use rustyline::error::ReadlineError;
 
 use crate::client::DaemonClient;
 use crate::commands::send_message;
@@ -36,7 +36,9 @@ pub async fn run_repl(conversation_id: Option<String>) -> Result<()> {
                 let _ = rl.add_history_entry(line);
 
                 // Send message
-                if let Err(e) = send_message(&mut client, conversation_id.clone(), line.to_string()).await {
+                if let Err(e) =
+                    send_message(&mut client, conversation_id.clone(), line.to_string()).await
+                {
                     eprintln!("{} {e}", "Error:".bright_red());
                 }
             }

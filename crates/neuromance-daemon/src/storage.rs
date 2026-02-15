@@ -63,9 +63,7 @@ impl Storage {
     /// - Directory creation fails
     pub fn new() -> Result<Self> {
         let data_dir = dirs::data_local_dir()
-            .ok_or_else(|| {
-                DaemonError::Storage("Failed to determine data directory".to_string())
-            })?
+            .ok_or_else(|| DaemonError::Storage("Failed to determine data directory".to_string()))?
             .join("neuromance");
 
         let conversations_dir = data_dir.join("conversations");
@@ -191,9 +189,8 @@ impl Storage {
             return Ok(None);
         }
 
-        let id = Uuid::parse_str(&id_str).map_err(|e| {
-            DaemonError::Storage(format!("Invalid UUID in current file: {e}"))
-        })?;
+        let id = Uuid::parse_str(&id_str)
+            .map_err(|e| DaemonError::Storage(format!("Invalid UUID in current file: {e}")))?;
 
         Ok(Some(id))
     }
@@ -330,7 +327,7 @@ impl Storage {
                 _ => {
                     return Err(DaemonError::InvalidConversationId(format!(
                         "Ambiguous short hash: {id_or_name}"
-                    )))
+                    )));
                 }
             }
         }
@@ -464,7 +461,9 @@ mod tests {
         storage.set_bookmark("test-bookmark", &conv.id).unwrap();
 
         // Resolve by full UUID
-        let resolved = storage.resolve_conversation_id(&conv.id.to_string()).unwrap();
+        let resolved = storage
+            .resolve_conversation_id(&conv.id.to_string())
+            .unwrap();
         assert_eq!(resolved, conv.id);
 
         // Resolve by bookmark

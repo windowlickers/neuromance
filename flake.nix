@@ -109,6 +109,15 @@
           };
         });
 
+        # Combined package with both CLI and daemon
+        neuromance-full = pkgs.symlinkJoin {
+          name = "neuromance-full-${version}";
+          paths = [ neuromance-cli neuromance-daemon ];
+          meta = neuromance-cli.meta // {
+            description = "Neuromance CLI and daemon for persistent LLM conversations";
+          };
+        };
+
       in
       {
         # `nix flake check` runs all of these
@@ -129,9 +138,25 @@
         };
 
         packages = {
-          inherit neuromance neuromance-cli neuromance-daemon;
-          default = neuromance;
+          inherit neuromance neuromance-cli neuromance-daemon neuromance-full;
+          default = neuromance-full;  # Install both by default
           nm = neuromance-cli;  # Alias for the nm binary
+        };
+
+        # Apps for `nix run`
+        apps = {
+          nm = flake-utils.lib.mkApp {
+            drv = neuromance-cli;
+            exePath = "/bin/nm";
+          };
+          daemon = flake-utils.lib.mkApp {
+            drv = neuromance-daemon;
+            exePath = "/bin/neuromance-daemon";
+          };
+          default = flake-utils.lib.mkApp {
+            drv = neuromance-cli;
+            exePath = "/bin/nm";
+          };
         };
 
         devShells.default = craneLib.devShell {

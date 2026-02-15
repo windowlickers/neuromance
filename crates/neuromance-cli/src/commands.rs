@@ -132,11 +132,7 @@ pub async fn list_messages(
                 return Ok(());
             }
 
-            println!(
-                "Showing {} of {} messages:",
-                messages.len(),
-                total_count
-            );
+            println!("Showing {} of {} messages:", messages.len(), total_count);
             println!();
 
             for msg in messages {
@@ -178,10 +174,7 @@ pub async fn list_messages(
 }
 
 /// Lists all conversations.
-pub async fn list_conversations(
-    client: &mut DaemonClient,
-    limit: Option<usize>,
-) -> Result<()> {
+pub async fn list_conversations(client: &mut DaemonClient, limit: Option<usize>) -> Result<()> {
     let request = DaemonRequest::ListConversations { limit };
 
     client.send_request(&request).await?;

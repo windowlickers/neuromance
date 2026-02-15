@@ -10,7 +10,7 @@ use log::{debug, error, info, warn};
 use neuromance_common::protocol::{DaemonRequest, DaemonResponse};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use tokio::time::Instant;
 
 use crate::config::DaemonConfig;
@@ -127,7 +127,9 @@ impl Server {
                                 Ok(responses) => {
                                     // Write responses (may be multiple for streaming)
                                     for response in responses {
-                                        if let Err(e) = Self::write_response(&mut writer, &response).await {
+                                        if let Err(e) =
+                                            Self::write_response(&mut writer, &response).await
+                                        {
                                             error!("Failed to write response: {e}");
                                             break;
                                         }
@@ -164,10 +166,7 @@ impl Server {
     /// Handles a daemon request.
     ///
     /// Returns a vector of responses (for streaming, multiple responses may be sent).
-    async fn handle_request(
-        &self,
-        request: DaemonRequest,
-    ) -> Result<Vec<DaemonResponse>> {
+    async fn handle_request(&self, request: DaemonRequest) -> Result<Vec<DaemonResponse>> {
         match request {
             DaemonRequest::SendMessage {
                 conversation_id,
@@ -179,7 +178,10 @@ impl Server {
                 // Spawn task to handle sending
                 let manager = Arc::clone(&self.manager);
                 tokio::spawn(async move {
-                    if let Err(e) = manager.send_message(conversation_id, content, tx.clone()).await {
+                    if let Err(e) = manager
+                        .send_message(conversation_id, content, tx.clone())
+                        .await
+                    {
                         let _ = tx.send(DaemonResponse::Error {
                             message: e.to_string(),
                         });
@@ -199,7 +201,10 @@ impl Server {
                 model,
                 system_message,
             } => {
-                let summary = self.manager.create_conversation(model, system_message).await?;
+                let summary = self
+                    .manager
+                    .create_conversation(model, system_message)
+                    .await?;
                 Ok(vec![DaemonResponse::ConversationCreated {
                     conversation: summary,
                 }])
@@ -209,10 +214,8 @@ impl Server {
                 conversation_id,
                 limit,
             } => {
-                let (messages, total_count, conv_id) = self
-                    .manager
-                    .get_messages(conversation_id, limit)
-                    .await?;
+                let (messages, total_count, conv_id) =
+                    self.manager.get_messages(conversation_id, limit).await?;
 
                 Ok(vec![DaemonResponse::Messages {
                     conversation_id: conv_id,
