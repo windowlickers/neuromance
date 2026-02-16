@@ -239,12 +239,7 @@ pub async fn list_messages(
                 println!("{} {}", "●".bright_white(), role_str.bold());
 
                 if !msg.content.is_empty() {
-                    let preview = if msg.content.len() > 200 {
-                        format!("{}...", &msg.content[..200])
-                    } else {
-                        msg.content.clone()
-                    };
-                    println!("  {preview}");
+                    println!("  {}", truncate_chars(&msg.content, 200));
                 }
 
                 if !msg.tool_calls.is_empty() {
@@ -725,5 +720,127 @@ fn format_relative_time(timestamp: DateTime<Utc>) -> String {
         format!("{} minutes ago", diff.num_minutes())
     } else {
         "just now".to_string()
+    }
+}
+
+/// Truncates a string to at most `max_chars` characters, respecting
+/// UTF-8 character boundaries. Returns the original string if shorter.
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.len() <= max_chars {
+        return s.to_string();
+    }
+    let truncate_idx = s
+        .char_indices()
+        .take(max_chars)
+        .last()
+        .map_or(0, |(idx, ch)| idx + ch.len_utf8());
+    format!("{}...", &s[..truncate_idx])
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+    use chrono::TimeDelta;
+
+    #[test]
+    fn format_duration_zero() {
+        assert_eq!(format_duration(0), "0s");
+    }
+
+    #[test]
+    fn format_duration_seconds_only() {
+        assert_eq!(format_duration(45), "45s");
+    }
+
+    #[test]
+    fn format_duration_minutes_and_seconds() {
+        assert_eq!(format_duration(125), "2m 5s");
+    }
+
+    #[test]
+    fn format_duration_hours_minutes_seconds() {
+        assert_eq!(format_duration(3661), "1h 1m 1s");
+    }
+
+    #[test]
+    fn format_duration_exact_hour() {
+        assert_eq!(format_duration(3600), "1h 0m 0s");
+    }
+
+    #[test]
+    fn format_duration_exact_minute() {
+        assert_eq!(format_duration(60), "1m 0s");
+    }
+
+    #[test]
+    fn format_relative_time_just_now() {
+        let now = Utc::now();
+        assert_eq!(format_relative_time(now), "just now");
+    }
+
+    #[test]
+    fn format_relative_time_minutes_ago() {
+        let timestamp = Utc::now() - TimeDelta::minutes(5);
+        assert_eq!(format_relative_time(timestamp), "5 minutes ago");
+    }
+
+    #[test]
+    fn format_relative_time_hours_ago() {
+        let timestamp = Utc::now() - TimeDelta::hours(3);
+        assert_eq!(format_relative_time(timestamp), "3 hours ago");
+    }
+
+    #[test]
+    fn format_relative_time_days_ago() {
+        let timestamp = Utc::now() - TimeDelta::days(2);
+        assert_eq!(format_relative_time(timestamp), "2 days ago");
+    }
+
+    #[test]
+    fn format_relative_time_one_day() {
+        let timestamp = Utc::now() - TimeDelta::days(1);
+        assert_eq!(format_relative_time(timestamp), "1 days ago");
+    }
+
+    #[test]
+    fn truncate_chars_short_string() {
+        assert_eq!(truncate_chars("hello", 200), "hello");
+    }
+
+    #[test]
+    fn truncate_chars_ascii() {
+        let long = "a".repeat(300);
+        let result = truncate_chars(&long, 200);
+        assert_eq!(result.len(), 203); // 200 chars + "..."
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn truncate_chars_multibyte_utf8() {
+        // Each emoji is 4 bytes. 50 emojis = 200 bytes but only 50 chars.
+        let emojis = "\u{1F600}".repeat(50);
+        let result = truncate_chars(&emojis, 10);
+        // Should truncate to 10 characters (40 bytes) + "..."
+        assert!(result.ends_with("..."));
+        // Count actual chars (minus the 3 dots)
+        let char_count = result.chars().count();
+        assert_eq!(char_count, 13); // 10 emojis + 3 dots
+    }
+
+    #[test]
+    fn truncate_chars_empty_string() {
+        assert_eq!(truncate_chars("", 200), "");
+    }
+
+    #[test]
+    fn truncate_chars_mixed_utf8() {
+        // Mix of 1-byte, 2-byte, 3-byte, and 4-byte chars
+        let mixed = "aé中\u{1F600}".repeat(60);
+        let result = truncate_chars(&mixed, 200);
+        assert!(result.ends_with("..."));
+        // Should not panic — that's the main test
     }
 }

@@ -127,11 +127,17 @@ impl ConversationManager {
                 .map_err(|e| DaemonError::Other(e.to_string()))?;
         }
 
+        // Persist model in conversation metadata
+        conversation.metadata.insert(
+            "model".to_string(),
+            serde_json::Value::String(model_nickname.clone()),
+        );
+
         // Save conversation
         self.storage.save_conversation(&conversation)?;
         self.storage.set_active_conversation(&conversation.id)?;
 
-        // Track model for this conversation
+        // Track model for this conversation (in-memory cache)
         self.conversation_models
             .insert(conversation.id, model_nickname.clone());
 
@@ -191,6 +197,9 @@ impl ConversationManager {
             message_count = conversation.messages.len(),
             "Loaded conversation"
         );
+
+        // Restore model from metadata if not cached (e.g. after restart)
+        self.populate_model_from_metadata(&conversation);
 
         // Add user message
         let user_msg = conversation.user_message(&content);
@@ -479,6 +488,7 @@ impl ConversationManager {
 
         // Load conversation and build summary before deleting
         let conversation = self.storage.load_conversation(&id)?;
+        self.populate_model_from_metadata(&conversation);
         let model = self.get_conversation_model(&id);
         let bookmarks = self.storage.get_conversation_bookmarks(&id)?;
         let summary = ConversationSummary::from_conversation(&conversation, model, bookmarks);
@@ -538,9 +548,11 @@ impl ConversationManager {
             loaded.truncate(limit);
         }
 
-        // Build summaries
+        // Build summaries (populate model cache from metadata to avoid
+        // redundant storage loads since conversations are already loaded)
         let mut summaries = Vec::with_capacity(loaded.len());
         for (id, conv) in &loaded {
+            self.populate_model_from_metadata(conv);
             let model = self.get_conversation_model(id);
             let bookmarks = self.storage.get_conversation_bookmarks(id)?;
             summaries.push(ConversationSummary::from_conversation(
@@ -595,12 +607,40 @@ impl ConversationManager {
 
     /// Gets the model nickname for a conversation.
     ///
-    /// Returns the active model if no specific model is set for this conversation.
+    /// Checks in-memory cache first, then falls back to conversation
+    /// metadata on disk (handles daemon restart). Returns the active
+    /// model if no specific model is set.
     #[must_use]
     pub fn get_conversation_model(&self, conversation_id: &Uuid) -> String {
-        self.conversation_models
-            .get(conversation_id)
-            .map_or_else(|| self.config.active_model.clone(), |e| e.value().clone())
+        // Check in-memory cache
+        if let Some(model) = self.conversation_models.get(conversation_id) {
+            return model.value().clone();
+        }
+
+        // Fall back to conversation metadata (handles daemon restart)
+        if let Ok(conv) = self.storage.load_conversation(conversation_id)
+            && let Some(model) = conv.metadata.get("model").and_then(|v| v.as_str())
+        {
+            let model = model.to_string();
+            self.conversation_models
+                .insert(*conversation_id, model.clone());
+            return model;
+        }
+
+        self.config.active_model.clone()
+    }
+
+    /// Populates the in-memory model cache from conversation metadata.
+    fn populate_model_from_metadata(&self, conversation: &Conversation) {
+        if !self.conversation_models.contains_key(&conversation.id)
+            && let Some(model) = conversation
+                .metadata
+                .get("model")
+                .and_then(|v| v.as_str())
+        {
+            self.conversation_models
+                .insert(conversation.id, model.to_string());
+        }
     }
 
     /// Switches the model for a conversation.
@@ -631,20 +671,26 @@ impl ConversationManager {
         // Validate model exists
         self.config.get_model(&model_nickname)?;
 
-        // Update conversation model mapping
+        // Update conversation model mapping (in-memory cache)
         self.conversation_models.insert(id, model_nickname.clone());
 
         // Invalidate cached client to force recreation with new model
         self.clients.remove(&id);
+
+        // Persist model in conversation metadata
+        let mut conversation = self.storage.load_conversation(&id)?;
+        conversation.metadata.insert(
+            "model".to_string(),
+            serde_json::Value::String(model_nickname.clone()),
+        );
+        conversation.touch();
+        self.storage.save_conversation(&conversation)?;
 
         info!(
             conversation_id = %id,
             model = %model_nickname,
             "Switched conversation model"
         );
-
-        // Load conversation and return summary with new model
-        let conversation = self.storage.load_conversation(&id)?;
         let bookmarks = self.storage.get_conversation_bookmarks(&id)?;
         Ok(ConversationSummary::from_conversation(
             &conversation,
