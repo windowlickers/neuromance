@@ -15,7 +15,7 @@ use tracing::{debug, error, info, instrument, warn};
 
 use crate::config::DaemonConfig;
 use crate::conversation_manager::ConversationManager;
-use crate::error::Result;
+use crate::error::{DaemonError, Result};
 use crate::storage::Storage;
 
 /// Daemon server state.
@@ -159,18 +159,43 @@ impl Server {
                 Ok(_) => {
                     // Parse request
                     match serde_json::from_str::<DaemonRequest>(&line) {
+                        Ok(DaemonRequest::SendMessage {
+                            conversation_id,
+                            content,
+                        }) => {
+                            debug!("Received SendMessage request");
+                            if let Err(e) = self
+                                .handle_streaming_session(
+                                    conversation_id,
+                                    content,
+                                    &mut reader,
+                                    &mut writer,
+                                )
+                                .await
+                            {
+                                error!(error = %e, "Streaming session error");
+                                let response = DaemonResponse::Error {
+                                    message: e.to_string(),
+                                };
+                                let _ =
+                                    Self::write_response(&mut writer, &response).await;
+                            }
+                        }
                         Ok(request) => {
                             debug!(request = ?request, "Received request");
 
                             // Handle request
                             match self.handle_request(request).await {
                                 Ok(responses) => {
-                                    // Write responses (may be multiple for streaming)
                                     for response in responses {
                                         if let Err(e) =
-                                            Self::write_response(&mut writer, &response).await
+                                            Self::write_response(&mut writer, &response)
+                                                .await
                                         {
-                                            error!(error = %e, "Failed to write response");
+                                            error!(
+                                                error = %e,
+                                                "Failed to write response"
+                                            );
                                             break;
                                         }
                                     }
@@ -180,7 +205,8 @@ impl Server {
                                     let response = DaemonResponse::Error {
                                         message: e.to_string(),
                                     };
-                                    let _ = Self::write_response(&mut writer, &response).await;
+                                    let _ =
+                                        Self::write_response(&mut writer, &response).await;
                                 }
                             }
                         }
@@ -207,10 +233,6 @@ impl Server {
     #[instrument(skip_all)]
     async fn handle_request(&self, request: DaemonRequest) -> Result<Vec<DaemonResponse>> {
         match request {
-            DaemonRequest::SendMessage {
-                conversation_id,
-                content,
-            } => self.handle_send_message(conversation_id, content).await,
             DaemonRequest::NewConversation {
                 model,
                 system_message,
@@ -253,11 +275,17 @@ impl Server {
         }
     }
 
-    async fn handle_send_message(
+    /// Streams responses directly to the client as they arrive.
+    ///
+    /// Handles tool approval requests inline by reading the client's
+    /// response from the socket during the streaming session.
+    async fn handle_streaming_session(
         &self,
         conversation_id: Option<String>,
         content: String,
-    ) -> Result<Vec<DaemonResponse>> {
+        reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+        writer: &mut tokio::net::unix::OwnedWriteHalf,
+    ) -> Result<()> {
         let (tx, mut rx) = mpsc::unbounded_channel();
 
         let manager = Arc::clone(&self.manager);
@@ -272,12 +300,66 @@ impl Server {
             }
         });
 
-        let mut responses = Vec::new();
         while let Some(response) = rx.recv().await {
-            responses.push(response);
+            let needs_approval =
+                matches!(&response, DaemonResponse::ToolApprovalRequest { .. });
+            Self::write_response(writer, &response).await?;
+
+            if needs_approval {
+                self.read_tool_approval(reader, writer).await?;
+            }
         }
 
-        Ok(responses)
+        Ok(())
+    }
+
+    /// Reads a tool approval request from the client during a streaming session.
+    async fn read_tool_approval(
+        &self,
+        reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+        writer: &mut tokio::net::unix::OwnedWriteHalf,
+    ) -> Result<()> {
+        let mut line = String::new();
+        let bytes_read = reader.read_line(&mut line).await?;
+
+        if bytes_read == 0 {
+            return Err(DaemonError::Other(
+                "Client disconnected during tool approval".to_string(),
+            ));
+        }
+
+        match serde_json::from_str::<DaemonRequest>(&line) {
+            Ok(DaemonRequest::ToolApproval {
+                conversation_id,
+                tool_call_id,
+                approval,
+            }) => {
+                let responses = self.handle_tool_approval(
+                    &conversation_id,
+                    &tool_call_id,
+                    approval,
+                )?;
+                for response in responses {
+                    Self::write_response(writer, &response).await?;
+                }
+            }
+            Ok(other) => {
+                warn!(request = ?other, "Unexpected request during tool approval");
+                let response = DaemonResponse::Error {
+                    message: "Expected ToolApproval request".to_string(),
+                };
+                Self::write_response(writer, &response).await?;
+            }
+            Err(e) => {
+                warn!(error = %e, "Invalid JSON during tool approval");
+                let response = DaemonResponse::Error {
+                    message: format!("Invalid JSON: {e}"),
+                };
+                Self::write_response(writer, &response).await?;
+            }
+        }
+
+        Ok(())
     }
 
     async fn handle_new_conversation(
