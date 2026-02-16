@@ -274,6 +274,18 @@ impl DaemonClient {
             .map_err(|e| anyhow::anyhow!("{e}"))
     }
 
+    /// Prunes conversations (empty only, or all).
+    pub async fn prune_conversations(
+        &mut self,
+        all: bool,
+    ) -> Result<proto::PruneConversationsResponse> {
+        self.inner
+            .prune_conversations(proto::PruneConversationsRequest { all })
+            .await
+            .map(tonic::Response::into_inner)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
     /// Switches a conversation's model.
     pub async fn switch_model(
         &mut self,

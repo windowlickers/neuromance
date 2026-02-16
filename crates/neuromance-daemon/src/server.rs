@@ -563,6 +563,31 @@ impl neuromance_proto::Neuromance for GrpcService {
         }))
     }
 
+    async fn prune_conversations(
+        &self,
+        request: Request<proto::PruneConversationsRequest>,
+    ) -> std::result::Result<Response<proto::PruneConversationsResponse>, Status> {
+        self.inner.touch_activity().await;
+        let req = request.into_inner();
+
+        let (summaries, skipped) = self
+            .inner
+            .manager
+            .prune_conversations(req.all)
+            .await
+            .map_err(|e| daemon_error_to_status(&e))?;
+
+        let deleted: Vec<proto::ConversationSummaryProto> = summaries
+            .iter()
+            .map(proto::ConversationSummaryProto::from)
+            .collect();
+
+        Ok(Response::new(proto::PruneConversationsResponse {
+            deleted,
+            skipped,
+        }))
+    }
+
     async fn switch_model(
         &self,
         request: Request<proto::SwitchModelRequest>,

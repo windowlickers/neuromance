@@ -69,6 +69,17 @@ enum Command {
         force: bool,
     },
 
+    /// Delete old or empty conversations in bulk
+    Prune {
+        /// Delete ALL conversations, not just empty ones
+        #[arg(long)]
+        all: bool,
+
+        /// Skip confirmation prompt
+        #[arg(short, long)]
+        force: bool,
+    },
+
     /// List all conversations
     #[command(alias = "convs", alias = "c")]
     Conversations {
@@ -190,6 +201,11 @@ async fn main() -> Result<()> {
         }) => {
             let mut client = DaemonClient::connect().await?;
             commands::delete_conversation(&mut client, conversation, force).await?;
+        }
+
+        Some(Command::Prune { all, force }) => {
+            let mut client = DaemonClient::connect().await?;
+            commands::prune_conversations(&mut client, all, force).await?;
         }
 
         Some(Command::Conversations { limit }) => {

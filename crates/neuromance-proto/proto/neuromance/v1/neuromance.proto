@@ -27,6 +27,9 @@ service Neuromance {
   // Delete a conversation.
   rpc DeleteConversation(DeleteConversationRequest) returns (DeleteConversationResponse);
 
+  // Bulk-delete empty or all conversations.
+  rpc PruneConversations(PruneConversationsRequest) returns (PruneConversationsResponse);
+
   // Switch the model for a conversation.
   rpc SwitchModel(SwitchModelRequest) returns (SwitchModelResponse);
 
@@ -278,6 +281,17 @@ message DeleteConversationRequest {
 
 message DeleteConversationResponse {
   string message = 1;
+}
+
+message PruneConversationsRequest {
+  // false = empty only, true = all conversations
+  bool all = 1;
+}
+
+message PruneConversationsResponse {
+  repeated ConversationSummaryProto deleted = 1;
+  // Active or unloadable conversations that were skipped
+  uint32 skipped = 2;
 }
 
 message SwitchModelRequest {

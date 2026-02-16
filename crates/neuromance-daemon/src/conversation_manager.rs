@@ -627,6 +627,92 @@ impl ConversationManager {
         Ok((messages, total_count, id.to_string()))
     }
 
+    /// Bulk-deletes conversations.
+    ///
+    /// When `all` is false, only empty conversations (no messages) are
+    /// deleted. When `all` is true, all non-active conversations are
+    /// deleted.
+    ///
+    /// The active conversation and any unloadable conversations are
+    /// always skipped.
+    ///
+    /// Returns the deleted summaries and the number of skipped
+    /// conversations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if storage operations fail.
+    #[instrument(skip(self), fields(all = all))]
+    pub async fn prune_conversations(&self, all: bool) -> Result<(Vec<ConversationSummary>, u32)> {
+        let loaded = self
+            .storage
+            .run(move |s| {
+                let ids = s.list_conversations()?;
+                let active_id = s.get_active_conversation()?;
+
+                let mut to_delete = Vec::new();
+                let mut skipped: u32 = 0;
+
+                for id in ids {
+                    if active_id == Some(id) {
+                        skipped += 1;
+                        continue;
+                    }
+
+                    match s.load_conversation(&id) {
+                        Ok(conv) => {
+                            if all || conv.messages.is_empty() {
+                                let bookmarks =
+                                    s.get_conversation_bookmarks(&id).unwrap_or_default();
+                                to_delete.push((id, conv, bookmarks));
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                conversation_id = %id,
+                                error = %e,
+                                "Skipping unloadable conversation"
+                            );
+                            skipped += 1;
+                        }
+                    }
+                }
+
+                for (id, _, _) in &to_delete {
+                    let _ = s.remove_bookmarks_for_conversation(id);
+                    s.delete_conversation(id)?;
+                }
+
+                Ok((to_delete, skipped))
+            })
+            .await?;
+
+        let (deleted_data, skipped) = loaded;
+        let mut summaries = Vec::with_capacity(deleted_data.len());
+
+        for (id, conv, bookmarks) in &deleted_data {
+            self.populate_model_from_metadata(conv);
+            let model = self.get_conversation_model(id);
+            summaries.push(ConversationSummary::from_conversation(
+                conv,
+                model,
+                bookmarks.clone(),
+            ));
+
+            self.clients.remove(id);
+            self.conversation_locks.remove(id);
+            self.conversation_models.remove(id);
+        }
+
+        info!(
+            deleted = deleted_data.len(),
+            skipped = skipped,
+            "Pruned conversations"
+        );
+
+        Ok((summaries, skipped))
+    }
+
     /// Resolves a conversation ID from an optional string, falling back to the active conversation.
     fn resolve_or_active(&self, id: Option<String>) -> Result<Uuid> {
         if let Some(id_str) = id {
@@ -896,5 +982,85 @@ api_key_env = "OPENAI_API_KEY"
 
         assert!(result.is_err());
         assert!(matches!(result, Err(DaemonError::NoActiveConversation)));
+    }
+
+    #[tokio::test]
+    async fn test_prune_empty_only() {
+        let (manager, _temp) = test_manager();
+
+        // Two empty conversations
+        manager.create_conversation(None, None).await.unwrap();
+        manager.create_conversation(None, None).await.unwrap();
+
+        // One with a system message (has messages)
+        manager
+            .create_conversation(None, Some("system".to_string()))
+            .await
+            .unwrap();
+
+        // All three exist (active is the last created)
+        let all = manager.list_conversations(None).await.unwrap();
+        assert_eq!(all.len(), 3);
+
+        let (deleted, skipped) = manager.prune_conversations(false).await.unwrap();
+
+        // Only the two empty non-active conversations deleted
+        assert_eq!(deleted.len(), 2);
+        for d in &deleted {
+            assert_eq!(d.message_count, 0);
+        }
+        // Active conversation was skipped
+        assert!(skipped >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_prune_all() {
+        let (manager, _temp) = test_manager();
+
+        manager.create_conversation(None, None).await.unwrap();
+        manager
+            .create_conversation(None, Some("sys".to_string()))
+            .await
+            .unwrap();
+        let last = manager.create_conversation(None, None).await.unwrap();
+
+        // Last is active
+        let last_uuid = Uuid::parse_str(&last.id).unwrap();
+
+        let (deleted, skipped) = manager.prune_conversations(true).await.unwrap();
+
+        // All non-active deleted
+        assert_eq!(deleted.len(), 2);
+        assert_eq!(skipped, 1); // active
+        for d in &deleted {
+            assert_ne!(d.id, last.id);
+        }
+
+        // Active still exists
+        assert!(manager.storage.load_conversation(&last_uuid).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_prune_skips_active() {
+        let (manager, _temp) = test_manager();
+
+        manager.create_conversation(None, None).await.unwrap();
+        let active = manager.create_conversation(None, None).await.unwrap();
+
+        let (deleted, skipped) = manager.prune_conversations(true).await.unwrap();
+
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(skipped, 1);
+        assert_ne!(deleted[0].id, active.id);
+    }
+
+    #[tokio::test]
+    async fn test_prune_empty_storage() {
+        let (manager, _temp) = test_manager();
+
+        let (deleted, skipped) = manager.prune_conversations(false).await.unwrap();
+
+        assert!(deleted.is_empty());
+        assert_eq!(skipped, 0);
     }
 }

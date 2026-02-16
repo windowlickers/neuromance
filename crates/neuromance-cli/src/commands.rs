@@ -300,6 +300,71 @@ pub async fn delete_conversation(
     Ok(())
 }
 
+/// Prunes conversations (empty only, or all) after preview and confirmation.
+pub async fn prune_conversations(client: &mut DaemonClient, all: bool, force: bool) -> Result<()> {
+    let resp = client.list_conversations(None).await?;
+
+    let candidates: Vec<_> = resp
+        .conversations
+        .iter()
+        .filter(|c| all || c.message_count == 0)
+        .collect();
+
+    if candidates.is_empty() {
+        println!("No conversations to prune");
+        return Ok(());
+    }
+
+    let label = if all { "all" } else { "empty" };
+    println!(
+        "Found {} {} conversation(s) to delete:",
+        candidates.len(),
+        label
+    );
+    println!();
+
+    for conv in &candidates {
+        let title = conv.title.as_deref().unwrap_or("(untitled)");
+        println!(
+            "  {} {} - {} ({} messages)",
+            "●".bright_white(),
+            conv.short_id.bright_cyan(),
+            title,
+            conv.message_count,
+        );
+    }
+
+    println!();
+    println!(
+        "  {} Active conversation will be skipped",
+        "i".bright_blue()
+    );
+
+    if !force {
+        print!("\nProceed? [y/N] ");
+        let _ = std::io::stdout().flush();
+
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+
+        if !matches!(input.trim(), "y" | "Y" | "yes" | "YES") {
+            println!("Cancelled");
+            return Ok(());
+        }
+    }
+
+    let result = client.prune_conversations(all).await?;
+
+    println!(
+        "{} Deleted {} conversation(s), skipped {}",
+        "✓".bright_green(),
+        result.deleted.len(),
+        result.skipped,
+    );
+
+    Ok(())
+}
+
 /// Gets daemon status.
 pub async fn daemon_status(client: &mut DaemonClient) -> Result<()> {
     let resp = client.get_status().await?;
