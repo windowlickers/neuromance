@@ -11,6 +11,8 @@ use neuromance::Core;
 use neuromance_client::{AnthropicClient, LLMClient, OpenAIClient, ResponsesClient};
 use neuromance_common::protocol::{ConversationSummary, DaemonResponse};
 use neuromance_common::{Config, Conversation, Message, MessageRole, ToolApproval};
+use neuromance_tools::ToolImplementation;
+use neuromance_tools::mcp::McpManager;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
@@ -37,6 +39,7 @@ struct ChatLoopConfig {
     auto_approve: bool,
     max_turns: Option<u32>,
     thinking_budget: u32,
+    tools: Vec<Arc<dyn ToolImplementation>>,
 }
 
 /// Manages conversations and their associated Core instances.
@@ -60,11 +63,22 @@ pub struct ConversationManager {
 
     /// Model per conversation (conversation ID -> model nickname)
     conversation_models: DashMap<Uuid, String>,
+
+    /// MCP server manager (None if no MCP servers configured)
+    mcp_manager: Option<Arc<McpManager>>,
+
+    /// Built-in tools to register on each Core instance
+    builtin_tools: Vec<Arc<dyn ToolImplementation>>,
 }
 
 impl ConversationManager {
     /// Creates a new conversation manager.
-    pub fn new(storage: Arc<Storage>, config: Arc<DaemonConfig>) -> Self {
+    pub fn new(
+        storage: Arc<Storage>,
+        config: Arc<DaemonConfig>,
+        mcp_manager: Option<Arc<McpManager>>,
+        builtin_tools: Vec<Arc<dyn ToolImplementation>>,
+    ) -> Self {
         Self {
             storage,
             config,
@@ -72,6 +86,8 @@ impl ConversationManager {
             conversation_locks: DashMap::new(),
             pending_approvals: Arc::new(DashMap::new()),
             conversation_models: DashMap::new(),
+            mcp_manager,
+            builtin_tools,
         }
     }
 
@@ -195,6 +211,19 @@ impl ConversationManager {
         // Prepare messages for Core
         let messages: Vec<Message> = conversation.messages.to_vec();
 
+        // Collect tools: built-in + MCP
+        let mut tools: Vec<Arc<dyn ToolImplementation>> =
+            self.builtin_tools.clone();
+
+        if let Some(ref mcp) = self.mcp_manager {
+            match mcp.get_all_tools().await {
+                Ok(mcp_tools) => tools.extend(mcp_tools),
+                Err(e) => {
+                    warn!("Failed to load MCP tools: {e}");
+                }
+            }
+        }
+
         let conv_id_str = id.to_string();
         let config = ChatLoopConfig {
             conversation_id: conv_id_str.clone(),
@@ -203,6 +232,7 @@ impl ConversationManager {
             auto_approve: self.config.settings.auto_approve_tools,
             max_turns: self.config.settings.max_turns.try_into().ok(),
             thinking_budget: self.config.settings.thinking_budget,
+            tools,
         };
 
         let updated_messages = match client_enum {
@@ -266,6 +296,10 @@ impl ConversationManager {
 
         core.auto_approve_tools = config.auto_approve;
         core.max_turns = config.max_turns;
+
+        for tool in config.tools {
+            core.tool_executor.add_tool_arc(tool);
+        }
 
         core = core.with_event_callback(move |event| {
             let tx = tx.clone();
@@ -604,7 +638,12 @@ api_key_env = "OPENAI_API_KEY"
         "#;
 
         let config: DaemonConfig = toml::from_str(config_toml).unwrap();
-        let manager = ConversationManager::new(storage, Arc::new(config));
+        let manager = ConversationManager::new(
+            storage,
+            Arc::new(config),
+            None,
+            Vec::new(),
+        );
 
         (manager, temp_dir)
     }
