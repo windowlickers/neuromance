@@ -148,8 +148,11 @@ pub async fn send_message(
                 eprintln!("\n{} {message}", "Error:".bright_red());
                 break; // Done
             }
-            _ => {
-                // Unexpected response, continue
+            other => {
+                eprintln!(
+                    "\n{} Unexpected response during streaming: {other:?}",
+                    "Warning:".bright_yellow()
+                );
             }
         }
     }

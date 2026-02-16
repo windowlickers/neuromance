@@ -181,14 +181,12 @@ impl Storage {
             let entry = entry?;
             let path = entry.path();
 
-            if path.extension().is_some_and(|ext| ext == "json") {
-                if let Some(stem) = path.file_stem() {
-                    if let Some(stem_str) = stem.to_str() {
-                        if let Ok(id) = Uuid::parse_str(stem_str) {
-                            ids.push(id);
-                        }
-                    }
-                }
+            if path.extension().is_some_and(|ext| ext == "json")
+                && let Some(stem) = path.file_stem()
+                && let Some(stem_str) = stem.to_str()
+                && let Ok(id) = Uuid::parse_str(stem_str)
+            {
+                ids.push(id);
             }
         }
 
