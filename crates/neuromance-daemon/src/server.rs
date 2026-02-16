@@ -203,205 +203,255 @@ impl Server {
         Ok(())
     }
 
-    /// Handles a daemon request.
-    ///
-    /// Returns a vector of responses (for streaming, multiple responses may be sent).
-    #[instrument(skip(self), fields(request_type = ?request))]
-    async fn handle_request(&self, request: DaemonRequest) -> Result<Vec<DaemonResponse>> {
+    /// Dispatches a daemon request to the appropriate handler.
+    #[instrument(skip_all)]
+    async fn handle_request(
+        &self,
+        request: DaemonRequest,
+    ) -> Result<Vec<DaemonResponse>> {
         match request {
             DaemonRequest::SendMessage {
                 conversation_id,
                 content,
-            } => {
-                // Create channel for streaming responses
-                let (tx, mut rx) = mpsc::unbounded_channel();
-
-                // Spawn task to handle sending
-                let manager = Arc::clone(&self.manager);
-                tokio::spawn(async move {
-                    if let Err(e) = manager
-                        .send_message(conversation_id, content, tx.clone())
-                        .await
-                    {
-                        let _ = tx.send(DaemonResponse::Error {
-                            message: e.to_string(),
-                        });
-                    }
-                });
-
-                // Collect responses
-                let mut responses = Vec::new();
-                while let Some(response) = rx.recv().await {
-                    responses.push(response);
-                }
-
-                Ok(responses)
-            }
-
+            } => self.handle_send_message(conversation_id, content).await,
             DaemonRequest::NewConversation {
                 model,
                 system_message,
-            } => {
-                let summary = self
-                    .manager
-                    .create_conversation(model, system_message)
-                    .await?;
-                Ok(vec![DaemonResponse::ConversationCreated {
-                    conversation: summary,
-                }])
-            }
-
+            } => self.handle_new_conversation(model, system_message).await,
             DaemonRequest::ListMessages {
                 conversation_id,
                 limit,
-            } => {
-                let (messages, total_count, conv_id) =
-                    self.manager.get_messages(conversation_id, limit)?;
-
-                Ok(vec![DaemonResponse::Messages {
-                    conversation_id: conv_id,
-                    messages,
-                    total_count,
-                }])
-            }
-
+            } => Ok(self.handle_list_messages(conversation_id, limit)?),
             DaemonRequest::ListConversations { limit } => {
-                let conversations = self.manager.list_conversations(limit)?;
-                Ok(vec![DaemonResponse::Conversations { conversations }])
+                Ok(self.handle_list_conversations(limit)?)
             }
-
             DaemonRequest::SetBookmark {
                 conversation_id,
                 name,
-            } => {
-                let id = self.storage.resolve_conversation_id(&conversation_id)?;
-                self.storage.set_bookmark(&name, &id)?;
-
-                Ok(vec![DaemonResponse::Success {
-                    message: format!("Set bookmark '{name}' for conversation {conversation_id}"),
-                }])
-            }
-
+            } => Ok(self.handle_set_bookmark(conversation_id, name)?),
             DaemonRequest::RemoveBookmark { name } => {
-                self.storage.remove_bookmark(&name)?;
-
-                Ok(vec![DaemonResponse::Success {
-                    message: format!("Removed bookmark '{name}'"),
-                }])
+                Ok(self.handle_remove_bookmark(name)?)
             }
-
             DaemonRequest::SwitchModel {
                 conversation_id,
                 model_nickname,
             } => {
-                let summary = self
-                    .manager
-                    .switch_model(conversation_id, model_nickname)
-                    .await?;
-                Ok(vec![DaemonResponse::ConversationCreated {
-                    conversation: summary,
-                }])
+                self.handle_switch_model(conversation_id, model_nickname)
+                    .await
             }
-
-            DaemonRequest::ListModels => {
-                let models = self.config.models.clone();
-                let active = self.config.active_model.clone();
-
-                Ok(vec![DaemonResponse::Models { models, active }])
-            }
-
+            DaemonRequest::ListModels => Ok(self.handle_list_models()),
             DaemonRequest::ToolApproval {
                 conversation_id,
                 tool_call_id,
                 approval,
             } => {
-                self.manager
-                    .approve_tool(&conversation_id, &tool_call_id, approval)?;
-
-                Ok(vec![DaemonResponse::Success {
-                    message: "Tool approval processed".to_string(),
-                }])
+                Ok(self.handle_tool_approval(
+                    conversation_id,
+                    tool_call_id,
+                    approval,
+                )?)
             }
-
-            DaemonRequest::Status => {
-                let uptime_seconds = self.start_time.elapsed().as_secs();
-                let active_conversations = self.manager.clients.len();
-
-                Ok(vec![DaemonResponse::Status {
-                    uptime_seconds,
-                    active_conversations,
-                    current_conversation: None,
-                }])
-            }
-
+            DaemonRequest::Status => Ok(self.handle_status()),
             DaemonRequest::DetailedStatus => {
-                let uptime_seconds = self.start_time.elapsed().as_secs();
-                let active_conversations = self.manager.clients.len();
-
-                // Get current conversation details
-                let current_conversation = self
-                    .storage
-                    .get_active_conversation()
-                    .ok()
-                    .flatten()
-                    .and_then(|id| {
-                        // Load conversation
-                        let conv = self.storage.load_conversation(&id).ok()?;
-
-                        // Get model for this conversation
-                        let model = self.manager.get_conversation_model(&id);
-
-                        // Get bookmarks for this conversation
-                        let bookmarks = self
-                            .storage
-                            .get_conversation_bookmarks(&id)
-                            .unwrap_or_default();
-
-                        Some(neuromance_common::protocol::ConversationSummary::from_conversation(
-                            &conv, model, bookmarks,
-                        ))
-                    });
-
-                Ok(vec![DaemonResponse::Status {
-                    uptime_seconds,
-                    active_conversations,
-                    current_conversation,
-                }])
+                Ok(self.handle_detailed_status())
             }
-
             DaemonRequest::Health { client_version } => {
-                let daemon_version = env!("CARGO_PKG_VERSION").to_string();
-                let uptime_seconds = self.start_time.elapsed().as_secs();
-
-                // Check version compatibility (same major.minor)
-                let (compatible, warning) = Self::check_version_compatibility(
-                    &daemon_version,
-                    &client_version,
-                );
-
-                Ok(vec![DaemonResponse::Health {
-                    daemon_version,
-                    compatible,
-                    warning,
-                    uptime_seconds,
-                }])
+                Ok(self.handle_health(client_version))
             }
-
-            DaemonRequest::Shutdown => {
-                info!("Shutdown requested by client");
-                let _ = self.shutdown_tx.send(());
-                Ok(vec![DaemonResponse::Success {
-                    message: "Shutdown initiated".to_string(),
-                }])
-            }
-
+            DaemonRequest::Shutdown => Ok(self.handle_shutdown()),
             _ => {
-                // Handle any future variants
+                warn!("Unknown request variant received");
                 Ok(vec![DaemonResponse::Error {
                     message: "Unknown request variant".to_string(),
                 }])
             }
         }
+    }
+
+    async fn handle_send_message(
+        &self,
+        conversation_id: Option<String>,
+        content: String,
+    ) -> Result<Vec<DaemonResponse>> {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let manager = Arc::clone(&self.manager);
+        tokio::spawn(async move {
+            if let Err(e) = manager
+                .send_message(conversation_id, content, tx.clone())
+                .await
+            {
+                let _ = tx.send(DaemonResponse::Error {
+                    message: e.to_string(),
+                });
+            }
+        });
+
+        let mut responses = Vec::new();
+        while let Some(response) = rx.recv().await {
+            responses.push(response);
+        }
+
+        Ok(responses)
+    }
+
+    async fn handle_new_conversation(
+        &self,
+        model: Option<String>,
+        system_message: Option<String>,
+    ) -> Result<Vec<DaemonResponse>> {
+        let summary = self
+            .manager
+            .create_conversation(model, system_message)
+            .await?;
+        Ok(vec![DaemonResponse::ConversationCreated {
+            conversation: summary,
+        }])
+    }
+
+    fn handle_list_messages(
+        &self,
+        conversation_id: Option<String>,
+        limit: Option<usize>,
+    ) -> Result<Vec<DaemonResponse>> {
+        let (messages, total_count, conv_id) =
+            self.manager.get_messages(conversation_id, limit)?;
+        Ok(vec![DaemonResponse::Messages {
+            conversation_id: conv_id,
+            messages,
+            total_count,
+        }])
+    }
+
+    fn handle_list_conversations(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<Vec<DaemonResponse>> {
+        let conversations = self.manager.list_conversations(limit)?;
+        Ok(vec![DaemonResponse::Conversations { conversations }])
+    }
+
+    fn handle_set_bookmark(
+        &self,
+        conversation_id: String,
+        name: String,
+    ) -> Result<Vec<DaemonResponse>> {
+        let id = self
+            .storage
+            .resolve_conversation_id(&conversation_id)?;
+        self.storage.set_bookmark(&name, &id)?;
+        Ok(vec![DaemonResponse::Success {
+            message: format!(
+                "Set bookmark '{name}' for conversation {conversation_id}"
+            ),
+        }])
+    }
+
+    fn handle_remove_bookmark(
+        &self,
+        name: String,
+    ) -> Result<Vec<DaemonResponse>> {
+        self.storage.remove_bookmark(&name)?;
+        Ok(vec![DaemonResponse::Success {
+            message: format!("Removed bookmark '{name}'"),
+        }])
+    }
+
+    async fn handle_switch_model(
+        &self,
+        conversation_id: Option<String>,
+        model_nickname: String,
+    ) -> Result<Vec<DaemonResponse>> {
+        let summary = self
+            .manager
+            .switch_model(conversation_id, model_nickname)
+            .await?;
+        Ok(vec![DaemonResponse::ConversationCreated {
+            conversation: summary,
+        }])
+    }
+
+    fn handle_list_models(&self) -> Vec<DaemonResponse> {
+        let models = self.config.models.clone();
+        let active = self.config.active_model.clone();
+        vec![DaemonResponse::Models { models, active }]
+    }
+
+    fn handle_tool_approval(
+        &self,
+        conversation_id: String,
+        tool_call_id: String,
+        approval: neuromance_common::ToolApproval,
+    ) -> Result<Vec<DaemonResponse>> {
+        self.manager
+            .approve_tool(&conversation_id, &tool_call_id, approval)?;
+        Ok(vec![DaemonResponse::Success {
+            message: "Tool approval processed".to_string(),
+        }])
+    }
+
+    fn handle_status(&self) -> Vec<DaemonResponse> {
+        let uptime_seconds = self.start_time.elapsed().as_secs();
+        let active_conversations = self.manager.clients.len();
+        vec![DaemonResponse::Status {
+            uptime_seconds,
+            active_conversations,
+            current_conversation: None,
+        }]
+    }
+
+    fn handle_detailed_status(&self) -> Vec<DaemonResponse> {
+        let uptime_seconds = self.start_time.elapsed().as_secs();
+        let active_conversations = self.manager.clients.len();
+
+        let current_conversation = self
+            .storage
+            .get_active_conversation()
+            .ok()
+            .flatten()
+            .and_then(|id| {
+                let conv = self.storage.load_conversation(&id).ok()?;
+                let model = self.manager.get_conversation_model(&id);
+                let bookmarks = self
+                    .storage
+                    .get_conversation_bookmarks(&id)
+                    .unwrap_or_default();
+                Some(
+                    neuromance_common::protocol::ConversationSummary::from_conversation(
+                        &conv, model, bookmarks,
+                    ),
+                )
+            });
+
+        vec![DaemonResponse::Status {
+            uptime_seconds,
+            active_conversations,
+            current_conversation,
+        }]
+    }
+
+    fn handle_health(
+        &self,
+        client_version: String,
+    ) -> Vec<DaemonResponse> {
+        let daemon_version = env!("CARGO_PKG_VERSION").to_string();
+        let uptime_seconds = self.start_time.elapsed().as_secs();
+        let (compatible, warning) =
+            Self::check_version_compatibility(&daemon_version, &client_version);
+        vec![DaemonResponse::Health {
+            daemon_version,
+            compatible,
+            warning,
+            uptime_seconds,
+        }]
+    }
+
+    fn handle_shutdown(&self) -> Vec<DaemonResponse> {
+        info!("Shutdown requested by client");
+        let _ = self.shutdown_tx.send(());
+        vec![DaemonResponse::Success {
+            message: "Shutdown initiated".to_string(),
+        }]
     }
 
     /// Writes a response to the client.
