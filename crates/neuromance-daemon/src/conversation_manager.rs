@@ -686,12 +686,9 @@ api_key_env = "OPENAI_API_KEY"
             .switch_model(Some(summary.id.clone()), "nonexistent".to_string())
             .await;
 
-        assert!(result.is_err());
-        if let Err(DaemonError::ModelNotFound(name)) = result {
-            assert_eq!(name, "nonexistent");
-        } else {
-            panic!("Expected ModelNotFound error");
-        }
+        assert!(
+            matches!(&result, Err(DaemonError::ModelNotFound(name)) if name == "nonexistent")
+        );
     }
 
     #[tokio::test]
