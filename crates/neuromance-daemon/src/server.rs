@@ -3,6 +3,7 @@
 //! Listens on a Unix domain socket and handles line-delimited JSON requests
 //! from the `nm` CLI client.
 
+use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -84,6 +85,10 @@ impl Server {
 
         // Bind Unix socket
         let listener = UnixListener::bind(socket_path)?;
+        std::fs::set_permissions(
+            socket_path,
+            std::fs::Permissions::from_mode(0o600),
+        )?;
         info!(socket_path = %socket_path.display(), "Daemon listening");
 
         // Subscribe to shutdown signal
