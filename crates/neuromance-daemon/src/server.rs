@@ -199,6 +199,9 @@ impl Server {
                     break;
                 }
                 Ok(Ok(_)) => {
+                    // Any data on the socket is evidence of activity
+                    *self.last_activity.write().await = Instant::now();
+
                     // Parse request
                     match serde_json::from_str::<DaemonRequest>(&line) {
                         Ok(DaemonRequest::SendMessage {
@@ -272,17 +275,19 @@ impl Server {
             DaemonRequest::ListMessages {
                 conversation_id,
                 limit,
-            } => Ok(self.handle_list_messages(conversation_id, limit)?),
+            } => self.handle_list_messages(conversation_id, limit).await,
             DaemonRequest::ListConversations { limit } => {
-                Ok(self.handle_list_conversations(limit)?)
+                self.handle_list_conversations(limit).await
             }
             DaemonRequest::SetBookmark {
                 conversation_id,
                 name,
-            } => Ok(self.handle_set_bookmark(&conversation_id, &name)?),
-            DaemonRequest::RemoveBookmark { name } => Ok(self.handle_remove_bookmark(&name)?),
+            } => self.handle_set_bookmark(&conversation_id, &name).await,
+            DaemonRequest::RemoveBookmark { name } => {
+                self.handle_remove_bookmark(&name).await
+            }
             DaemonRequest::DeleteConversation { conversation_id } => {
-                Ok(self.handle_delete_conversation(&conversation_id)?)
+                self.handle_delete_conversation(&conversation_id).await
             }
             DaemonRequest::SwitchModel {
                 conversation_id,
@@ -298,7 +303,7 @@ impl Server {
                 approval,
             } => Ok(self.handle_tool_approval(&conversation_id, &tool_call_id, approval)?),
             DaemonRequest::Status => Ok(self.handle_status()),
-            DaemonRequest::DetailedStatus => Ok(self.handle_detailed_status()),
+            DaemonRequest::DetailedStatus => self.handle_detailed_status().await,
             DaemonRequest::Health { client_version } => Ok(self.handle_health(&client_version)),
             DaemonRequest::Shutdown => Ok(self.handle_shutdown()),
             _ => {
@@ -408,12 +413,13 @@ impl Server {
         }])
     }
 
-    fn handle_list_messages(
+    async fn handle_list_messages(
         &self,
         conversation_id: Option<String>,
         limit: Option<usize>,
     ) -> Result<Vec<DaemonResponse>> {
-        let (messages, total_count, conv_id) = self.manager.get_messages(conversation_id, limit)?;
+        let (messages, total_count, conv_id) =
+            self.manager.get_messages(conversation_id, limit).await?;
         Ok(vec![DaemonResponse::Messages {
             conversation_id: conv_id,
             messages,
@@ -421,32 +427,55 @@ impl Server {
         }])
     }
 
-    fn handle_list_conversations(&self, limit: Option<usize>) -> Result<Vec<DaemonResponse>> {
-        let conversations = self.manager.list_conversations(limit)?;
+    async fn handle_list_conversations(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<Vec<DaemonResponse>> {
+        let conversations =
+            self.manager.list_conversations(limit).await?;
         Ok(vec![DaemonResponse::Conversations { conversations }])
     }
 
-    fn handle_set_bookmark(
+    async fn handle_set_bookmark(
         &self,
         conversation_id: &str,
         name: &str,
     ) -> Result<Vec<DaemonResponse>> {
-        let id = self.storage.resolve_conversation_id(conversation_id)?;
-        self.storage.set_bookmark(name, &id)?;
+        let conv_id = conversation_id.to_string();
+        let bm_name = name.to_string();
+        self.storage
+            .run(move |s| {
+                let id = s.resolve_conversation_id(&conv_id)?;
+                s.set_bookmark(&bm_name, &id)?;
+                Ok(())
+            })
+            .await?;
         Ok(vec![DaemonResponse::Success {
-            message: format!("Set bookmark '{name}' for conversation {conversation_id}"),
+            message: format!(
+                "Set bookmark '{name}' for conversation {conversation_id}"
+            ),
         }])
     }
 
-    fn handle_remove_bookmark(&self, name: &str) -> Result<Vec<DaemonResponse>> {
-        self.storage.remove_bookmark(name)?;
+    async fn handle_remove_bookmark(
+        &self,
+        name: &str,
+    ) -> Result<Vec<DaemonResponse>> {
+        let bm_name = name.to_string();
+        self.storage
+            .run(move |s| s.remove_bookmark(&bm_name))
+            .await?;
         Ok(vec![DaemonResponse::Success {
             message: format!("Removed bookmark '{name}'"),
         }])
     }
 
-    fn handle_delete_conversation(&self, conversation_id: &str) -> Result<Vec<DaemonResponse>> {
-        let (summary, removed_bookmarks) = self.manager.delete_conversation(conversation_id)?;
+    async fn handle_delete_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<DaemonResponse>> {
+        let (summary, removed_bookmarks) =
+            self.manager.delete_conversation(conversation_id).await?;
 
         let title_part = summary
             .title
@@ -456,7 +485,10 @@ impl Server {
         let bookmark_part = if removed_bookmarks.is_empty() {
             String::new()
         } else {
-            format!(" (removed bookmarks: {})", removed_bookmarks.join(", "))
+            format!(
+                " (removed bookmarks: {})",
+                removed_bookmarks.join(", ")
+            )
         };
 
         Ok(vec![DaemonResponse::Success {
@@ -510,44 +542,46 @@ impl Server {
         }]
     }
 
-    fn handle_detailed_status(&self) -> Vec<DaemonResponse> {
+    async fn handle_detailed_status(&self) -> Result<Vec<DaemonResponse>> {
         let uptime_seconds = self.start_time.elapsed().as_secs();
         let active_conversations = self.manager.active_conversation_count();
 
-        let current_conversation = match self.storage.get_active_conversation() {
-            Ok(Some(id)) => match self.storage.load_conversation(&id) {
-                Ok(conv) => {
-                    let model = self.manager.get_conversation_model(&id);
-                    let bookmarks = match self.storage.get_conversation_bookmarks(&id) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            warn!(error = %e, "Failed to load bookmarks for status");
-                            Vec::new()
-                        }
-                    };
-                    Some(
-                        neuromance_common::protocol::ConversationSummary::from_conversation(
-                            &conv, model, bookmarks,
-                        ),
-                    )
-                }
-                Err(e) => {
-                    warn!(conversation_id = %id, error = %e, "Failed to load active conversation for status");
-                    None
-                }
-            },
+        let loaded = self
+            .storage
+            .run(|s| {
+                let active_id = s.get_active_conversation()?;
+                let Some(id) = active_id else {
+                    return Ok(None);
+                };
+                let conv = s.load_conversation(&id)?;
+                let bookmarks = s
+                    .get_conversation_bookmarks(&id)
+                    .unwrap_or_default();
+                Ok(Some((id, conv, bookmarks)))
+            })
+            .await;
+
+        let current_conversation = match loaded {
+            Ok(Some((id, conv, bookmarks))) => {
+                let model = self.manager.get_conversation_model(&id);
+                Some(
+                    neuromance_common::protocol::ConversationSummary::from_conversation(
+                        &conv, model, bookmarks,
+                    ),
+                )
+            }
             Ok(None) => None,
             Err(e) => {
-                warn!(error = %e, "Failed to read active conversation for status");
+                warn!(error = %e, "Failed to load active conversation for status");
                 None
             }
         };
 
-        vec![DaemonResponse::Status {
+        Ok(vec![DaemonResponse::Status {
             uptime_seconds,
             active_conversations,
             current_conversation,
-        }]
+        }])
     }
 
     fn handle_health(&self, client_version: &str) -> Vec<DaemonResponse> {

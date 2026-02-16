@@ -134,8 +134,13 @@ impl ConversationManager {
         );
 
         // Save conversation
-        self.storage.save_conversation(&conversation)?;
-        self.storage.set_active_conversation(&conversation.id)?;
+        let conv_for_save = conversation.clone();
+        self.storage
+            .run(move |s| {
+                s.save_conversation(&conv_for_save)?;
+                s.set_active_conversation(&conv_for_save.id)
+            })
+            .await?;
 
         // Track model for this conversation (in-memory cache)
         self.conversation_models
@@ -147,7 +152,10 @@ impl ConversationManager {
             "Created new conversation"
         );
 
-        let bookmarks = self.storage.get_conversation_bookmarks(&conversation.id)?;
+        let conv_id = conversation.id;
+        let bookmarks = self.storage
+            .run(move |s| s.get_conversation_bookmarks(&conv_id))
+            .await?;
         Ok(ConversationSummary::from_conversation(
             &conversation,
             model_nickname,
@@ -191,7 +199,9 @@ impl ConversationManager {
         let _guard = lock.lock().await;
 
         // Load conversation
-        let mut conversation = self.storage.load_conversation(&id)?;
+        let mut conversation = self.storage
+            .run(move |s| s.load_conversation(&id))
+            .await?;
         debug!(
             conversation_id = %id,
             message_count = conversation.messages.len(),
@@ -263,7 +273,10 @@ impl ConversationManager {
         }
 
         // Save updated conversation
-        self.storage.save_conversation(&conversation)?;
+        let conv_for_save = conversation.clone();
+        self.storage
+            .run(move |s| s.save_conversation(&conv_for_save))
+            .await?;
         debug!(conversation_id = %id, "Saved conversation");
 
         // Send completion notification
@@ -480,31 +493,38 @@ impl ConversationManager {
     /// - The conversation cannot be loaded
     /// - Storage operations fail
     #[instrument(skip(self), fields(conversation_id = %conversation_id))]
-    pub fn delete_conversation(
+    pub async fn delete_conversation(
         &self,
         conversation_id: &str,
     ) -> Result<(ConversationSummary, Vec<String>)> {
-        let id = self.storage.resolve_conversation_id(conversation_id)?;
+        let conv_id_str = conversation_id.to_string();
+        let (id, conversation, bookmarks, removed_bookmarks) = self
+            .storage
+            .run(move |s| {
+                let id = s.resolve_conversation_id(&conv_id_str)?;
+                let conversation = s.load_conversation(&id)?;
+                let bookmarks =
+                    s.get_conversation_bookmarks(&id)?;
+                let removed =
+                    s.remove_bookmarks_for_conversation(&id)?;
 
-        // Load conversation and build summary before deleting
-        let conversation = self.storage.load_conversation(&id)?;
+                if let Ok(Some(active_id)) =
+                    s.get_active_conversation()
+                    && active_id == id
+                {
+                    s.clear_active_conversation()?;
+                }
+
+                s.delete_conversation(&id)?;
+                Ok((id, conversation, bookmarks, removed))
+            })
+            .await?;
+
         self.populate_model_from_metadata(&conversation);
         let model = self.get_conversation_model(&id);
-        let bookmarks = self.storage.get_conversation_bookmarks(&id)?;
-        let summary = ConversationSummary::from_conversation(&conversation, model, bookmarks);
-
-        // Remove bookmarks pointing to this conversation
-        let removed_bookmarks = self.storage.remove_bookmarks_for_conversation(&id)?;
-
-        // Clear active conversation if it matches
-        if let Ok(Some(active_id)) = self.storage.get_active_conversation()
-            && active_id == id
-        {
-            self.storage.clear_active_conversation()?;
-        }
-
-        // Delete the conversation file
-        self.storage.delete_conversation(&id)?;
+        let summary = ConversationSummary::from_conversation(
+            &conversation, model, bookmarks,
+        );
 
         // Clean up in-memory state
         self.clients.remove(&id);
@@ -525,38 +545,56 @@ impl ConversationManager {
     /// # Errors
     ///
     /// Returns an error if storage operations fail.
-    pub fn list_conversations(&self, limit: Option<usize>) -> Result<Vec<ConversationSummary>> {
-        let ids = self.storage.list_conversations()?;
+    pub async fn list_conversations(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<Vec<ConversationSummary>> {
+        let loaded = self
+            .storage
+            .run(move |s| {
+                let ids = s.list_conversations()?;
 
-        // Load all conversations, logging failures
-        let mut loaded: Vec<(Uuid, Conversation)> = ids
-            .into_iter()
-            .filter_map(|id| match self.storage.load_conversation(&id) {
-                Ok(conv) => Some((id, conv)),
-                Err(e) => {
-                    warn!(conversation_id = %id, error = %e, "Skipping unloadable conversation");
-                    None
+                let mut loaded: Vec<(Uuid, Conversation, Vec<String>)> =
+                    ids.into_iter()
+                        .filter_map(|id| {
+                            match s.load_conversation(&id) {
+                                Ok(conv) => {
+                                    let bm = s
+                                        .get_conversation_bookmarks(&id)
+                                        .ok()
+                                        .unwrap_or_default();
+                                    Some((id, conv, bm))
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        conversation_id = %id,
+                                        error = %e,
+                                        "Skipping unloadable conversation"
+                                    );
+                                    None
+                                }
+                            }
+                        })
+                        .collect();
+
+                loaded.sort_by(|a, b| {
+                    b.1.updated_at.cmp(&a.1.updated_at)
+                });
+
+                if let Some(limit) = limit {
+                    loaded.truncate(limit);
                 }
+
+                Ok(loaded)
             })
-            .collect();
+            .await?;
 
-        // Sort by updated_at (most recent first)
-        loaded.sort_by(|a, b| b.1.updated_at.cmp(&a.1.updated_at));
-
-        // Apply limit
-        if let Some(limit) = limit {
-            loaded.truncate(limit);
-        }
-
-        // Build summaries (populate model cache from metadata to avoid
-        // redundant storage loads since conversations are already loaded)
         let mut summaries = Vec::with_capacity(loaded.len());
-        for (id, conv) in &loaded {
+        for (id, conv, bookmarks) in &loaded {
             self.populate_model_from_metadata(conv);
             let model = self.get_conversation_model(id);
-            let bookmarks = self.storage.get_conversation_bookmarks(id)?;
             summaries.push(ConversationSummary::from_conversation(
-                conv, model, bookmarks,
+                conv, model, bookmarks.clone(),
             ));
         }
 
@@ -568,21 +606,24 @@ impl ConversationManager {
     /// # Errors
     ///
     /// Returns an error if the conversation is not found.
-    pub fn get_messages(
+    pub async fn get_messages(
         &self,
         conversation_id: Option<String>,
         limit: Option<usize>,
     ) -> Result<(Vec<Message>, usize, String)> {
         let id = self.resolve_or_active(conversation_id)?;
 
-        let conversation = self.storage.load_conversation(&id)?;
+        let conversation = self.storage
+            .run(move |s| s.load_conversation(&id))
+            .await?;
         let total_count = conversation.messages.len();
 
         let mut messages = conversation.messages.to_vec();
 
         // Apply limit (most recent first)
         if let Some(limit) = limit {
-            messages = messages.into_iter().rev().take(limit).rev().collect();
+            messages =
+                messages.into_iter().rev().take(limit).rev().collect();
         }
 
         Ok((messages, total_count, id.to_string()))
@@ -678,24 +719,31 @@ impl ConversationManager {
         self.clients.remove(&id);
 
         // Persist model in conversation metadata
-        let mut conversation = self.storage.load_conversation(&id)?;
-        conversation.metadata.insert(
-            "model".to_string(),
-            serde_json::Value::String(model_nickname.clone()),
-        );
-        conversation.touch();
-        self.storage.save_conversation(&conversation)?;
+        let nickname_for_save = model_nickname.clone();
+        let conversation = self
+            .storage
+            .run(move |s| {
+                let mut conv = s.load_conversation(&id)?;
+                conv.metadata.insert(
+                    "model".to_string(),
+                    serde_json::Value::String(nickname_for_save),
+                );
+                conv.touch();
+                s.save_conversation(&conv)?;
+                let bookmarks = s.get_conversation_bookmarks(&id)?;
+                Ok((conv, bookmarks))
+            })
+            .await?;
 
         info!(
             conversation_id = %id,
             model = %model_nickname,
             "Switched conversation model"
         );
-        let bookmarks = self.storage.get_conversation_bookmarks(&id)?;
         Ok(ConversationSummary::from_conversation(
-            &conversation,
+            &conversation.0,
             model_nickname,
-            bookmarks,
+            conversation.1,
         ))
     }
 }
@@ -748,7 +796,7 @@ api_key_env = "OPENAI_API_KEY"
         manager.storage.set_bookmark("test-bm", &uuid).unwrap();
 
         // Delete the conversation
-        let (deleted, removed_bookmarks) = manager.delete_conversation(&conv_id).unwrap();
+        let (deleted, removed_bookmarks) = manager.delete_conversation(&conv_id).await.unwrap();
         assert_eq!(deleted.id, conv_id);
         assert_eq!(removed_bookmarks, vec!["test-bm".to_string()]);
 
@@ -767,7 +815,7 @@ api_key_env = "OPENAI_API_KEY"
     #[tokio::test]
     async fn test_delete_conversation_not_found() {
         let (manager, _temp) = test_manager();
-        let result = manager.delete_conversation("nonexistent");
+        let result = manager.delete_conversation("nonexistent").await;
         assert!(result.is_err());
     }
 
@@ -787,7 +835,7 @@ api_key_env = "OPENAI_API_KEY"
         );
 
         // Delete the first — should not clear active
-        manager.delete_conversation(&first.id).unwrap();
+        manager.delete_conversation(&first.id).await.unwrap();
         assert_eq!(
             manager.storage.get_active_conversation().unwrap(),
             Some(second_uuid)

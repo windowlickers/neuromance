@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use neuromance_common::Conversation;
 use serde::{Deserialize, Serialize};
@@ -45,7 +45,9 @@ pub struct Storage {
     /// PID file path
     pid_file: PathBuf,
 
-    /// Serializes bookmark read-modify-write operations
+    /// Serializes bookmark read-modify-write operations.
+    /// `std::sync::Mutex` is correct here because Storage methods run on
+    /// the blocking thread pool via `spawn_blocking`, not the async runtime.
     bookmarks_lock: Mutex<()>,
 }
 
@@ -90,6 +92,27 @@ impl Storage {
             pid_file,
             bookmarks_lock: Mutex::new(()),
         })
+    }
+
+    /// Runs a synchronous closure on the blocking thread pool.
+    ///
+    /// All async callers should use this to avoid blocking
+    /// tokio worker threads with file I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the blocking task panics or the closure fails.
+    pub async fn run<F, T>(self: &Arc<Self>, f: F) -> Result<T>
+    where
+        F: FnOnce(&Self) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let this = Arc::clone(self);
+        tokio::task::spawn_blocking(move || f(&this))
+            .await
+            .map_err(|e| {
+                DaemonError::Storage(format!("Task join error: {e}"))
+            })?
     }
 
     /// Returns the socket path for the Unix domain socket.
