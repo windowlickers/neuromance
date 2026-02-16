@@ -1557,6 +1557,7 @@ dependencies = [
  "chrono",
  "neuromance-common",
  "prost",
+ "prost-types",
  "serde_json",
  "smallvec",
  "tonic",

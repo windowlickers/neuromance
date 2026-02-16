@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package neuromance.v1;
 
+import "google/protobuf/timestamp.proto";
+
 // The Neuromance daemon service.
 service Neuromance {
   // Bidirectional streaming RPC for chat with tool approval.
@@ -153,7 +155,7 @@ message MessageProto {
   string content = 4;
   // Metadata as JSON-encoded key-value pairs.
   map<string, string> metadata = 5;
-  string timestamp = 6;
+  google.protobuf.Timestamp timestamp = 6;
   repeated ToolCallProto tool_calls = 7;
   optional string tool_call_id = 8;
   optional string name = 9;
@@ -192,8 +194,8 @@ message ConversationSummaryProto {
   string short_id = 2;
   optional string title = 3;
   uint64 message_count = 4;
-  string created_at = 5;
-  string updated_at = 6;
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp updated_at = 6;
   repeated string bookmarks = 7;
   string model = 8;
 }

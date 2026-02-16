@@ -15,6 +15,7 @@ rust-version.workspace = true
 [dependencies]
 neuromance-common = { version = "0.0.6", path = "../neuromance-common" }
 prost = { workspace = true }
+prost-types = { workspace = true }
 tonic = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }

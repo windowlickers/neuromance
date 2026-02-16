@@ -2,12 +2,34 @@
 
 use chrono::{DateTime, Utc};
 use neuromance_common::chat::{Message, MessageRole, ReasoningContent};
+use prost_types::Timestamp;
 use neuromance_common::client::{InputTokensDetails, OutputTokensDetails, Usage};
 use neuromance_common::protocol::{ConversationSummary, ModelProfile};
 use neuromance_common::tools::{FunctionCall, ToolApproval, ToolCall};
 use smallvec::SmallVec;
 
 use crate::proto;
+
+const fn datetime_to_timestamp(dt: &DateTime<Utc>) -> Timestamp {
+    Timestamp {
+        seconds: dt.timestamp(),
+        #[allow(clippy::cast_possible_wrap)]
+        nanos: dt.timestamp_subsec_nanos() as i32,
+    }
+}
+
+fn timestamp_to_datetime(
+    ts: &Timestamp,
+) -> Result<DateTime<Utc>, String> {
+    #[allow(clippy::cast_sign_loss)]
+    DateTime::from_timestamp(ts.seconds, ts.nanos as u32)
+        .ok_or_else(|| {
+            format!(
+                "Invalid timestamp: {}s {}ns",
+                ts.seconds, ts.nanos
+            )
+        })
+}
 
 // --- MessageRole ---
 
@@ -138,7 +160,7 @@ impl From<&Message> for proto::MessageProto {
             role: proto::MessageRole::from(msg.role).into(),
             content: msg.content.clone(),
             metadata,
-            timestamp: msg.timestamp.to_rfc3339(),
+            timestamp: Some(datetime_to_timestamp(&msg.timestamp)),
             tool_calls: msg
                 .tool_calls
                 .iter()
@@ -168,10 +190,9 @@ pub fn message_from_proto(msg: proto::MessageProto) -> Result<Message, String> {
         .conversation_id
         .parse()
         .map_err(|e| format!("Invalid conversation_id: {e}"))?;
-    let timestamp: DateTime<Utc> = msg
-        .timestamp
-        .parse()
-        .map_err(|e| format!("Invalid timestamp: {e}"))?;
+    let timestamp: DateTime<Utc> = timestamp_to_datetime(
+        msg.timestamp.as_ref().ok_or("Missing timestamp")?,
+    )?;
 
     let role: MessageRole = proto::MessageRole::try_from(msg.role)
         .map_err(|_| format!("Invalid message role: {}", msg.role))?
@@ -259,8 +280,8 @@ impl From<&ConversationSummary> for proto::ConversationSummaryProto {
             short_id: cs.short_id.clone(),
             title: cs.title.clone(),
             message_count: cs.message_count as u64,
-            created_at: cs.created_at.to_rfc3339(),
-            updated_at: cs.updated_at.to_rfc3339(),
+            created_at: Some(datetime_to_timestamp(&cs.created_at)),
+            updated_at: Some(datetime_to_timestamp(&cs.updated_at)),
             bookmarks: cs.bookmarks.clone(),
             model: cs.model.clone(),
         }
@@ -275,14 +296,12 @@ impl From<&ConversationSummary> for proto::ConversationSummaryProto {
 pub fn conversation_summary_from_proto(
     cs: proto::ConversationSummaryProto,
 ) -> Result<ConversationSummary, String> {
-    let created_at: DateTime<Utc> = cs
-        .created_at
-        .parse()
-        .map_err(|e| format!("Invalid created_at: {e}"))?;
-    let updated_at: DateTime<Utc> = cs
-        .updated_at
-        .parse()
-        .map_err(|e| format!("Invalid updated_at: {e}"))?;
+    let created_at: DateTime<Utc> = timestamp_to_datetime(
+        cs.created_at.as_ref().ok_or("Missing created_at")?,
+    )?;
+    let updated_at: DateTime<Utc> = timestamp_to_datetime(
+        cs.updated_at.as_ref().ok_or("Missing updated_at")?,
+    )?;
 
     Ok(ConversationSummary {
         id: cs.id,
@@ -535,7 +554,10 @@ mod tests {
             role: 999,
             content: "Hello".to_string(),
             metadata: HashMap::default(),
-            timestamp: Utc::now().to_rfc3339(),
+            timestamp: Some(prost_types::Timestamp {
+                seconds: Utc::now().timestamp(),
+                nanos: 0,
+            }),
             tool_calls: vec![],
             tool_call_id: None,
             name: None,
