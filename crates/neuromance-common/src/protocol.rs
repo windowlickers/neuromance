@@ -224,6 +224,12 @@ pub enum DaemonResponse {
         conversation: ConversationSummary,
     },
 
+    /// Model was switched for a conversation.
+    ModelSwitched {
+        /// Updated conversation summary with the new model
+        conversation: ConversationSummary,
+    },
+
     /// List of messages from a conversation.
     Messages {
         /// The conversation these messages belong to

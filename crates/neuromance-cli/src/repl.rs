@@ -71,11 +71,24 @@ pub async fn run_repl(conversation_id: Option<String>) -> Result<()> {
                 // Add to history
                 let _ = rl.add_history_entry(line);
 
-                // Send message
+                // Send message, attempting reconnection on failure
                 if let Err(e) =
                     send_message(&mut client, conversation_id.clone(), line.to_string()).await
                 {
                     eprintln!("{} {e}", "Error:".bright_red());
+                    eprintln!("{}", "Attempting to reconnect...".dimmed());
+                    match DaemonClient::connect().await {
+                        Ok(new_client) => {
+                            client = new_client;
+                            eprintln!("{} Reconnected", "✓".bright_green());
+                        }
+                        Err(reconnect_err) => {
+                            eprintln!(
+                                "{} Failed to reconnect: {reconnect_err}",
+                                "Error:".bright_red()
+                            );
+                        }
+                    }
                 }
             }
             Err(ReadlineError::Interrupted) => {

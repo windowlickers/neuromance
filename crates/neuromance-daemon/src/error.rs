@@ -71,7 +71,7 @@ pub type Result<T> = std::result::Result<T, DaemonError>;
 
 impl From<anyhow::Error> for DaemonError {
     fn from(err: anyhow::Error) -> Self {
-        Self::Other(err.to_string())
+        Self::Other(format!("{err:?}"))
     }
 }
 

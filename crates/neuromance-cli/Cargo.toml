@@ -22,16 +22,16 @@ workspace = true
 [dependencies]
 neuromance-common = { version = "0.0.6", path = "../neuromance-common" }
 rustyline = "17.0.1"
-anyhow = "1.0"
-tokio = { version = "1", features = ["full"] }
+anyhow = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
 serde = { workspace = true }
-serde_json = "1.0"
-clap = { version = "4.4", features = ["derive"] }
-colored = "3.0"
+serde_json = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+colored = { workspace = true }
 chrono = { workspace = true }
 dirs = "5.0"
 log = { workspace = true }
-env_logger = "0.11"
+env_logger = { workspace = true }
 fs2 = "0.4"
 
 [target.'cfg(unix)'.dependencies]

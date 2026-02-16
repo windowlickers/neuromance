@@ -67,9 +67,7 @@ fn init_tracing() {
 }
 
 /// Collects enabled built-in tools based on configuration.
-fn collect_builtin_tools(
-    config: &BuiltinToolsConfig,
-) -> Vec<Arc<dyn ToolImplementation>> {
+fn collect_builtin_tools(config: &BuiltinToolsConfig) -> Vec<Arc<dyn ToolImplementation>> {
     let mut tools: Vec<Arc<dyn ToolImplementation>> = Vec::new();
 
     if config.current_time {
@@ -157,10 +155,7 @@ async fn main() -> Result<()> {
     let builtin_tools = collect_builtin_tools(&builtin_config);
 
     if !builtin_tools.is_empty() {
-        info!(
-            "Enabled {} built-in tool(s)",
-            builtin_tools.len()
-        );
+        info!("Enabled {} built-in tool(s)", builtin_tools.len());
     }
 
     // Create conversation manager

@@ -53,7 +53,7 @@ pub struct ConversationManager {
     /// Active clients (conversation ID -> Client)
     ///
     /// Uses `DashMap` for concurrent access without blocking
-    pub clients: DashMap<Uuid, ClientType>,
+    clients: DashMap<Uuid, ClientType>,
 
     /// Per-conversation locks to serialize `send_message` operations
     conversation_locks: DashMap<Uuid, Arc<Mutex<()>>>,
@@ -172,14 +172,7 @@ impl ConversationManager {
         content: String,
         response_tx: mpsc::UnboundedSender<DaemonResponse>,
     ) -> Result<()> {
-        // Resolve conversation ID
-        let id = if let Some(id_str) = conversation_id {
-            self.storage.resolve_conversation_id(&id_str)?
-        } else {
-            self.storage
-                .get_active_conversation()?
-                .ok_or(DaemonError::NoActiveConversation)?
-        };
+        let id = self.resolve_or_active(conversation_id)?;
 
         debug!(conversation_id = %id, "Resolved conversation ID");
 
@@ -212,8 +205,7 @@ impl ConversationManager {
         let messages: Vec<Message> = conversation.messages.to_vec();
 
         // Collect tools: built-in + MCP
-        let mut tools: Vec<Arc<dyn ToolImplementation>> =
-            self.builtin_tools.clone();
+        let mut tools: Vec<Arc<dyn ToolImplementation>> = self.builtin_tools.clone();
 
         if let Some(ref mcp) = self.mcp_manager {
             match mcp.get_all_tools().await {
@@ -230,7 +222,7 @@ impl ConversationManager {
             response_tx: response_tx.clone(),
             pending_approvals: Arc::clone(&self.pending_approvals),
             auto_approve: self.config.settings.auto_approve_tools,
-            max_turns: self.config.settings.max_turns.try_into().ok(),
+            max_turns: Some(self.config.settings.max_turns),
             thinking_budget: self.config.settings.thinking_budget,
             tools,
         };
@@ -489,15 +481,10 @@ impl ConversationManager {
         let conversation = self.storage.load_conversation(&id)?;
         let model = self.get_conversation_model(&id);
         let bookmarks = self.storage.get_conversation_bookmarks(&id)?;
-        let summary = ConversationSummary::from_conversation(
-            &conversation,
-            model,
-            bookmarks,
-        );
+        let summary = ConversationSummary::from_conversation(&conversation, model, bookmarks);
 
         // Remove bookmarks pointing to this conversation
-        let removed_bookmarks =
-            self.storage.remove_bookmarks_for_conversation(&id)?;
+        let removed_bookmarks = self.storage.remove_bookmarks_for_conversation(&id)?;
 
         // Clear active conversation if it matches
         if let Ok(Some(active_id)) = self.storage.get_active_conversation()
@@ -529,36 +516,36 @@ impl ConversationManager {
     ///
     /// Returns an error if storage operations fail.
     pub fn list_conversations(&self, limit: Option<usize>) -> Result<Vec<ConversationSummary>> {
-        let mut ids = self.storage.list_conversations()?;
+        let ids = self.storage.list_conversations()?;
+
+        // Load all conversations, logging failures
+        let mut loaded: Vec<(Uuid, Conversation)> = ids
+            .into_iter()
+            .filter_map(|id| match self.storage.load_conversation(&id) {
+                Ok(conv) => Some((id, conv)),
+                Err(e) => {
+                    warn!(conversation_id = %id, error = %e, "Skipping unloadable conversation");
+                    None
+                }
+            })
+            .collect();
 
         // Sort by updated_at (most recent first)
-        ids.sort_by_cached_key(|id| {
-            self.storage
-                .load_conversation(id)
-                .map(|c| c.updated_at)
-                .ok()
-        });
-        ids.reverse();
+        loaded.sort_by(|a, b| b.1.updated_at.cmp(&a.1.updated_at));
 
         // Apply limit
         if let Some(limit) = limit {
-            ids.truncate(limit);
+            loaded.truncate(limit);
         }
 
-        // Load summaries
-        let mut summaries = Vec::new();
-        for id in ids {
-            if let Ok(conv) = self.storage.load_conversation(&id) {
-                let model = self
-                    .conversation_models
-                    .get(&id)
-                    .map_or_else(|| self.config.active_model.clone(), |e| e.value().clone());
-
-                let bookmarks = self.storage.get_conversation_bookmarks(&id)?;
-                summaries.push(ConversationSummary::from_conversation(
-                    &conv, model, bookmarks,
-                ));
-            }
+        // Build summaries
+        let mut summaries = Vec::with_capacity(loaded.len());
+        for (id, conv) in &loaded {
+            let model = self.get_conversation_model(id);
+            let bookmarks = self.storage.get_conversation_bookmarks(id)?;
+            summaries.push(ConversationSummary::from_conversation(
+                conv, model, bookmarks,
+            ));
         }
 
         Ok(summaries)
@@ -574,13 +561,7 @@ impl ConversationManager {
         conversation_id: Option<String>,
         limit: Option<usize>,
     ) -> Result<(Vec<Message>, usize, String)> {
-        let id = if let Some(id_str) = conversation_id {
-            self.storage.resolve_conversation_id(&id_str)?
-        } else {
-            self.storage
-                .get_active_conversation()?
-                .ok_or(DaemonError::NoActiveConversation)?
-        };
+        let id = self.resolve_or_active(conversation_id)?;
 
         let conversation = self.storage.load_conversation(&id)?;
         let total_count = conversation.messages.len();
@@ -593,6 +574,23 @@ impl ConversationManager {
         }
 
         Ok((messages, total_count, id.to_string()))
+    }
+
+    /// Resolves a conversation ID from an optional string, falling back to the active conversation.
+    fn resolve_or_active(&self, id: Option<String>) -> Result<Uuid> {
+        if let Some(id_str) = id {
+            self.storage.resolve_conversation_id(&id_str)
+        } else {
+            self.storage
+                .get_active_conversation()?
+                .ok_or(DaemonError::NoActiveConversation)
+        }
+    }
+
+    /// Returns the number of active conversation clients.
+    #[must_use]
+    pub fn active_conversation_count(&self) -> usize {
+        self.clients.len()
     }
 
     /// Gets the model nickname for a conversation.
@@ -628,14 +626,7 @@ impl ConversationManager {
         conversation_id: Option<String>,
         model_nickname: String,
     ) -> Result<ConversationSummary> {
-        // Resolve conversation ID
-        let id = if let Some(id_str) = conversation_id {
-            self.storage.resolve_conversation_id(&id_str)?
-        } else {
-            self.storage
-                .get_active_conversation()?
-                .ok_or(DaemonError::NoActiveConversation)?
-        };
+        let id = self.resolve_or_active(conversation_id)?;
 
         // Validate model exists
         self.config.get_model(&model_nickname)?;
@@ -694,12 +685,7 @@ api_key_env = "OPENAI_API_KEY"
         "#;
 
         let config: DaemonConfig = toml::from_str(config_toml).unwrap();
-        let manager = ConversationManager::new(
-            storage,
-            Arc::new(config),
-            None,
-            Vec::new(),
-        );
+        let manager = ConversationManager::new(storage, Arc::new(config), None, Vec::new());
 
         (manager, temp_dir)
     }
@@ -716,8 +702,7 @@ api_key_env = "OPENAI_API_KEY"
         manager.storage.set_bookmark("test-bm", &uuid).unwrap();
 
         // Delete the conversation
-        let (deleted, removed_bookmarks) =
-            manager.delete_conversation(&conv_id).unwrap();
+        let (deleted, removed_bookmarks) = manager.delete_conversation(&conv_id).unwrap();
         assert_eq!(deleted.id, conv_id);
         assert_eq!(removed_bookmarks, vec!["test-bm".to_string()]);
 

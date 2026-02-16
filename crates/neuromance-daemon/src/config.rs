@@ -58,7 +58,7 @@ pub struct Settings {
 
     /// Maximum conversation turns before stopping (default: 20)
     #[serde(default = "default_max_turns")]
-    pub max_turns: usize,
+    pub max_turns: u32,
 
     /// Default thinking budget in tokens (default: 10000)
     #[serde(default = "default_thinking_budget")]
@@ -73,15 +73,17 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             auto_approve_tools: false,
-            max_turns: default_max_turns(),
+            max_turns: DEFAULT_MAX_TURNS,
             thinking_budget: default_thinking_budget(),
             inactivity_timeout: default_inactivity_timeout(),
         }
     }
 }
 
-const fn default_max_turns() -> usize {
-    20
+const DEFAULT_MAX_TURNS: u32 = 20;
+
+const fn default_max_turns() -> u32 {
+    DEFAULT_MAX_TURNS
 }
 
 const fn default_thinking_budget() -> u32 {
@@ -243,11 +245,8 @@ impl ToolsConfig {
             return Ok(None);
         }
 
-        let contents = fs::read_to_string(&path).map_err(|e| {
-            DaemonError::Config(format!(
-                "Failed to read tools config: {e}"
-            ))
-        })?;
+        let contents = fs::read_to_string(&path)
+            .map_err(|e| DaemonError::Config(format!("Failed to read tools config: {e}")))?;
 
         let config: Self = toml::from_str(&contents)?;
         Ok(Some(config))
@@ -260,11 +259,7 @@ impl ToolsConfig {
     /// Returns an error if the config directory cannot be determined.
     pub fn config_path() -> Result<PathBuf> {
         let config_dir = dirs::config_dir()
-            .ok_or_else(|| {
-                DaemonError::Config(
-                    "Failed to determine config directory".to_string(),
-                )
-            })?
+            .ok_or_else(|| DaemonError::Config("Failed to determine config directory".to_string()))?
             .join("neuromance");
 
         Ok(config_dir.join("tools.toml"))

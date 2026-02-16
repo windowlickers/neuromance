@@ -1,7 +1,7 @@
 //! Unix socket client for communicating with the daemon.
 
 use std::fs::{File, OpenOptions};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -23,9 +23,8 @@ impl DaemonClient {
     /// # Errors
     ///
     /// Returns an error if the socket is unavailable after timeout.
-    async fn wait_for_socket(socket_path: &PathBuf, timeout_secs: u64) -> Result<UnixStream> {
-        let deadline = tokio::time::Instant::now()
-            + Duration::from_secs(timeout_secs);
+    async fn wait_for_socket(socket_path: &Path, timeout_secs: u64) -> Result<UnixStream> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
         let mut delay = Duration::from_millis(50);
         let max_delay = Duration::from_millis(500);
 
@@ -35,9 +34,7 @@ impl DaemonClient {
             }
 
             if tokio::time::Instant::now() + delay > deadline {
-                anyhow::bail!(
-                    "Socket unavailable after {timeout_secs}s timeout"
-                );
+                anyhow::bail!("Socket unavailable after {timeout_secs}s timeout");
             }
 
             tokio::time::sleep(delay).await;
@@ -165,7 +162,7 @@ impl DaemonClient {
     /// Reads the daemon PID from the PID file.
     ///
     /// Returns `None` if the file doesn't exist or is invalid.
-    fn read_pid(pid_file: &PathBuf) -> Result<Option<u32>> {
+    fn read_pid(pid_file: &Path) -> Result<Option<u32>> {
         if !pid_file.exists() {
             return Ok(None);
         }
@@ -178,12 +175,15 @@ impl DaemonClient {
 
     /// Checks if a process with the given PID is running.
     ///
-    /// Uses platform-specific methods to verify process existence.
+    /// Uses `kill -0` which works on both Linux and macOS.
     #[cfg(unix)]
     fn is_process_running(pid: u32) -> bool {
-        // Check if /proc/<pid> exists on Linux
-        // This avoids unsafe code while being reliable on Linux
-        std::path::Path::new(&format!("/proc/{pid}")).exists()
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
     }
 
     #[cfg(not(unix))]
@@ -199,7 +199,7 @@ impl DaemonClient {
     /// # Errors
     ///
     /// Returns an error if lock file creation or locking fails.
-    fn acquire_spawn_lock(lock_file: &PathBuf) -> Result<File> {
+    fn acquire_spawn_lock(lock_file: &Path) -> Result<File> {
         // Ensure parent directory exists
         if let Some(parent) = lock_file.parent() {
             std::fs::create_dir_all(parent)?;

@@ -238,7 +238,9 @@ impl Storage {
     ///
     /// Returns an error if file writing fails.
     pub fn set_active_conversation(&self, id: &Uuid) -> Result<()> {
-        fs::write(&self.current_file, id.to_string())?;
+        let temp_path = self.current_file.with_extension("tmp");
+        fs::write(&temp_path, id.to_string())?;
+        fs::rename(&temp_path, &self.current_file)?;
         Ok(())
     }
 
@@ -268,7 +270,9 @@ impl Storage {
     pub fn save_bookmarks(&self, map: &HashMap<String, String>) -> Result<()> {
         let bookmarks = Bookmarks { map: map.clone() };
         let json = serde_json::to_string_pretty(&bookmarks)?;
-        fs::write(&self.bookmarks_file, json)?;
+        let temp_path = self.bookmarks_file.with_extension("tmp");
+        fs::write(&temp_path, json)?;
+        fs::rename(&temp_path, &self.bookmarks_file)?;
         Ok(())
     }
 
@@ -280,9 +284,10 @@ impl Storage {
     /// - The bookmark already exists
     /// - Saving fails
     pub fn set_bookmark(&self, name: &str, conversation_id: &Uuid) -> Result<()> {
-        let _guard = self.bookmarks_lock.lock().map_err(|e| {
-            DaemonError::Storage(format!("Bookmark lock poisoned: {e}"))
-        })?;
+        let _guard = self
+            .bookmarks_lock
+            .lock()
+            .map_err(|e| DaemonError::Storage(format!("Bookmark lock poisoned: {e}")))?;
 
         let mut bookmarks = self.load_bookmarks()?;
 
@@ -304,9 +309,10 @@ impl Storage {
     /// - The bookmark doesn't exist
     /// - Saving fails
     pub fn remove_bookmark(&self, name: &str) -> Result<()> {
-        let _guard = self.bookmarks_lock.lock().map_err(|e| {
-            DaemonError::Storage(format!("Bookmark lock poisoned: {e}"))
-        })?;
+        let _guard = self
+            .bookmarks_lock
+            .lock()
+            .map_err(|e| DaemonError::Storage(format!("Bookmark lock poisoned: {e}")))?;
 
         let mut bookmarks = self.load_bookmarks()?;
 
@@ -440,13 +446,11 @@ impl Storage {
     /// # Errors
     ///
     /// Returns an error if bookmark loading or saving fails.
-    pub fn remove_bookmarks_for_conversation(
-        &self,
-        id: &Uuid,
-    ) -> Result<Vec<String>> {
-        let _guard = self.bookmarks_lock.lock().map_err(|e| {
-            DaemonError::Storage(format!("Bookmark lock poisoned: {e}"))
-        })?;
+    pub fn remove_bookmarks_for_conversation(&self, id: &Uuid) -> Result<Vec<String>> {
+        let _guard = self
+            .bookmarks_lock
+            .lock()
+            .map_err(|e| DaemonError::Storage(format!("Bookmark lock poisoned: {e}")))?;
 
         let mut bookmarks = self.load_bookmarks()?;
         let id_str = id.to_string();

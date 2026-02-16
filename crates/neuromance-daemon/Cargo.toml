@@ -37,7 +37,7 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 
 # Concurrent collections
-dashmap = "6.0"
+dashmap = { workspace = true }
 
 # Utilities
 dirs = "5.0"

@@ -4,7 +4,7 @@
 //! from the `nm` CLI client.
 
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,6 +22,21 @@ use crate::storage::Storage;
 
 /// Maximum size of a single request line (1 MB).
 const MAX_REQUEST_SIZE: usize = 1024 * 1024;
+
+/// Idle timeout for a client connection with no complete request (5 minutes).
+const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Checks if a process with the given PID is running.
+///
+/// Uses `kill -0` which works on both Linux and macOS.
+fn is_process_running(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
 
 /// Daemon server state.
 pub struct Server {
@@ -77,7 +92,7 @@ impl Server {
         // Check for an existing daemon before removing the socket
         if socket_path.exists() {
             if let Some(existing_pid) = self.storage.read_pid()
-                && Path::new(&format!("/proc/{existing_pid}")).exists()
+                && is_process_running(existing_pid)
             {
                 return Err(DaemonError::Other(format!(
                     "Another daemon is running (pid {existing_pid})"
@@ -93,10 +108,7 @@ impl Server {
 
         // Bind Unix socket
         let listener = UnixListener::bind(socket_path)?;
-        std::fs::set_permissions(
-            socket_path,
-            std::fs::Permissions::from_mode(0o600),
-        )?;
+        std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))?;
         info!(socket_path = %socket_path.display(), "Daemon listening");
 
         // Subscribe to shutdown signal
@@ -163,14 +175,30 @@ impl Server {
         let mut line = String::new();
 
         loop {
-            // Read line-delimited JSON (size-limited)
-            match Self::read_line_limited(&mut reader, &mut line).await {
-                Ok(0) => {
-                    // Connection closed
+            // Read line-delimited JSON (size-limited, with idle timeout)
+            let read_result = tokio::time::timeout(
+                CONNECTION_IDLE_TIMEOUT,
+                Self::read_line_limited(&mut reader, &mut line),
+            )
+            .await;
+
+            match read_result {
+                Err(_) => {
+                    warn!(
+                        "Client connection timed out after {}s of inactivity",
+                        CONNECTION_IDLE_TIMEOUT.as_secs()
+                    );
+                    break;
+                }
+                Ok(Err(e)) => {
+                    error!(error = %e, "Read error");
+                    break;
+                }
+                Ok(Ok(0)) => {
                     debug!("Client disconnected");
                     break;
                 }
-                Ok(_) => {
+                Ok(Ok(_)) => {
                     // Parse request
                     match serde_json::from_str::<DaemonRequest>(&line) {
                         Ok(DaemonRequest::SendMessage {
@@ -189,8 +217,7 @@ impl Server {
                             {
                                 error!(error = %e, "Streaming session error");
                                 let response: DaemonResponse = e.into();
-                                let _ =
-                                    Self::write_response(&mut writer, &response).await;
+                                let _ = Self::write_response(&mut writer, &response).await;
                             }
                         }
                         Ok(request) => {
@@ -201,8 +228,7 @@ impl Server {
                                 Ok(responses) => {
                                     for response in responses {
                                         if let Err(e) =
-                                            Self::write_response(&mut writer, &response)
-                                                .await
+                                            Self::write_response(&mut writer, &response).await
                                         {
                                             error!(
                                                 error = %e,
@@ -215,8 +241,7 @@ impl Server {
                                 Err(e) => {
                                     error!(error = %e, "Request handling error");
                                     let response: DaemonResponse = e.into();
-                                    let _ =
-                                        Self::write_response(&mut writer, &response).await;
+                                    let _ = Self::write_response(&mut writer, &response).await;
                                 }
                             }
                         }
@@ -229,10 +254,6 @@ impl Server {
                             let _ = Self::write_response(&mut writer, &response).await;
                         }
                     }
-                }
-                Err(e) => {
-                    error!(error = %e, "Read error");
-                    break;
                 }
             }
         }
@@ -314,8 +335,7 @@ impl Server {
         });
 
         while let Some(response) = rx.recv().await {
-            let needs_approval =
-                matches!(&response, DaemonResponse::ToolApprovalRequest { .. });
+            let needs_approval = matches!(&response, DaemonResponse::ToolApprovalRequest { .. });
             Self::write_response(writer, &response).await?;
 
             if needs_approval {
@@ -333,8 +353,7 @@ impl Server {
         writer: &mut tokio::net::unix::OwnedWriteHalf,
     ) -> Result<()> {
         let mut line = String::new();
-        let bytes_read =
-            Self::read_line_limited(reader, &mut line).await?;
+        let bytes_read = Self::read_line_limited(reader, &mut line).await?;
 
         if bytes_read == 0 {
             return Err(DaemonError::Other(
@@ -348,11 +367,8 @@ impl Server {
                 tool_call_id,
                 approval,
             }) => {
-                let responses = self.handle_tool_approval(
-                    &conversation_id,
-                    &tool_call_id,
-                    approval,
-                )?;
+                let responses =
+                    self.handle_tool_approval(&conversation_id, &tool_call_id, approval)?;
                 for response in responses {
                     Self::write_response(writer, &response).await?;
                 }
@@ -429,12 +445,8 @@ impl Server {
         }])
     }
 
-    fn handle_delete_conversation(
-        &self,
-        conversation_id: &str,
-    ) -> Result<Vec<DaemonResponse>> {
-        let (summary, removed_bookmarks) =
-            self.manager.delete_conversation(conversation_id)?;
+    fn handle_delete_conversation(&self, conversation_id: &str) -> Result<Vec<DaemonResponse>> {
+        let (summary, removed_bookmarks) = self.manager.delete_conversation(conversation_id)?;
 
         let title_part = summary
             .title
@@ -444,10 +456,7 @@ impl Server {
         let bookmark_part = if removed_bookmarks.is_empty() {
             String::new()
         } else {
-            format!(
-                " (removed bookmarks: {})",
-                removed_bookmarks.join(", ")
-            )
+            format!(" (removed bookmarks: {})", removed_bookmarks.join(", "))
         };
 
         Ok(vec![DaemonResponse::Success {
@@ -467,7 +476,7 @@ impl Server {
             .manager
             .switch_model(conversation_id, model_nickname)
             .await?;
-        Ok(vec![DaemonResponse::ConversationCreated {
+        Ok(vec![DaemonResponse::ModelSwitched {
             conversation: summary,
         }])
     }
@@ -493,7 +502,7 @@ impl Server {
 
     fn handle_status(&self) -> Vec<DaemonResponse> {
         let uptime_seconds = self.start_time.elapsed().as_secs();
-        let active_conversations = self.manager.clients.len();
+        let active_conversations = self.manager.active_conversation_count();
         vec![DaemonResponse::Status {
             uptime_seconds,
             active_conversations,
@@ -503,26 +512,36 @@ impl Server {
 
     fn handle_detailed_status(&self) -> Vec<DaemonResponse> {
         let uptime_seconds = self.start_time.elapsed().as_secs();
-        let active_conversations = self.manager.clients.len();
+        let active_conversations = self.manager.active_conversation_count();
 
-        let current_conversation = self
-            .storage
-            .get_active_conversation()
-            .ok()
-            .flatten()
-            .and_then(|id| {
-                let conv = self.storage.load_conversation(&id).ok()?;
-                let model = self.manager.get_conversation_model(&id);
-                let bookmarks = self
-                    .storage
-                    .get_conversation_bookmarks(&id)
-                    .unwrap_or_default();
-                Some(
-                    neuromance_common::protocol::ConversationSummary::from_conversation(
-                        &conv, model, bookmarks,
-                    ),
-                )
-            });
+        let current_conversation = match self.storage.get_active_conversation() {
+            Ok(Some(id)) => match self.storage.load_conversation(&id) {
+                Ok(conv) => {
+                    let model = self.manager.get_conversation_model(&id);
+                    let bookmarks = match self.storage.get_conversation_bookmarks(&id) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            warn!(error = %e, "Failed to load bookmarks for status");
+                            Vec::new()
+                        }
+                    };
+                    Some(
+                        neuromance_common::protocol::ConversationSummary::from_conversation(
+                            &conv, model, bookmarks,
+                        ),
+                    )
+                }
+                Err(e) => {
+                    warn!(conversation_id = %id, error = %e, "Failed to load active conversation for status");
+                    None
+                }
+            },
+            Ok(None) => None,
+            Err(e) => {
+                warn!(error = %e, "Failed to read active conversation for status");
+                None
+            }
+        };
 
         vec![DaemonResponse::Status {
             uptime_seconds,
@@ -581,8 +600,7 @@ impl Server {
                 return Ok(total);
             }
 
-            let newline_pos =
-                available.iter().position(|&b| b == b'\n');
+            let newline_pos = available.iter().position(|&b| b == b'\n');
             let n = newline_pos.map_or(available.len(), |p| p + 1);
 
             total += n;
@@ -594,11 +612,7 @@ impl Server {
             }
 
             let chunk = std::str::from_utf8(&available[..n])
-                .map_err(|_| {
-                    DaemonError::Other(
-                        "Invalid UTF-8 in request".to_string(),
-                    )
-                })?;
+                .map_err(|_| DaemonError::Other("Invalid UTF-8 in request".to_string()))?;
             buf.push_str(chunk);
             reader.consume(n);
 

@@ -321,8 +321,8 @@ pub async fn set_bookmark(
     name: String,
 ) -> Result<()> {
     let request = DaemonRequest::SetBookmark {
-        conversation_id: conversation_id.clone(),
-        name: name.clone(),
+        conversation_id,
+        name,
     };
 
     client.send_request(&request).await?;
@@ -346,7 +346,7 @@ pub async fn set_bookmark(
 
 /// Removes a bookmark.
 pub async fn remove_bookmark(client: &mut DaemonClient, name: String) -> Result<()> {
-    let request = DaemonRequest::RemoveBookmark { name: name.clone() };
+    let request = DaemonRequest::RemoveBookmark { name };
 
     client.send_request(&request).await?;
 
@@ -550,7 +550,7 @@ pub async fn switch_model(
 ) -> Result<()> {
     let request = DaemonRequest::SwitchModel {
         conversation_id,
-        model_nickname: model_nickname.clone(),
+        model_nickname,
     };
 
     client.send_request(&request).await?;
@@ -558,16 +558,16 @@ pub async fn switch_model(
     let response = client.read_response().await?;
 
     match response {
-        DaemonResponse::ConversationCreated { conversation } => {
+        DaemonResponse::ModelSwitched { conversation } => {
             println!(
                 "{} Switched to model {}",
                 "✓".bright_green(),
-                model_nickname.bright_yellow()
+                conversation.model.bright_yellow()
             );
             println!(
                 "  {} {}",
                 "Conversation:".dimmed(),
-                conversation.id.bright_cyan()
+                conversation.short_id.bright_cyan()
             );
         }
         DaemonResponse::Error { message, .. } => {
