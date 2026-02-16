@@ -29,9 +29,6 @@ use crate::error::{DaemonError, Result};
 
 /// Manages conversation storage on disk.
 pub struct Storage {
-    /// Base data directory (`~/.local/share/neuromance`)
-    data_dir: PathBuf,
-
     /// Conversations directory
     conversations_dir: PathBuf,
 
@@ -82,7 +79,6 @@ impl Storage {
         })?;
 
         Ok(Self {
-            data_dir,
             conversations_dir,
             current_file,
             bookmarks_file,
@@ -97,12 +93,6 @@ impl Storage {
         &self.socket_path
     }
 
-    /// Returns the PID file path.
-    #[must_use]
-    pub fn pid_file(&self) -> &Path {
-        &self.pid_file
-    }
-
     /// Writes the daemon PID to the PID file.
     ///
     /// # Errors
@@ -111,25 +101,6 @@ impl Storage {
     pub fn write_pid(&self, pid: u32) -> Result<()> {
         fs::write(&self.pid_file, pid.to_string())?;
         Ok(())
-    }
-
-    /// Reads the daemon PID from the PID file.
-    ///
-    /// Returns `None` if the file doesn't exist.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if reading or parsing fails.
-    pub fn read_pid(&self) -> Result<Option<u32>> {
-        if !self.pid_file.exists() {
-            return Ok(None);
-        }
-
-        let content = fs::read_to_string(&self.pid_file)?;
-        let pid = content.trim().parse::<u32>()
-            .map_err(|e| DaemonError::Storage(format!("Invalid PID in file: {e}")))?;
-
-        Ok(Some(pid))
     }
 
     /// Removes the PID file.
@@ -224,21 +195,6 @@ impl Storage {
         Ok(ids)
     }
 
-    /// Deletes a conversation from disk.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if file deletion fails.
-    pub fn delete_conversation(&self, id: &Uuid) -> Result<()> {
-        let path = self.conversation_path(id);
-
-        if path.exists() {
-            fs::remove_file(&path)?;
-        }
-
-        Ok(())
-    }
-
     /// Gets the active conversation ID.
     ///
     /// Returns `None` if no active conversation is set.
@@ -270,18 +226,6 @@ impl Storage {
     /// Returns an error if file writing fails.
     pub fn set_active_conversation(&self, id: &Uuid) -> Result<()> {
         fs::write(&self.current_file, id.to_string())?;
-        Ok(())
-    }
-
-    /// Clears the active conversation.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if file deletion fails.
-    pub fn clear_active_conversation(&self) -> Result<()> {
-        if self.current_file.exists() {
-            fs::remove_file(&self.current_file)?;
-        }
         Ok(())
     }
 
@@ -447,7 +391,6 @@ impl Storage {
         fs::create_dir_all(&conversations_dir).ok();
 
         Self {
-            data_dir: data_dir.clone(),
             conversations_dir,
             current_file: data_dir.join("current"),
             bookmarks_file: data_dir.join("bookmarks.json"),
@@ -473,7 +416,6 @@ mod tests {
         fs::create_dir_all(&conversations_dir).unwrap();
 
         let storage = Storage {
-            data_dir: data_dir.clone(),
             conversations_dir,
             current_file: data_dir.join("current"),
             bookmarks_file: data_dir.join("bookmarks.json"),
@@ -522,9 +464,6 @@ mod tests {
         storage.set_active_conversation(&conv_id).unwrap();
 
         assert_eq!(storage.get_active_conversation().unwrap(), Some(conv_id));
-
-        storage.clear_active_conversation().unwrap();
-        assert!(storage.get_active_conversation().unwrap().is_none());
     }
 
     #[test]
