@@ -256,7 +256,7 @@ impl Server {
                 limit,
             } => {
                 let (messages, total_count, conv_id) =
-                    self.manager.get_messages(conversation_id, limit).await?;
+                    self.manager.get_messages(conversation_id, limit)?;
 
                 Ok(vec![DaemonResponse::Messages {
                     conversation_id: conv_id,
@@ -266,7 +266,7 @@ impl Server {
             }
 
             DaemonRequest::ListConversations { limit } => {
-                let conversations = self.manager.list_conversations(limit).await?;
+                let conversations = self.manager.list_conversations(limit)?;
                 Ok(vec![DaemonResponse::Conversations { conversations }])
             }
 
@@ -316,7 +316,7 @@ impl Server {
                 approval,
             } => {
                 self.manager
-                    .approve_tool(conversation_id, tool_call_id, approval)?;
+                    .approve_tool(&conversation_id, &tool_call_id, approval)?;
 
                 Ok(vec![DaemonResponse::Success {
                     message: "Tool approval processed".to_string(),

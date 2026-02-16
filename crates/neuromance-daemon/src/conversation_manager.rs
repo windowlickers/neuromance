@@ -29,6 +29,16 @@ pub enum ClientType {
     Responses(ResponsesClient),
 }
 
+/// Configuration for the chat loop execution.
+struct ChatLoopConfig {
+    conversation_id: String,
+    response_tx: mpsc::UnboundedSender<DaemonResponse>,
+    pending_approvals: Arc<DashMap<(String, String), oneshot::Sender<ToolApproval>>>,
+    auto_approve: bool,
+    max_turns: Option<u32>,
+    thinking_budget: u32,
+}
+
 /// Manages conversations and their associated Core instances.
 pub struct ConversationManager {
     /// Storage backend
@@ -39,7 +49,7 @@ pub struct ConversationManager {
 
     /// Active clients (conversation ID -> Client)
     ///
-    /// Uses DashMap for concurrent access without blocking
+    /// Uses `DashMap` for concurrent access without blocking
     pub clients: DashMap<Uuid, ClientType>,
 
     /// Pending tool approvals (conversation ID, tool call ID) -> response channel
@@ -173,52 +183,25 @@ impl ConversationManager {
         // Prepare messages for Core
         let messages: Vec<Message> = conversation.messages.to_vec();
 
-        // Execute chat loop with callbacks
         let conv_id_str = id.to_string();
-        let pending_approvals = Arc::clone(&self.pending_approvals);
-        let auto_approve = self.config.settings.auto_approve_tools;
-        let max_turns = self.config.settings.max_turns.try_into().ok();
-        let thinking_budget = self.config.settings.thinking_budget;
+        let config = ChatLoopConfig {
+            conversation_id: conv_id_str.clone(),
+            response_tx: response_tx.clone(),
+            pending_approvals: Arc::clone(&self.pending_approvals),
+            auto_approve: self.config.settings.auto_approve_tools,
+            max_turns: self.config.settings.max_turns.try_into().ok(),
+            thinking_budget: self.config.settings.thinking_budget,
+        };
 
         let updated_messages = match client_enum {
             ClientType::Anthropic(client) => {
-                Self::execute_chat_loop(
-                    client,
-                    messages,
-                    &conv_id_str,
-                    response_tx.clone(),
-                    pending_approvals,
-                    auto_approve,
-                    max_turns,
-                    thinking_budget,
-                )
-                .await
+                Self::execute_chat_loop(client, messages, config).await
             }
             ClientType::OpenAI(client) => {
-                Self::execute_chat_loop(
-                    client,
-                    messages,
-                    &conv_id_str,
-                    response_tx.clone(),
-                    pending_approvals,
-                    auto_approve,
-                    max_turns,
-                    thinking_budget,
-                )
-                .await
+                Self::execute_chat_loop(client, messages, config).await
             }
             ClientType::Responses(client) => {
-                Self::execute_chat_loop(
-                    client,
-                    messages,
-                    &conv_id_str,
-                    response_tx.clone(),
-                    pending_approvals,
-                    auto_approve,
-                    max_turns,
-                    thinking_budget,
-                )
-                .await
+                Self::execute_chat_loop(client, messages, config).await
             }
         }
         .map_err(|e| DaemonError::Core(e.to_string()))?;
@@ -243,13 +226,13 @@ impl ConversationManager {
         debug!(conversation_id = %id, "Saved conversation");
 
         // Send completion notification
-        if let Some(last_msg) = updated_messages.last() {
-            if last_msg.role == MessageRole::Assistant {
-                let _ = response_tx.send(DaemonResponse::MessageCompleted {
-                    conversation_id: conv_id_str,
-                    message: Box::new(last_msg.clone()),
-                });
-            }
+        if let Some(last_msg) = updated_messages.last()
+            && last_msg.role == MessageRole::Assistant
+        {
+            let _ = response_tx.send(DaemonResponse::MessageCompleted {
+                conversation_id: conv_id_str,
+                message: Box::new(last_msg.clone()),
+            });
         }
 
         Ok(())
@@ -259,26 +242,20 @@ impl ConversationManager {
     async fn execute_chat_loop<C>(
         client: C,
         messages: Vec<Message>,
-        conversation_id: &str,
-        response_tx: mpsc::UnboundedSender<DaemonResponse>,
-        pending_approvals: Arc<DashMap<(String, String), oneshot::Sender<ToolApproval>>>,
-        auto_approve: bool,
-        max_turns: Option<u32>,
-        thinking_budget: u32,
+        config: ChatLoopConfig,
     ) -> anyhow::Result<Vec<Message>>
     where
         C: LLMClient + Send + Sync,
     {
-        // Build Core with callbacks
-        let conv_id = conversation_id.to_string();
-        let tx = response_tx.clone();
+        let conv_id = config.conversation_id.clone();
+        let tx = config.response_tx.clone();
 
         let mut core = Core::new(client)
             .with_streaming()
-            .with_thinking_budget(thinking_budget);
+            .with_thinking_budget(config.thinking_budget);
 
-        core.auto_approve_tools = auto_approve;
-        core.max_turns = max_turns;
+        core.auto_approve_tools = config.auto_approve;
+        core.max_turns = config.max_turns;
 
         core = core.with_event_callback(move |event| {
             let tx = tx.clone();
@@ -313,7 +290,9 @@ impl ConversationManager {
             }
         });
 
-        let conv_id_for_approval = conversation_id.to_string();
+        let conv_id_for_approval = config.conversation_id;
+        let response_tx = config.response_tx;
+        let pending_approvals = config.pending_approvals;
         core = core.with_tool_approval_callback(move |tool_call| {
             let conv_id = conv_id_for_approval.clone();
             let tool_call = tool_call.clone();
@@ -321,31 +300,28 @@ impl ConversationManager {
             let pending_approvals = Arc::clone(&pending_approvals);
 
             async move {
-                // Create oneshot channel for approval response
                 let (tx, rx) = oneshot::channel();
 
-                // Store the response channel
                 let key = (conv_id.clone(), tool_call.id.clone());
                 pending_approvals.insert(key, tx);
 
-                // Send approval request to client
                 let _ = response_tx.send(DaemonResponse::ToolApprovalRequest {
                     conversation_id: conv_id,
                     tool_call,
                 });
 
-                // Wait for approval response
                 match rx.await {
                     Ok(approval) => approval,
                     Err(_) => {
                         warn!("Tool approval channel closed unexpectedly");
-                        ToolApproval::Denied("Approval channel closed".to_string())
+                        ToolApproval::Denied(
+                            "Approval channel closed".to_string(),
+                        )
                     }
                 }
             }
         });
 
-        // Execute the chat loop
         core.chat_with_tool_loop(messages).await
     }
 
@@ -357,14 +333,14 @@ impl ConversationManager {
     #[instrument(skip(self), fields(conversation_id = %conversation_id, tool_call_id = %tool_call_id, approval = ?approval))]
     pub fn approve_tool(
         &self,
-        conversation_id: String,
-        tool_call_id: String,
+        conversation_id: &str,
+        tool_call_id: &str,
         approval: ToolApproval,
     ) -> Result<()> {
-        let key = (conversation_id.clone(), tool_call_id.clone());
+        let key = (conversation_id.to_string(), tool_call_id.to_string());
 
         if let Some((_, tx)) = self.pending_approvals.remove(&key) {
-            let _ = tx.send(approval.clone());
+            let _ = tx.send(approval);
             debug!("Tool approval sent");
             Ok(())
         } else {
@@ -458,7 +434,7 @@ impl ConversationManager {
     /// # Errors
     ///
     /// Returns an error if storage operations fail.
-    pub async fn list_conversations(
+    pub fn list_conversations(
         &self,
         limit: Option<usize>,
     ) -> Result<Vec<ConversationSummary>> {
@@ -503,7 +479,7 @@ impl ConversationManager {
     /// # Errors
     ///
     /// Returns an error if the conversation is not found.
-    pub async fn get_messages(
+    pub fn get_messages(
         &self,
         conversation_id: Option<String>,
         limit: Option<usize>,
@@ -609,7 +585,7 @@ mod tests {
     use tempfile::TempDir;
 
     /// Creates a test conversation manager with temporary storage.
-    async fn test_manager() -> (ConversationManager, TempDir) {
+    fn test_manager() -> (ConversationManager, TempDir) {
         let temp_dir = TempDir::new().unwrap();
         let storage = Arc::new(Storage::new_test(temp_dir.path().to_path_buf()));
 
@@ -637,7 +613,7 @@ api_key_env = "OPENAI_API_KEY"
 
     #[tokio::test]
     async fn test_switch_model() {
-        let (manager, _temp) = test_manager().await;
+        let (manager, _temp) = test_manager();
 
         // Create a conversation
         let summary = manager
@@ -673,7 +649,7 @@ api_key_env = "OPENAI_API_KEY"
 
     #[tokio::test]
     async fn test_switch_model_invalid_model() {
-        let (manager, _temp) = test_manager().await;
+        let (manager, _temp) = test_manager();
 
         // Create a conversation
         let summary = manager
@@ -693,7 +669,7 @@ api_key_env = "OPENAI_API_KEY"
 
     #[tokio::test]
     async fn test_switch_model_no_active() {
-        let (manager, _temp) = test_manager().await;
+        let (manager, _temp) = test_manager();
 
         // Try to switch without active conversation
         let result = manager
