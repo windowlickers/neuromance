@@ -83,6 +83,9 @@ message ToolApprovalDecision {
 
 // Server-to-client events in a Chat stream.
 message ChatEvent {
+  // The conversation this event belongs to.
+  string conversation_id = 7;
+
   oneof event {
     StreamChunk stream_chunk = 1;
     ToolApprovalRequestProto tool_approval_request = 2;
@@ -95,19 +98,16 @@ message ChatEvent {
 
 // A chunk of streaming content.
 message StreamChunk {
-  string conversation_id = 1;
   string content = 2;
 }
 
 // Request for user approval of a tool call.
 message ToolApprovalRequestProto {
-  string conversation_id = 1;
   ToolCallProto tool_call = 2;
 }
 
 // Result of a tool execution.
 message ToolResultProto {
-  string conversation_id = 1;
   string tool_name = 2;
   string result = 3;
   bool success = 4;
@@ -115,7 +115,6 @@ message ToolResultProto {
 
 // Token usage statistics.
 message UsageProto {
-  string conversation_id = 1;
   uint32 prompt_tokens = 2;
   uint32 completion_tokens = 3;
   uint32 total_tokens = 4;
@@ -135,7 +134,6 @@ message OutputTokensDetailsProto {
 
 // Indicates a message exchange is complete.
 message MessageCompleted {
-  string conversation_id = 1;
   MessageProto message = 2;
 }
 

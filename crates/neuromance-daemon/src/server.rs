@@ -302,8 +302,8 @@ impl neuromance_proto::Neuromance for GrpcService {
                         conversation_id: cid,
                         content: c,
                     } => proto::ChatEvent {
+                        conversation_id: cid,
                         event: Some(proto::chat_event::Event::StreamChunk(proto::StreamChunk {
-                            conversation_id: cid,
                             content: c,
                         })),
                     },
@@ -312,9 +312,9 @@ impl neuromance_proto::Neuromance for GrpcService {
                         tool_call,
                     } => {
                         let event = proto::ChatEvent {
+                            conversation_id: cid.clone(),
                             event: Some(proto::chat_event::Event::ToolApprovalRequest(
                                 proto::ToolApprovalRequestProto {
-                                    conversation_id: cid.clone(),
                                     tool_call: Some(proto::ToolCallProto::from(&tool_call)),
                                 },
                             )),
@@ -340,9 +340,9 @@ impl neuromance_proto::Neuromance for GrpcService {
                         result: res,
                         success,
                     } => proto::ChatEvent {
+                        conversation_id: cid,
                         event: Some(proto::chat_event::Event::ToolResult(
                             proto::ToolResultProto {
-                                conversation_id: cid,
                                 tool_name,
                                 result: res,
                                 success,
@@ -352,25 +352,25 @@ impl neuromance_proto::Neuromance for GrpcService {
                     DaemonResponse::Usage {
                         conversation_id: cid,
                         usage,
-                    } => {
-                        let mut pu = proto::UsageProto::from(&usage);
-                        pu.conversation_id = cid;
-                        proto::ChatEvent {
-                            event: Some(proto::chat_event::Event::Usage(pu)),
-                        }
-                    }
+                    } => proto::ChatEvent {
+                        conversation_id: cid,
+                        event: Some(proto::chat_event::Event::Usage(
+                            proto::UsageProto::from(&usage),
+                        )),
+                    },
                     DaemonResponse::MessageCompleted {
                         conversation_id: cid,
                         message: msg,
                     } => proto::ChatEvent {
+                        conversation_id: cid,
                         event: Some(proto::chat_event::Event::MessageCompleted(
                             proto::MessageCompleted {
-                                conversation_id: cid,
                                 message: Some(proto::MessageProto::from(msg.as_ref())),
                             },
                         )),
                     },
                     DaemonResponse::Error { code, message: msg } => proto::ChatEvent {
+                        conversation_id: String::new(),
                         event: Some(proto::chat_event::Event::Error(proto::ChatError {
                             code: proto::ErrorCode::from(code).into(),
                             message: msg,
@@ -391,6 +391,7 @@ impl neuromance_proto::Neuromance for GrpcService {
                     "Message processing task panicked"
                 );
                 let err = proto::ChatEvent {
+                    conversation_id: String::new(),
                     event: Some(proto::chat_event::Event::Error(proto::ChatError {
                         code: proto::ErrorCode::Internal.into(),
                         message: "Message processing failed unexpectedly".to_string(),
@@ -721,6 +722,7 @@ async fn read_tool_approval(
 /// Creates a `ChatError` event from a `DaemonError`.
 fn make_chat_error(err: &DaemonError) -> proto::ChatEvent {
     proto::ChatEvent {
+        conversation_id: String::new(),
         event: Some(proto::chat_event::Event::Error(proto::ChatError {
             code: daemon_error_to_proto_code(err).into(),
             message: err.to_string(),

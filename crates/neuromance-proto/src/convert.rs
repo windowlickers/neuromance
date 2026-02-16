@@ -210,7 +210,6 @@ pub fn message_from_proto(msg: proto::MessageProto) -> Result<Message, String> {
 impl From<&Usage> for proto::UsageProto {
     fn from(u: &Usage) -> Self {
         Self {
-            conversation_id: String::new(),
             prompt_tokens: u.prompt_tokens,
             completion_tokens: u.completion_tokens,
             total_tokens: u.total_tokens,

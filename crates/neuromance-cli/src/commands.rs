@@ -104,6 +104,7 @@ pub async fn send_message(
             break;
         };
 
+        let cid = event.conversation_id;
         match event.event {
             Some(proto::chat_event::Event::StreamChunk(chunk)) => {
                 print!("{}", chunk.content);
@@ -115,7 +116,7 @@ pub async fn send_message(
                     let approval = prompt_tool_approval(&tc, theme)?;
 
                     session
-                        .send_tool_approval(req.conversation_id, tc.id, approval)
+                        .send_tool_approval(cid, tc.id, approval)
                         .await?;
                 }
             }
@@ -135,8 +136,8 @@ pub async fn send_message(
                     ])
                 );
             }
-            Some(proto::chat_event::Event::MessageCompleted(mc)) => {
-                resolved_id = Some(mc.conversation_id);
+            Some(proto::chat_event::Event::MessageCompleted(_mc)) => {
+                resolved_id = Some(cid);
                 display_assistant_end(theme);
                 break;
             }
