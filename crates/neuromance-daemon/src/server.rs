@@ -285,7 +285,7 @@ impl neuromance_proto::Neuromance for GrpcService {
         };
 
         let (event_tx, event_rx) = mpsc::channel(64);
-        let (response_tx, mut response_rx) = mpsc::unbounded_channel();
+        let (response_tx, mut response_rx) = mpsc::channel(64);
 
         let manager = Arc::clone(&self.inner.manager);
         let server = Arc::clone(&self.inner);
@@ -296,7 +296,7 @@ impl neuromance_proto::Neuromance for GrpcService {
                 .send_message(conversation_id, content, response_tx.clone())
                 .await
             {
-                let _ = response_tx.send(e.into());
+                let _ = response_tx.send(e.into()).await;
             }
         });
 

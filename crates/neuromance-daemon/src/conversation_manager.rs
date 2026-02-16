@@ -34,7 +34,7 @@ pub enum ClientType {
 /// Configuration for the chat loop execution.
 struct ChatLoopConfig {
     conversation_id: String,
-    response_tx: mpsc::UnboundedSender<DaemonResponse>,
+    response_tx: mpsc::Sender<DaemonResponse>,
     pending_approvals: Arc<DashMap<(String, String), oneshot::Sender<ToolApproval>>>,
     auto_approve: bool,
     max_turns: Option<u32>,
@@ -185,7 +185,7 @@ impl ConversationManager {
         &self,
         conversation_id: Option<String>,
         content: String,
-        response_tx: mpsc::UnboundedSender<DaemonResponse>,
+        response_tx: mpsc::Sender<DaemonResponse>,
     ) -> Result<()> {
         let id = self.resolve_or_active(conversation_id)?;
 
@@ -285,7 +285,7 @@ impl ConversationManager {
             let _ = response_tx.send(DaemonResponse::MessageCompleted {
                 conversation_id: conv_id_str,
                 message: Box::new(last_msg.clone()),
-            });
+            }).await;
         }
 
         Ok(())
@@ -323,7 +323,7 @@ impl ConversationManager {
                         let _ = tx.send(DaemonResponse::StreamChunk {
                             conversation_id: conv_id,
                             content,
-                        });
+                        }).await;
                     }
                     neuromance::CoreEvent::ToolResult {
                         name,
@@ -335,13 +335,13 @@ impl ConversationManager {
                             tool_name: name,
                             result,
                             success,
-                        });
+                        }).await;
                     }
                     neuromance::CoreEvent::Usage(usage) => {
                         let _ = tx.send(DaemonResponse::Usage {
                             conversation_id: conv_id,
                             usage,
-                        });
+                        }).await;
                     }
                 }
             }
@@ -365,7 +365,7 @@ impl ConversationManager {
                 let _ = response_tx.send(DaemonResponse::ToolApprovalRequest {
                     conversation_id: conv_id,
                     tool_call,
-                });
+                }).await;
 
                 rx.await.unwrap_or_else(|_| {
                     warn!("Tool approval channel closed unexpectedly");
