@@ -5,7 +5,6 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::pin::Pin;
-use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,20 +17,12 @@ use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{error, info, instrument, warn};
 
+use neuromance_daemon::process::is_process_running;
+
 use crate::config::DaemonConfig;
 use crate::conversation_manager::ConversationManager;
 use crate::error::{DaemonError, Result};
 use crate::storage::Storage;
-
-/// Checks if a process with the given PID is running.
-fn is_process_running(pid: u32) -> bool {
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
-}
 
 /// Converts a `DaemonError` into a gRPC `Status`.
 fn daemon_error_to_status(err: &DaemonError) -> Status {

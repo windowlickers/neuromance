@@ -12,6 +12,10 @@ categories = ["command-line-utilities", "development-tools"]
 readme = "README.md"
 rust-version.workspace = true
 
+[lib]
+name = "neuromance_daemon"
+path = "src/lib.rs"
+
 [[bin]]
 name = "neuromance-daemon"
 path = "src/main.rs"

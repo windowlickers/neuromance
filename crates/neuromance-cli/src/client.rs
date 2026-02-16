@@ -8,6 +8,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use fs2::FileExt;
 use hyper_util::rt::TokioIo;
+use neuromance_daemon::process::is_process_running;
 use neuromance_proto::NeuromanceClient;
 use neuromance_proto::proto;
 use tokio::net::UnixStream;
@@ -119,7 +120,7 @@ impl DaemonClient {
 
         // Check if daemon process exists via PID file
         if let Some(pid) = Self::read_pid(&pid_file)? {
-            if Self::is_process_running(pid) {
+            if is_process_running(pid) {
                 Self::wait_for_socket(&socket_path, 10)
                     .await
                     .context(format!("Daemon (PID {pid}) but socket unavailable"))?;
@@ -362,21 +363,6 @@ impl DaemonClient {
 
         let content = std::fs::read_to_string(pid_file).context("Failed to read PID file")?;
         Ok(content.trim().parse::<u32>().ok())
-    }
-
-    #[cfg(unix)]
-    fn is_process_running(pid: u32) -> bool {
-        Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
-    }
-
-    #[cfg(not(unix))]
-    fn is_process_running(_pid: u32) -> bool {
-        true
     }
 
     fn acquire_spawn_lock(lock_file: &Path) -> Result<File> {

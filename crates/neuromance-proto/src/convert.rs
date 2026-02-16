@@ -173,8 +173,8 @@ pub fn message_from_proto(msg: proto::MessageProto) -> Result<Message, String> {
         .parse()
         .map_err(|e| format!("Invalid timestamp: {e}"))?;
 
-    let role = proto::MessageRole::try_from(msg.role)
-        .unwrap_or(proto::MessageRole::Unspecified)
+    let role: MessageRole = proto::MessageRole::try_from(msg.role)
+        .map_err(|_| format!("Invalid message role: {}", msg.role))?
         .into();
 
     let metadata = msg
@@ -523,6 +523,28 @@ mod tests {
         assert_eq!(msg.conversation_id, back.conversation_id);
         assert_eq!(msg.role, back.role);
         assert_eq!(msg.content, back.content);
+    }
+
+    #[test]
+    fn test_message_from_proto_invalid_role() {
+        use std::collections::HashMap;
+        use uuid::Uuid;
+
+        let proto_msg = proto::MessageProto {
+            id: Uuid::new_v4().to_string(),
+            conversation_id: Uuid::new_v4().to_string(),
+            role: 999,
+            content: "Hello".to_string(),
+            metadata: HashMap::default(),
+            timestamp: Utc::now().to_rfc3339(),
+            tool_calls: vec![],
+            tool_call_id: None,
+            name: None,
+            reasoning: None,
+        };
+
+        let err = message_from_proto(proto_msg).unwrap_err();
+        assert!(err.contains("Invalid message role"), "got: {err}");
     }
 
     #[test]
