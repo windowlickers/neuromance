@@ -3,6 +3,7 @@
 //! Manages active Core instances for each conversation, creates new conversations,
 //! handles message sending with tool execution, and coordinates tool approval.
 
+use std::collections::HashSet;
 use std::env;
 use std::sync::Arc;
 
@@ -263,8 +264,10 @@ impl ConversationManager {
         );
 
         // Update conversation with new messages
+        let existing_ids: HashSet<Uuid> =
+            conversation.messages.iter().map(|m| m.id).collect();
         for msg in &updated_messages {
-            if conversation.messages.iter().all(|m| m.id != msg.id) {
+            if !existing_ids.contains(&msg.id) {
                 conversation
                     .add_message(msg.clone())
                     .map_err(|e| DaemonError::Other(e.to_string()))?;
