@@ -127,6 +127,37 @@ pub enum DaemonRequest {
     Shutdown,
 }
 
+/// Machine-readable error codes for programmatic error handling.
+///
+/// Allows clients to distinguish error types without parsing message strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ErrorCode {
+    /// Conversation not found
+    ConversationNotFound,
+    /// Model not found in configuration
+    ModelNotFound,
+    /// Bookmark not found
+    BookmarkNotFound,
+    /// Bookmark already exists
+    BookmarkExists,
+    /// No active conversation set
+    NoActiveConversation,
+    /// Invalid conversation ID format
+    InvalidConversationId,
+    /// LLM client or orchestration error
+    LlmError,
+    /// Configuration error
+    ConfigError,
+    /// Storage/persistence error
+    StorageError,
+    /// Invalid or malformed request
+    InvalidRequest,
+    /// Internal server error
+    Internal,
+}
+
 /// Responses sent from the daemon to the client.
 ///
 /// These include streaming content, tool results, conversation metadata,
@@ -242,7 +273,9 @@ pub enum DaemonResponse {
 
     /// An error occurred.
     Error {
-        /// Error message
+        /// Machine-readable error code
+        code: ErrorCode,
+        /// Human-readable error message
         message: String,
     },
 }

@@ -144,7 +144,7 @@ pub async fn send_message(
                 display_assistant_end();
                 break; // Done
             }
-            DaemonResponse::Error { message } => {
+            DaemonResponse::Error { message, .. } => {
                 eprintln!("\n{} {message}", "Error:".bright_red());
                 break; // Done
             }
@@ -187,7 +187,7 @@ pub async fn new_conversation(
             }
             println!("  Model: {}", conversation.model.bright_yellow());
         }
-        DaemonResponse::Error { message } => {
+        DaemonResponse::Error { message, .. } => {
             eprintln!("{} {message}", "Error:".bright_red());
         }
         _ => {
@@ -254,7 +254,7 @@ pub async fn list_messages(
                 println!();
             }
         }
-        DaemonResponse::Error { message } => {
+        DaemonResponse::Error { message, .. } => {
             eprintln!("{} {message}", "Error:".bright_red());
         }
         _ => {
@@ -303,7 +303,7 @@ pub async fn list_conversations(client: &mut DaemonClient, limit: Option<usize>)
                 println!();
             }
         }
-        DaemonResponse::Error { message } => {
+        DaemonResponse::Error { message, .. } => {
             eprintln!("{} {message}", "Error:".bright_red());
         }
         _ => {
@@ -333,7 +333,7 @@ pub async fn set_bookmark(
         DaemonResponse::Success { message } => {
             println!("{} {message}", "✓".bright_green());
         }
-        DaemonResponse::Error { message } => {
+        DaemonResponse::Error { message, .. } => {
             eprintln!("{} {message}", "Error:".bright_red());
         }
         _ => {
@@ -356,7 +356,7 @@ pub async fn remove_bookmark(client: &mut DaemonClient, name: String) -> Result<
         DaemonResponse::Success { message } => {
             println!("{} {message}", "✓".bright_green());
         }
-        DaemonResponse::Error { message } => {
+        DaemonResponse::Error { message, .. } => {
             eprintln!("{} {message}", "Error:".bright_red());
         }
         _ => {
@@ -385,7 +385,7 @@ pub async fn daemon_status(client: &mut DaemonClient) -> Result<()> {
             println!("  Uptime: {uptime_seconds}s");
             println!("  Active conversations: {active_conversations}");
         }
-        DaemonResponse::Error { message } => {
+        DaemonResponse::Error { message, .. } => {
             eprintln!("{} {message}", "Error:".bright_red());
         }
         _ => {
@@ -438,7 +438,7 @@ pub async fn daemon_health(client: &mut DaemonClient) -> Result<()> {
                 println!("{} {}", "Warning:".bright_yellow(), warning_msg);
             }
         }
-        DaemonResponse::Error { message } => {
+        DaemonResponse::Error { message, .. } => {
             eprintln!("{} {message}", "Error:".bright_red());
         }
         _ => {
@@ -489,7 +489,7 @@ pub async fn list_models(client: &mut DaemonClient) -> Result<()> {
                 );
             }
         }
-        DaemonResponse::Error { message } => {
+        DaemonResponse::Error { message, .. } => {
             eprintln!("{} {message}", "Error:".bright_red());
         }
         _ => {
@@ -528,7 +528,7 @@ pub async fn switch_model(
                 conversation.id.bright_cyan()
             );
         }
-        DaemonResponse::Error { message } => {
+        DaemonResponse::Error { message, .. } => {
             eprintln!("{} {message}", "Error:".bright_red());
         }
         _ => {
@@ -562,7 +562,7 @@ pub async fn status(client: &mut DaemonClient, json: bool) -> Result<()> {
                 print_status_human(uptime_seconds, active_conversations, current_conversation);
             }
         }
-        DaemonResponse::Error { message } => {
+        DaemonResponse::Error { message, .. } => {
             if json {
                 eprintln!(r#"{{"error":"{}"}}"#, message.replace('"', r#"\""#));
             } else {

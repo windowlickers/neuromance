@@ -108,6 +108,16 @@ impl Storage {
         Ok(())
     }
 
+    /// Reads the PID from the PID file, if it exists.
+    ///
+    /// Returns `None` if the file doesn't exist or can't be parsed.
+    #[must_use]
+    pub fn read_pid(&self) -> Option<u32> {
+        fs::read_to_string(&self.pid_file)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+    }
+
     /// Removes the PID file.
     ///
     /// # Errors

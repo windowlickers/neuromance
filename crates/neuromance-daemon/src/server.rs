@@ -4,10 +4,11 @@
 //! from the `nm` CLI client.
 
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use neuromance_common::protocol::{DaemonRequest, DaemonResponse};
+use neuromance_common::protocol::{DaemonRequest, DaemonResponse, ErrorCode};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{RwLock, broadcast, mpsc};
@@ -73,15 +74,22 @@ impl Server {
     pub async fn run(self: Arc<Self>) -> Result<()> {
         let socket_path = self.storage.socket_path();
 
+        // Check for an existing daemon before removing the socket
+        if socket_path.exists() {
+            if let Some(existing_pid) = self.storage.read_pid()
+                && Path::new(&format!("/proc/{existing_pid}")).exists()
+            {
+                return Err(DaemonError::Other(format!(
+                    "Another daemon is running (pid {existing_pid})"
+                )));
+            }
+            std::fs::remove_file(socket_path)?;
+        }
+
         // Write PID file
         let pid = std::process::id();
         self.storage.write_pid(pid)?;
         info!(pid = %pid, "Daemon started");
-
-        // Remove existing socket file
-        if socket_path.exists() {
-            std::fs::remove_file(socket_path)?;
-        }
 
         // Bind Unix socket
         let listener = UnixListener::bind(socket_path)?;
@@ -180,9 +188,7 @@ impl Server {
                                 .await
                             {
                                 error!(error = %e, "Streaming session error");
-                                let response = DaemonResponse::Error {
-                                    message: e.to_string(),
-                                };
+                                let response: DaemonResponse = e.into();
                                 let _ =
                                     Self::write_response(&mut writer, &response).await;
                             }
@@ -208,9 +214,7 @@ impl Server {
                                 }
                                 Err(e) => {
                                     error!(error = %e, "Request handling error");
-                                    let response = DaemonResponse::Error {
-                                        message: e.to_string(),
-                                    };
+                                    let response: DaemonResponse = e.into();
                                     let _ =
                                         Self::write_response(&mut writer, &response).await;
                                 }
@@ -219,6 +223,7 @@ impl Server {
                         Err(e) => {
                             warn!(error = %e, "Invalid request JSON");
                             let response = DaemonResponse::Error {
+                                code: ErrorCode::InvalidRequest,
                                 message: format!("Invalid JSON: {e}"),
                             };
                             let _ = Self::write_response(&mut writer, &response).await;
@@ -275,6 +280,7 @@ impl Server {
             _ => {
                 warn!("Unknown request variant received");
                 Ok(vec![DaemonResponse::Error {
+                    code: ErrorCode::InvalidRequest,
                     message: "Unknown request variant".to_string(),
                 }])
             }
@@ -300,9 +306,7 @@ impl Server {
                 .send_message(conversation_id, content, tx.clone())
                 .await
             {
-                let _ = tx.send(DaemonResponse::Error {
-                    message: e.to_string(),
-                });
+                let _ = tx.send(e.into());
             }
         });
 
@@ -353,6 +357,7 @@ impl Server {
             Ok(other) => {
                 warn!(request = ?other, "Unexpected request during tool approval");
                 let response = DaemonResponse::Error {
+                    code: ErrorCode::InvalidRequest,
                     message: "Expected ToolApproval request".to_string(),
                 };
                 Self::write_response(writer, &response).await?;
@@ -360,6 +365,7 @@ impl Server {
             Err(e) => {
                 warn!(error = %e, "Invalid JSON during tool approval");
                 let response = DaemonResponse::Error {
+                    code: ErrorCode::InvalidRequest,
                     message: format!("Invalid JSON: {e}"),
                 };
                 Self::write_response(writer, &response).await?;
