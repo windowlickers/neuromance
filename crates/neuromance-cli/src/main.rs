@@ -46,6 +46,7 @@ enum Command {
     },
 
     /// Create a new conversation
+    #[command(alias = "n")]
     New {
         /// Model nickname to use
         #[arg(short, long)]
@@ -57,7 +58,7 @@ enum Command {
     },
 
     /// List all conversations
-    #[command(alias = "convs")]
+    #[command(alias = "convs", alias = "c")]
     Conversations {
         /// Maximum number of conversations to show
         #[arg(short = 'n', long)]
@@ -65,18 +66,21 @@ enum Command {
     },
 
     /// Manage bookmarks
+    #[command(alias = "b")]
     Bookmark {
         #[command(subcommand)]
         action: BookmarkAction,
     },
 
     /// Manage models
+    #[command(alias = "m")]
     Model {
         #[command(subcommand)]
         action: ModelAction,
     },
 
     /// Show current status (daemon + active conversation)
+    #[command(alias = "st")]
     Status {
         /// Output as JSON
         #[arg(long)]
@@ -84,6 +88,7 @@ enum Command {
     },
 
     /// Daemon management
+    #[command(alias = "d")]
     Daemon {
         #[command(subcommand)]
         action: DaemonAction,
