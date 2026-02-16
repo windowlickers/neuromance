@@ -24,23 +24,25 @@ impl DaemonClient {
     ///
     /// Returns an error if the socket is unavailable after timeout.
     async fn wait_for_socket(socket_path: &PathBuf, timeout_secs: u64) -> Result<UnixStream> {
-        let mut delay_ms = 50;
-        let max_attempts = timeout_secs * 10; // Rough estimate accounting for backoff
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_secs(timeout_secs);
+        let mut delay = Duration::from_millis(50);
+        let max_delay = Duration::from_millis(500);
 
-        for attempt in 0..max_attempts {
+        loop {
             if let Ok(stream) = UnixStream::connect(socket_path).await {
                 return Ok(stream);
             }
 
-            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-
-            // Exponential backoff up to 500ms
-            if attempt < 5 {
-                delay_ms = (delay_ms * 2).min(500);
+            if tokio::time::Instant::now() + delay > deadline {
+                anyhow::bail!(
+                    "Socket unavailable after {timeout_secs}s timeout"
+                );
             }
-        }
 
-        anyhow::bail!("Socket unavailable after {timeout_secs}s timeout")
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(max_delay);
+        }
     }
 
     /// Connects to the daemon, auto-spawning if needed.
