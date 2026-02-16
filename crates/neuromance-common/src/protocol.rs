@@ -123,6 +123,12 @@ pub enum DaemonRequest {
         client_version: String,
     },
 
+    /// Delete a conversation and its associated bookmarks.
+    DeleteConversation {
+        /// The conversation ID (full UUID, short hash, or bookmark name)
+        conversation_id: String,
+    },
+
     /// Request graceful daemon shutdown.
     Shutdown,
 }
@@ -509,6 +515,24 @@ mod tests {
             parsed2,
             DaemonRequest::ListConversations { limit: Some(10) }
         ));
+    }
+
+    #[test]
+    fn test_delete_conversation_serialization() {
+        let request = DaemonRequest::DeleteConversation {
+            conversation_id: "abc1234".to_string(),
+        };
+
+        let json = serde_json::to_string(&request).expect("Failed to serialize");
+        let deserialized: DaemonRequest =
+            serde_json::from_str(&json).expect("Failed to deserialize");
+
+        match deserialized {
+            DaemonRequest::DeleteConversation { conversation_id } => {
+                assert_eq!(conversation_id, "abc1234");
+            }
+            _ => panic!("Wrong variant"),
+        }
     }
 
     #[test]

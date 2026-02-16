@@ -367,6 +367,48 @@ pub async fn remove_bookmark(client: &mut DaemonClient, name: String) -> Result<
     Ok(())
 }
 
+/// Deletes a conversation after optional confirmation.
+pub async fn delete_conversation(
+    client: &mut DaemonClient,
+    conversation_id: String,
+    force: bool,
+) -> Result<()> {
+    if !force {
+        print!(
+            "Delete conversation '{}'? [y/N] ",
+            conversation_id.bright_cyan()
+        );
+        let _ = std::io::stdout().flush();
+
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+
+        if !matches!(input.trim(), "y" | "Y" | "yes" | "YES") {
+            println!("Cancelled");
+            return Ok(());
+        }
+    }
+
+    let request = DaemonRequest::DeleteConversation { conversation_id };
+    client.send_request(&request).await?;
+
+    let response = client.read_response().await?;
+
+    match response {
+        DaemonResponse::Success { message } => {
+            println!("{} {message}", "✓".bright_green());
+        }
+        DaemonResponse::Error { message, .. } => {
+            eprintln!("{} {message}", "Error:".bright_red());
+        }
+        _ => {
+            eprintln!("{} Unexpected response", "Error:".bright_red());
+        }
+    }
+
+    Ok(())
+}
+
 /// Gets daemon status.
 pub async fn daemon_status(client: &mut DaemonClient) -> Result<()> {
     let request = DaemonRequest::Status;

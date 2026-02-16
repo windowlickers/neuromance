@@ -467,6 +467,62 @@ impl ConversationManager {
         Ok(client)
     }
 
+    /// Deletes a conversation and cleans up all associated state.
+    ///
+    /// Removes bookmarks, clears active conversation if it matches,
+    /// deletes the conversation file, and cleans up in-memory state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The conversation ID cannot be resolved
+    /// - The conversation cannot be loaded
+    /// - Storage operations fail
+    #[instrument(skip(self), fields(conversation_id = %conversation_id))]
+    pub fn delete_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<(ConversationSummary, Vec<String>)> {
+        let id = self.storage.resolve_conversation_id(conversation_id)?;
+
+        // Load conversation and build summary before deleting
+        let conversation = self.storage.load_conversation(&id)?;
+        let model = self.get_conversation_model(&id);
+        let bookmarks = self.storage.get_conversation_bookmarks(&id)?;
+        let summary = ConversationSummary::from_conversation(
+            &conversation,
+            model,
+            bookmarks,
+        );
+
+        // Remove bookmarks pointing to this conversation
+        let removed_bookmarks =
+            self.storage.remove_bookmarks_for_conversation(&id)?;
+
+        // Clear active conversation if it matches
+        if let Ok(Some(active_id)) = self.storage.get_active_conversation()
+            && active_id == id
+        {
+            self.storage.clear_active_conversation()?;
+        }
+
+        // Delete the conversation file
+        self.storage.delete_conversation(&id)?;
+
+        // Clean up in-memory state
+        self.clients.remove(&id);
+        self.conversation_locks.remove(&id);
+        self.conversation_models.remove(&id);
+
+        info!(
+            conversation_id = %id,
+            removed_bookmarks = ?removed_bookmarks,
+            "Deleted conversation"
+        );
+
+        Ok((summary, removed_bookmarks))
+    }
+
     /// Lists conversations.
     ///
     /// # Errors
@@ -646,6 +702,65 @@ api_key_env = "OPENAI_API_KEY"
         );
 
         (manager, temp_dir)
+    }
+
+    #[tokio::test]
+    async fn test_delete_conversation() {
+        let (manager, _temp) = test_manager();
+
+        let summary = manager.create_conversation(None, None).await.unwrap();
+        let conv_id = summary.id;
+
+        // Set a bookmark
+        let uuid = Uuid::parse_str(&conv_id).unwrap();
+        manager.storage.set_bookmark("test-bm", &uuid).unwrap();
+
+        // Delete the conversation
+        let (deleted, removed_bookmarks) =
+            manager.delete_conversation(&conv_id).unwrap();
+        assert_eq!(deleted.id, conv_id);
+        assert_eq!(removed_bookmarks, vec!["test-bm".to_string()]);
+
+        // Verify conversation is gone from storage
+        assert!(manager.storage.load_conversation(&uuid).is_err());
+
+        // Verify active conversation is cleared
+        assert!(manager.storage.get_active_conversation().unwrap().is_none());
+
+        // Verify in-memory state is cleaned up
+        assert!(!manager.clients.contains_key(&uuid));
+        assert!(!manager.conversation_locks.contains_key(&uuid));
+        assert!(!manager.conversation_models.contains_key(&uuid));
+    }
+
+    #[tokio::test]
+    async fn test_delete_conversation_not_found() {
+        let (manager, _temp) = test_manager();
+        let result = manager.delete_conversation("nonexistent");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_delete_preserves_other_active() {
+        let (manager, _temp) = test_manager();
+
+        // Create two conversations
+        let first = manager.create_conversation(None, None).await.unwrap();
+        let second = manager.create_conversation(None, None).await.unwrap();
+
+        // Active conversation is now `second`
+        let second_uuid = Uuid::parse_str(&second.id).unwrap();
+        assert_eq!(
+            manager.storage.get_active_conversation().unwrap(),
+            Some(second_uuid)
+        );
+
+        // Delete the first — should not clear active
+        manager.delete_conversation(&first.id).unwrap();
+        assert_eq!(
+            manager.storage.get_active_conversation().unwrap(),
+            Some(second_uuid)
+        );
     }
 
     #[tokio::test]

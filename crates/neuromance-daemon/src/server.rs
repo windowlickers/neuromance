@@ -260,6 +260,9 @@ impl Server {
                 name,
             } => Ok(self.handle_set_bookmark(&conversation_id, &name)?),
             DaemonRequest::RemoveBookmark { name } => Ok(self.handle_remove_bookmark(&name)?),
+            DaemonRequest::DeleteConversation { conversation_id } => {
+                Ok(self.handle_delete_conversation(&conversation_id)?)
+            }
             DaemonRequest::SwitchModel {
                 conversation_id,
                 model_nickname,
@@ -423,6 +426,35 @@ impl Server {
         self.storage.remove_bookmark(name)?;
         Ok(vec![DaemonResponse::Success {
             message: format!("Removed bookmark '{name}'"),
+        }])
+    }
+
+    fn handle_delete_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<DaemonResponse>> {
+        let (summary, removed_bookmarks) =
+            self.manager.delete_conversation(conversation_id)?;
+
+        let title_part = summary
+            .title
+            .as_deref()
+            .map_or(String::new(), |t| format!(" '{t}'"));
+
+        let bookmark_part = if removed_bookmarks.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " (removed bookmarks: {})",
+                removed_bookmarks.join(", ")
+            )
+        };
+
+        Ok(vec![DaemonResponse::Success {
+            message: format!(
+                "Deleted conversation {}{title_part}{bookmark_part}",
+                summary.short_id
+            ),
         }])
     }
 

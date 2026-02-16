@@ -398,6 +398,75 @@ impl Storage {
         Ok(names)
     }
 
+    /// Deletes a conversation file from disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The conversation file doesn't exist
+    /// - File deletion fails
+    #[instrument(skip(self), fields(conversation_id = %id))]
+    pub fn delete_conversation(&self, id: &Uuid) -> Result<()> {
+        let path = self.conversation_path(id);
+
+        if !path.exists() {
+            return Err(DaemonError::ConversationNotFound(id.to_string()));
+        }
+
+        fs::remove_file(&path)?;
+        debug!(conversation_id = %id, "Deleted conversation file");
+
+        Ok(())
+    }
+
+    /// Clears the active conversation marker.
+    ///
+    /// Removes the `current` file. No-op if no active conversation is set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if file deletion fails.
+    pub fn clear_active_conversation(&self) -> Result<()> {
+        if self.current_file.exists() {
+            fs::remove_file(&self.current_file)?;
+        }
+        Ok(())
+    }
+
+    /// Removes all bookmarks pointing to a conversation.
+    ///
+    /// Returns the names of removed bookmarks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if bookmark loading or saving fails.
+    pub fn remove_bookmarks_for_conversation(
+        &self,
+        id: &Uuid,
+    ) -> Result<Vec<String>> {
+        let _guard = self.bookmarks_lock.lock().map_err(|e| {
+            DaemonError::Storage(format!("Bookmark lock poisoned: {e}"))
+        })?;
+
+        let mut bookmarks = self.load_bookmarks()?;
+        let id_str = id.to_string();
+
+        let removed: Vec<String> = bookmarks
+            .iter()
+            .filter(|(_, conv_id)| *conv_id == &id_str)
+            .map(|(name, _)| name.clone())
+            .collect();
+
+        if !removed.is_empty() {
+            for name in &removed {
+                bookmarks.remove(name);
+            }
+            self.save_bookmarks(&bookmarks)?;
+        }
+
+        Ok(removed)
+    }
+
     /// Returns the path to a conversation file.
     fn conversation_path(&self, id: &Uuid) -> PathBuf {
         self.conversations_dir.join(format!("{id}.json"))
@@ -530,6 +599,83 @@ mod tests {
         let short_hash = &conv.id.to_string()[..7];
         let resolved = storage.resolve_conversation_id(short_hash).unwrap();
         assert_eq!(resolved, conv.id);
+    }
+
+    #[test]
+    fn test_delete_conversation() {
+        let (storage, _temp) = setup_test_storage();
+
+        let conv = Conversation::new().with_title("To Delete");
+        storage.save_conversation(&conv).unwrap();
+
+        // Verify it exists
+        assert!(storage.load_conversation(&conv.id).is_ok());
+
+        // Delete it
+        storage.delete_conversation(&conv.id).unwrap();
+
+        // Verify it's gone
+        assert!(storage.load_conversation(&conv.id).is_err());
+    }
+
+    #[test]
+    fn test_delete_conversation_not_found() {
+        let (storage, _temp) = setup_test_storage();
+        let id = Uuid::new_v4();
+        assert!(matches!(
+            storage.delete_conversation(&id),
+            Err(DaemonError::ConversationNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn test_clear_active_conversation() {
+        let (storage, _temp) = setup_test_storage();
+
+        let conv_id = Uuid::new_v4();
+        storage.set_active_conversation(&conv_id).unwrap();
+        assert!(storage.get_active_conversation().unwrap().is_some());
+
+        storage.clear_active_conversation().unwrap();
+        assert!(storage.get_active_conversation().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_clear_active_conversation_noop_when_unset() {
+        let (storage, _temp) = setup_test_storage();
+        // Should not error when no active conversation
+        storage.clear_active_conversation().unwrap();
+    }
+
+    #[test]
+    fn test_remove_bookmarks_for_conversation() {
+        let (storage, _temp) = setup_test_storage();
+
+        let conv_id = Uuid::new_v4();
+        let other_id = Uuid::new_v4();
+
+        storage.set_bookmark("bookmark1", &conv_id).unwrap();
+        storage.set_bookmark("bookmark2", &conv_id).unwrap();
+        storage.set_bookmark("other", &other_id).unwrap();
+
+        let removed = storage.remove_bookmarks_for_conversation(&conv_id).unwrap();
+        assert_eq!(removed.len(), 2);
+        assert!(removed.contains(&"bookmark1".to_string()));
+        assert!(removed.contains(&"bookmark2".to_string()));
+
+        // Other bookmark should remain
+        let remaining = storage.load_bookmarks().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert!(remaining.contains_key("other"));
+    }
+
+    #[test]
+    fn test_remove_bookmarks_for_conversation_none() {
+        let (storage, _temp) = setup_test_storage();
+        let conv_id = Uuid::new_v4();
+
+        let removed = storage.remove_bookmarks_for_conversation(&conv_id).unwrap();
+        assert!(removed.is_empty());
     }
 
     #[test]

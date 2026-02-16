@@ -57,6 +57,17 @@ enum Command {
         system: Option<String>,
     },
 
+    /// Delete a conversation
+    #[command(alias = "rm")]
+    Delete {
+        /// Conversation ID (bookmark, full UUID, or short hash)
+        conversation: String,
+
+        /// Skip confirmation prompt
+        #[arg(short, long)]
+        force: bool,
+    },
+
     /// List all conversations
     #[command(alias = "convs", alias = "c")]
     Conversations {
@@ -169,6 +180,14 @@ async fn main() -> Result<()> {
         Some(Command::New { model, system }) => {
             let mut client = DaemonClient::connect().await?;
             commands::new_conversation(&mut client, model, system).await?;
+        }
+
+        Some(Command::Delete {
+            conversation,
+            force,
+        }) => {
+            let mut client = DaemonClient::connect().await?;
+            commands::delete_conversation(&mut client, conversation, force).await?;
         }
 
         Some(Command::Conversations { limit }) => {
