@@ -221,17 +221,40 @@ impl DaemonClient {
 
     /// Spawns the daemon in the background.
     ///
+    /// Stderr is redirected to `~/.local/share/neuromance/daemon.log`
+    /// so spawn failures produce diagnostic output.
+    ///
     /// # Errors
     ///
     /// Returns an error if the daemon executable cannot be found or spawned.
     fn spawn_daemon() -> Result<()> {
+        let stderr_stdio = Self::open_daemon_log()
+            .map_or_else(|_| Stdio::null(), Stdio::from);
+
         Command::new("neuromance-daemon")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(stderr_stdio)
             .spawn()
             .context("Failed to spawn daemon. Is neuromance-daemon in PATH?")?;
 
         Ok(())
+    }
+
+    /// Opens the daemon log file for appending.
+    ///
+    /// Creates the parent directory if it doesn't exist.
+    fn open_daemon_log() -> Result<File> {
+        let log_path = Self::data_dir()?.join("daemon.log");
+
+        if let Some(parent) = log_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .context("Failed to open daemon log file")
     }
 }

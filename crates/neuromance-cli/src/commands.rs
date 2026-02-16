@@ -126,8 +126,23 @@ pub async fn send_message(
                 };
                 client.send_request(&approval_request).await?;
 
-                // Read and ignore the Success response
-                let _ = client.read_response().await?;
+                // Check the approval response for errors
+                match client.read_response().await? {
+                    DaemonResponse::Error { message, .. } => {
+                        eprintln!(
+                            "\n{} {message}",
+                            "Error:".bright_red()
+                        );
+                        break;
+                    }
+                    DaemonResponse::Success { .. } => {}
+                    other => {
+                        eprintln!(
+                            "\n{} Unexpected response after tool approval: {other:?}",
+                            "Warning:".bright_yellow()
+                        );
+                    }
+                }
             }
             DaemonResponse::ToolResult {
                 tool_name,

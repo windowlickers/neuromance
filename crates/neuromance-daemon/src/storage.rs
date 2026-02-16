@@ -18,6 +18,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -79,9 +80,26 @@ impl Storage {
         let socket_path = data_dir.join("neuromance.sock");
         let pid_file = data_dir.join("neuromance.pid");
 
-        // Create directories
-        fs::create_dir_all(&conversations_dir).map_err(|e| {
-            DaemonError::Storage(format!("Failed to create conversations directory: {e}"))
+        // Create directories with restricted permissions (owner-only)
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&conversations_dir)
+            .map_err(|e| {
+                DaemonError::Storage(format!(
+                    "Failed to create conversations directory: {e}"
+                ))
+            })?;
+
+        // Harden existing installs: ensure data dir is owner-only
+        fs::set_permissions(
+            &data_dir,
+            fs::Permissions::from_mode(0o700),
+        )
+        .map_err(|e| {
+            DaemonError::Storage(format!(
+                "Failed to set data directory permissions: {e}"
+            ))
         })?;
 
         Ok(Self {
