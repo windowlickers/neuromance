@@ -7,6 +7,8 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "Long-running daemon for managing Neuromance conversations"
+keywords = ["llm", "daemon", "ai", "conversation"]
+categories = ["command-line-utilities", "development-tools"]
 readme = "README.md"
 rust-version.workspace = true
 

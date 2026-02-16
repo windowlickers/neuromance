@@ -6,10 +6,80 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use colored::Colorize;
 use neuromance_common::protocol::{DaemonRequest, DaemonResponse};
+use neuromance_common::{ToolApproval, ToolCall};
+use rustyline::DefaultEditor;
 use serde_json::json;
 
 use crate::client::DaemonClient;
-use crate::display::{display_assistant_end, display_assistant_header, display_tool_result};
+use crate::display::{
+    display_assistant_end, display_assistant_header, display_tool_call_request, display_tool_result,
+};
+
+/// Prompts the user to approve, deny, or quit a tool call.
+///
+/// Returns the user's approval decision.
+fn prompt_tool_approval(tool_call: &ToolCall) -> Result<ToolApproval> {
+    // Display the tool request
+    display_tool_call_request(tool_call);
+
+    let args_display = tool_call.function.arguments_json();
+    println!(
+        "\n{} Execute tool '{}' with arguments:",
+        "Tool Approval Required:".bright_yellow().bold(),
+        tool_call.function.name.bright_green(),
+    );
+    println!("  {}", args_display.bright_cyan());
+    println!(
+        "{} /yes or /y to approve, /no or /n to deny, /quit or /q to abort",
+        "→".bright_yellow()
+    );
+
+    let mut editor = DefaultEditor::new()?;
+
+    loop {
+        let prompt = format!("{} ", "Approve?".bright_yellow().bold());
+        match editor.readline(&prompt) {
+            Ok(line) => {
+                let line = line.trim();
+                editor.add_history_entry(line).ok();
+
+                match line {
+                    "/yes" | "/y" => {
+                        println!("{} Tool approved\n", "✓".bright_green().bold());
+                        return Ok(ToolApproval::Approved);
+                    }
+                    "/no" | "/n" => {
+                        println!("{} Tool denied\n", "✗".bright_red().bold());
+                        return Ok(ToolApproval::Denied(
+                            "User denied tool execution".to_string(),
+                        ));
+                    }
+                    "/quit" | "/q" => {
+                        println!("{} Aborting conversation\n", "!".bright_red().bold());
+                        return Ok(ToolApproval::Quit);
+                    }
+                    _ => {
+                        println!(
+                            "{} Invalid response. Use /yes, /no, or /quit",
+                            "!".bright_yellow().bold()
+                        );
+                    }
+                }
+            }
+            Err(rustyline::error::ReadlineError::Interrupted) => {
+                return Ok(ToolApproval::Denied(
+                    "User interrupted with CTRL-C".to_string(),
+                ));
+            }
+            Err(rustyline::error::ReadlineError::Eof) => {
+                return Ok(ToolApproval::Quit);
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!("Error reading input: {e}"));
+            }
+        }
+    }
+}
 
 /// Sends a message to a conversation.
 pub async fn send_message(
@@ -26,46 +96,63 @@ pub async fn send_message(
 
     display_assistant_header();
 
-    // Read streaming responses
-    client
-        .read_until_complete(|response| {
-            match response {
-                DaemonResponse::StreamChunk { content, .. } => {
-                    print!("{content}");
-                    let _ = std::io::stdout().flush();
-                    true // Continue
-                }
-                DaemonResponse::ToolResult {
-                    tool_name,
-                    result,
-                    success,
-                    ..
-                } => {
-                    display_tool_result(tool_name, result, *success);
-                    true // Continue
-                }
-                DaemonResponse::Usage { usage, .. } => {
-                    println!(
-                        "\n{} {} tokens (in: {}, out: {})",
-                        "○".bright_blue(),
-                        usage.total_tokens,
-                        usage.prompt_tokens,
-                        usage.completion_tokens
-                    );
-                    true // Continue
-                }
-                DaemonResponse::MessageCompleted { .. } => {
-                    display_assistant_end();
-                    false // Done
-                }
-                DaemonResponse::Error { message } => {
-                    eprintln!("\n{} {message}", "Error:".bright_red());
-                    false // Done
-                }
-                _ => true, // Continue for other responses
+    // Read streaming responses with manual loop to handle async tool approval
+    loop {
+        let response = client.read_response().await?;
+
+        match response {
+            DaemonResponse::StreamChunk { content, .. } => {
+                print!("{content}");
+                let _ = std::io::stdout().flush();
             }
-        })
-        .await?;
+            DaemonResponse::ToolApprovalRequest {
+                conversation_id,
+                tool_call,
+            } => {
+                // Prompt user for approval
+                let approval = prompt_tool_approval(&tool_call)?;
+
+                // Send approval back to daemon
+                let approval_request = DaemonRequest::ToolApproval {
+                    conversation_id,
+                    tool_call_id: tool_call.id.clone(),
+                    approval,
+                };
+                client.send_request(&approval_request).await?;
+
+                // Read and ignore the Success response
+                let _ = client.read_response().await?;
+            }
+            DaemonResponse::ToolResult {
+                tool_name,
+                result,
+                success,
+                ..
+            } => {
+                display_tool_result(&tool_name, &result, success);
+            }
+            DaemonResponse::Usage { usage, .. } => {
+                println!(
+                    "\n{} {} tokens (in: {}, out: {})",
+                    "○".bright_blue(),
+                    usage.total_tokens,
+                    usage.prompt_tokens,
+                    usage.completion_tokens
+                );
+            }
+            DaemonResponse::MessageCompleted { .. } => {
+                display_assistant_end();
+                break; // Done
+            }
+            DaemonResponse::Error { message } => {
+                eprintln!("\n{} {message}", "Error:".bright_red());
+                break; // Done
+            }
+            _ => {
+                // Unexpected response, continue
+            }
+        }
+    }
 
     Ok(())
 }
@@ -292,7 +379,7 @@ pub async fn daemon_status(client: &mut DaemonClient) -> Result<()> {
             ..
         } => {
             println!("{} Daemon is running", "✓".bright_green());
-            println!("  Uptime: {}s", uptime_seconds);
+            println!("  Uptime: {uptime_seconds}s");
             println!("  Active conversations: {active_conversations}");
         }
         DaemonResponse::Error { message } => {
@@ -331,7 +418,7 @@ pub async fn daemon_health(client: &mut DaemonClient) -> Result<()> {
             println!("  Daemon version: {}", daemon_version.bright_cyan());
             println!("  Client version: {}", env!("CARGO_PKG_VERSION").bright_cyan());
             println!("  Compatible: {}", if compatible { "yes".bright_green() } else { "no".bright_red() });
-            println!("  Uptime: {}s", uptime_seconds);
+            println!("  Uptime: {uptime_seconds}s");
 
             if let Some(warning_msg) = warning {
                 println!();
@@ -452,7 +539,7 @@ pub async fn status(client: &mut DaemonClient, json: bool) -> Result<()> {
             current_conversation,
         } => {
             if json {
-                print_status_json(true, Some(uptime_seconds), active_conversations, current_conversation)?;
+                print_status_json(true, Some(uptime_seconds), active_conversations, current_conversation.as_ref())?;
             } else {
                 print_status_human(uptime_seconds, active_conversations, current_conversation);
             }
@@ -498,9 +585,9 @@ fn print_status_human(
     println!("{} Daemon is running", "✓".bright_green());
     println!("  Uptime: {}", format_duration(uptime_seconds));
     println!("  Active conversations: {active_conversations}");
+    println!();
 
     if let Some(conv) = current_conversation {
-        println!();
         println!("{} Current conversation", "●".bright_cyan());
         println!("  ID: {}", conv.short_id.bright_cyan());
 
@@ -517,7 +604,6 @@ fn print_status_human(
 
         println!("  Updated: {}", format_relative_time(conv.updated_at));
     } else {
-        println!();
         println!("{} No current conversation", "○".dimmed());
     }
 }
@@ -527,7 +613,7 @@ fn print_status_json(
     daemon_running: bool,
     uptime_seconds: Option<u64>,
     active_conversations: usize,
-    current_conversation: Option<neuromance_common::protocol::ConversationSummary>,
+    current_conversation: Option<&neuromance_common::protocol::ConversationSummary>,
 ) -> Result<()> {
     let output = if daemon_running {
         json!({

@@ -178,7 +178,7 @@ pub enum DaemonResponse {
         /// The conversation this message belongs to
         conversation_id: String,
         /// The completed assistant message
-        message: Message,
+        message: Box<Message>,
     },
 
     /// A new conversation was created.
@@ -324,10 +324,10 @@ pub struct ModelProfile {
     /// Full model identifier (e.g., "claude-sonnet-4-5-20250929")
     pub model: String,
 
-    /// Environment variable name for the API key (e.g., "ANTHROPIC_API_KEY")
+    /// Environment variable name for the API key (e.g., `ANTHROPIC_API_KEY`)
     pub api_key_env: String,
 
-    /// Optional custom base URL (e.g., "https://openrouter.ai/api/v1")
+    /// Optional custom base URL (e.g., <https://openrouter.ai/api/v1>)
     #[serde(default)]
     pub base_url: Option<String>,
 }
@@ -434,7 +434,7 @@ mod tests {
 
         let response = DaemonResponse::ToolApprovalRequest {
             conversation_id: conv_id.clone(),
-            tool_call: tool_call.clone(),
+            tool_call,
         };
 
         let json = serde_json::to_string(&response).expect("Failed to serialize");
@@ -459,10 +459,10 @@ mod tests {
         let request1 = DaemonRequest::Status;
         let request2 = DaemonRequest::ListConversations { limit: Some(10) };
 
-        let line1 = format!("{}\n", serde_json::to_string(&request1).unwrap());
-        let line2 = format!("{}\n", serde_json::to_string(&request2).unwrap());
+        let json_line1 = format!("{}\n", serde_json::to_string(&request1).unwrap());
+        let json_line2 = format!("{}\n", serde_json::to_string(&request2).unwrap());
 
-        let wire_data = format!("{line1}{line2}");
+        let wire_data = format!("{json_line1}{json_line2}");
 
         // Parse line by line
         let lines: Vec<&str> = wire_data.lines().collect();

@@ -247,7 +247,7 @@ impl ConversationManager {
             if last_msg.role == MessageRole::Assistant {
                 let _ = response_tx.send(DaemonResponse::MessageCompleted {
                     conversation_id: conv_id_str,
-                    message: last_msg.clone(),
+                    message: Box::new(last_msg.clone()),
                 });
             }
         }

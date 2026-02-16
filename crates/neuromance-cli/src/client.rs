@@ -136,26 +136,6 @@ impl DaemonClient {
         Ok(response)
     }
 
-    /// Reads responses until a completion condition is met.
-    ///
-    /// Calls the handler for each response. Returns when the handler returns `false`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if reading or parsing fails.
-    pub async fn read_until_complete<F>(&mut self, mut handler: F) -> Result<()>
-    where
-        F: FnMut(&DaemonResponse) -> bool,
-    {
-        loop {
-            let response = self.read_response().await?;
-            if !handler(&response) {
-                break;
-            }
-        }
-        Ok(())
-    }
-
     /// Returns the data directory path.
     fn data_dir() -> Result<PathBuf> {
         dirs::data_local_dir()
