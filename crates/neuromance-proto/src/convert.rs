@@ -202,10 +202,13 @@ pub fn message_from_proto(msg: proto::MessageProto) -> Result<Message, String> {
         .metadata
         .into_iter()
         .map(|(k, v)| {
-            let val = serde_json::from_str(&v).unwrap_or(serde_json::Value::String(v));
-            (k, val)
+            let val = serde_json::from_str(&v)
+                .map_err(|e| {
+                    format!("Invalid JSON in metadata key {k:?}: {e}")
+                })?;
+            Ok((k, val))
         })
-        .collect();
+        .collect::<Result<_, String>>()?;
 
     let tool_calls: SmallVec<[ToolCall; 2]> =
         msg.tool_calls.into_iter().map(ToolCall::from).collect();
