@@ -302,7 +302,7 @@ impl Server {
                 tool_call_id,
                 approval,
             } => Ok(self.handle_tool_approval(&conversation_id, &tool_call_id, approval)?),
-            DaemonRequest::Status => Ok(self.handle_status()),
+            DaemonRequest::Status => self.handle_status().await,
             DaemonRequest::DetailedStatus => self.handle_detailed_status().await,
             DaemonRequest::Health { client_version } => Ok(self.handle_health(&client_version)),
             DaemonRequest::Shutdown => Ok(self.handle_shutdown()),
@@ -532,19 +532,21 @@ impl Server {
         }])
     }
 
-    fn handle_status(&self) -> Vec<DaemonResponse> {
+    async fn handle_status(&self) -> Result<Vec<DaemonResponse>> {
         let uptime_seconds = self.start_time.elapsed().as_secs();
-        let active_conversations = self.manager.active_conversation_count();
-        vec![DaemonResponse::Status {
+        let active_conversations =
+            self.manager.conversation_count().await.unwrap_or(0);
+        Ok(vec![DaemonResponse::Status {
             uptime_seconds,
             active_conversations,
             current_conversation: None,
-        }]
+        }])
     }
 
     async fn handle_detailed_status(&self) -> Result<Vec<DaemonResponse>> {
         let uptime_seconds = self.start_time.elapsed().as_secs();
-        let active_conversations = self.manager.active_conversation_count();
+        let active_conversations =
+            self.manager.conversation_count().await.unwrap_or(0);
 
         let loaded = self
             .storage

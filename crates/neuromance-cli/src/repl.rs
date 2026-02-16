@@ -15,7 +15,7 @@ use crate::theme::Theme;
 ///
 /// Returns an error if the REPL initialization or message sending fails.
 pub async fn run_repl(
-    conversation_id: Option<String>,
+    initial_conversation_id: Option<String>,
     theme: &Theme,
 ) -> Result<()> {
     println!("{}", theme.repl_title.render(&[]));
@@ -24,6 +24,7 @@ pub async fn run_repl(
 
     let mut rl = DefaultEditor::new()?;
     let mut client = DaemonClient::connect().await?;
+    let mut conversation_id = initial_conversation_id;
 
     let prompt = theme.prompt_user.render(&[]);
 
@@ -78,22 +79,35 @@ pub async fn run_repl(
                 let _ = rl.add_history_entry(line);
 
                 // Send message, attempting reconnection on failure
-                if let Err(e) =
-                    send_message(&mut client, conversation_id.clone(), line.to_string(), theme)
-                        .await
+                match send_message(
+                    &mut client,
+                    conversation_id.clone(),
+                    line.to_string(),
+                    theme,
+                )
+                .await
                 {
-                    eprintln!("{} {e}", "Error:".bright_red());
-                    eprintln!("{}", "Attempting to reconnect...".dimmed());
-                    match DaemonClient::connect().await {
-                        Ok(new_client) => {
-                            client = new_client;
-                            eprintln!("{} Reconnected", "✓".bright_green());
+                    Ok(resolved_id) => {
+                        // Pin to the resolved conversation for all
+                        // subsequent messages in this REPL session
+                        if resolved_id.is_some() {
+                            conversation_id = resolved_id;
                         }
-                        Err(reconnect_err) => {
-                            eprintln!(
-                                "{} Failed to reconnect: {reconnect_err}",
-                                "Error:".bright_red()
-                            );
+                    }
+                    Err(e) => {
+                        eprintln!("{} {e}", "Error:".bright_red());
+                        eprintln!("{}", "Attempting to reconnect...".dimmed());
+                        match DaemonClient::connect().await {
+                            Ok(new_client) => {
+                                client = new_client;
+                                eprintln!("{} Reconnected", "✓".bright_green());
+                            }
+                            Err(reconnect_err) => {
+                                eprintln!(
+                                    "{} Failed to reconnect: {reconnect_err}",
+                                    "Error:".bright_red()
+                                );
+                            }
                         }
                     }
                 }

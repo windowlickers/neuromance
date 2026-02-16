@@ -640,10 +640,12 @@ impl ConversationManager {
         }
     }
 
-    /// Returns the number of active conversation clients.
-    #[must_use]
-    pub fn active_conversation_count(&self) -> usize {
-        self.clients.len()
+    /// Returns the number of persisted conversations.
+    pub async fn conversation_count(&self) -> Result<usize> {
+        let count = self.storage
+            .run(|s| Ok(s.list_conversations()?.len()))
+            .await?;
+        Ok(count)
     }
 
     /// Gets the model nickname for a conversation.

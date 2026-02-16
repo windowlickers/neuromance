@@ -83,12 +83,15 @@ fn prompt_tool_approval(tool_call: &ToolCall, theme: &Theme) -> Result<ToolAppro
 }
 
 /// Sends a message to a conversation.
+///
+/// Returns the conversation ID from the completed message response,
+/// so callers can pin subsequent messages to the same conversation.
 pub async fn send_message(
     client: &mut DaemonClient,
     conversation_id: Option<String>,
     message: String,
     theme: &Theme,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let request = DaemonRequest::SendMessage {
         conversation_id,
         content: message,
@@ -99,6 +102,7 @@ pub async fn send_message(
     display_assistant_header(theme);
 
     // Read streaming responses with manual loop to handle async tool approval
+    let mut resolved_id = None;
     loop {
         let response = client.read_response().await?;
 
@@ -146,13 +150,16 @@ pub async fn send_message(
                     ])
                 );
             }
-            DaemonResponse::MessageCompleted { .. } => {
+            DaemonResponse::MessageCompleted {
+                conversation_id, ..
+            } => {
+                resolved_id = Some(conversation_id);
                 display_assistant_end(theme);
-                break; // Done
+                break;
             }
             DaemonResponse::Error { message, .. } => {
                 eprintln!("\n{} {message}", "Error:".bright_red());
-                break; // Done
+                break;
             }
             other => {
                 eprintln!(
@@ -163,7 +170,7 @@ pub async fn send_message(
         }
     }
 
-    Ok(())
+    Ok(resolved_id)
 }
 
 /// Creates a new conversation.
