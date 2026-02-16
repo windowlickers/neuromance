@@ -18,6 +18,9 @@ use crate::conversation_manager::ConversationManager;
 use crate::error::{DaemonError, Result};
 use crate::storage::Storage;
 
+/// Maximum size of a single request line (1 MB).
+const MAX_REQUEST_SIZE: usize = 1024 * 1024;
+
 /// Daemon server state.
 pub struct Server {
     /// Conversation manager
@@ -147,10 +150,8 @@ impl Server {
         let mut line = String::new();
 
         loop {
-            line.clear();
-
-            // Read line-delimited JSON
-            match reader.read_line(&mut line).await {
+            // Read line-delimited JSON (size-limited)
+            match Self::read_line_limited(&mut reader, &mut line).await {
                 Ok(0) => {
                     // Connection closed
                     debug!("Client disconnected");
@@ -320,7 +321,8 @@ impl Server {
         writer: &mut tokio::net::unix::OwnedWriteHalf,
     ) -> Result<()> {
         let mut line = String::new();
-        let bytes_read = reader.read_line(&mut line).await?;
+        let bytes_read =
+            Self::read_line_limited(reader, &mut line).await?;
 
         if bytes_read == 0 {
             return Err(DaemonError::Other(
@@ -517,6 +519,50 @@ impl Server {
         writer.write_all(b"\n").await?;
         writer.flush().await?;
         Ok(())
+    }
+
+    /// Reads a newline-delimited line with a size limit.
+    ///
+    /// Returns the number of bytes read (0 = EOF). Errors if the
+    /// line exceeds `MAX_REQUEST_SIZE` before a newline is found.
+    async fn read_line_limited(
+        reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+        buf: &mut String,
+    ) -> Result<usize> {
+        buf.clear();
+        let mut total = 0;
+
+        loop {
+            let available = reader.fill_buf().await?;
+            if available.is_empty() {
+                return Ok(total);
+            }
+
+            let newline_pos =
+                available.iter().position(|&b| b == b'\n');
+            let n = newline_pos.map_or(available.len(), |p| p + 1);
+
+            total += n;
+            if total > MAX_REQUEST_SIZE {
+                reader.consume(n);
+                return Err(DaemonError::Other(format!(
+                    "Request exceeds {MAX_REQUEST_SIZE} byte limit"
+                )));
+            }
+
+            let chunk = std::str::from_utf8(&available[..n])
+                .map_err(|_| {
+                    DaemonError::Other(
+                        "Invalid UTF-8 in request".to_string(),
+                    )
+                })?;
+            buf.push_str(chunk);
+            reader.consume(n);
+
+            if newline_pos.is_some() {
+                return Ok(total);
+            }
+        }
     }
 
     /// Checks version compatibility between daemon and client.
