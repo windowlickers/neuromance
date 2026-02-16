@@ -11,6 +11,9 @@ use neuromance_common::protocol::{DaemonRequest, DaemonResponse};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
+/// Maximum size of a single daemon response line (10 MB).
+const MAX_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
+
 /// Client for communicating with the Neuromance daemon.
 pub struct DaemonClient {
     reader: BufReader<tokio::net::unix::OwnedReadHalf>,
@@ -127,10 +130,34 @@ impl DaemonClient {
     /// Returns an error if reading or parsing fails.
     pub async fn read_response(&mut self) -> Result<DaemonResponse> {
         let mut line = String::new();
-        self.reader.read_line(&mut line).await?;
 
-        if line.is_empty() {
-            anyhow::bail!("Connection closed by daemon");
+        loop {
+            let available = self.reader.fill_buf().await?;
+            if available.is_empty() {
+                if line.is_empty() {
+                    anyhow::bail!("Connection closed by daemon");
+                }
+                break;
+            }
+
+            let newline_pos =
+                available.iter().position(|&b| b == b'\n');
+            let n = newline_pos.map_or(available.len(), |p| p + 1);
+
+            let chunk = std::str::from_utf8(&available[..n])
+                .context("Invalid UTF-8 in daemon response")?;
+            line.push_str(chunk);
+            self.reader.consume(n);
+
+            if line.len() > MAX_RESPONSE_SIZE {
+                anyhow::bail!(
+                    "Daemon response exceeds {MAX_RESPONSE_SIZE} byte limit"
+                );
+            }
+
+            if newline_pos.is_some() {
+                break;
+            }
         }
 
         let response = serde_json::from_str(&line)?;

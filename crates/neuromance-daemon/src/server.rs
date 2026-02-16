@@ -330,7 +330,7 @@ impl Server {
         let (tx, mut rx) = mpsc::unbounded_channel();
 
         let manager = Arc::clone(&self.manager);
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             if let Err(e) = manager
                 .send_message(conversation_id, content, tx.clone())
                 .await
@@ -340,12 +340,26 @@ impl Server {
         });
 
         while let Some(response) = rx.recv().await {
-            let needs_approval = matches!(&response, DaemonResponse::ToolApprovalRequest { .. });
+            let needs_approval = matches!(
+                &response,
+                DaemonResponse::ToolApprovalRequest { .. }
+            );
             Self::write_response(writer, &response).await?;
 
             if needs_approval {
                 self.read_tool_approval(reader, writer).await?;
             }
+        }
+
+        // Detect task panics that silently dropped the sender
+        if let Err(join_err) = handle.await {
+            error!(error = %join_err, "Message processing task panicked");
+            let response = DaemonResponse::Error {
+                code: ErrorCode::Internal,
+                message: "Message processing failed unexpectedly"
+                    .to_string(),
+            };
+            Self::write_response(writer, &response).await?;
         }
 
         Ok(())
@@ -642,6 +656,23 @@ impl Server {
             total += n;
             if total > MAX_REQUEST_SIZE {
                 reader.consume(n);
+                // Drain to next newline to prevent framing corruption
+                if newline_pos.is_none() {
+                    loop {
+                        let remaining = reader.fill_buf().await?;
+                        if remaining.is_empty() {
+                            break;
+                        }
+                        let nl = remaining
+                            .iter()
+                            .position(|&b| b == b'\n');
+                        let drain = nl.map_or(remaining.len(), |p| p + 1);
+                        reader.consume(drain);
+                        if nl.is_some() {
+                            break;
+                        }
+                    }
+                }
                 return Err(DaemonError::Other(format!(
                     "Request exceeds {MAX_REQUEST_SIZE} byte limit"
                 )));
