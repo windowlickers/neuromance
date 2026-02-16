@@ -11,7 +11,7 @@ use neuromance::Core;
 use neuromance_client::{AnthropicClient, LLMClient, OpenAIClient, ResponsesClient};
 use neuromance_common::protocol::{ConversationSummary, DaemonResponse};
 use neuromance_common::{Config, Conversation, Message, MessageRole, ToolApproval};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
@@ -52,6 +52,9 @@ pub struct ConversationManager {
     /// Uses `DashMap` for concurrent access without blocking
     pub clients: DashMap<Uuid, ClientType>,
 
+    /// Per-conversation locks to serialize `send_message` operations
+    conversation_locks: DashMap<Uuid, Arc<Mutex<()>>>,
+
     /// Pending tool approvals (conversation ID, tool call ID) -> response channel
     pending_approvals: Arc<DashMap<(String, String), oneshot::Sender<ToolApproval>>>,
 
@@ -66,6 +69,7 @@ impl ConversationManager {
             storage,
             config,
             clients: DashMap::new(),
+            conversation_locks: DashMap::new(),
             pending_approvals: Arc::new(DashMap::new()),
             conversation_models: DashMap::new(),
         }
@@ -162,6 +166,14 @@ impl ConversationManager {
         };
 
         debug!(conversation_id = %id, "Resolved conversation ID");
+
+        // Acquire per-conversation lock to prevent concurrent modifications
+        let lock = self
+            .conversation_locks
+            .entry(id)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
 
         // Load conversation
         let mut conversation = self.storage.load_conversation(&id)?;

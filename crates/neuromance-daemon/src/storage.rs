@@ -19,6 +19,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use neuromance_common::Conversation;
 use serde::{Deserialize, Serialize};
@@ -43,6 +44,9 @@ pub struct Storage {
 
     /// PID file path
     pid_file: PathBuf,
+
+    /// Serializes bookmark read-modify-write operations
+    bookmarks_lock: Mutex<()>,
 }
 
 /// Bookmark mapping stored in `bookmarks.json`.
@@ -84,6 +88,7 @@ impl Storage {
             bookmarks_file,
             socket_path,
             pid_file,
+            bookmarks_lock: Mutex::new(()),
         })
     }
 
@@ -265,6 +270,10 @@ impl Storage {
     /// - The bookmark already exists
     /// - Saving fails
     pub fn set_bookmark(&self, name: &str, conversation_id: &Uuid) -> Result<()> {
+        let _guard = self.bookmarks_lock.lock().map_err(|e| {
+            DaemonError::Storage(format!("Bookmark lock poisoned: {e}"))
+        })?;
+
         let mut bookmarks = self.load_bookmarks()?;
 
         if bookmarks.contains_key(name) {
@@ -285,6 +294,10 @@ impl Storage {
     /// - The bookmark doesn't exist
     /// - Saving fails
     pub fn remove_bookmark(&self, name: &str) -> Result<()> {
+        let _guard = self.bookmarks_lock.lock().map_err(|e| {
+            DaemonError::Storage(format!("Bookmark lock poisoned: {e}"))
+        })?;
+
         let mut bookmarks = self.load_bookmarks()?;
 
         if !bookmarks.contains_key(name) {
@@ -394,6 +407,7 @@ impl Storage {
             bookmarks_file: data_dir.join("bookmarks.json"),
             socket_path: data_dir.join("neuromance.sock"),
             pid_file: data_dir.join("neuromance.pid"),
+            bookmarks_lock: Mutex::new(()),
         }
     }
 }
@@ -419,6 +433,7 @@ mod tests {
             bookmarks_file: data_dir.join("bookmarks.json"),
             socket_path: data_dir.join("neuromance.sock"),
             pid_file: data_dir.join("neuromance.pid"),
+            bookmarks_lock: Mutex::new(()),
         };
 
         (storage, temp_dir)
