@@ -9,9 +9,9 @@ use std::time::Duration;
 use neuromance_common::protocol::{DaemonRequest, DaemonResponse};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{RwLock, mpsc, broadcast};
+use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio::time::Instant;
-use tracing::{debug, error, info, warn, instrument};
+use tracing::{debug, error, info, instrument, warn};
 
 use crate::config::DaemonConfig;
 use crate::conversation_manager::ConversationManager;
@@ -205,10 +205,7 @@ impl Server {
 
     /// Dispatches a daemon request to the appropriate handler.
     #[instrument(skip_all)]
-    async fn handle_request(
-        &self,
-        request: DaemonRequest,
-    ) -> Result<Vec<DaemonResponse>> {
+    async fn handle_request(&self, request: DaemonRequest) -> Result<Vec<DaemonResponse>> {
         match request {
             DaemonRequest::SendMessage {
                 conversation_id,
@@ -228,10 +225,8 @@ impl Server {
             DaemonRequest::SetBookmark {
                 conversation_id,
                 name,
-            } => Ok(self.handle_set_bookmark(conversation_id, name)?),
-            DaemonRequest::RemoveBookmark { name } => {
-                Ok(self.handle_remove_bookmark(name)?)
-            }
+            } => Ok(self.handle_set_bookmark(&conversation_id, &name)?),
+            DaemonRequest::RemoveBookmark { name } => Ok(self.handle_remove_bookmark(&name)?),
             DaemonRequest::SwitchModel {
                 conversation_id,
                 model_nickname,
@@ -244,20 +239,10 @@ impl Server {
                 conversation_id,
                 tool_call_id,
                 approval,
-            } => {
-                Ok(self.handle_tool_approval(
-                    conversation_id,
-                    tool_call_id,
-                    approval,
-                )?)
-            }
+            } => Ok(self.handle_tool_approval(&conversation_id, &tool_call_id, approval)?),
             DaemonRequest::Status => Ok(self.handle_status()),
-            DaemonRequest::DetailedStatus => {
-                Ok(self.handle_detailed_status())
-            }
-            DaemonRequest::Health { client_version } => {
-                Ok(self.handle_health(client_version))
-            }
+            DaemonRequest::DetailedStatus => Ok(self.handle_detailed_status()),
+            DaemonRequest::Health { client_version } => Ok(self.handle_health(&client_version)),
             DaemonRequest::Shutdown => Ok(self.handle_shutdown()),
             _ => {
                 warn!("Unknown request variant received");
@@ -314,8 +299,7 @@ impl Server {
         conversation_id: Option<String>,
         limit: Option<usize>,
     ) -> Result<Vec<DaemonResponse>> {
-        let (messages, total_count, conv_id) =
-            self.manager.get_messages(conversation_id, limit)?;
+        let (messages, total_count, conv_id) = self.manager.get_messages(conversation_id, limit)?;
         Ok(vec![DaemonResponse::Messages {
             conversation_id: conv_id,
             messages,
@@ -323,35 +307,25 @@ impl Server {
         }])
     }
 
-    fn handle_list_conversations(
-        &self,
-        limit: Option<usize>,
-    ) -> Result<Vec<DaemonResponse>> {
+    fn handle_list_conversations(&self, limit: Option<usize>) -> Result<Vec<DaemonResponse>> {
         let conversations = self.manager.list_conversations(limit)?;
         Ok(vec![DaemonResponse::Conversations { conversations }])
     }
 
     fn handle_set_bookmark(
         &self,
-        conversation_id: String,
-        name: String,
+        conversation_id: &str,
+        name: &str,
     ) -> Result<Vec<DaemonResponse>> {
-        let id = self
-            .storage
-            .resolve_conversation_id(&conversation_id)?;
-        self.storage.set_bookmark(&name, &id)?;
+        let id = self.storage.resolve_conversation_id(conversation_id)?;
+        self.storage.set_bookmark(name, &id)?;
         Ok(vec![DaemonResponse::Success {
-            message: format!(
-                "Set bookmark '{name}' for conversation {conversation_id}"
-            ),
+            message: format!("Set bookmark '{name}' for conversation {conversation_id}"),
         }])
     }
 
-    fn handle_remove_bookmark(
-        &self,
-        name: String,
-    ) -> Result<Vec<DaemonResponse>> {
-        self.storage.remove_bookmark(&name)?;
+    fn handle_remove_bookmark(&self, name: &str) -> Result<Vec<DaemonResponse>> {
+        self.storage.remove_bookmark(name)?;
         Ok(vec![DaemonResponse::Success {
             message: format!("Removed bookmark '{name}'"),
         }])
@@ -379,12 +353,12 @@ impl Server {
 
     fn handle_tool_approval(
         &self,
-        conversation_id: String,
-        tool_call_id: String,
+        conversation_id: &str,
+        tool_call_id: &str,
         approval: neuromance_common::ToolApproval,
     ) -> Result<Vec<DaemonResponse>> {
         self.manager
-            .approve_tool(&conversation_id, &tool_call_id, approval)?;
+            .approve_tool(conversation_id, tool_call_id, approval)?;
         Ok(vec![DaemonResponse::Success {
             message: "Tool approval processed".to_string(),
         }])
@@ -430,14 +404,11 @@ impl Server {
         }]
     }
 
-    fn handle_health(
-        &self,
-        client_version: String,
-    ) -> Vec<DaemonResponse> {
+    fn handle_health(&self, client_version: &str) -> Vec<DaemonResponse> {
         let daemon_version = env!("CARGO_PKG_VERSION").to_string();
         let uptime_seconds = self.start_time.elapsed().as_secs();
         let (compatible, warning) =
-            Self::check_version_compatibility(&daemon_version, &client_version);
+            Self::check_version_compatibility(&daemon_version, client_version);
         vec![DaemonResponse::Health {
             daemon_version,
             compatible,
@@ -468,8 +439,11 @@ impl Server {
 
     /// Checks version compatibility between daemon and client.
     ///
-    /// Returns (compatible, optional_warning). Compatible means same major.minor version.
-    fn check_version_compatibility(daemon_version: &str, client_version: &str) -> (bool, Option<String>) {
+    /// Returns (compatible, warning). Compatible means same major.minor version.
+    fn check_version_compatibility(
+        daemon_version: &str,
+        client_version: &str,
+    ) -> (bool, Option<String>) {
         let daemon_parts: Vec<&str> = daemon_version.split('.').collect();
         let client_parts: Vec<&str> = client_version.split('.').collect();
 

@@ -182,15 +182,6 @@ impl DaemonConfig {
             .find(|m| m.nickname == nickname)
             .ok_or_else(|| DaemonError::ModelNotFound(nickname.to_string()))
     }
-
-    /// Gets the active model profile.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the active model is not found (should not happen after validation).
-    pub fn get_active_model(&self) -> Result<&ModelProfile> {
-        self.get_model(&self.active_model)
-    }
 }
 
 #[cfg(test)]
@@ -243,14 +234,6 @@ thinking_budget = 20000
         assert_eq!(model.model, "claude-sonnet-4-5-20250929");
 
         assert!(config.get_model("nonexistent").is_err());
-    }
-
-    #[test]
-    fn test_get_active_model() {
-        let config: DaemonConfig = toml::from_str(sample_config_toml()).unwrap();
-
-        let model = config.get_active_model().unwrap();
-        assert_eq!(model.nickname, "sonnet");
     }
 
     #[test]

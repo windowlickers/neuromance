@@ -69,7 +69,9 @@ impl DaemonClient {
                 // Daemon is running but socket not ready yet, wait for it
                 let stream = Self::wait_for_socket(&socket_path, 10)
                     .await
-                    .context(format!("Daemon process exists (PID {pid}) but socket unavailable"))?;
+                    .context(format!(
+                        "Daemon process exists (PID {pid}) but socket unavailable"
+                    ))?;
                 return Ok(Self::from_stream(stream));
             }
             // Stale PID file, clean it up
@@ -166,8 +168,7 @@ impl DaemonClient {
             return Ok(None);
         }
 
-        let content = std::fs::read_to_string(pid_file)
-            .context("Failed to read PID file")?;
+        let content = std::fs::read_to_string(pid_file).context("Failed to read PID file")?;
 
         let pid = content.trim().parse::<u32>().ok();
         Ok(pid)

@@ -384,7 +384,7 @@ impl Storage {
     ///
     /// Only available for testing within the crate.
     #[cfg(test)]
-    pub(crate) fn new_test(data_dir: PathBuf) -> Self {
+    pub(crate) fn new_test(data_dir: &Path) -> Self {
         let conversations_dir = data_dir.join("conversations");
         fs::create_dir_all(&conversations_dir).ok();
 

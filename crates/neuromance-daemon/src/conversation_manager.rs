@@ -8,11 +8,11 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 use neuromance::Core;
-use tracing::{debug, info, instrument, warn};
 use neuromance_client::{AnthropicClient, LLMClient, OpenAIClient, ResponsesClient};
 use neuromance_common::protocol::{ConversationSummary, DaemonResponse};
 use neuromance_common::{Config, Conversation, Message, MessageRole, ToolApproval};
 use tokio::sync::{mpsc, oneshot};
+use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
 use crate::config::DaemonConfig;
@@ -137,7 +137,7 @@ impl ConversationManager {
     ///
     /// * `conversation_id` - The conversation ID (or None for active conversation)
     /// * `content` - The message content
-    /// * `response_tx` - Channel to send DaemonResponse events
+    /// * `response_tx` - Channel to send `DaemonResponse` events
     ///
     /// # Errors
     ///
@@ -197,9 +197,7 @@ impl ConversationManager {
             ClientType::Anthropic(client) => {
                 Self::execute_chat_loop(client, messages, config).await
             }
-            ClientType::OpenAI(client) => {
-                Self::execute_chat_loop(client, messages, config).await
-            }
+            ClientType::OpenAI(client) => Self::execute_chat_loop(client, messages, config).await,
             ClientType::Responses(client) => {
                 Self::execute_chat_loop(client, messages, config).await
             }
@@ -310,15 +308,10 @@ impl ConversationManager {
                     tool_call,
                 });
 
-                match rx.await {
-                    Ok(approval) => approval,
-                    Err(_) => {
-                        warn!("Tool approval channel closed unexpectedly");
-                        ToolApproval::Denied(
-                            "Approval channel closed".to_string(),
-                        )
-                    }
-                }
+                rx.await.unwrap_or_else(|_| {
+                    warn!("Tool approval channel closed unexpectedly");
+                    ToolApproval::Denied("Approval channel closed".to_string())
+                })
             }
         });
 
@@ -364,8 +357,7 @@ impl ConversationManager {
         let model_nickname = self
             .conversation_models
             .get(conversation_id)
-            .map(|e| e.value().clone())
-            .unwrap_or_else(|| self.config.active_model.clone());
+            .map_or_else(|| self.config.active_model.clone(), |e| e.value().clone());
 
         // Get model profile
         let model_profile = self.config.get_model(&model_nickname)?;
@@ -434,10 +426,7 @@ impl ConversationManager {
     /// # Errors
     ///
     /// Returns an error if storage operations fail.
-    pub fn list_conversations(
-        &self,
-        limit: Option<usize>,
-    ) -> Result<Vec<ConversationSummary>> {
+    pub fn list_conversations(&self, limit: Option<usize>) -> Result<Vec<ConversationSummary>> {
         let mut ids = self.storage.list_conversations()?;
 
         // Sort by updated_at (most recent first)
@@ -461,8 +450,7 @@ impl ConversationManager {
                 let model = self
                     .conversation_models
                     .get(&id)
-                    .map(|e| e.value().clone())
-                    .unwrap_or_else(|| self.config.active_model.clone());
+                    .map_or_else(|| self.config.active_model.clone(), |e| e.value().clone());
 
                 let bookmarks = self.storage.get_conversation_bookmarks(&id)?;
                 summaries.push(ConversationSummary::from_conversation(
@@ -512,8 +500,7 @@ impl ConversationManager {
     pub fn get_conversation_model(&self, conversation_id: &Uuid) -> String {
         self.conversation_models
             .get(conversation_id)
-            .map(|e| e.value().clone())
-            .unwrap_or_else(|| self.config.active_model.clone())
+            .map_or_else(|| self.config.active_model.clone(), |e| e.value().clone())
     }
 
     /// Switches the model for a conversation.
@@ -552,8 +539,7 @@ impl ConversationManager {
         self.config.get_model(&model_nickname)?;
 
         // Update conversation model mapping
-        self.conversation_models
-            .insert(id, model_nickname.clone());
+        self.conversation_models.insert(id, model_nickname.clone());
 
         // Invalidate cached client to force recreation with new model
         self.clients.remove(&id);
@@ -587,7 +573,7 @@ mod tests {
     /// Creates a test conversation manager with temporary storage.
     fn test_manager() -> (ConversationManager, TempDir) {
         let temp_dir = TempDir::new().unwrap();
-        let storage = Arc::new(Storage::new_test(temp_dir.path().to_path_buf()));
+        let storage = Arc::new(Storage::new_test(temp_dir.path()));
 
         let config_toml = r#"
 active_model = "test-model"
@@ -635,11 +621,7 @@ api_key_env = "OPENAI_API_KEY"
         // Verify model mapping was updated
         let uuid = uuid::Uuid::parse_str(&conv_id).unwrap();
         assert_eq!(
-            manager
-                .conversation_models
-                .get(&uuid)
-                .unwrap()
-                .value(),
+            manager.conversation_models.get(&uuid).unwrap().value(),
             "other-model"
         );
 
@@ -652,19 +634,14 @@ api_key_env = "OPENAI_API_KEY"
         let (manager, _temp) = test_manager();
 
         // Create a conversation
-        let summary = manager
-            .create_conversation(None, None)
-            .await
-            .unwrap();
+        let summary = manager.create_conversation(None, None).await.unwrap();
 
         // Try to switch to non-existent model
         let result = manager
             .switch_model(Some(summary.id.clone()), "nonexistent".to_string())
             .await;
 
-        assert!(
-            matches!(&result, Err(DaemonError::ModelNotFound(name)) if name == "nonexistent")
-        );
+        assert!(matches!(&result, Err(DaemonError::ModelNotFound(name)) if name == "nonexistent"));
     }
 
     #[tokio::test]
@@ -672,9 +649,7 @@ api_key_env = "OPENAI_API_KEY"
         let (manager, _temp) = test_manager();
 
         // Try to switch without active conversation
-        let result = manager
-            .switch_model(None, "other-model".to_string())
-            .await;
+        let result = manager.switch_model(None, "other-model".to_string()).await;
 
         assert!(result.is_err());
         assert!(matches!(result, Err(DaemonError::NoActiveConversation)));

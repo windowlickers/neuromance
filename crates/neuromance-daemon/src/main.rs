@@ -30,7 +30,7 @@ use crate::storage::Storage;
 ///
 /// Log level is controlled via `RUST_LOG` environment variable.
 fn init_tracing() {
-    use tracing_subscriber::{fmt, EnvFilter};
+    use tracing_subscriber::{EnvFilter, fmt};
 
     let format = std::env::var("NEUROMANCE_LOG_FORMAT")
         .unwrap_or_else(|_| "pretty".to_string())

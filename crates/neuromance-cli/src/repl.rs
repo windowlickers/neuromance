@@ -49,7 +49,10 @@ pub async fn run_repl(conversation_id: Option<String>) -> Result<()> {
                         }
                         ["help"] => {
                             println!("{}", "REPL Commands:".bright_cyan().bold());
-                            println!("  {} - Switch to a different model", ":switch <model>".bright_yellow());
+                            println!(
+                                "  {} - Switch to a different model",
+                                ":switch <model>".bright_yellow()
+                            );
                             println!("  {} - Show this help message", ":help".bright_yellow());
                             println!("  {} - Exit the REPL", "Ctrl-D".bright_yellow());
                             println!();

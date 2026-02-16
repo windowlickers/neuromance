@@ -419,8 +419,18 @@ pub async fn daemon_health(client: &mut DaemonClient) -> Result<()> {
             }
 
             println!("  Daemon version: {}", daemon_version.bright_cyan());
-            println!("  Client version: {}", env!("CARGO_PKG_VERSION").bright_cyan());
-            println!("  Compatible: {}", if compatible { "yes".bright_green() } else { "no".bright_red() });
+            println!(
+                "  Client version: {}",
+                env!("CARGO_PKG_VERSION").bright_cyan()
+            );
+            println!(
+                "  Compatible: {}",
+                if compatible {
+                    "yes".bright_green()
+                } else {
+                    "no".bright_red()
+                }
+            );
             println!("  Uptime: {uptime_seconds}s");
 
             if let Some(warning_msg) = warning {
@@ -542,7 +552,12 @@ pub async fn status(client: &mut DaemonClient, json: bool) -> Result<()> {
             current_conversation,
         } => {
             if json {
-                print_status_json(true, Some(uptime_seconds), active_conversations, current_conversation.as_ref())?;
+                print_status_json(
+                    true,
+                    Some(uptime_seconds),
+                    active_conversations,
+                    current_conversation.as_ref(),
+                )?;
             } else {
                 print_status_human(uptime_seconds, active_conversations, current_conversation);
             }
