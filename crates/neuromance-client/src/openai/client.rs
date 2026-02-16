@@ -357,11 +357,7 @@ pub fn convert_chunk_to_chat_chunk(chunk: &ChatCompletionChunk) -> ChatChunk {
 
                         if let Some(function) = delta.function.as_ref() {
                             let name = function.name.clone().unwrap_or_default();
-                            let arguments = function
-                                .arguments
-                                .as_ref()
-                                .map(|args| vec![args.clone()])
-                                .unwrap_or_default();
+                            let arguments = function.arguments.clone().unwrap_or_default();
 
                             result.push(ToolCall {
                                 id: id.clone(),
@@ -601,13 +597,7 @@ impl OpenAIClient {
                         call_type: tc.r#type.to_string(),
                         function: FunctionCall {
                             name: tc.function.name.to_string(),
-                            // OpenAI returns a single JSON string; wrap it in a Vec for our FunctionCall type
-                            // NOTE: We don't validate the JSON here - validation should happen at tool execution time
-                            arguments: if tc.function.arguments.is_empty() {
-                                vec![]
-                            } else {
-                                vec![tc.function.arguments.to_string()]
-                            },
+                            arguments: tc.function.arguments.to_string(),
                         },
                     });
                 }
@@ -1120,7 +1110,7 @@ mod tests {
         assert_eq!(tool_call.call_type, "function");
         assert_eq!(tool_call.function.name, "get_weather");
         assert_eq!(
-            tool_call.function.arguments[0],
+            tool_call.function.arguments,
             "{\"location\":\"San Francisco\",\"unit\":\"celsius\"}"
         );
     }

@@ -192,7 +192,7 @@ async fn main() -> Result<()> {
             // executing the tool
             let tool_result = tool_execution(
                 &tool_call.function.name,
-                &tool_call.function.arguments_json(),
+                tool_call.function.arguments_json(),
             )?;
             info!("Result: {tool_result}");
 

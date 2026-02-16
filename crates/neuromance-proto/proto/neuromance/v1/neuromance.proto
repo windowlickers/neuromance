@@ -185,7 +185,7 @@ message ToolCallProto {
 // A function call (name + arguments).
 message FunctionCallProto {
   string name = 1;
-  repeated string arguments = 2;
+  string arguments = 2;
 }
 
 // Conversation summary for listings.

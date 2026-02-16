@@ -354,9 +354,9 @@ impl neuromance_proto::Neuromance for GrpcService {
                         usage,
                     } => proto::ChatEvent {
                         conversation_id: cid,
-                        event: Some(proto::chat_event::Event::Usage(
-                            proto::UsageProto::from(&usage),
-                        )),
+                        event: Some(proto::chat_event::Event::Usage(proto::UsageProto::from(
+                            &usage,
+                        ))),
                     },
                     DaemonResponse::MessageCompleted {
                         conversation_id: cid,

@@ -27,7 +27,7 @@
 //! conv.add_message(user_msg).unwrap();
 //!
 //! // Assistant responds with a tool call
-//! let tool_call = ToolCall::new("get_weather", [r#"{"location": "Tokyo"}"#]);
+//! let tool_call = ToolCall::new("get_weather", r#"{"location": "Tokyo"}"#);
 //! let assistant_msg = conv.assistant_message("Let me check that.")
 //!     .with_tool_calls(vec![tool_call.clone()])
 //!     .unwrap();
@@ -465,10 +465,10 @@ mod tests {
 
     #[test]
     fn test_tool_call_creation() {
-        let tool_call = ToolCall::new("test_function", [r#"{"param": "value"}"#]);
+        let tool_call = ToolCall::new("test_function", r#"{"param": "value"}"#);
 
         assert_eq!(tool_call.function.name, "test_function");
-        assert_eq!(tool_call.function.arguments, vec![r#"{"param": "value"}"#]);
+        assert_eq!(tool_call.function.arguments, r#"{"param": "value"}"#);
         assert_eq!(tool_call.call_type, "function");
         assert!(!tool_call.id.is_empty());
     }
@@ -476,7 +476,7 @@ mod tests {
     #[test]
     fn test_message_with_tool_calls() {
         let conv_id = Uuid::new_v4();
-        let tool_call = ToolCall::new("get_weather", [r#"{"location": "New York"}"#]);
+        let tool_call = ToolCall::new("get_weather", r#"{"location": "New York"}"#);
         let msg = Message::assistant(conv_id, "I'll check the weather for you.")
             .with_tool_calls(vec![tool_call])
             .expect("Failed to add tool calls");
@@ -485,14 +485,14 @@ mod tests {
         assert_eq!(msg.tool_calls[0].function.name, "get_weather");
         assert_eq!(
             msg.tool_calls[0].function.arguments,
-            vec![r#"{"location": "New York"}"#]
+            r#"{"location": "New York"}"#
         );
     }
 
     #[test]
     fn test_message_tool_call_validation() {
         let conv_id = Uuid::new_v4();
-        let tool_call = ToolCall::new("get_weather", [r#"{"location": "New York"}"#]);
+        let tool_call = ToolCall::new("get_weather", r#"{"location": "New York"}"#);
 
         // Should fail on user message
         let user_msg = Message::user(conv_id, "What's the weather?");
@@ -560,21 +560,12 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_call_with_multiple_args() {
-        let tool_call = ToolCall::new(
-            "complex_function",
-            vec![
-                "arg1".to_string(),
-                "arg2".to_string(),
-                r#"{"key": "value"}"#.to_string(),
-            ],
-        );
+    fn test_tool_call_with_json_args() {
+        let tool_call = ToolCall::new("complex_function", r#"{"key": "value"}"#);
 
         assert_eq!(tool_call.function.name, "complex_function");
-        assert_eq!(tool_call.function.arguments.len(), 3);
-        assert_eq!(tool_call.function.arguments[0], "arg1");
-        assert_eq!(tool_call.function.arguments[1], "arg2");
-        assert_eq!(tool_call.function.arguments[2], r#"{"key": "value"}"#);
+        assert_eq!(tool_call.function.arguments, r#"{"key": "value"}"#);
+        assert_eq!(tool_call.function.arguments_json(), r#"{"key": "value"}"#);
     }
 }
 
@@ -652,16 +643,15 @@ mod proptests {
         #[test]
         fn tool_call_accepts_various_argument_types(
             func_name in ".*",
-            args in prop::collection::vec(".*", 0..10),
+            args in ".*",
         ) {
-            // Test with Vec<String>
-            let tc1 = ToolCall::new(func_name.as_str(), args.clone());
+            // Test with &str
+            let tc1 = ToolCall::new(func_name.as_str(), args.as_str());
             assert_eq!(tc1.function.name, func_name);
             assert_eq!(tc1.function.arguments, args);
 
-            // Test with &[&str]
-            let str_refs: Vec<&str> = args.iter().map(std::string::String::as_str).collect();
-            let tc2 = ToolCall::new(func_name.as_str(), str_refs);
+            // Test with String
+            let tc2 = ToolCall::new(func_name.as_str(), args.clone());
             assert_eq!(tc2.function.name, func_name);
             assert_eq!(tc2.function.arguments, args);
         }

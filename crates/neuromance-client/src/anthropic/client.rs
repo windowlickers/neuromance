@@ -297,7 +297,7 @@ impl AnthropicClient {
                         call_type: "function".to_string(),
                         function: FunctionCall {
                             name: name.clone(),
-                            arguments: vec![input.to_string()],
+                            arguments: input.to_string(),
                         },
                     });
                 }
@@ -1206,11 +1206,8 @@ mod tests {
         let tool_call = &tool_calls_result[0];
         assert_eq!(tool_call.id, "toolu_abc123");
         assert_eq!(tool_call.function.name, "get_weather");
-        assert_eq!(tool_call.function.arguments.len(), 1);
-
         // Verify the JSON was parsed correctly
-        let args: serde_json::Value =
-            serde_json::from_str(&tool_call.function.arguments[0]).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&tool_call.function.arguments).unwrap();
         assert_eq!(args["location"], "San Francisco");
     }
 
@@ -1432,7 +1429,7 @@ mod tests {
             call_type: "function".to_string(),
             function: FunctionCall {
                 name: "calculate".to_string(),
-                arguments: vec![r#"{"expression":"2+2"}"#.to_string()],
+                arguments: r#"{"expression":"2+2"}"#.to_string(),
             },
         });
 

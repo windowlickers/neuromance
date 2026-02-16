@@ -713,13 +713,9 @@ impl From<&Message> for AnthropicMessage {
 
                 // Add tool_use blocks for each tool call
                 for tool_call in &message.tool_calls {
-                    // Parse the arguments JSON string back to a Value
-                    let input = tool_call
-                        .function
-                        .arguments
-                        .first()
-                        .and_then(|arg| serde_json::from_str(arg).ok())
-                        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+                    let input: serde_json::Value =
+                        serde_json::from_str(tool_call.function.arguments_json())
+                            .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
 
                     blocks.push(RequestContentBlock::ToolUse {
                         id: tool_call.id.clone(),
@@ -918,7 +914,7 @@ impl StreamingToolCall {
             call_type: "function".to_string(),
             function: FunctionCall {
                 name: self.name,
-                arguments: vec![input.to_string()],
+                arguments: input.to_string(),
             },
         })
     }

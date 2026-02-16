@@ -2,10 +2,10 @@
 
 use chrono::{DateTime, Utc};
 use neuromance_common::chat::{Message, MessageRole, ReasoningContent};
-use prost_types::Timestamp;
 use neuromance_common::client::{InputTokensDetails, OutputTokensDetails, Usage};
 use neuromance_common::protocol::{ConversationSummary, ModelProfile};
 use neuromance_common::tools::{FunctionCall, ToolApproval, ToolCall};
+use prost_types::Timestamp;
 use smallvec::SmallVec;
 
 use crate::proto;
@@ -18,17 +18,10 @@ const fn datetime_to_timestamp(dt: &DateTime<Utc>) -> Timestamp {
     }
 }
 
-fn timestamp_to_datetime(
-    ts: &Timestamp,
-) -> Result<DateTime<Utc>, String> {
+fn timestamp_to_datetime(ts: &Timestamp) -> Result<DateTime<Utc>, String> {
     #[allow(clippy::cast_sign_loss)]
     DateTime::from_timestamp(ts.seconds, ts.nanos as u32)
-        .ok_or_else(|| {
-            format!(
-                "Invalid timestamp: {}s {}ns",
-                ts.seconds, ts.nanos
-            )
-        })
+        .ok_or_else(|| format!("Invalid timestamp: {}s {}ns", ts.seconds, ts.nanos))
 }
 
 // --- MessageRole ---
@@ -76,7 +69,7 @@ impl From<proto::ToolCallProto> for ToolCall {
         let function = tc.function.map_or_else(
             || FunctionCall {
                 name: String::new(),
-                arguments: Vec::new(),
+                arguments: String::new(),
             },
             |f| FunctionCall {
                 name: f.name,
@@ -190,9 +183,8 @@ pub fn message_from_proto(msg: proto::MessageProto) -> Result<Message, String> {
         .conversation_id
         .parse()
         .map_err(|e| format!("Invalid conversation_id: {e}"))?;
-    let timestamp: DateTime<Utc> = timestamp_to_datetime(
-        msg.timestamp.as_ref().ok_or("Missing timestamp")?,
-    )?;
+    let timestamp: DateTime<Utc> =
+        timestamp_to_datetime(msg.timestamp.as_ref().ok_or("Missing timestamp")?)?;
 
     let role: MessageRole = proto::MessageRole::try_from(msg.role)
         .map_err(|_| format!("Invalid message role: {}", msg.role))?
@@ -203,9 +195,7 @@ pub fn message_from_proto(msg: proto::MessageProto) -> Result<Message, String> {
         .into_iter()
         .map(|(k, v)| {
             let val = serde_json::from_str(&v)
-                .map_err(|e| {
-                    format!("Invalid JSON in metadata key {k:?}: {e}")
-                })?;
+                .map_err(|e| format!("Invalid JSON in metadata key {k:?}: {e}"))?;
             Ok((k, val))
         })
         .collect::<Result<_, String>>()?;
@@ -299,12 +289,10 @@ impl From<&ConversationSummary> for proto::ConversationSummaryProto {
 pub fn conversation_summary_from_proto(
     cs: proto::ConversationSummaryProto,
 ) -> Result<ConversationSummary, String> {
-    let created_at: DateTime<Utc> = timestamp_to_datetime(
-        cs.created_at.as_ref().ok_or("Missing created_at")?,
-    )?;
-    let updated_at: DateTime<Utc> = timestamp_to_datetime(
-        cs.updated_at.as_ref().ok_or("Missing updated_at")?,
-    )?;
+    let created_at: DateTime<Utc> =
+        timestamp_to_datetime(cs.created_at.as_ref().ok_or("Missing created_at")?)?;
+    let updated_at: DateTime<Utc> =
+        timestamp_to_datetime(cs.updated_at.as_ref().ok_or("Missing updated_at")?)?;
 
     Ok(ConversationSummary {
         id: cs.id,
@@ -416,7 +404,7 @@ mod tests {
 
     #[test]
     fn test_tool_call_roundtrip() {
-        let tc = ToolCall::new("test_tool", vec!["arg1".to_string()]);
+        let tc = ToolCall::new("test_tool", "arg1");
         let proto_tc = proto::ToolCallProto::from(&tc);
         let back = ToolCall::from(proto_tc);
 

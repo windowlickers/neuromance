@@ -165,8 +165,7 @@ impl From<&FunctionCall> for OpenAIFunction {
     fn from(function_call: &FunctionCall) -> Self {
         Self {
             name: Cow::Owned(function_call.name.clone()),
-            // OpenAI expects a single JSON string; join all argument fragments
-            arguments: Cow::Owned(function_call.arguments_json()),
+            arguments: Cow::Owned(function_call.arguments_json().to_owned()),
         }
     }
 }

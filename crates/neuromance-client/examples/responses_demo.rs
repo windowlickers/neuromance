@@ -146,7 +146,7 @@ async fn main() -> Result<()> {
         for tc in &tool_calls {
             let args_str = tc.function.arguments_json();
             println!("  Tool call: {}({})", tc.function.name, args_str);
-            let result = execute_tool(&tc.function.name, &args_str)?;
+            let result = execute_tool(&tc.function.name, args_str)?;
             println!("  Result:    {result}");
 
             let tool_msg = Message::tool(

@@ -266,7 +266,7 @@ impl ToolExecutor {
         if json == "{}" {
             Ok(Value::Object(serde_json::Map::new()))
         } else {
-            serde_json::from_str(&json).or_else(|_| Ok(Value::String(json)))
+            serde_json::from_str(json).or_else(|_| Ok(Value::String(json.to_owned())))
         }
     }
 }
@@ -285,64 +285,57 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn fc(args: Vec<String>) -> FunctionCall {
+    fn fc(args: &str) -> FunctionCall {
         FunctionCall {
             name: "test".to_string(),
-            arguments: args,
+            arguments: args.to_string(),
         }
     }
 
     #[test]
     fn test_parse_arguments_empty() {
-        let result = ToolExecutor::parse_arguments(&fc(vec![])).unwrap();
+        let result = ToolExecutor::parse_arguments(&fc("")).unwrap();
         assert_eq!(result, json!({}));
     }
 
     #[test]
-    fn test_parse_arguments_single_json_object() {
-        let f = fc(vec![r#"{"key": "value", "number": 42}"#.to_string()]);
+    fn test_parse_arguments_json_object() {
+        let f = fc(r#"{"key": "value", "number": 42}"#);
         let result = ToolExecutor::parse_arguments(&f).unwrap();
         assert_eq!(result, json!({"key": "value", "number": 42}));
     }
 
     #[test]
-    fn test_parse_arguments_single_json_array() {
-        let f = fc(vec![r#"["item1", "item2", "item3"]"#.to_string()]);
+    fn test_parse_arguments_json_array() {
+        let f = fc(r#"["item1", "item2", "item3"]"#);
         let result = ToolExecutor::parse_arguments(&f).unwrap();
         assert_eq!(result, json!(["item1", "item2", "item3"]));
     }
 
     #[test]
-    fn test_parse_arguments_single_string_fallback() {
-        let f = fc(vec!["plain text argument".to_string()]);
+    fn test_parse_arguments_string_fallback() {
+        let f = fc("plain text argument");
         let result = ToolExecutor::parse_arguments(&f).unwrap();
         assert_eq!(result, json!("plain text argument"));
     }
 
     #[test]
-    fn test_parse_arguments_single_invalid_json_fallback() {
-        let f = fc(vec![r#"{"incomplete json"#.to_string()]);
+    fn test_parse_arguments_invalid_json_fallback() {
+        let f = fc(r#"{"incomplete json"#);
         let result = ToolExecutor::parse_arguments(&f).unwrap();
         assert_eq!(result, json!(r#"{"incomplete json"#));
     }
 
     #[test]
-    fn test_parse_arguments_multiple_fragments_joined() {
-        let f = fc(vec![r#"{"key":"#.to_string(), r#""value"}"#.to_string()]);
-        let result = ToolExecutor::parse_arguments(&f).unwrap();
-        assert_eq!(result, json!({"key": "value"}));
-    }
-
-    #[test]
-    fn test_parse_arguments_single_number_string() {
-        let f = fc(vec!["42".to_string()]);
+    fn test_parse_arguments_number_string() {
+        let f = fc("42");
         let result = ToolExecutor::parse_arguments(&f).unwrap();
         assert_eq!(result, json!(42));
     }
 
     #[test]
-    fn test_parse_arguments_single_boolean_string() {
-        let f = fc(vec!["true".to_string()]);
+    fn test_parse_arguments_boolean_string() {
+        let f = fc("true");
         let result = ToolExecutor::parse_arguments(&f).unwrap();
         assert_eq!(result, json!(true));
     }

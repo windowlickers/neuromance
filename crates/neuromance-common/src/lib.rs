@@ -49,7 +49,7 @@
 //! };
 //!
 //! // Create a tool call using the into() conversion
-//! let tool_call = ToolCall::new("get_current_time", Vec::<String>::new());
+//! let tool_call = ToolCall::new("get_current_time", "");
 //! ```
 
 /// Chat conversation and message types.

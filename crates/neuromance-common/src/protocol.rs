@@ -254,7 +254,7 @@ mod tests {
 
     #[test]
     fn test_tool_approval_request_response() {
-        let tool_call = ToolCall::new("test_tool", vec!["arg1".to_string()]);
+        let tool_call = ToolCall::new("test_tool", "arg1");
         let conv_id = uuid::Uuid::new_v4().to_string();
 
         let response = DaemonResponse::ToolApprovalRequest {

@@ -264,8 +264,7 @@ impl ConversationManager {
         );
 
         // Update conversation with new messages
-        let existing_ids: HashSet<Uuid> =
-            conversation.messages.iter().map(|m| m.id).collect();
+        let existing_ids: HashSet<Uuid> = conversation.messages.iter().map(|m| m.id).collect();
         for msg in &updated_messages {
             if !existing_ids.contains(&msg.id) {
                 conversation
@@ -285,10 +284,12 @@ impl ConversationManager {
         if let Some(last_msg) = updated_messages.last()
             && last_msg.role == MessageRole::Assistant
         {
-            let _ = response_tx.send(DaemonResponse::MessageCompleted {
-                conversation_id: conv_id_str,
-                message: Box::new(last_msg.clone()),
-            }).await;
+            let _ = response_tx
+                .send(DaemonResponse::MessageCompleted {
+                    conversation_id: conv_id_str,
+                    message: Box::new(last_msg.clone()),
+                })
+                .await;
         }
 
         Ok(())
@@ -323,28 +324,34 @@ impl ConversationManager {
             async move {
                 match event {
                     neuromance::CoreEvent::Streaming(content) => {
-                        let _ = tx.send(DaemonResponse::StreamChunk {
-                            conversation_id: conv_id,
-                            content,
-                        }).await;
+                        let _ = tx
+                            .send(DaemonResponse::StreamChunk {
+                                conversation_id: conv_id,
+                                content,
+                            })
+                            .await;
                     }
                     neuromance::CoreEvent::ToolResult {
                         name,
                         result,
                         success,
                     } => {
-                        let _ = tx.send(DaemonResponse::ToolResult {
-                            conversation_id: conv_id,
-                            tool_name: name,
-                            result,
-                            success,
-                        }).await;
+                        let _ = tx
+                            .send(DaemonResponse::ToolResult {
+                                conversation_id: conv_id,
+                                tool_name: name,
+                                result,
+                                success,
+                            })
+                            .await;
                     }
                     neuromance::CoreEvent::Usage(usage) => {
-                        let _ = tx.send(DaemonResponse::Usage {
-                            conversation_id: conv_id,
-                            usage,
-                        }).await;
+                        let _ = tx
+                            .send(DaemonResponse::Usage {
+                                conversation_id: conv_id,
+                                usage,
+                            })
+                            .await;
                     }
                 }
             }
@@ -365,10 +372,12 @@ impl ConversationManager {
                 let key = (conv_id.clone(), tool_call.id.clone());
                 pending_approvals.insert(key, tx);
 
-                let _ = response_tx.send(DaemonResponse::ToolApprovalRequest {
-                    conversation_id: conv_id,
-                    tool_call,
-                }).await;
+                let _ = response_tx
+                    .send(DaemonResponse::ToolApprovalRequest {
+                        conversation_id: conv_id,
+                        tool_call,
+                    })
+                    .await;
 
                 rx.await.unwrap_or_else(|_| {
                     warn!("Tool approval channel closed unexpectedly");

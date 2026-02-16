@@ -115,9 +115,7 @@ pub async fn send_message(
                     let tc = neuromance_common::ToolCall::from(tc_proto);
                     let approval = prompt_tool_approval(&tc, theme)?;
 
-                    session
-                        .send_tool_approval(cid, tc.id, approval)
-                        .await?;
+                    session.send_tool_approval(cid, tc.id, approval).await?;
                 }
             }
             Some(proto::chat_event::Event::ToolResult(tr)) => {

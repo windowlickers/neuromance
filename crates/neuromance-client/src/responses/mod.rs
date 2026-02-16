@@ -393,11 +393,10 @@ impl From<(&ChatRequest, &Config)> for ResponsesRequest {
                     }
                     // Then add each tool call as a separate FunctionCall item
                     for tool_call in &message.tool_calls {
-                        let arguments = tool_call.function.arguments_json();
                         input_items.push(InputItem::FunctionCall {
                             call_id: tool_call.id.clone(),
                             name: tool_call.function.name.clone(),
-                            arguments,
+                            arguments: tool_call.function.arguments_json().to_owned(),
                         });
                     }
                 }
@@ -923,7 +922,7 @@ impl StreamingFunctionCall {
             call_type: "function".to_string(),
             function: FunctionCall {
                 name: self.name,
-                arguments: vec![arguments],
+                arguments,
             },
         }
     }
@@ -974,7 +973,7 @@ pub fn convert_response_to_message(
                     call_type: "function".to_string(),
                     function: FunctionCall {
                         name: name.clone(),
-                        arguments: vec![arguments.clone()],
+                        arguments: arguments.clone(),
                     },
                 });
             }

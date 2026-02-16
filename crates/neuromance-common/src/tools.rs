@@ -226,21 +226,20 @@ pub struct Tool {
 pub struct FunctionCall {
     /// The name of the function being called.
     pub name: String,
-    /// The arguments passed to the function as strings.
-    pub arguments: Vec<String>,
+    /// The arguments as a single JSON string.
+    pub arguments: String,
 }
 
 impl FunctionCall {
-    /// Returns the arguments as a single JSON string.
+    /// Returns the arguments as a JSON string slice.
     ///
-    /// Joins all argument fragments (from streaming deltas) into one string.
-    /// Returns `"{}"` if no arguments are present.
+    /// Returns `"{}"` if the arguments string is empty.
     #[must_use]
-    pub fn arguments_json(&self) -> String {
+    pub fn arguments_json(&self) -> &str {
         if self.arguments.is_empty() {
-            "{}".to_string()
+            "{}"
         } else {
-            self.arguments.join("")
+            &self.arguments
         }
     }
 }
@@ -261,16 +260,12 @@ pub struct ToolCall {
 
 impl ToolCall {
     /// Creates a new tool call with a generated ID.
-    pub fn new<I, T>(name: impl Into<String>, arguments: I) -> Self
-    where
-        I: IntoIterator<Item = T>,
-        T: Into<String>,
-    {
+    pub fn new(name: impl Into<String>, arguments: impl Into<String>) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
             function: FunctionCall {
                 name: name.into(),
-                arguments: arguments.into_iter().map(Into::into).collect(),
+                arguments: arguments.into(),
             },
             call_type: "function".to_string(),
         }
@@ -284,18 +279,11 @@ impl ToolCall {
     pub fn merge_deltas(mut accumulated: Vec<Self>, deltas: &[Self]) -> Vec<Self> {
         for delta in deltas {
             if let Some(existing) = accumulated.iter_mut().find(|tc| tc.id == delta.id) {
-                // Merge arguments by concatenating fragments
-                for arg in &delta.function.arguments {
-                    if let Some(last_arg) = existing.function.arguments.last_mut() {
-                        // Append to the last argument (streaming sends fragments)
-                        last_arg.push_str(arg);
-                    } else {
-                        // No existing arguments, add as new
-                        existing.function.arguments.push(arg.clone());
-                    }
-                }
+                existing
+                    .function
+                    .arguments
+                    .push_str(&delta.function.arguments);
             } else {
-                // New tool call, add it
                 accumulated.push(delta.clone());
             }
         }
@@ -533,57 +521,43 @@ mod tests {
     fn test_function_call_creation() {
         let call = FunctionCall {
             name: "my_function".to_string(),
-            arguments: vec!["arg1".to_string(), "arg2".to_string()],
+            arguments: r#"{"key":"value"}"#.to_string(),
         };
 
         assert_eq!(call.name, "my_function");
-        assert_eq!(call.arguments.len(), 2);
-        assert_eq!(call.arguments[0], "arg1");
+        assert_eq!(call.arguments, r#"{"key":"value"}"#);
     }
 
     #[test]
     fn test_tool_call_new() {
-        let call = ToolCall::new("get_weather", vec!["NYC".to_string()]);
+        let call = ToolCall::new("get_weather", r#"{"city":"NYC"}"#);
 
         assert!(!call.id.is_empty());
         assert_eq!(call.function.name, "get_weather");
-        assert_eq!(call.function.arguments, vec!["NYC"]);
+        assert_eq!(call.function.arguments, r#"{"city":"NYC"}"#);
         assert_eq!(call.call_type, "function");
     }
 
     #[test]
-    fn test_tool_call_new_with_array_literal() {
-        let call = ToolCall::new("test_func", [r#"{"key": "value"}"#]);
+    fn test_tool_call_new_with_json() {
+        let call = ToolCall::new("test_func", r#"{"key": "value"}"#);
 
         assert_eq!(call.function.name, "test_func");
-        assert_eq!(call.function.arguments.len(), 1);
-        assert_eq!(call.function.arguments[0], r#"{"key": "value"}"#);
+        assert_eq!(call.function.arguments, r#"{"key": "value"}"#);
     }
 
     #[test]
     fn test_tool_call_new_empty_args() {
-        let call = ToolCall::new("no_args_func", Vec::<String>::new());
+        let call = ToolCall::new("no_args_func", "");
 
         assert_eq!(call.function.name, "no_args_func");
         assert!(call.function.arguments.is_empty());
-    }
-
-    #[test]
-    fn test_tool_call_new_multiple_args() {
-        let call = ToolCall::new(
-            "multi_arg_func",
-            vec!["arg1".to_string(), "arg2".to_string(), "arg3".to_string()],
-        );
-
-        assert_eq!(call.function.arguments.len(), 3);
-        assert_eq!(call.function.arguments[0], "arg1");
-        assert_eq!(call.function.arguments[1], "arg2");
-        assert_eq!(call.function.arguments[2], "arg3");
+        assert_eq!(call.function.arguments_json(), "{}");
     }
 
     #[test]
     fn test_tool_call_serialization() {
-        let call = ToolCall::new("test_function", vec!["test_arg".to_string()]);
+        let call = ToolCall::new("test_function", r#"{"arg":"test"}"#);
 
         let json = serde_json::to_value(&call).expect("Failed to serialize");
         assert_eq!(json["function"]["name"], "test_function");
@@ -596,66 +570,57 @@ mod tests {
 
     #[test]
     fn test_tool_call_unique_ids() {
-        let call1 = ToolCall::new("func", Vec::<String>::new());
-        let call2 = ToolCall::new("func", Vec::<String>::new());
+        let call1 = ToolCall::new("func", "");
+        let call2 = ToolCall::new("func", "");
 
         assert_ne!(call1.id, call2.id);
     }
 
     #[test]
     fn test_tool_call_delta_merging() {
-        // Simulate streaming chunks with tool call deltas that need to be merged
-        // This tests the delta merging logic used in streaming responses
         let deltas = vec![
-            // First delta: tool call with ID and partial arguments
             ToolCall {
                 id: "call_123".to_string(),
                 call_type: "function".to_string(),
                 function: FunctionCall {
                     name: "test_function".to_string(),
-                    arguments: vec![r#"{"param1": ""#.to_string()],
+                    arguments: r#"{"param1": ""#.to_string(),
                 },
             },
-            // Second delta: same ID, more argument fragments
             ToolCall {
                 id: "call_123".to_string(),
                 call_type: "function".to_string(),
                 function: FunctionCall {
                     name: "test_function".to_string(),
-                    arguments: vec![r#"hello", "param2": "#.to_string()],
+                    arguments: r#"hello", "param2": "#.to_string(),
                 },
             },
-            // Third delta: final argument fragment
             ToolCall {
                 id: "call_123".to_string(),
                 call_type: "function".to_string(),
                 function: FunctionCall {
                     name: "test_function".to_string(),
-                    arguments: vec![r"123}".to_string()],
+                    arguments: r"123}".to_string(),
                 },
             },
         ];
 
-        // Use the actual production merge function
         let mut tool_calls: Vec<ToolCall> = Vec::new();
         for delta in &deltas {
             tool_calls = ToolCall::merge_deltas(tool_calls, std::slice::from_ref(delta));
         }
 
-        // Verify the final merged result
         assert_eq!(tool_calls.len(), 1);
 
         let merged = &tool_calls[0];
         assert_eq!(merged.id, "call_123");
         assert_eq!(merged.function.name, "test_function");
-        assert_eq!(merged.function.arguments.len(), 1);
         assert_eq!(
-            merged.function.arguments[0],
+            merged.function.arguments,
             r#"{"param1": "hello", "param2": 123}"#
         );
 
-        // Verify it's valid JSON
-        let parsed: serde_json::Value = serde_json::from_str(&merged.function.arguments[0])
+        let parsed: serde_json::Value = serde_json::from_str(&merged.function.arguments)
             .expect("Merged arguments should be valid JSON");
         assert_eq!(parsed["param1"], "hello");
         assert_eq!(parsed["param2"], 123);
@@ -663,69 +628,61 @@ mod tests {
 
     #[test]
     fn test_multiple_tool_call_delta_merging() {
-        // Test merging multiple different tool calls in the same stream
         let deltas = vec![
-            // First tool call starts
             ToolCall {
                 id: "call_1".to_string(),
                 call_type: "function".to_string(),
                 function: FunctionCall {
                     name: "func1".to_string(),
-                    arguments: vec![r#"{"a":"#.to_string()],
+                    arguments: r#"{"a":"#.to_string(),
                 },
             },
-            // Second tool call starts
             ToolCall {
                 id: "call_2".to_string(),
                 call_type: "function".to_string(),
                 function: FunctionCall {
                     name: "func2".to_string(),
-                    arguments: vec![r#"{"b":"#.to_string()],
+                    arguments: r#"{"b":"#.to_string(),
                 },
             },
-            // First tool call continues
             ToolCall {
                 id: "call_1".to_string(),
                 call_type: "function".to_string(),
                 function: FunctionCall {
                     name: "func1".to_string(),
-                    arguments: vec![r"1}".to_string()],
+                    arguments: r"1}".to_string(),
                 },
             },
-            // Second tool call continues
             ToolCall {
                 id: "call_2".to_string(),
                 call_type: "function".to_string(),
                 function: FunctionCall {
                     name: "func2".to_string(),
-                    arguments: vec![r"2}".to_string()],
+                    arguments: r"2}".to_string(),
                 },
             },
         ];
 
-        // Use the actual production merge function
         let mut tool_calls: Vec<ToolCall> = Vec::new();
         for delta in &deltas {
             tool_calls = ToolCall::merge_deltas(tool_calls, std::slice::from_ref(delta));
         }
 
-        // Verify both tool calls were properly merged
         assert_eq!(tool_calls.len(), 2);
 
         let call1 = &tool_calls[0];
         assert_eq!(call1.id, "call_1");
         assert_eq!(call1.function.name, "func1");
-        assert_eq!(call1.function.arguments[0], r#"{"a":1}"#);
+        assert_eq!(call1.function.arguments, r#"{"a":1}"#);
 
         let call2 = &tool_calls[1];
         assert_eq!(call2.id, "call_2");
         assert_eq!(call2.function.name, "func2");
-        assert_eq!(call2.function.arguments[0], r#"{"b":2}"#);
+        assert_eq!(call2.function.arguments, r#"{"b":2}"#);
 
-        // Verify both are valid JSON
-        serde_json::from_str::<serde_json::Value>(&call1.function.arguments[0])
+        serde_json::from_str::<serde_json::Value>(&call1.function.arguments)
             .expect("First call should be valid JSON");
-        serde_json::from_str::<serde_json::Value>(&call2.function.arguments[0])
+        serde_json::from_str::<serde_json::Value>(&call2.function.arguments)
             .expect("Second call should be valid JSON");
     }
 }
@@ -748,7 +705,7 @@ mod proptests {
         #[test]
         fn fuzz_function_call_with_arbitrary_args(
             name in ".*",
-            args in prop::collection::vec(".*", 0..10),
+            args in ".*",
         ) {
             let call = FunctionCall {
                 name,
@@ -765,7 +722,7 @@ mod proptests {
         #[test]
         fn fuzz_tool_call_new_with_special_chars(
             func_name in r"[a-zA-Z0-9_\-\.]{1,50}",
-            args in prop::collection::vec(r"[\\x00-\\x7F]*", 0..5),
+            args in ".*",
         ) {
             let call = ToolCall::new(func_name.clone(), args.clone());
 
@@ -857,9 +814,8 @@ mod proptests {
         #[test]
         fn fuzz_tool_call_with_malformed_json_args(
             func_name in ".*",
-            num_args in 0usize..10,
+            arg_idx in 0usize..10,
         ) {
-            // Generate various potentially malformed JSON strings
             let malformed_jsons = [
                 "{",
                 "}",
@@ -873,17 +829,13 @@ mod proptests {
                 "   ",
             ];
 
-            let args: Vec<String> = (0..num_args)
-                .map(|i| malformed_jsons[i % malformed_jsons.len()].to_string())
-                .collect();
+            let args = malformed_jsons[arg_idx % malformed_jsons.len()];
 
-            let call = ToolCall::new(func_name.clone(), args.clone());
+            let call = ToolCall::new(func_name.clone(), args);
 
-            // Should create the call even with malformed JSON args
             assert_eq!(call.function.name, func_name);
             assert_eq!(call.function.arguments, args);
 
-            // Should serialize and deserialize the ToolCall itself
             let json = serde_json::to_string(&call).unwrap();
             let parsed: ToolCall = serde_json::from_str(&json).unwrap();
             assert_eq!(call.function.arguments, parsed.function.arguments);

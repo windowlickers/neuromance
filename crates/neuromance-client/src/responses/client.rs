@@ -525,7 +525,7 @@ fn convert_stream_event_to_chunk(
                 call_type: "function".to_string(),
                 function: FunctionCall {
                     name: function_name,
-                    arguments: vec![arguments],
+                    arguments,
                 },
             };
 
@@ -721,7 +721,7 @@ mod tests {
         assert_eq!(tool_call.call_type, "function");
         assert_eq!(tool_call.function.name, "get_weather");
         assert_eq!(
-            tool_call.function.arguments[0],
+            tool_call.function.arguments,
             "{\"location\":\"San Francisco\",\"unit\":\"celsius\"}"
         );
     }
@@ -985,7 +985,7 @@ mod tests {
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].id, "call_123");
         assert_eq!(tool_calls[0].function.name, "get_weather");
-        assert_eq!(tool_calls[0].function.arguments[0], r#"{"location":"SF"}"#);
+        assert_eq!(tool_calls[0].function.arguments, r#"{"location":"SF"}"#);
     }
 
     #[test]
@@ -1024,7 +1024,7 @@ mod tests {
         assert_eq!(tool_calls[0].id, "call_xyz");
         assert_eq!(tool_calls[0].function.name, "do_thing");
         // Empty args should default to "{}"
-        assert_eq!(tool_calls[0].function.arguments[0], "{}");
+        assert_eq!(tool_calls[0].function.arguments, "{}");
     }
 
     #[test]
