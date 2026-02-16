@@ -14,13 +14,14 @@ use crate::client::DaemonClient;
 use crate::display::{
     display_assistant_end, display_assistant_header, display_tool_call_request, display_tool_result,
 };
+use crate::theme::Theme;
 
 /// Prompts the user to approve, deny, or quit a tool call.
 ///
 /// Returns the user's approval decision.
-fn prompt_tool_approval(tool_call: &ToolCall) -> Result<ToolApproval> {
+fn prompt_tool_approval(tool_call: &ToolCall, theme: &Theme) -> Result<ToolApproval> {
     // Display the tool request
-    display_tool_call_request(tool_call);
+    display_tool_call_request(tool_call, theme);
 
     let args_display = tool_call.function.arguments_json();
     println!(
@@ -86,6 +87,7 @@ pub async fn send_message(
     client: &mut DaemonClient,
     conversation_id: Option<String>,
     message: String,
+    theme: &Theme,
 ) -> Result<()> {
     let request = DaemonRequest::SendMessage {
         conversation_id,
@@ -94,7 +96,7 @@ pub async fn send_message(
 
     client.send_request(&request).await?;
 
-    display_assistant_header();
+    display_assistant_header(theme);
 
     // Read streaming responses with manual loop to handle async tool approval
     loop {
@@ -110,7 +112,7 @@ pub async fn send_message(
                 tool_call,
             } => {
                 // Prompt user for approval
-                let approval = prompt_tool_approval(&tool_call)?;
+                let approval = prompt_tool_approval(&tool_call, theme)?;
 
                 // Send approval back to daemon
                 let approval_request = DaemonRequest::ToolApproval {
@@ -129,19 +131,23 @@ pub async fn send_message(
                 success,
                 ..
             } => {
-                display_tool_result(&tool_name, &result, success);
+                display_tool_result(&tool_name, &result, success, theme);
             }
             DaemonResponse::Usage { usage, .. } => {
+                let total = usage.total_tokens.to_string();
+                let input = usage.prompt_tokens.to_string();
+                let output = usage.completion_tokens.to_string();
                 println!(
-                    "\n{} {} tokens (in: {}, out: {})",
-                    "○".bright_blue(),
-                    usage.total_tokens,
-                    usage.prompt_tokens,
-                    usage.completion_tokens
+                    "{}",
+                    theme.usage_tokens.render(&[
+                        ("total", total.as_str()),
+                        ("input", input.as_str()),
+                        ("output", output.as_str()),
+                    ])
                 );
             }
             DaemonResponse::MessageCompleted { .. } => {
-                display_assistant_end();
+                display_assistant_end(theme);
                 break; // Done
             }
             DaemonResponse::Error { message, .. } => {

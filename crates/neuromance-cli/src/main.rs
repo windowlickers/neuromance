@@ -4,6 +4,7 @@ mod client;
 mod commands;
 mod display;
 mod repl;
+mod theme;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -153,11 +154,12 @@ async fn main() -> Result<()> {
     env_logger::init();
 
     let cli = Cli::parse();
+    let theme = theme::Theme::load();
 
     // Handle shorthand: `nm "message"`
     if let Some(message) = cli.message {
         let mut client = DaemonClient::connect().await?;
-        commands::send_message(&mut client, cli.conversation, message).await?;
+        commands::send_message(&mut client, cli.conversation, message, &theme).await?;
         return Ok(());
     }
 
@@ -165,11 +167,11 @@ async fn main() -> Result<()> {
     match cli.command {
         Some(Command::Send { message }) => {
             let mut client = DaemonClient::connect().await?;
-            commands::send_message(&mut client, cli.conversation, message).await?;
+            commands::send_message(&mut client, cli.conversation, message, &theme).await?;
         }
 
         Some(Command::Repl) => {
-            repl::run_repl(cli.conversation).await?;
+            repl::run_repl(cli.conversation, &theme).await?;
         }
 
         Some(Command::Messages { limit }) => {
@@ -251,7 +253,7 @@ async fn main() -> Result<()> {
 
         None => {
             // No command specified, enter REPL
-            repl::run_repl(cli.conversation).await?;
+            repl::run_repl(cli.conversation, &theme).await?;
         }
     }
 

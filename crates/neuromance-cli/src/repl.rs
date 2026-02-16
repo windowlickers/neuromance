@@ -7,22 +7,28 @@ use rustyline::error::ReadlineError;
 
 use crate::client::DaemonClient;
 use crate::commands::send_message;
+use crate::theme::Theme;
 
 /// Runs the REPL loop.
 ///
 /// # Errors
 ///
 /// Returns an error if the REPL initialization or message sending fails.
-pub async fn run_repl(conversation_id: Option<String>) -> Result<()> {
-    println!("{}", "Neuromance REPL".bright_magenta().bold());
-    println!("{}", "Ctrl-D to exit".dimmed());
+pub async fn run_repl(
+    conversation_id: Option<String>,
+    theme: &Theme,
+) -> Result<()> {
+    println!("{}", theme.repl_title.render(&[]));
+    println!("{}", theme.repl_subtitle.render(&[]));
     println!();
 
     let mut rl = DefaultEditor::new()?;
     let mut client = DaemonClient::connect().await?;
 
+    let prompt = theme.prompt_user.render(&[]);
+
     loop {
-        let readline = rl.readline(&format!("{} ", ">".bright_green()));
+        let readline = rl.readline(&prompt);
 
         match readline {
             Ok(line) => {
@@ -73,7 +79,8 @@ pub async fn run_repl(conversation_id: Option<String>) -> Result<()> {
 
                 // Send message, attempting reconnection on failure
                 if let Err(e) =
-                    send_message(&mut client, conversation_id.clone(), line.to_string()).await
+                    send_message(&mut client, conversation_id.clone(), line.to_string(), theme)
+                        .await
                 {
                     eprintln!("{} {e}", "Error:".bright_red());
                     eprintln!("{}", "Attempting to reconnect...".dimmed());
