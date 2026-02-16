@@ -27,8 +27,13 @@
         rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
-        # Common source filtering
-        src = craneLib.cleanCargoSource ./.;
+        # Source filtering — include .proto files alongside Rust sources
+        protoFilter = path: _type: builtins.match ".*\\.proto$" path != null;
+        src = pkgs.lib.cleanSourceWith {
+          src = ./.;
+          filter = path: type:
+            (protoFilter path type) || (craneLib.filterCargoSources path type);
+        };
 
         # Common build inputs (runtime dependencies)
         commonBuildInputs = with pkgs; [ openssl ]
@@ -38,7 +43,7 @@
           ];
 
         # Common native build inputs (build-time tools)
-        commonNativeBuildInputs = with pkgs; [ pkg-config ];
+        commonNativeBuildInputs = with pkgs; [ pkg-config protobuf ];
 
         # Common arguments for all builds
         commonArgs = {
@@ -47,6 +52,7 @@
           inherit version;
           buildInputs = commonBuildInputs;
           nativeBuildInputs = commonNativeBuildInputs;
+          PROTOC = "${pkgs.protobuf}/bin/protoc";
         };
 
         # Build dependencies separately for caching

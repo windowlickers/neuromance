@@ -86,20 +86,12 @@ impl Storage {
             .mode(0o700)
             .create(&conversations_dir)
             .map_err(|e| {
-                DaemonError::Storage(format!(
-                    "Failed to create conversations directory: {e}"
-                ))
+                DaemonError::Storage(format!("Failed to create conversations directory: {e}"))
             })?;
 
         // Harden existing installs: ensure data dir is owner-only
-        fs::set_permissions(
-            &data_dir,
-            fs::Permissions::from_mode(0o700),
-        )
-        .map_err(|e| {
-            DaemonError::Storage(format!(
-                "Failed to set data directory permissions: {e}"
-            ))
+        fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o700)).map_err(|e| {
+            DaemonError::Storage(format!("Failed to set data directory permissions: {e}"))
         })?;
 
         Ok(Self {
@@ -128,9 +120,7 @@ impl Storage {
         let this = Arc::clone(self);
         tokio::task::spawn_blocking(move || f(&this))
             .await
-            .map_err(|e| {
-                DaemonError::Storage(format!("Task join error: {e}"))
-            })?
+            .map_err(|e| DaemonError::Storage(format!("Task join error: {e}")))?
     }
 
     /// Returns the socket path for the Unix domain socket.

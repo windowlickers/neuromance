@@ -1,34 +1,29 @@
-//! Unix socket server for handling client connections.
+//! gRPC server for handling client connections.
 //!
-//! Listens on a Unix domain socket and handles line-delimited JSON requests
-//! from the `nm` CLI client.
+//! Implements the `Neuromance` gRPC service over a Unix domain socket using
+//! tonic. Replaces the previous line-delimited JSON protocol.
 
 use std::os::unix::fs::PermissionsExt;
+use std::pin::Pin;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
-use neuromance_common::protocol::{DaemonRequest, DaemonResponse, ErrorCode};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
+use futures::StreamExt;
+use neuromance_common::protocol::DaemonResponse;
+use neuromance_proto::proto;
 use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio::time::Instant;
-use tracing::{debug, error, info, instrument, warn};
+use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
+use tonic::{Request, Response, Status, Streaming};
+use tracing::{error, info, instrument, warn};
 
 use crate::config::DaemonConfig;
 use crate::conversation_manager::ConversationManager;
 use crate::error::{DaemonError, Result};
 use crate::storage::Storage;
 
-/// Maximum size of a single request line (1 MB).
-const MAX_REQUEST_SIZE: usize = 1024 * 1024;
-
-/// Idle timeout for a client connection with no complete request (5 minutes).
-const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
-
 /// Checks if a process with the given PID is running.
-///
-/// Uses `kill -0` which works on both Linux and macOS.
 fn is_process_running(pid: u32) -> bool {
     Command::new("kill")
         .args(["-0", &pid.to_string()])
@@ -36,6 +31,69 @@ fn is_process_running(pid: u32) -> bool {
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|s| s.success())
+}
+
+/// Converts a `DaemonError` into a gRPC `Status`.
+fn daemon_error_to_status(err: &DaemonError) -> Status {
+    match err {
+        DaemonError::ConversationNotFound(_)
+        | DaemonError::ModelNotFound(_)
+        | DaemonError::BookmarkNotFound(_) => Status::not_found(err.to_string()),
+        DaemonError::BookmarkExists(_) => Status::already_exists(err.to_string()),
+        DaemonError::NoActiveConversation => Status::failed_precondition(err.to_string()),
+        DaemonError::InvalidConversationId(_) => Status::invalid_argument(err.to_string()),
+        DaemonError::Storage(_) => Status::unavailable(err.to_string()),
+        _ => Status::internal(err.to_string()),
+    }
+}
+
+/// Maps a `DaemonError` to a proto `ErrorCode`.
+const fn daemon_error_to_proto_code(err: &DaemonError) -> proto::ErrorCode {
+    match err {
+        DaemonError::ConversationNotFound(_) => proto::ErrorCode::ConversationNotFound,
+        DaemonError::ModelNotFound(_) => proto::ErrorCode::ModelNotFound,
+        DaemonError::BookmarkNotFound(_) => proto::ErrorCode::BookmarkNotFound,
+        DaemonError::BookmarkExists(_) => proto::ErrorCode::BookmarkExists,
+        DaemonError::NoActiveConversation => proto::ErrorCode::NoActiveConversation,
+        DaemonError::InvalidConversationId(_) => proto::ErrorCode::InvalidConversationId,
+        DaemonError::Core(_) | DaemonError::Client(_) | DaemonError::Tool(_) => {
+            proto::ErrorCode::LlmError
+        }
+        DaemonError::Config(_) | DaemonError::Toml(_) => proto::ErrorCode::ConfigError,
+        DaemonError::Storage(_) => proto::ErrorCode::StorageError,
+        _ => proto::ErrorCode::Internal,
+    }
+}
+
+/// Checks version compatibility between daemon and client.
+///
+/// Returns (compatible, warning). Compatible means same major.minor.
+fn check_version_compatibility(
+    daemon_version: &str,
+    client_version: &str,
+) -> (bool, Option<String>) {
+    let daemon_parts: Vec<&str> = daemon_version.split('.').collect();
+    let client_parts: Vec<&str> = client_version.split('.').collect();
+
+    if daemon_parts.len() < 2 || client_parts.len() < 2 {
+        return (false, Some("Invalid version format".to_string()));
+    }
+
+    let daemon_mm = format!("{}.{}", daemon_parts[0], daemon_parts[1]);
+    let client_mm = format!("{}.{}", client_parts[0], client_parts[1]);
+
+    if daemon_mm == client_mm {
+        (true, None)
+    } else {
+        (
+            false,
+            Some(format!(
+                "Version mismatch: daemon={daemon_version}, \
+                 client={client_version}. \
+                 Please upgrade to matching versions."
+            )),
+        )
+    }
 }
 
 /// Daemon server state.
@@ -77,19 +135,15 @@ impl Server {
         }
     }
 
-    /// Runs the server.
-    ///
-    /// Binds to the Unix socket and accepts connections until shutdown is requested.
+    /// Runs the gRPC server over a Unix domain socket.
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - Socket binding fails
-    /// - Connection handling fails
+    /// Returns an error if socket binding or server startup fails.
     pub async fn run(self: Arc<Self>) -> Result<()> {
         let socket_path = self.storage.socket_path();
 
-        // Check for an existing daemon before removing the socket
+        // Check for an existing daemon
         if socket_path.exists() {
             if let Some(existing_pid) = self.storage.read_pid()
                 && is_process_running(existing_pid)
@@ -107,44 +161,38 @@ impl Server {
         info!(pid = %pid, "Daemon started");
 
         // Bind Unix socket
-        let listener = UnixListener::bind(socket_path)?;
+        let listener = tokio::net::UnixListener::bind(socket_path)?;
         std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))?;
-        info!(socket_path = %socket_path.display(), "Daemon listening");
+        info!(
+            socket_path = %socket_path.display(),
+            "Daemon listening"
+        );
 
-        // Subscribe to shutdown signal
-        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        let uds_stream = UnixListenerStream::new(listener);
 
-        // Spawn inactivity checker with shutdown awareness
+        // Spawn inactivity checker
         let server_clone = Arc::clone(&self);
         tokio::spawn(async move {
             server_clone.check_inactivity().await;
         });
 
-        // Accept connections until shutdown
-        loop {
-            tokio::select! {
-                result = listener.accept() => {
-                    match result {
-                        Ok((stream, _addr)) => {
-                            let server = Arc::clone(&self);
-                            debug!("Client connected");
-                            tokio::spawn(async move {
-                                if let Err(e) = server.handle_connection(stream).await {
-                                    error!(error = %e, "Connection handling error");
-                                }
-                            });
-                        }
-                        Err(e) => {
-                            error!(error = %e, "Accept error");
-                        }
-                    }
-                }
-                _ = shutdown_rx.recv() => {
-                    info!("Shutdown signal received, stopping accept loop");
-                    break;
-                }
-            }
-        }
+        // Subscribe to shutdown signal
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+
+        // Build tonic server
+        let grpc_service = GrpcService {
+            inner: Arc::clone(&self),
+        };
+        let svc = neuromance_proto::NeuromanceServer::new(grpc_service);
+
+        tonic::transport::Server::builder()
+            .add_service(svc)
+            .serve_with_incoming_shutdown(uds_stream, async move {
+                let _ = shutdown_rx.recv().await;
+                info!("Shutdown signal received, stopping server");
+            })
+            .await
+            .map_err(|e| DaemonError::Other(format!("gRPC server error: {e}")))?;
 
         // Clean up socket file
         if socket_path.exists() {
@@ -165,331 +213,343 @@ impl Server {
         Ok(())
     }
 
-    /// Handles a single client connection.
-    async fn handle_connection(self: Arc<Self>, stream: UnixStream) -> Result<()> {
-        // Update last activity
+    /// Updates the last activity timestamp.
+    async fn touch_activity(&self) {
         *self.last_activity.write().await = Instant::now();
+    }
 
-        let (reader, mut writer) = stream.into_split();
-        let mut reader = BufReader::new(reader);
-        let mut line = String::new();
+    /// Periodically checks for inactivity and shuts down.
+    async fn check_inactivity(self: Arc<Self>) {
+        let timeout = Duration::from_secs(self.config.settings.inactivity_timeout);
+        let check_interval = Duration::from_secs(60);
 
         loop {
-            // Read line-delimited JSON (size-limited, with idle timeout)
-            let read_result = tokio::time::timeout(
-                CONNECTION_IDLE_TIMEOUT,
-                Self::read_line_limited(&mut reader, &mut line),
-            )
-            .await;
+            tokio::time::sleep(check_interval).await;
 
-            match read_result {
-                Err(_) => {
-                    warn!(
-                        "Client connection timed out after {}s of inactivity",
-                        CONNECTION_IDLE_TIMEOUT.as_secs()
-                    );
-                    break;
-                }
-                Ok(Err(e)) => {
-                    error!(error = %e, "Read error");
-                    break;
-                }
-                Ok(Ok(0)) => {
-                    debug!("Client disconnected");
-                    break;
-                }
-                Ok(Ok(_)) => {
-                    // Any data on the socket is evidence of activity
-                    *self.last_activity.write().await = Instant::now();
-
-                    // Parse request
-                    match serde_json::from_str::<DaemonRequest>(&line) {
-                        Ok(DaemonRequest::SendMessage {
-                            conversation_id,
-                            content,
-                        }) => {
-                            debug!("Received SendMessage request");
-                            if let Err(e) = self
-                                .handle_streaming_session(
-                                    conversation_id,
-                                    content,
-                                    &mut reader,
-                                    &mut writer,
-                                )
-                                .await
-                            {
-                                error!(error = %e, "Streaming session error");
-                                let response: DaemonResponse = e.into();
-                                let _ = Self::write_response(&mut writer, &response).await;
-                            }
-                        }
-                        Ok(request) => {
-                            debug!(request = ?request, "Received request");
-
-                            // Handle request
-                            match self.handle_request(request).await {
-                                Ok(responses) => {
-                                    for response in responses {
-                                        if let Err(e) =
-                                            Self::write_response(&mut writer, &response).await
-                                        {
-                                            error!(
-                                                error = %e,
-                                                "Failed to write response"
-                                            );
-                                            break;
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    error!(error = %e, "Request handling error");
-                                    let response: DaemonResponse = e.into();
-                                    let _ = Self::write_response(&mut writer, &response).await;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "Invalid request JSON");
-                            let response = DaemonResponse::Error {
-                                code: ErrorCode::InvalidRequest,
-                                message: format!("Invalid JSON: {e}"),
-                            };
-                            let _ = Self::write_response(&mut writer, &response).await;
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Dispatches a daemon request to the appropriate handler.
-    #[instrument(skip_all)]
-    async fn handle_request(&self, request: DaemonRequest) -> Result<Vec<DaemonResponse>> {
-        match request {
-            DaemonRequest::NewConversation {
-                model,
-                system_message,
-            } => self.handle_new_conversation(model, system_message).await,
-            DaemonRequest::ListMessages {
-                conversation_id,
-                limit,
-            } => self.handle_list_messages(conversation_id, limit).await,
-            DaemonRequest::ListConversations { limit } => {
-                self.handle_list_conversations(limit).await
-            }
-            DaemonRequest::SetBookmark {
-                conversation_id,
-                name,
-            } => self.handle_set_bookmark(&conversation_id, &name).await,
-            DaemonRequest::RemoveBookmark { name } => {
-                self.handle_remove_bookmark(&name).await
-            }
-            DaemonRequest::DeleteConversation { conversation_id } => {
-                self.handle_delete_conversation(&conversation_id).await
-            }
-            DaemonRequest::SwitchModel {
-                conversation_id,
-                model_nickname,
-            } => {
-                self.handle_switch_model(conversation_id, model_nickname)
-                    .await
-            }
-            DaemonRequest::ListModels => Ok(self.handle_list_models()),
-            DaemonRequest::ToolApproval {
-                conversation_id,
-                tool_call_id,
-                approval,
-            } => Ok(self.handle_tool_approval(&conversation_id, &tool_call_id, approval)?),
-            DaemonRequest::Status => self.handle_status().await,
-            DaemonRequest::DetailedStatus => self.handle_detailed_status().await,
-            DaemonRequest::Health { client_version } => Ok(self.handle_health(&client_version)),
-            DaemonRequest::Shutdown => Ok(self.handle_shutdown()),
-            _ => {
-                warn!("Unknown request variant received");
-                Ok(vec![DaemonResponse::Error {
-                    code: ErrorCode::InvalidRequest,
-                    message: "Unknown request variant".to_string(),
-                }])
+            let last = *self.last_activity.read().await;
+            if last.elapsed() > timeout {
+                info!(
+                    inactive_seconds = last.elapsed().as_secs(),
+                    timeout_seconds = timeout.as_secs(),
+                    "Shutting down due to inactivity"
+                );
+                let _ = self.shutdown_tx.send(());
+                break;
             }
         }
     }
+}
 
-    /// Streams responses directly to the client as they arrive.
-    ///
-    /// Handles tool approval requests inline by reading the client's
-    /// response from the socket during the streaming session.
-    async fn handle_streaming_session(
+/// Wrapper that implements the tonic `Neuromance` service trait.
+struct GrpcService {
+    inner: Arc<Server>,
+}
+
+type ChatStream =
+    Pin<Box<dyn futures::Stream<Item = std::result::Result<proto::ChatEvent, Status>> + Send>>;
+
+#[allow(clippy::too_many_lines)]
+#[tonic::async_trait]
+impl neuromance_proto::Neuromance for GrpcService {
+    type ChatStream = ChatStream;
+
+    async fn chat(
         &self,
-        conversation_id: Option<String>,
-        content: String,
-        reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
-        writer: &mut tokio::net::unix::OwnedWriteHalf,
-    ) -> Result<()> {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        request: Request<Streaming<proto::ChatClientMessage>>,
+    ) -> std::result::Result<Response<Self::ChatStream>, Status> {
+        self.inner.touch_activity().await;
 
-        let manager = Arc::clone(&self.manager);
+        let mut in_stream = request.into_inner();
+
+        // First message must be SendMessageRequest
+        let first = in_stream
+            .next()
+            .await
+            .ok_or_else(|| Status::invalid_argument("Empty chat stream"))?
+            .map_err(|e| Status::internal(format!("Stream read error: {e}")))?;
+
+        let (conversation_id, content) = match first.message {
+            Some(proto::chat_client_message::Message::SendMessage(req)) => {
+                let conv_id = if req.conversation_id.is_empty() {
+                    None
+                } else {
+                    Some(req.conversation_id)
+                };
+                (conv_id, req.content)
+            }
+            _ => {
+                return Err(Status::invalid_argument(
+                    "First message must be SendMessageRequest",
+                ));
+            }
+        };
+
+        let (event_tx, event_rx) = mpsc::channel(64);
+        let (response_tx, mut response_rx) = mpsc::unbounded_channel();
+
+        let manager = Arc::clone(&self.inner.manager);
+        let server = Arc::clone(&self.inner);
+
+        // Spawn message processing task
         let handle = tokio::spawn(async move {
             if let Err(e) = manager
-                .send_message(conversation_id, content, tx.clone())
+                .send_message(conversation_id, content, response_tx.clone())
                 .await
             {
-                let _ = tx.send(e.into());
+                let _ = response_tx.send(e.into());
             }
         });
 
-        while let Some(response) = rx.recv().await {
-            let needs_approval = matches!(
-                &response,
-                DaemonResponse::ToolApprovalRequest { .. }
-            );
-            Self::write_response(writer, &response).await?;
+        // Bridge task: DaemonResponse → ChatEvent,
+        // reads tool approvals from client input stream
+        tokio::spawn(async move {
+            while let Some(response) = response_rx.recv().await {
+                server.touch_activity().await;
 
-            if needs_approval {
-                self.read_tool_approval(reader, writer).await?;
-            }
-        }
+                let event = match response {
+                    DaemonResponse::StreamChunk {
+                        conversation_id: cid,
+                        content: c,
+                    } => proto::ChatEvent {
+                        event: Some(proto::chat_event::Event::StreamChunk(proto::StreamChunk {
+                            conversation_id: cid,
+                            content: c,
+                        })),
+                    },
+                    DaemonResponse::ToolApprovalRequest {
+                        conversation_id: cid,
+                        tool_call,
+                    } => {
+                        let event = proto::ChatEvent {
+                            event: Some(proto::chat_event::Event::ToolApprovalRequest(
+                                proto::ToolApprovalRequestProto {
+                                    conversation_id: cid.clone(),
+                                    tool_call: Some(proto::ToolCallProto::from(&tool_call)),
+                                },
+                            )),
+                        };
 
-        // Detect task panics that silently dropped the sender
-        if let Err(join_err) = handle.await {
-            error!(error = %join_err, "Message processing task panicked");
-            let response = DaemonResponse::Error {
-                code: ErrorCode::Internal,
-                message: "Message processing failed unexpectedly"
-                    .to_string(),
-            };
-            Self::write_response(writer, &response).await?;
-        }
+                        if event_tx.send(Ok(event)).await.is_err() {
+                            break;
+                        }
 
-        Ok(())
-    }
+                        // Read tool approval from client
+                        let approval = read_tool_approval(&mut in_stream).await;
 
-    /// Reads a tool approval request from the client during a streaming session.
-    async fn read_tool_approval(
-        &self,
-        reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
-        writer: &mut tokio::net::unix::OwnedWriteHalf,
-    ) -> Result<()> {
-        let mut line = String::new();
-        let bytes_read = Self::read_line_limited(reader, &mut line).await?;
+                        if let Err(e) = server.manager.approve_tool(&cid, &tool_call.id, approval) {
+                            let err = make_chat_error(&e);
+                            let _ = event_tx.send(Ok(err)).await;
+                        }
 
-        if bytes_read == 0 {
-            return Err(DaemonError::Other(
-                "Client disconnected during tool approval".to_string(),
-            ));
-        }
+                        continue;
+                    }
+                    DaemonResponse::ToolResult {
+                        conversation_id: cid,
+                        tool_name,
+                        result: res,
+                        success,
+                    } => proto::ChatEvent {
+                        event: Some(proto::chat_event::Event::ToolResult(
+                            proto::ToolResultProto {
+                                conversation_id: cid,
+                                tool_name,
+                                result: res,
+                                success,
+                            },
+                        )),
+                    },
+                    DaemonResponse::Usage {
+                        conversation_id: cid,
+                        usage,
+                    } => {
+                        let mut pu = proto::UsageProto::from(&usage);
+                        pu.conversation_id = cid;
+                        proto::ChatEvent {
+                            event: Some(proto::chat_event::Event::Usage(pu)),
+                        }
+                    }
+                    DaemonResponse::MessageCompleted {
+                        conversation_id: cid,
+                        message: msg,
+                    } => proto::ChatEvent {
+                        event: Some(proto::chat_event::Event::MessageCompleted(
+                            proto::MessageCompleted {
+                                conversation_id: cid,
+                                message: Some(proto::MessageProto::from(msg.as_ref())),
+                            },
+                        )),
+                    },
+                    DaemonResponse::Error { code, message: msg } => proto::ChatEvent {
+                        event: Some(proto::chat_event::Event::Error(proto::ChatError {
+                            code: proto::ErrorCode::from(code).into(),
+                            message: msg,
+                        })),
+                    },
+                    _ => continue,
+                };
 
-        match serde_json::from_str::<DaemonRequest>(&line) {
-            Ok(DaemonRequest::ToolApproval {
-                conversation_id,
-                tool_call_id,
-                approval,
-            }) => {
-                let responses =
-                    self.handle_tool_approval(&conversation_id, &tool_call_id, approval)?;
-                for response in responses {
-                    Self::write_response(writer, &response).await?;
+                if event_tx.send(Ok(event)).await.is_err() {
+                    break;
                 }
             }
-            Ok(other) => {
-                warn!(request = ?other, "Unexpected request during tool approval");
-                let response = DaemonResponse::Error {
-                    code: ErrorCode::InvalidRequest,
-                    message: "Expected ToolApproval request".to_string(),
-                };
-                Self::write_response(writer, &response).await?;
-            }
-            Err(e) => {
-                warn!(error = %e, "Invalid JSON during tool approval");
-                let response = DaemonResponse::Error {
-                    code: ErrorCode::InvalidRequest,
-                    message: format!("Invalid JSON: {e}"),
-                };
-                Self::write_response(writer, &response).await?;
-            }
-        }
 
-        Ok(())
+            // Detect task panics
+            if let Err(join_err) = handle.await {
+                error!(
+                    error = %join_err,
+                    "Message processing task panicked"
+                );
+                let err = proto::ChatEvent {
+                    event: Some(proto::chat_event::Event::Error(proto::ChatError {
+                        code: proto::ErrorCode::Internal.into(),
+                        message: "Message processing failed unexpectedly".to_string(),
+                    })),
+                };
+                let _ = event_tx.send(Ok(err)).await;
+            }
+        });
+
+        let out_stream = ReceiverStream::new(event_rx);
+        Ok(Response::new(Box::pin(out_stream)))
     }
 
-    async fn handle_new_conversation(
+    async fn new_conversation(
         &self,
-        model: Option<String>,
-        system_message: Option<String>,
-    ) -> Result<Vec<DaemonResponse>> {
+        request: Request<proto::NewConversationRequest>,
+    ) -> std::result::Result<Response<proto::NewConversationResponse>, Status> {
+        self.inner.touch_activity().await;
+        let req = request.into_inner();
+
         let summary = self
+            .inner
             .manager
-            .create_conversation(model, system_message)
-            .await?;
-        Ok(vec![DaemonResponse::ConversationCreated {
-            conversation: summary,
-        }])
+            .create_conversation(req.model, req.system_message)
+            .await
+            .map_err(|e| daemon_error_to_status(&e))?;
+
+        Ok(Response::new(proto::NewConversationResponse {
+            conversation: Some(proto::ConversationSummaryProto::from(&summary)),
+        }))
     }
 
-    async fn handle_list_messages(
+    async fn list_messages(
         &self,
-        conversation_id: Option<String>,
-        limit: Option<usize>,
-    ) -> Result<Vec<DaemonResponse>> {
-        let (messages, total_count, conv_id) =
-            self.manager.get_messages(conversation_id, limit).await?;
-        Ok(vec![DaemonResponse::Messages {
-            conversation_id: conv_id,
-            messages,
-            total_count,
-        }])
+        request: Request<proto::ListMessagesRequest>,
+    ) -> std::result::Result<Response<proto::ListMessagesResponse>, Status> {
+        self.inner.touch_activity().await;
+        let req = request.into_inner();
+
+        let conv_id = if req.conversation_id.is_empty() {
+            None
+        } else {
+            Some(req.conversation_id)
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        let limit = req.limit.map(|l| l as usize);
+
+        let (messages, total_count, cid) = self
+            .inner
+            .manager
+            .get_messages(conv_id, limit)
+            .await
+            .map_err(|e| daemon_error_to_status(&e))?;
+
+        let proto_messages: Vec<proto::MessageProto> =
+            messages.iter().map(proto::MessageProto::from).collect();
+
+        Ok(Response::new(proto::ListMessagesResponse {
+            conversation_id: cid,
+            messages: proto_messages,
+            total_count: total_count as u64,
+        }))
     }
 
-    async fn handle_list_conversations(
+    async fn list_conversations(
         &self,
-        limit: Option<usize>,
-    ) -> Result<Vec<DaemonResponse>> {
-        let conversations =
-            self.manager.list_conversations(limit).await?;
-        Ok(vec![DaemonResponse::Conversations { conversations }])
+        request: Request<proto::ListConversationsRequest>,
+    ) -> std::result::Result<Response<proto::ListConversationsResponse>, Status> {
+        self.inner.touch_activity().await;
+        let req = request.into_inner();
+        #[allow(clippy::cast_possible_truncation)]
+        let limit = req.limit.map(|l| l as usize);
+
+        let conversations = self
+            .inner
+            .manager
+            .list_conversations(limit)
+            .await
+            .map_err(|e| daemon_error_to_status(&e))?;
+
+        let proto_convs: Vec<proto::ConversationSummaryProto> = conversations
+            .iter()
+            .map(proto::ConversationSummaryProto::from)
+            .collect();
+
+        Ok(Response::new(proto::ListConversationsResponse {
+            conversations: proto_convs,
+        }))
     }
 
-    async fn handle_set_bookmark(
+    async fn set_bookmark(
         &self,
-        conversation_id: &str,
-        name: &str,
-    ) -> Result<Vec<DaemonResponse>> {
-        let conv_id = conversation_id.to_string();
-        let bm_name = name.to_string();
-        self.storage
+        request: Request<proto::SetBookmarkRequest>,
+    ) -> std::result::Result<Response<proto::SetBookmarkResponse>, Status> {
+        self.inner.touch_activity().await;
+        let req = request.into_inner();
+        let conv_id = req.conversation_id.clone();
+        let bm_name = req.name.clone();
+
+        self.inner
+            .storage
             .run(move |s| {
                 let id = s.resolve_conversation_id(&conv_id)?;
                 s.set_bookmark(&bm_name, &id)?;
                 Ok(())
             })
-            .await?;
-        Ok(vec![DaemonResponse::Success {
+            .await
+            .map_err(|e| daemon_error_to_status(&e))?;
+
+        Ok(Response::new(proto::SetBookmarkResponse {
             message: format!(
-                "Set bookmark '{name}' for conversation {conversation_id}"
+                "Set bookmark '{}' for conversation {}",
+                req.name, req.conversation_id
             ),
-        }])
+        }))
     }
 
-    async fn handle_remove_bookmark(
+    async fn remove_bookmark(
         &self,
-        name: &str,
-    ) -> Result<Vec<DaemonResponse>> {
-        let bm_name = name.to_string();
-        self.storage
+        request: Request<proto::RemoveBookmarkRequest>,
+    ) -> std::result::Result<Response<proto::RemoveBookmarkResponse>, Status> {
+        self.inner.touch_activity().await;
+        let req = request.into_inner();
+        let bm_name = req.name.clone();
+
+        self.inner
+            .storage
             .run(move |s| s.remove_bookmark(&bm_name))
-            .await?;
-        Ok(vec![DaemonResponse::Success {
-            message: format!("Removed bookmark '{name}'"),
-        }])
+            .await
+            .map_err(|e| daemon_error_to_status(&e))?;
+
+        Ok(Response::new(proto::RemoveBookmarkResponse {
+            message: format!("Removed bookmark '{}'", req.name),
+        }))
     }
 
-    async fn handle_delete_conversation(
+    #[instrument(skip(self))]
+    async fn delete_conversation(
         &self,
-        conversation_id: &str,
-    ) -> Result<Vec<DaemonResponse>> {
-        let (summary, removed_bookmarks) =
-            self.manager.delete_conversation(conversation_id).await?;
+        request: Request<proto::DeleteConversationRequest>,
+    ) -> std::result::Result<Response<proto::DeleteConversationResponse>, Status> {
+        self.inner.touch_activity().await;
+        let req = request.into_inner();
+
+        let (summary, removed_bookmarks) = self
+            .inner
+            .manager
+            .delete_conversation(&req.conversation_id)
+            .await
+            .map_err(|e| daemon_error_to_status(&e))?;
 
         let title_part = summary
             .title
@@ -499,246 +559,181 @@ impl Server {
         let bookmark_part = if removed_bookmarks.is_empty() {
             String::new()
         } else {
-            format!(
-                " (removed bookmarks: {})",
-                removed_bookmarks.join(", ")
-            )
+            format!(" (removed bookmarks: {})", removed_bookmarks.join(", "))
         };
 
-        Ok(vec![DaemonResponse::Success {
+        Ok(Response::new(proto::DeleteConversationResponse {
             message: format!(
-                "Deleted conversation {}{title_part}{bookmark_part}",
+                "Deleted conversation {}{title_part}\
+                 {bookmark_part}",
                 summary.short_id
             ),
-        }])
+        }))
     }
 
-    async fn handle_switch_model(
+    async fn switch_model(
         &self,
-        conversation_id: Option<String>,
-        model_nickname: String,
-    ) -> Result<Vec<DaemonResponse>> {
+        request: Request<proto::SwitchModelRequest>,
+    ) -> std::result::Result<Response<proto::SwitchModelResponse>, Status> {
+        self.inner.touch_activity().await;
+        let req = request.into_inner();
+
+        let conv_id = if req.conversation_id.is_empty() {
+            None
+        } else {
+            Some(req.conversation_id)
+        };
+
         let summary = self
+            .inner
             .manager
-            .switch_model(conversation_id, model_nickname)
-            .await?;
-        Ok(vec![DaemonResponse::ModelSwitched {
-            conversation: summary,
-        }])
+            .switch_model(conv_id, req.model_nickname)
+            .await
+            .map_err(|e| daemon_error_to_status(&e))?;
+
+        Ok(Response::new(proto::SwitchModelResponse {
+            conversation: Some(proto::ConversationSummaryProto::from(&summary)),
+        }))
     }
 
-    fn handle_list_models(&self) -> Vec<DaemonResponse> {
-        let models = self.config.models.clone();
-        let active = self.config.active_model.clone();
-        vec![DaemonResponse::Models { models, active }]
-    }
-
-    fn handle_tool_approval(
+    async fn list_models(
         &self,
-        conversation_id: &str,
-        tool_call_id: &str,
-        approval: neuromance_common::ToolApproval,
-    ) -> Result<Vec<DaemonResponse>> {
-        self.manager
-            .approve_tool(conversation_id, tool_call_id, approval)?;
-        Ok(vec![DaemonResponse::Success {
-            message: "Tool approval processed".to_string(),
-        }])
+        _request: Request<proto::ListModelsRequest>,
+    ) -> std::result::Result<Response<proto::ListModelsResponse>, Status> {
+        self.inner.touch_activity().await;
+
+        let models: Vec<proto::ModelProfileProto> = self
+            .inner
+            .config
+            .models
+            .iter()
+            .map(proto::ModelProfileProto::from)
+            .collect();
+
+        Ok(Response::new(proto::ListModelsResponse {
+            models,
+            active: self.inner.config.active_model.clone(),
+        }))
     }
 
-    async fn handle_status(&self) -> Result<Vec<DaemonResponse>> {
-        let uptime_seconds = self.start_time.elapsed().as_secs();
-        let active_conversations =
-            self.manager.conversation_count().await.unwrap_or(0);
-        Ok(vec![DaemonResponse::Status {
-            uptime_seconds,
-            active_conversations,
-            current_conversation: None,
-        }])
+    async fn get_status(
+        &self,
+        _request: Request<proto::GetStatusRequest>,
+    ) -> std::result::Result<Response<proto::GetStatusResponse>, Status> {
+        self.inner.touch_activity().await;
+
+        let uptime = self.inner.start_time.elapsed().as_secs();
+        let active = self.inner.manager.conversation_count().await.unwrap_or(0);
+
+        Ok(Response::new(proto::GetStatusResponse {
+            uptime_seconds: uptime,
+            active_conversations: active as u64,
+        }))
     }
 
-    async fn handle_detailed_status(&self) -> Result<Vec<DaemonResponse>> {
-        let uptime_seconds = self.start_time.elapsed().as_secs();
-        let active_conversations =
-            self.manager.conversation_count().await.unwrap_or(0);
+    async fn get_detailed_status(
+        &self,
+        _request: Request<proto::GetDetailedStatusRequest>,
+    ) -> std::result::Result<Response<proto::GetDetailedStatusResponse>, Status> {
+        self.inner.touch_activity().await;
+
+        let uptime = self.inner.start_time.elapsed().as_secs();
+        let active = self.inner.manager.conversation_count().await.unwrap_or(0);
 
         let loaded = self
+            .inner
             .storage
             .run(|s| {
-                let active_id = s.get_active_conversation()?;
-                let Some(id) = active_id else {
+                let Some(id) = s.get_active_conversation()? else {
                     return Ok(None);
                 };
                 let conv = s.load_conversation(&id)?;
-                let bookmarks = s
-                    .get_conversation_bookmarks(&id)
-                    .unwrap_or_default();
-                Ok(Some((id, conv, bookmarks)))
+                let bm = s.get_conversation_bookmarks(&id).unwrap_or_default();
+                Ok(Some((id, conv, bm)))
             })
             .await;
 
-        let current_conversation = match loaded {
-            Ok(Some((id, conv, bookmarks))) => {
-                let model = self.manager.get_conversation_model(&id);
-                Some(
-                    neuromance_common::protocol::ConversationSummary::from_conversation(
-                        &conv, model, bookmarks,
-                    ),
-                )
+        let current = match loaded {
+            Ok(Some((id, conv, bm))) => {
+                let model = self.inner.manager.get_conversation_model(&id);
+                let summary = neuromance_common::protocol::ConversationSummary::from_conversation(
+                    &conv, model, bm,
+                );
+                Some(proto::ConversationSummaryProto::from(&summary))
             }
             Ok(None) => None,
             Err(e) => {
-                warn!(error = %e, "Failed to load active conversation for status");
+                warn!(
+                    error = %e,
+                    "Failed to load active conversation"
+                );
                 None
             }
         };
 
-        Ok(vec![DaemonResponse::Status {
-            uptime_seconds,
-            active_conversations,
-            current_conversation,
-        }])
+        Ok(Response::new(proto::GetDetailedStatusResponse {
+            uptime_seconds: uptime,
+            active_conversations: active as u64,
+            current_conversation: current,
+        }))
     }
 
-    fn handle_health(&self, client_version: &str) -> Vec<DaemonResponse> {
+    async fn health_check(
+        &self,
+        request: Request<proto::HealthCheckRequest>,
+    ) -> std::result::Result<Response<proto::HealthCheckResponse>, Status> {
+        self.inner.touch_activity().await;
+        let req = request.into_inner();
+
         let daemon_version = env!("CARGO_PKG_VERSION").to_string();
-        let uptime_seconds = self.start_time.elapsed().as_secs();
+        let uptime = self.inner.start_time.elapsed().as_secs();
         let (compatible, warning) =
-            Self::check_version_compatibility(&daemon_version, client_version);
-        vec![DaemonResponse::Health {
+            check_version_compatibility(&daemon_version, &req.client_version);
+
+        Ok(Response::new(proto::HealthCheckResponse {
             daemon_version,
             compatible,
             warning,
-            uptime_seconds,
-        }]
+            uptime_seconds: uptime,
+        }))
     }
 
-    fn handle_shutdown(&self) -> Vec<DaemonResponse> {
+    async fn shutdown(
+        &self,
+        _request: Request<proto::ShutdownRequest>,
+    ) -> std::result::Result<Response<proto::ShutdownResponse>, Status> {
         info!("Shutdown requested by client");
-        let _ = self.shutdown_tx.send(());
-        vec![DaemonResponse::Success {
+        let _ = self.inner.shutdown_tx.send(());
+
+        Ok(Response::new(proto::ShutdownResponse {
             message: "Shutdown initiated".to_string(),
-        }]
+        }))
     }
+}
 
-    /// Writes a response to the client.
-    async fn write_response(
-        writer: &mut tokio::net::unix::OwnedWriteHalf,
-        response: &DaemonResponse,
-    ) -> Result<()> {
-        let json = serde_json::to_string(response)?;
-        writer.write_all(json.as_bytes()).await?;
-        writer.write_all(b"\n").await?;
-        writer.flush().await?;
-        Ok(())
+/// Reads a tool approval response from the client stream.
+async fn read_tool_approval(
+    stream: &mut Streaming<proto::ChatClientMessage>,
+) -> neuromance_common::ToolApproval {
+    match stream.next().await {
+        Some(Ok(msg)) => match msg.message {
+            Some(proto::chat_client_message::Message::ToolApproval(ta)) => ta.approval.map_or_else(
+                || neuromance_common::ToolApproval::Denied("No approval decision".to_string()),
+                neuromance_common::ToolApproval::from,
+            ),
+            _ => neuromance_common::ToolApproval::Denied("Expected tool approval".to_string()),
+        },
+        _ => neuromance_common::ToolApproval::Denied("Client disconnected".to_string()),
     }
+}
 
-    /// Reads a newline-delimited line with a size limit.
-    ///
-    /// Returns the number of bytes read (0 = EOF). Errors if the
-    /// line exceeds `MAX_REQUEST_SIZE` before a newline is found.
-    async fn read_line_limited(
-        reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
-        buf: &mut String,
-    ) -> Result<usize> {
-        buf.clear();
-        let mut total = 0;
-
-        loop {
-            let available = reader.fill_buf().await?;
-            if available.is_empty() {
-                return Ok(total);
-            }
-
-            let newline_pos = available.iter().position(|&b| b == b'\n');
-            let n = newline_pos.map_or(available.len(), |p| p + 1);
-
-            total += n;
-            if total > MAX_REQUEST_SIZE {
-                reader.consume(n);
-                // Drain to next newline to prevent framing corruption
-                if newline_pos.is_none() {
-                    loop {
-                        let remaining = reader.fill_buf().await?;
-                        if remaining.is_empty() {
-                            break;
-                        }
-                        let nl = remaining
-                            .iter()
-                            .position(|&b| b == b'\n');
-                        let drain = nl.map_or(remaining.len(), |p| p + 1);
-                        reader.consume(drain);
-                        if nl.is_some() {
-                            break;
-                        }
-                    }
-                }
-                return Err(DaemonError::Other(format!(
-                    "Request exceeds {MAX_REQUEST_SIZE} byte limit"
-                )));
-            }
-
-            let chunk = std::str::from_utf8(&available[..n])
-                .map_err(|_| DaemonError::Other("Invalid UTF-8 in request".to_string()))?;
-            buf.push_str(chunk);
-            reader.consume(n);
-
-            if newline_pos.is_some() {
-                return Ok(total);
-            }
-        }
-    }
-
-    /// Checks version compatibility between daemon and client.
-    ///
-    /// Returns (compatible, warning). Compatible means same major.minor version.
-    fn check_version_compatibility(
-        daemon_version: &str,
-        client_version: &str,
-    ) -> (bool, Option<String>) {
-        let daemon_parts: Vec<&str> = daemon_version.split('.').collect();
-        let client_parts: Vec<&str> = client_version.split('.').collect();
-
-        if daemon_parts.len() < 2 || client_parts.len() < 2 {
-            return (false, Some("Invalid version format".to_string()));
-        }
-
-        let daemon_major_minor = format!("{}.{}", daemon_parts[0], daemon_parts[1]);
-        let client_major_minor = format!("{}.{}", client_parts[0], client_parts[1]);
-
-        if daemon_major_minor == client_major_minor {
-            (true, None)
-        } else {
-            (
-                false,
-                Some(format!(
-                    "Version mismatch: daemon={daemon_version}, client={client_version}. \
-                     Please upgrade to matching versions."
-                )),
-            )
-        }
-    }
-
-    /// Periodically checks for inactivity and shuts down if timeout exceeded.
-    async fn check_inactivity(self: Arc<Self>) {
-        let timeout = Duration::from_secs(self.config.settings.inactivity_timeout);
-        let check_interval = Duration::from_secs(60);
-
-        loop {
-            tokio::time::sleep(check_interval).await;
-
-            let last_activity = *self.last_activity.read().await;
-            if last_activity.elapsed() > timeout {
-                let inactive_secs = last_activity.elapsed().as_secs();
-                info!(
-                    inactive_seconds = inactive_secs,
-                    timeout_seconds = timeout.as_secs(),
-                    "Shutting down due to inactivity"
-                );
-                let _ = self.shutdown_tx.send(());
-                break;
-            }
-        }
+/// Creates a `ChatError` event from a `DaemonError`.
+fn make_chat_error(err: &DaemonError) -> proto::ChatEvent {
+    proto::ChatEvent {
+        event: Some(proto::chat_event::Event::Error(proto::ChatError {
+            code: daemon_error_to_proto_code(err).into(),
+            message: err.to_string(),
+        })),
     }
 }
 
@@ -751,21 +746,21 @@ mod tests {
 
     #[test]
     fn test_version_compatibility_same_version() {
-        let (compatible, warning) = Server::check_version_compatibility("0.0.6", "0.0.6");
+        let (compatible, warning) = check_version_compatibility("0.0.6", "0.0.6");
         assert!(compatible);
         assert!(warning.is_none());
     }
 
     #[test]
     fn test_version_compatibility_same_major_minor() {
-        let (compatible, warning) = Server::check_version_compatibility("0.0.6", "0.0.7");
+        let (compatible, warning) = check_version_compatibility("0.0.6", "0.0.7");
         assert!(compatible);
         assert!(warning.is_none());
     }
 
     #[test]
     fn test_version_compatibility_different_minor() {
-        let (compatible, warning) = Server::check_version_compatibility("0.1.0", "0.0.6");
+        let (compatible, warning) = check_version_compatibility("0.1.0", "0.0.6");
         assert!(!compatible);
         assert!(warning.is_some());
         assert!(warning.unwrap().contains("Version mismatch"));
@@ -773,14 +768,14 @@ mod tests {
 
     #[test]
     fn test_version_compatibility_different_major() {
-        let (compatible, warning) = Server::check_version_compatibility("1.0.0", "0.0.6");
+        let (compatible, warning) = check_version_compatibility("1.0.0", "0.0.6");
         assert!(!compatible);
         assert!(warning.is_some());
     }
 
     #[test]
     fn test_version_compatibility_invalid_format() {
-        let (compatible, warning) = Server::check_version_compatibility("invalid", "0.0.6");
+        let (compatible, warning) = check_version_compatibility("invalid", "0.0.6");
         assert!(!compatible);
         assert!(warning.is_some());
         assert!(warning.unwrap().contains("Invalid version format"));
@@ -788,7 +783,7 @@ mod tests {
 
     #[test]
     fn test_version_compatibility_short_version() {
-        let (compatible, warning) = Server::check_version_compatibility("0", "0.0.6");
+        let (compatible, warning) = check_version_compatibility("0", "0.0.6");
         assert!(!compatible);
         assert!(warning.is_some());
         assert!(warning.unwrap().contains("Invalid version format"));

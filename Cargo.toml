@@ -8,6 +8,7 @@ members = [
   "crates/neuromance-client",
   "crates/neuromance-tools",
   "crates/neuromance-daemon",
+  "crates/neuromance-proto",
 ]
 
 [workspace.metadata.crane]
@@ -62,6 +63,10 @@ rmcp = { version = "0.14.0", features = [
     "transport-streamable-http-client-reqwest",
 ]}
 url = "2.5"
+tonic = "0.12"
+prost = "0.13"
+tokio-stream = "0.1"
+hyper-util = "0.1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

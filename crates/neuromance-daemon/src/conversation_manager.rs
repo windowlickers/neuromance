@@ -153,7 +153,8 @@ impl ConversationManager {
         );
 
         let conv_id = conversation.id;
-        let bookmarks = self.storage
+        let bookmarks = self
+            .storage
             .run(move |s| s.get_conversation_bookmarks(&conv_id))
             .await?;
         Ok(ConversationSummary::from_conversation(
@@ -199,9 +200,7 @@ impl ConversationManager {
         let _guard = lock.lock().await;
 
         // Load conversation
-        let mut conversation = self.storage
-            .run(move |s| s.load_conversation(&id))
-            .await?;
+        let mut conversation = self.storage.run(move |s| s.load_conversation(&id)).await?;
         debug!(
             conversation_id = %id,
             message_count = conversation.messages.len(),
@@ -503,13 +502,10 @@ impl ConversationManager {
             .run(move |s| {
                 let id = s.resolve_conversation_id(&conv_id_str)?;
                 let conversation = s.load_conversation(&id)?;
-                let bookmarks =
-                    s.get_conversation_bookmarks(&id)?;
-                let removed =
-                    s.remove_bookmarks_for_conversation(&id)?;
+                let bookmarks = s.get_conversation_bookmarks(&id)?;
+                let removed = s.remove_bookmarks_for_conversation(&id)?;
 
-                if let Ok(Some(active_id)) =
-                    s.get_active_conversation()
+                if let Ok(Some(active_id)) = s.get_active_conversation()
                     && active_id == id
                 {
                     s.clear_active_conversation()?;
@@ -522,9 +518,7 @@ impl ConversationManager {
 
         self.populate_model_from_metadata(&conversation);
         let model = self.get_conversation_model(&id);
-        let summary = ConversationSummary::from_conversation(
-            &conversation, model, bookmarks,
-        );
+        let summary = ConversationSummary::from_conversation(&conversation, model, bookmarks);
 
         // Clean up in-memory state
         self.clients.remove(&id);
@@ -554,32 +548,25 @@ impl ConversationManager {
             .run(move |s| {
                 let ids = s.list_conversations()?;
 
-                let mut loaded: Vec<(Uuid, Conversation, Vec<String>)> =
-                    ids.into_iter()
-                        .filter_map(|id| {
-                            match s.load_conversation(&id) {
-                                Ok(conv) => {
-                                    let bm = s
-                                        .get_conversation_bookmarks(&id)
-                                        .ok()
-                                        .unwrap_or_default();
-                                    Some((id, conv, bm))
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        conversation_id = %id,
-                                        error = %e,
-                                        "Skipping unloadable conversation"
-                                    );
-                                    None
-                                }
-                            }
-                        })
-                        .collect();
+                let mut loaded: Vec<(Uuid, Conversation, Vec<String>)> = ids
+                    .into_iter()
+                    .filter_map(|id| match s.load_conversation(&id) {
+                        Ok(conv) => {
+                            let bm = s.get_conversation_bookmarks(&id).ok().unwrap_or_default();
+                            Some((id, conv, bm))
+                        }
+                        Err(e) => {
+                            warn!(
+                                conversation_id = %id,
+                                error = %e,
+                                "Skipping unloadable conversation"
+                            );
+                            None
+                        }
+                    })
+                    .collect();
 
-                loaded.sort_by(|a, b| {
-                    b.1.updated_at.cmp(&a.1.updated_at)
-                });
+                loaded.sort_by(|a, b| b.1.updated_at.cmp(&a.1.updated_at));
 
                 if let Some(limit) = limit {
                     loaded.truncate(limit);
@@ -594,7 +581,9 @@ impl ConversationManager {
             self.populate_model_from_metadata(conv);
             let model = self.get_conversation_model(id);
             summaries.push(ConversationSummary::from_conversation(
-                conv, model, bookmarks.clone(),
+                conv,
+                model,
+                bookmarks.clone(),
             ));
         }
 
@@ -613,17 +602,14 @@ impl ConversationManager {
     ) -> Result<(Vec<Message>, usize, String)> {
         let id = self.resolve_or_active(conversation_id)?;
 
-        let conversation = self.storage
-            .run(move |s| s.load_conversation(&id))
-            .await?;
+        let conversation = self.storage.run(move |s| s.load_conversation(&id)).await?;
         let total_count = conversation.messages.len();
 
         let mut messages = conversation.messages.to_vec();
 
         // Apply limit (most recent first)
         if let Some(limit) = limit {
-            messages =
-                messages.into_iter().rev().take(limit).rev().collect();
+            messages = messages.into_iter().rev().take(limit).rev().collect();
         }
 
         Ok((messages, total_count, id.to_string()))
@@ -642,7 +628,8 @@ impl ConversationManager {
 
     /// Returns the number of persisted conversations.
     pub async fn conversation_count(&self) -> Result<usize> {
-        let count = self.storage
+        let count = self
+            .storage
             .run(|s| Ok(s.list_conversations()?.len()))
             .await?;
         Ok(count)
@@ -676,10 +663,7 @@ impl ConversationManager {
     /// Populates the in-memory model cache from conversation metadata.
     fn populate_model_from_metadata(&self, conversation: &Conversation) {
         if !self.conversation_models.contains_key(&conversation.id)
-            && let Some(model) = conversation
-                .metadata
-                .get("model")
-                .and_then(|v| v.as_str())
+            && let Some(model) = conversation.metadata.get("model").and_then(|v| v.as_str())
         {
             self.conversation_models
                 .insert(conversation.id, model.to_string());

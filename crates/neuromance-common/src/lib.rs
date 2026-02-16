@@ -85,7 +85,7 @@ pub use client::{
     ToolChoice, Usage,
 };
 pub use features::{ReasoningLevel, ThinkingMode};
-pub use protocol::{ConversationSummary, DaemonRequest, DaemonResponse, ErrorCode, ModelProfile};
+pub use protocol::{ConversationSummary, DaemonResponse, ErrorCode, ModelProfile};
 pub use tools::{
     Function, FunctionCall, ObjectSchema, Parameters, Property, Tool, ToolApproval, ToolCall,
 };

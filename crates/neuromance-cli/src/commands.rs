@@ -5,8 +5,8 @@ use std::io::Write;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use colored::Colorize;
-use neuromance_common::protocol::{DaemonRequest, DaemonResponse};
-use neuromance_common::{ToolApproval, ToolCall};
+use neuromance_common::ToolApproval;
+use neuromance_proto::{conversation_summary_from_proto, proto};
 use rustyline::DefaultEditor;
 use serde_json::json;
 
@@ -17,10 +17,10 @@ use crate::display::{
 use crate::theme::Theme;
 
 /// Prompts the user to approve, deny, or quit a tool call.
-///
-/// Returns the user's approval decision.
-fn prompt_tool_approval(tool_call: &ToolCall, theme: &Theme) -> Result<ToolApproval> {
-    // Display the tool request
+fn prompt_tool_approval(
+    tool_call: &neuromance_common::ToolCall,
+    theme: &Theme,
+) -> Result<ToolApproval> {
     display_tool_call_request(tool_call, theme);
 
     let args_display = tool_call.function.arguments_json();
@@ -31,7 +31,8 @@ fn prompt_tool_approval(tool_call: &ToolCall, theme: &Theme) -> Result<ToolAppro
     );
     println!("  {}", args_display.bright_cyan());
     println!(
-        "{} /yes or /y to approve, /no or /n to deny, /quit or /q to abort",
+        "{} /yes or /y to approve, /no or /n to deny, \
+         /quit or /q to abort",
         "→".bright_yellow()
     );
 
@@ -61,7 +62,8 @@ fn prompt_tool_approval(tool_call: &ToolCall, theme: &Theme) -> Result<ToolAppro
                     }
                     _ => {
                         println!(
-                            "{} Invalid response. Use /yes, /no, or /quit",
+                            "{} Invalid response. \
+                             Use /yes, /no, or /quit",
                             "!".bright_yellow().bold()
                         );
                     }
@@ -84,7 +86,7 @@ fn prompt_tool_approval(tool_call: &ToolCall, theme: &Theme) -> Result<ToolAppro
 
 /// Sends a message to a conversation.
 ///
-/// Returns the conversation ID from the completed message response,
+/// Returns the conversation ID from the completed message,
 /// so callers can pin subsequent messages to the same conversation.
 pub async fn send_message(
     client: &mut DaemonClient,
@@ -92,70 +94,38 @@ pub async fn send_message(
     message: String,
     theme: &Theme,
 ) -> Result<Option<String>> {
-    let request = DaemonRequest::SendMessage {
-        conversation_id,
-        content: message,
-    };
-
-    client.send_request(&request).await?;
+    let mut session = client.chat(conversation_id, message).await?;
 
     display_assistant_header(theme);
 
-    // Read streaming responses with manual loop to handle async tool approval
     let mut resolved_id = None;
     loop {
-        let response = client.read_response().await?;
+        let Some(event) = session.next_event().await? else {
+            break;
+        };
 
-        match response {
-            DaemonResponse::StreamChunk { content, .. } => {
-                print!("{content}");
+        match event.event {
+            Some(proto::chat_event::Event::StreamChunk(chunk)) => {
+                print!("{}", chunk.content);
                 let _ = std::io::stdout().flush();
             }
-            DaemonResponse::ToolApprovalRequest {
-                conversation_id,
-                tool_call,
-            } => {
-                // Prompt user for approval
-                let approval = prompt_tool_approval(&tool_call, theme)?;
+            Some(proto::chat_event::Event::ToolApprovalRequest(req)) => {
+                if let Some(tc_proto) = req.tool_call {
+                    let tc = neuromance_common::ToolCall::from(tc_proto);
+                    let approval = prompt_tool_approval(&tc, theme)?;
 
-                // Send approval back to daemon
-                let approval_request = DaemonRequest::ToolApproval {
-                    conversation_id,
-                    tool_call_id: tool_call.id.clone(),
-                    approval,
-                };
-                client.send_request(&approval_request).await?;
-
-                // Check the approval response for errors
-                match client.read_response().await? {
-                    DaemonResponse::Error { message, .. } => {
-                        eprintln!(
-                            "\n{} {message}",
-                            "Error:".bright_red()
-                        );
-                        break;
-                    }
-                    DaemonResponse::Success { .. } => {}
-                    other => {
-                        eprintln!(
-                            "\n{} Unexpected response after tool approval: {other:?}",
-                            "Warning:".bright_yellow()
-                        );
-                    }
+                    session
+                        .send_tool_approval(req.conversation_id, tc.id, approval)
+                        .await?;
                 }
             }
-            DaemonResponse::ToolResult {
-                tool_name,
-                result,
-                success,
-                ..
-            } => {
-                display_tool_result(&tool_name, &result, success, theme);
+            Some(proto::chat_event::Event::ToolResult(tr)) => {
+                display_tool_result(&tr.tool_name, &tr.result, tr.success, theme);
             }
-            DaemonResponse::Usage { usage, .. } => {
-                let total = usage.total_tokens.to_string();
-                let input = usage.prompt_tokens.to_string();
-                let output = usage.completion_tokens.to_string();
+            Some(proto::chat_event::Event::Usage(u)) => {
+                let total = u.total_tokens.to_string();
+                let input = u.prompt_tokens.to_string();
+                let output = u.completion_tokens.to_string();
                 println!(
                     "{}",
                     theme.usage_tokens.render(&[
@@ -165,23 +135,16 @@ pub async fn send_message(
                     ])
                 );
             }
-            DaemonResponse::MessageCompleted {
-                conversation_id, ..
-            } => {
-                resolved_id = Some(conversation_id);
+            Some(proto::chat_event::Event::MessageCompleted(mc)) => {
+                resolved_id = Some(mc.conversation_id);
                 display_assistant_end(theme);
                 break;
             }
-            DaemonResponse::Error { message, .. } => {
-                eprintln!("\n{} {message}", "Error:".bright_red());
+            Some(proto::chat_event::Event::Error(e)) => {
+                eprintln!("\n{} {}", "Error:".bright_red(), e.message);
                 break;
             }
-            other => {
-                eprintln!(
-                    "\n{} Unexpected response during streaming: {other:?}",
-                    "Warning:".bright_yellow()
-                );
-            }
+            None => {}
         }
     }
 
@@ -194,33 +157,18 @@ pub async fn new_conversation(
     model: Option<String>,
     system_message: Option<String>,
 ) -> Result<()> {
-    let request = DaemonRequest::NewConversation {
-        model,
-        system_message,
-    };
+    let resp = client.new_conversation(model, system_message).await?;
 
-    client.send_request(&request).await?;
-
-    let response = client.read_response().await?;
-
-    match response {
-        DaemonResponse::ConversationCreated { conversation } => {
-            println!(
-                "{} Created conversation {}",
-                "✓".bright_green(),
-                conversation.short_id.bright_cyan()
-            );
-            if let Some(title) = conversation.title {
-                println!("  Title: {title}");
-            }
-            println!("  Model: {}", conversation.model.bright_yellow());
+    if let Some(conv) = resp.conversation {
+        println!(
+            "{} Created conversation {}",
+            "✓".bright_green(),
+            conv.short_id.bright_cyan()
+        );
+        if let Some(title) = conv.title {
+            println!("  Title: {title}");
         }
-        DaemonResponse::Error { message, .. } => {
-            eprintln!("{} {message}", "Error:".bright_red());
-        }
-        _ => {
-            eprintln!("{} Unexpected response", "Error:".bright_red());
-        }
+        println!("  Model: {}", conv.model.bright_yellow());
     }
 
     Ok(())
@@ -232,57 +180,42 @@ pub async fn list_messages(
     conversation_id: Option<String>,
     limit: Option<usize>,
 ) -> Result<()> {
-    let request = DaemonRequest::ListMessages {
-        conversation_id,
-        limit,
-    };
+    let resp = client.list_messages(conversation_id, limit).await?;
 
-    client.send_request(&request).await?;
+    if resp.messages.is_empty() {
+        println!("No messages in this conversation");
+        return Ok(());
+    }
 
-    let response = client.read_response().await?;
+    println!(
+        "Showing {} of {} messages:",
+        resp.messages.len(),
+        resp.total_count
+    );
+    println!();
 
-    match response {
-        DaemonResponse::Messages {
-            messages,
-            total_count,
-            ..
-        } => {
-            if messages.is_empty() {
-                println!("No messages in this conversation");
-                return Ok(());
-            }
+    for msg in resp.messages {
+        let role =
+            proto::MessageRole::try_from(msg.role).unwrap_or(proto::MessageRole::Unspecified);
+        let role_str = match role {
+            proto::MessageRole::System => "System".bright_blue(),
+            proto::MessageRole::User => "User".bright_green(),
+            proto::MessageRole::Assistant => "Assistant".bright_magenta(),
+            proto::MessageRole::Tool => "Tool".bright_yellow(),
+            proto::MessageRole::Unspecified => "Unknown".bright_white(),
+        };
 
-            println!("Showing {} of {} messages:", messages.len(), total_count);
-            println!();
+        println!("{} {}", "●".bright_white(), role_str.bold());
 
-            for msg in messages {
-                let role_str = match msg.role {
-                    neuromance_common::MessageRole::System => "System".bright_blue(),
-                    neuromance_common::MessageRole::User => "User".bright_green(),
-                    neuromance_common::MessageRole::Assistant => "Assistant".bright_magenta(),
-                    neuromance_common::MessageRole::Tool => "Tool".bright_yellow(),
-                    _ => "Unknown".bright_white(),
-                };
-
-                println!("{} {}", "●".bright_white(), role_str.bold());
-
-                if !msg.content.is_empty() {
-                    println!("  {}", truncate_chars(&msg.content, 200));
-                }
-
-                if !msg.tool_calls.is_empty() {
-                    println!("  {} tool calls", msg.tool_calls.len());
-                }
-
-                println!();
-            }
+        if !msg.content.is_empty() {
+            println!("  {}", truncate_chars(&msg.content, 200));
         }
-        DaemonResponse::Error { message, .. } => {
-            eprintln!("{} {message}", "Error:".bright_red());
+
+        if !msg.tool_calls.is_empty() {
+            println!("  {} tool calls", msg.tool_calls.len());
         }
-        _ => {
-            eprintln!("{} Unexpected response", "Error:".bright_red());
-        }
+
+        println!();
     }
 
     Ok(())
@@ -290,48 +223,34 @@ pub async fn list_messages(
 
 /// Lists all conversations.
 pub async fn list_conversations(client: &mut DaemonClient, limit: Option<usize>) -> Result<()> {
-    let request = DaemonRequest::ListConversations { limit };
+    let resp = client.list_conversations(limit).await?;
 
-    client.send_request(&request).await?;
+    if resp.conversations.is_empty() {
+        println!("No conversations found");
+        return Ok(());
+    }
 
-    let response = client.read_response().await?;
+    println!("Conversations:");
+    println!();
 
-    match response {
-        DaemonResponse::Conversations { conversations } => {
-            if conversations.is_empty() {
-                println!("No conversations found");
-                return Ok(());
-            }
+    for conv in resp.conversations {
+        let id_display = conv.short_id.bright_cyan();
+        let model_display = conv.model.bright_yellow();
 
-            println!("Conversations:");
-            println!();
+        print!("{} {} ({})", "●".bright_white(), id_display, model_display);
 
-            for conv in conversations {
-                let id_display = conv.short_id.bright_cyan();
-                let model_display = conv.model.bright_yellow();
-
-                print!("{} {} ({})", "●".bright_white(), id_display, model_display);
-
-                if let Some(title) = conv.title {
-                    print!(" - {title}");
-                }
-
-                println!();
-
-                if !conv.bookmarks.is_empty() {
-                    println!("  Bookmarks: {}", conv.bookmarks.join(", "));
-                }
-
-                println!("  {} messages", conv.message_count);
-                println!();
-            }
+        if let Some(title) = conv.title {
+            print!(" - {title}");
         }
-        DaemonResponse::Error { message, .. } => {
-            eprintln!("{} {message}", "Error:".bright_red());
+
+        println!();
+
+        if !conv.bookmarks.is_empty() {
+            println!("  Bookmarks: {}", conv.bookmarks.join(", "));
         }
-        _ => {
-            eprintln!("{} Unexpected response", "Error:".bright_red());
-        }
+
+        println!("  {} messages", conv.message_count);
+        println!();
     }
 
     Ok(())
@@ -343,50 +262,15 @@ pub async fn set_bookmark(
     conversation_id: String,
     name: String,
 ) -> Result<()> {
-    let request = DaemonRequest::SetBookmark {
-        conversation_id,
-        name,
-    };
-
-    client.send_request(&request).await?;
-
-    let response = client.read_response().await?;
-
-    match response {
-        DaemonResponse::Success { message } => {
-            println!("{} {message}", "✓".bright_green());
-        }
-        DaemonResponse::Error { message, .. } => {
-            eprintln!("{} {message}", "Error:".bright_red());
-        }
-        _ => {
-            eprintln!("{} Unexpected response", "Error:".bright_red());
-        }
-    }
-
+    let resp = client.set_bookmark(conversation_id, name).await?;
+    println!("{} {}", "✓".bright_green(), resp.message);
     Ok(())
 }
 
 /// Removes a bookmark.
 pub async fn remove_bookmark(client: &mut DaemonClient, name: String) -> Result<()> {
-    let request = DaemonRequest::RemoveBookmark { name };
-
-    client.send_request(&request).await?;
-
-    let response = client.read_response().await?;
-
-    match response {
-        DaemonResponse::Success { message } => {
-            println!("{} {message}", "✓".bright_green());
-        }
-        DaemonResponse::Error { message, .. } => {
-            eprintln!("{} {message}", "Error:".bright_red());
-        }
-        _ => {
-            eprintln!("{} Unexpected response", "Error:".bright_red());
-        }
-    }
-
+    let resp = client.remove_bookmark(name).await?;
+    println!("{} {}", "✓".bright_green(), resp.message);
     Ok(())
 }
 
@@ -412,103 +296,48 @@ pub async fn delete_conversation(
         }
     }
 
-    let request = DaemonRequest::DeleteConversation { conversation_id };
-    client.send_request(&request).await?;
-
-    let response = client.read_response().await?;
-
-    match response {
-        DaemonResponse::Success { message } => {
-            println!("{} {message}", "✓".bright_green());
-        }
-        DaemonResponse::Error { message, .. } => {
-            eprintln!("{} {message}", "Error:".bright_red());
-        }
-        _ => {
-            eprintln!("{} Unexpected response", "Error:".bright_red());
-        }
-    }
-
+    let resp = client.delete_conversation(conversation_id).await?;
+    println!("{} {}", "✓".bright_green(), resp.message);
     Ok(())
 }
 
 /// Gets daemon status.
 pub async fn daemon_status(client: &mut DaemonClient) -> Result<()> {
-    let request = DaemonRequest::Status;
-
-    client.send_request(&request).await?;
-
-    let response = client.read_response().await?;
-
-    match response {
-        DaemonResponse::Status {
-            uptime_seconds,
-            active_conversations,
-            ..
-        } => {
-            println!("{} Daemon is running", "✓".bright_green());
-            println!("  Uptime: {uptime_seconds}s");
-            println!("  Active conversations: {active_conversations}");
-        }
-        DaemonResponse::Error { message, .. } => {
-            eprintln!("{} {message}", "Error:".bright_red());
-        }
-        _ => {
-            eprintln!("{} Unexpected response", "Error:".bright_red());
-        }
-    }
-
+    let resp = client.get_status().await?;
+    println!("{} Daemon is running", "✓".bright_green());
+    println!("  Uptime: {}s", resp.uptime_seconds);
+    println!("  Active conversations: {}", resp.active_conversations);
     Ok(())
 }
 
 /// Checks daemon health and version compatibility.
 pub async fn daemon_health(client: &mut DaemonClient) -> Result<()> {
-    let client_version = env!("CARGO_PKG_VERSION").to_string();
-    let request = DaemonRequest::Health { client_version };
+    let resp = client.health_check().await?;
 
-    client.send_request(&request).await?;
+    if resp.compatible {
+        println!("{} Daemon is healthy", "✓".bright_green());
+    } else {
+        println!("{} Version compatibility issue", "⚠".bright_yellow());
+    }
 
-    let response = client.read_response().await?;
-
-    match response {
-        DaemonResponse::Health {
-            daemon_version,
-            compatible,
-            warning,
-            uptime_seconds,
-        } => {
-            if compatible {
-                println!("{} Daemon is healthy", "✓".bright_green());
-            } else {
-                println!("{} Version compatibility issue", "⚠".bright_yellow());
-            }
-
-            println!("  Daemon version: {}", daemon_version.bright_cyan());
-            println!(
-                "  Client version: {}",
-                env!("CARGO_PKG_VERSION").bright_cyan()
-            );
-            println!(
-                "  Compatible: {}",
-                if compatible {
-                    "yes".bright_green()
-                } else {
-                    "no".bright_red()
-                }
-            );
-            println!("  Uptime: {uptime_seconds}s");
-
-            if let Some(warning_msg) = warning {
-                println!();
-                println!("{} {}", "Warning:".bright_yellow(), warning_msg);
-            }
+    println!("  Daemon version: {}", resp.daemon_version.bright_cyan());
+    println!(
+        "  Client version: {}",
+        env!("CARGO_PKG_VERSION").bright_cyan()
+    );
+    println!(
+        "  Compatible: {}",
+        if resp.compatible {
+            "yes".bright_green()
+        } else {
+            "no".bright_red()
         }
-        DaemonResponse::Error { message, .. } => {
-            eprintln!("{} {message}", "Error:".bright_red());
-        }
-        _ => {
-            eprintln!("{} Unexpected response", "Error:".bright_red());
-        }
+    );
+    println!("  Uptime: {}s", resp.uptime_seconds);
+
+    if let Some(warning_msg) = resp.warning {
+        println!();
+        println!("{} {}", "Warning:".bright_yellow(), warning_msg);
     }
 
     Ok(())
@@ -516,50 +345,32 @@ pub async fn daemon_health(client: &mut DaemonClient) -> Result<()> {
 
 /// Shuts down the daemon.
 pub async fn shutdown_daemon(client: &mut DaemonClient) -> Result<()> {
-    let request = DaemonRequest::Shutdown;
-
-    client.send_request(&request).await?;
-
+    let _ = client.shutdown().await?;
     println!("{} Daemon shutdown requested", "✓".bright_green());
-
     Ok(())
 }
 
 /// Lists available models.
 pub async fn list_models(client: &mut DaemonClient) -> Result<()> {
-    let request = DaemonRequest::ListModels;
+    let resp = client.list_models().await?;
 
-    client.send_request(&request).await?;
+    println!("Available models:");
+    println!();
 
-    let response = client.read_response().await?;
+    for model in resp.models {
+        let marker = if model.nickname == resp.active {
+            "●".bright_green()
+        } else {
+            "○".bright_white()
+        };
 
-    match response {
-        DaemonResponse::Models { models, active } => {
-            println!("Available models:");
-            println!();
-
-            for model in models {
-                let marker = if model.nickname == active {
-                    "●".bright_green()
-                } else {
-                    "○".bright_white()
-                };
-
-                println!(
-                    "{} {} ({} / {})",
-                    marker,
-                    model.nickname.bright_cyan(),
-                    model.provider.bright_yellow(),
-                    model.model
-                );
-            }
-        }
-        DaemonResponse::Error { message, .. } => {
-            eprintln!("{} {message}", "Error:".bright_red());
-        }
-        _ => {
-            eprintln!("{} Unexpected response", "Error:".bright_red());
-        }
+        println!(
+            "{} {} ({} / {})",
+            marker,
+            model.nickname.bright_cyan(),
+            model.provider.bright_yellow(),
+            model.model
+        );
     }
 
     Ok(())
@@ -571,76 +382,42 @@ pub async fn switch_model(
     conversation_id: Option<String>,
     model_nickname: String,
 ) -> Result<()> {
-    let request = DaemonRequest::SwitchModel {
-        conversation_id,
-        model_nickname,
-    };
+    let resp = client.switch_model(conversation_id, model_nickname).await?;
 
-    client.send_request(&request).await?;
-
-    let response = client.read_response().await?;
-
-    match response {
-        DaemonResponse::ModelSwitched { conversation } => {
-            println!(
-                "{} Switched to model {}",
-                "✓".bright_green(),
-                conversation.model.bright_yellow()
-            );
-            println!(
-                "  {} {}",
-                "Conversation:".dimmed(),
-                conversation.short_id.bright_cyan()
-            );
-        }
-        DaemonResponse::Error { message, .. } => {
-            eprintln!("{} {message}", "Error:".bright_red());
-        }
-        _ => {
-            eprintln!("{} Unexpected response", "Error:".bright_red());
-        }
+    if let Some(conv) = resp.conversation {
+        println!(
+            "{} Switched to model {}",
+            "✓".bright_green(),
+            conv.model.bright_yellow()
+        );
+        println!(
+            "  {} {}",
+            "Conversation:".dimmed(),
+            conv.short_id.bright_cyan()
+        );
     }
 
     Ok(())
 }
 
-/// Shows comprehensive status (daemon + current conversation).
+/// Shows comprehensive status.
+#[allow(clippy::cast_possible_truncation)]
 pub async fn status(client: &mut DaemonClient, json: bool) -> Result<()> {
-    let request = DaemonRequest::DetailedStatus;
-    client.send_request(&request).await?;
-    let response = client.read_response().await?;
+    let resp = client.get_detailed_status().await?;
+    let active = resp.active_conversations as usize;
 
-    match response {
-        DaemonResponse::Status {
-            uptime_seconds,
-            active_conversations,
-            current_conversation,
-        } => {
-            if json {
-                print_status_json(
-                    true,
-                    Some(uptime_seconds),
-                    active_conversations,
-                    current_conversation.as_ref(),
-                )?;
-            } else {
-                print_status_human(uptime_seconds, active_conversations, current_conversation);
-            }
-        }
-        DaemonResponse::Error { message, .. } => {
-            if json {
-                eprintln!(r#"{{"error":"{}"}}"#, message.replace('"', r#"\""#));
-            } else {
-                eprintln!("{} {message}", "Error:".bright_red());
-            }
-        }
-        _ => {
-            if json {
-                eprintln!(r#"{{"error":"Unexpected response"}}"#);
-            } else {
-                eprintln!("{} Unexpected response", "Error:".bright_red());
-            }
-        }
+    if json {
+        let current = resp
+            .current_conversation
+            .and_then(|cs| conversation_summary_from_proto(cs).ok());
+
+        print_status_json(true, Some(resp.uptime_seconds), active, current.as_ref())?;
+    } else {
+        let current = resp
+            .current_conversation
+            .and_then(|cs| conversation_summary_from_proto(cs).ok());
+
+        print_status_human(resp.uptime_seconds, active, current);
     }
 
     Ok(())
@@ -720,7 +497,7 @@ fn print_status_json(
     Ok(())
 }
 
-/// Formats duration as human-readable string (e.g., "1h 5m 23s").
+/// Formats duration as human-readable string.
 fn format_duration(seconds: u64) -> String {
     let hours = seconds / 3600;
     let minutes = (seconds % 3600) / 60;
@@ -735,7 +512,7 @@ fn format_duration(seconds: u64) -> String {
     }
 }
 
-/// Formats relative time (e.g., "5 minutes ago").
+/// Formats relative time.
 fn format_relative_time(timestamp: DateTime<Utc>) -> String {
     let now = Utc::now();
     let diff = now.signed_duration_since(timestamp);
@@ -751,8 +528,7 @@ fn format_relative_time(timestamp: DateTime<Utc>) -> String {
     }
 }
 
-/// Truncates a string to at most `max_chars` characters, respecting
-/// UTF-8 character boundaries. Returns the original string if shorter.
+/// Truncates a string to at most `max_chars` characters.
 fn truncate_chars(s: &str, max_chars: usize) -> String {
     if s.len() <= max_chars {
         return s.to_string();
@@ -842,20 +618,17 @@ mod tests {
     fn truncate_chars_ascii() {
         let long = "a".repeat(300);
         let result = truncate_chars(&long, 200);
-        assert_eq!(result.len(), 203); // 200 chars + "..."
+        assert_eq!(result.len(), 203);
         assert!(result.ends_with("..."));
     }
 
     #[test]
     fn truncate_chars_multibyte_utf8() {
-        // Each emoji is 4 bytes. 50 emojis = 200 bytes but only 50 chars.
         let emojis = "\u{1F600}".repeat(50);
         let result = truncate_chars(&emojis, 10);
-        // Should truncate to 10 characters (40 bytes) + "..."
         assert!(result.ends_with("..."));
-        // Count actual chars (minus the 3 dots)
         let char_count = result.chars().count();
-        assert_eq!(char_count, 13); // 10 emojis + 3 dots
+        assert_eq!(char_count, 13);
     }
 
     #[test]
@@ -865,10 +638,8 @@ mod tests {
 
     #[test]
     fn truncate_chars_mixed_utf8() {
-        // Mix of 1-byte, 2-byte, 3-byte, and 4-byte chars
         let mixed = "aé中\u{1F600}".repeat(60);
         let result = truncate_chars(&mixed, 200);
         assert!(result.ends_with("..."));
-        // Should not panic — that's the main test
     }
 }

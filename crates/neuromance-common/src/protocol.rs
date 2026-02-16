@@ -1,137 +1,16 @@
-//! Daemon/client communication protocol for Neuromance.
+//! Domain types for daemon/client communication.
 //!
-//! This module defines the line-delimited JSON protocol used for communication
-//! between the lightweight `nm` CLI client and the long-running `neuromance-daemon`.
-//! The protocol supports streaming responses, tool approval, and conversation management.
-//!
-//! # Wire Format
-//!
-//! Messages are sent as line-delimited JSON over a Unix socket. Each message is:
-//! 1. Serialized to JSON
-//! 2. Followed by a newline character (`\n`)
-//!
-//! # Example Flow
-//!
-//! ```text
-//! Client → Daemon: {"SendMessage":{"conversation_id":null,"content":"Hello"}}
-//! Daemon → Client: {"StreamChunk":{"conversation_id":"abc123","content":"Hi"}}
-//! Daemon → Client: {"StreamChunk":{"conversation_id":"abc123","content":" there"}}
-//! Daemon → Client: {"MessageCompleted":{"conversation_id":"abc123","message":{...}}}
-//! ```
+//! Defines internal event types used by the daemon's conversation manager,
+//! domain value objects (`ConversationSummary`, `ModelProfile`, `ErrorCode`),
+//! and the `DaemonResponse` event enum for streaming results through mpsc channels.
+//! The wire protocol is defined separately in `neuromance-proto` using gRPC/protobuf.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::chat::Message;
 use crate::client::Usage;
-use crate::tools::{ToolApproval, ToolCall};
-
-/// Requests sent from the client to the daemon.
-///
-/// These represent user actions like sending messages, creating conversations,
-/// or managing daemon state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[non_exhaustive]
-pub enum DaemonRequest {
-    /// Send a message to a conversation and receive streaming response.
-    ///
-    /// If `conversation_id` is `None`, the active conversation is used.
-    SendMessage {
-        /// The conversation to send to (or None for active conversation)
-        conversation_id: Option<String>,
-        /// The message content
-        content: String,
-    },
-
-    /// Create a new conversation.
-    ///
-    /// Returns a `ConversationCreated` response with the new conversation details.
-    NewConversation {
-        /// Optional model nickname to use (defaults to active model)
-        model: Option<String>,
-        /// Optional system message to initialize the conversation
-        system_message: Option<String>,
-    },
-
-    /// List messages from a conversation.
-    ///
-    /// If `conversation_id` is `None`, the active conversation is used.
-    ListMessages {
-        /// The conversation to list from (or None for active conversation)
-        conversation_id: Option<String>,
-        /// Maximum number of messages to return (most recent first)
-        limit: Option<usize>,
-    },
-
-    /// List all conversations.
-    ListConversations {
-        /// Maximum number of conversations to return (most recent first)
-        limit: Option<usize>,
-    },
-
-    /// Set a bookmark (name) for a conversation.
-    SetBookmark {
-        /// The conversation ID (full UUID or short hash)
-        conversation_id: String,
-        /// The bookmark name
-        name: String,
-    },
-
-    /// Remove a bookmark.
-    RemoveBookmark {
-        /// The bookmark name to remove
-        name: String,
-    },
-
-    /// Switch the model for a conversation.
-    ///
-    /// If `conversation_id` is `None`, switches the active conversation's model.
-    SwitchModel {
-        /// The conversation to switch (or None for active conversation)
-        conversation_id: Option<String>,
-        /// The model nickname to switch to
-        model_nickname: String,
-    },
-
-    /// List available model profiles.
-    ListModels,
-
-    /// Respond to a tool approval request.
-    ///
-    /// This completes a pending tool approval operation.
-    ToolApproval {
-        /// The conversation ID
-        conversation_id: String,
-        /// The tool call ID being approved/denied
-        tool_call_id: String,
-        /// The approval decision
-        approval: ToolApproval,
-    },
-
-    /// Get daemon status (uptime, active conversations, etc.)
-    Status,
-
-    /// Request detailed status including current conversation.
-    DetailedStatus,
-
-    /// Check daemon health and version compatibility.
-    ///
-    /// Returns health status and version information. The client should include
-    /// its own version in the request for compatibility checking.
-    Health {
-        /// Client version for compatibility checking
-        client_version: String,
-    },
-
-    /// Delete a conversation and its associated bookmarks.
-    DeleteConversation {
-        /// The conversation ID (full UUID, short hash, or bookmark name)
-        conversation_id: String,
-    },
-
-    /// Request graceful daemon shutdown.
-    Shutdown,
-}
+use crate::tools::ToolCall;
 
 /// Machine-readable error codes for programmatic error handling.
 ///
@@ -164,11 +43,9 @@ pub enum ErrorCode {
     Internal,
 }
 
-/// Responses sent from the daemon to the client.
+/// Internal events sent from the conversation manager through mpsc channels.
 ///
-/// These include streaming content, tool results, conversation metadata,
-/// and success/error notifications. Multiple responses may be sent for a
-/// single request (e.g., streaming chunks followed by completion).
+/// The gRPC server bridge converts these into proto `ChatEvent` messages.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum DaemonResponse {
@@ -193,8 +70,6 @@ pub enum DaemonResponse {
     },
 
     /// Request for user approval of a tool call.
-    ///
-    /// The daemon will block waiting for a `ToolApproval` request in response.
     ToolApprovalRequest {
         /// The conversation requiring approval
         conversation_id: String,
@@ -216,71 +91,6 @@ pub enum DaemonResponse {
         conversation_id: String,
         /// The completed assistant message
         message: Box<Message>,
-    },
-
-    /// A new conversation was created.
-    ConversationCreated {
-        /// Summary of the newly created conversation
-        conversation: ConversationSummary,
-    },
-
-    /// Model was switched for a conversation.
-    ModelSwitched {
-        /// Updated conversation summary with the new model
-        conversation: ConversationSummary,
-    },
-
-    /// List of messages from a conversation.
-    Messages {
-        /// The conversation these messages belong to
-        conversation_id: String,
-        /// The messages (most recent first if limited)
-        messages: Vec<Message>,
-        /// Total message count in the conversation
-        total_count: usize,
-    },
-
-    /// List of conversations.
-    Conversations {
-        /// Conversation summaries (most recent first if limited)
-        conversations: Vec<ConversationSummary>,
-    },
-
-    /// List of available model profiles.
-    Models {
-        /// Available model profiles
-        models: Vec<ModelProfile>,
-        /// Nickname of the active model
-        active: String,
-    },
-
-    /// Daemon status information.
-    Status {
-        /// How long the daemon has been running (in seconds)
-        uptime_seconds: u64,
-        /// Number of currently active conversations
-        active_conversations: usize,
-        /// Current/active conversation details (if any)
-        #[serde(skip_serializing_if = "Option::is_none")]
-        current_conversation: Option<ConversationSummary>,
-    },
-
-    /// Daemon health check response.
-    Health {
-        /// Daemon version
-        daemon_version: String,
-        /// Whether the client version is compatible
-        compatible: bool,
-        /// Optional compatibility warning message
-        warning: Option<String>,
-        /// Daemon uptime in seconds
-        uptime_seconds: u64,
-    },
-
-    /// A successful operation (generic success).
-    Success {
-        /// Description of what succeeded
-        message: String,
     },
 
     /// An error occurred.
@@ -326,12 +136,6 @@ pub struct ConversationSummary {
 
 impl ConversationSummary {
     /// Creates a conversation summary from a conversation and model.
-    ///
-    /// # Arguments
-    ///
-    /// * `conversation` - The conversation to summarize
-    /// * `model` - The model nickname
-    /// * `bookmarks` - Bookmark names for this conversation
     #[must_use]
     pub fn from_conversation(
         conversation: &crate::chat::Conversation,
@@ -384,30 +188,6 @@ mod tests {
     #![allow(clippy::panic)]
 
     use super::*;
-    use uuid::Uuid;
-
-    #[test]
-    fn test_daemon_request_serialization() {
-        let request = DaemonRequest::SendMessage {
-            conversation_id: None,
-            content: "Hello".to_string(),
-        };
-
-        let json = serde_json::to_string(&request).expect("Failed to serialize");
-        let deserialized: DaemonRequest =
-            serde_json::from_str(&json).expect("Failed to deserialize");
-
-        match deserialized {
-            DaemonRequest::SendMessage {
-                conversation_id,
-                content,
-            } => {
-                assert!(conversation_id.is_none());
-                assert_eq!(content, "Hello");
-            }
-            _ => panic!("Wrong variant"),
-        }
-    }
 
     #[test]
     fn test_daemon_response_serialization() {
@@ -475,7 +255,7 @@ mod tests {
     #[test]
     fn test_tool_approval_request_response() {
         let tool_call = ToolCall::new("test_tool", vec!["arg1".to_string()]);
-        let conv_id = Uuid::new_v4().to_string();
+        let conv_id = uuid::Uuid::new_v4().to_string();
 
         let response = DaemonResponse::ToolApprovalRequest {
             conversation_id: conv_id.clone(),
@@ -493,125 +273,6 @@ mod tests {
             } => {
                 assert_eq!(conversation_id, conv_id);
                 assert_eq!(tc.function.name, "test_tool");
-            }
-            _ => panic!("Wrong variant"),
-        }
-    }
-
-    #[test]
-    fn test_line_delimited_json_format() {
-        // Simulate line-delimited JSON wire format
-        let request1 = DaemonRequest::Status;
-        let request2 = DaemonRequest::ListConversations { limit: Some(10) };
-
-        let json_line1 = format!("{}\n", serde_json::to_string(&request1).unwrap());
-        let json_line2 = format!("{}\n", serde_json::to_string(&request2).unwrap());
-
-        let wire_data = format!("{json_line1}{json_line2}");
-
-        // Parse line by line
-        let lines: Vec<&str> = wire_data.lines().collect();
-        assert_eq!(lines.len(), 2);
-
-        let parsed1: DaemonRequest = serde_json::from_str(lines[0]).unwrap();
-        let parsed2: DaemonRequest = serde_json::from_str(lines[1]).unwrap();
-
-        assert!(matches!(parsed1, DaemonRequest::Status));
-        assert!(matches!(
-            parsed2,
-            DaemonRequest::ListConversations { limit: Some(10) }
-        ));
-    }
-
-    #[test]
-    fn test_delete_conversation_serialization() {
-        let request = DaemonRequest::DeleteConversation {
-            conversation_id: "abc1234".to_string(),
-        };
-
-        let json = serde_json::to_string(&request).expect("Failed to serialize");
-        let deserialized: DaemonRequest =
-            serde_json::from_str(&json).expect("Failed to deserialize");
-
-        match deserialized {
-            DaemonRequest::DeleteConversation { conversation_id } => {
-                assert_eq!(conversation_id, "abc1234");
-            }
-            _ => panic!("Wrong variant"),
-        }
-    }
-
-    #[test]
-    fn test_health_request_serialization() {
-        let request = DaemonRequest::Health {
-            client_version: "0.0.6".to_string(),
-        };
-
-        let json = serde_json::to_string(&request).expect("Failed to serialize");
-        let deserialized: DaemonRequest =
-            serde_json::from_str(&json).expect("Failed to deserialize");
-
-        match deserialized {
-            DaemonRequest::Health { client_version } => {
-                assert_eq!(client_version, "0.0.6");
-            }
-            _ => panic!("Wrong variant"),
-        }
-    }
-
-    #[test]
-    fn test_health_response_serialization() {
-        let response = DaemonResponse::Health {
-            daemon_version: "0.0.6".to_string(),
-            compatible: true,
-            warning: None,
-            uptime_seconds: 3600,
-        };
-
-        let json = serde_json::to_string(&response).expect("Failed to serialize");
-        let deserialized: DaemonResponse =
-            serde_json::from_str(&json).expect("Failed to deserialize");
-
-        match deserialized {
-            DaemonResponse::Health {
-                daemon_version,
-                compatible,
-                warning,
-                uptime_seconds,
-            } => {
-                assert_eq!(daemon_version, "0.0.6");
-                assert!(compatible);
-                assert!(warning.is_none());
-                assert_eq!(uptime_seconds, 3600);
-            }
-            _ => panic!("Wrong variant"),
-        }
-    }
-
-    #[test]
-    fn test_health_response_with_warning() {
-        let response = DaemonResponse::Health {
-            daemon_version: "0.1.0".to_string(),
-            compatible: false,
-            warning: Some("Version mismatch".to_string()),
-            uptime_seconds: 1800,
-        };
-
-        let json = serde_json::to_string(&response).expect("Failed to serialize");
-        let deserialized: DaemonResponse =
-            serde_json::from_str(&json).expect("Failed to deserialize");
-
-        match deserialized {
-            DaemonResponse::Health {
-                daemon_version,
-                compatible,
-                warning,
-                uptime_seconds,
-            } => {
-                assert_eq!(daemon_version, "0.1.0");
-                assert!(!compatible);
-                assert_eq!(warning, Some("Version mismatch".to_string()));
-                assert_eq!(uptime_seconds, 1800);
             }
             _ => panic!("Wrong variant"),
         }

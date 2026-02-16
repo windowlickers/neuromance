@@ -21,6 +21,7 @@ workspace = true
 
 [dependencies]
 neuromance-common = { version = "0.0.6", path = "../neuromance-common" }
+neuromance-proto = { version = "0.0.6", path = "../neuromance-proto" }
 rustyline = "17.0.1"
 anyhow = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
@@ -34,6 +35,10 @@ dirs = "5.0"
 log = { workspace = true }
 env_logger = { workspace = true }
 fs2 = "0.4"
+tonic = { workspace = true }
+tokio-stream = { workspace = true }
+hyper-util = { workspace = true }
+tower = "0.4"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

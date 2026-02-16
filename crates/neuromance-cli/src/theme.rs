@@ -54,9 +54,7 @@ fn style_to_ansi(spec: &str) -> Result<String> {
         } else if let Some(c) = color_code(token) {
             codes.push(c);
         } else {
-            return Err(anyhow::anyhow!(
-                "unknown style token: '{token}'"
-            ));
+            return Err(anyhow::anyhow!("unknown style token: '{token}'"));
         }
     }
 
@@ -112,22 +110,16 @@ impl Template {
                         tag.push(c);
                     }
                     if !found_close {
-                        return Err(anyhow::anyhow!(
-                            "unclosed '<' in template"
-                        ));
+                        return Err(anyhow::anyhow!("unclosed '<' in template"));
                     }
 
                     if !buf.is_empty() {
-                        segments.push(Segment::Literal(
-                            std::mem::take(&mut buf),
-                        ));
+                        segments.push(Segment::Literal(std::mem::take(&mut buf)));
                     }
 
                     if tag == "/" {
                         if !no_color {
-                            segments.push(Segment::Literal(
-                                RESET.to_string(),
-                            ));
+                            segments.push(Segment::Literal(RESET.to_string()));
                         }
                     } else if !no_color {
                         let ansi = style_to_ansi(&tag)?;
@@ -146,15 +138,11 @@ impl Template {
                         var_name.push(c);
                     }
                     if !found_close {
-                        return Err(anyhow::anyhow!(
-                            "unclosed '{{' in template"
-                        ));
+                        return Err(anyhow::anyhow!("unclosed '{{' in template"));
                     }
 
                     if !buf.is_empty() {
-                        segments.push(Segment::Literal(
-                            std::mem::take(&mut buf),
-                        ));
+                        segments.push(Segment::Literal(std::mem::take(&mut buf)));
                     }
                     segments.push(Segment::Variable(var_name));
                 }
@@ -198,9 +186,7 @@ impl Template {
             match seg {
                 Segment::Literal(s) => out.push_str(s),
                 Segment::Variable(name) => {
-                    if let Some((_, val)) =
-                        vars.iter().find(|(k, _)| k == name)
-                    {
+                    if let Some((_, val)) = vars.iter().find(|(k, _)| k == name) {
                         out.push_str(val);
                     }
                 }
@@ -264,42 +250,27 @@ struct UsageSection {
     tokens: Option<String>,
 }
 
-fn parse_or_default(
-    custom: Option<&str>,
-    default: &str,
-) -> Template {
+fn parse_or_default(custom: Option<&str>, default: &str) -> Template {
     custom
         .and_then(|s| match Template::parse(s) {
             Ok(t) => Some(t),
             Err(e) => {
-                log::warn!(
-                    "theme: failed to parse template: {e}"
-                );
+                log::warn!("theme: failed to parse template: {e}");
                 None
             }
         })
         .unwrap_or_else(|| {
             // Defaults are known-good — infallible
-            Template::parse(default)
-                .unwrap_or_else(|_| Template { segments: vec![] })
+            Template::parse(default).unwrap_or_else(|_| Template { segments: vec![] })
         })
 }
 
 impl Default for Theme {
     fn default() -> Self {
         Self {
-            prompt_user: parse_or_default(
-                None,
-                "<bold bright_green>></> ",
-            ),
-            repl_title: parse_or_default(
-                None,
-                "<bold bright_magenta>Neuromance REPL</>",
-            ),
-            repl_subtitle: parse_or_default(
-                None,
-                "<dim>Ctrl-D to exit</>",
-            ),
+            prompt_user: parse_or_default(None, "<bold bright_green>></> "),
+            repl_title: parse_or_default(None, "<bold bright_magenta>Neuromance REPL</>"),
+            repl_subtitle: parse_or_default(None, "<dim>Ctrl-D to exit</>"),
             assistant_header: parse_or_default(
                 None,
                 "\n╭─● <bold bright_magenta>Assistant</>\n╰───────────○",
@@ -310,10 +281,7 @@ impl Default for Theme {
                 "\n○ <bright_yellow>Tool call:</> \
                  <bold bright_green>{name}</>",
             ),
-            tool_arg: parse_or_default(
-                None,
-                "  <cyan>{key}</>: {value}",
-            ),
+            tool_arg: parse_or_default(None, "  <cyan>{key}</>: {value}"),
             tool_result_ok: parse_or_default(
                 None,
                 "○ <bright_green>Result:</> \
@@ -347,10 +315,7 @@ impl Theme {
                 return Self::default();
             }
             Err(e) => {
-                log::warn!(
-                    "theme: failed to read {}: {e}",
-                    path.display()
-                );
+                log::warn!("theme: failed to read {}: {e}", path.display());
                 return Self::default();
             }
         };
@@ -376,102 +341,74 @@ impl Theme {
         let usage = file.usage.unwrap_or_default();
 
         Self {
-            prompt_user: prompt.user.as_deref().map_or(
-                defaults.prompt_user,
-                |s| {
-                    parse_or_default(
-                        Some(s),
-                        "<bold bright_green>></> ",
-                    )
-                },
-            ),
-            repl_title: repl.title.as_deref().map_or(
-                defaults.repl_title,
-                |s| {
-                    parse_or_default(
-                        Some(s),
-                        "<bold bright_magenta>Neuromance REPL</>",
-                    )
-                },
-            ),
-            repl_subtitle: repl.subtitle.as_deref().map_or(
-                defaults.repl_subtitle,
-                |s| {
-                    parse_or_default(
-                        Some(s),
-                        "<dim>Ctrl-D to exit</>",
-                    )
-                },
-            ),
-            assistant_header: assistant.header.as_deref().map_or(
-                defaults.assistant_header,
-                |s| {
+            prompt_user: prompt.user.as_deref().map_or(defaults.prompt_user, |s| {
+                parse_or_default(Some(s), "<bold bright_green>></> ")
+            }),
+            repl_title: repl.title.as_deref().map_or(defaults.repl_title, |s| {
+                parse_or_default(Some(s), "<bold bright_magenta>Neuromance REPL</>")
+            }),
+            repl_subtitle: repl
+                .subtitle
+                .as_deref()
+                .map_or(defaults.repl_subtitle, |s| {
+                    parse_or_default(Some(s), "<dim>Ctrl-D to exit</>")
+                }),
+            assistant_header: assistant
+                .header
+                .as_deref()
+                .map_or(defaults.assistant_header, |s| {
                     parse_or_default(
                         Some(s),
                         "\n╭─● <bold bright_magenta>Assistant</>\n╰───────────○",
                     )
-                },
-            ),
-            assistant_footer: assistant.footer.as_deref().map_or(
-                defaults.assistant_footer,
-                |s| parse_or_default(Some(s), ""),
-            ),
-            tool_call: tool.call.as_deref().map_or(
-                defaults.tool_call,
-                |s| {
-                    parse_or_default(
-                        Some(s),
-                        "\n○ <bright_yellow>Tool call:</> \
+                }),
+            assistant_footer: assistant
+                .footer
+                .as_deref()
+                .map_or(defaults.assistant_footer, |s| parse_or_default(Some(s), "")),
+            tool_call: tool.call.as_deref().map_or(defaults.tool_call, |s| {
+                parse_or_default(
+                    Some(s),
+                    "\n○ <bright_yellow>Tool call:</> \
                          <bold bright_green>{name}</>",
-                    )
-                },
-            ),
-            tool_arg: tool.arg.as_deref().map_or(
-                defaults.tool_arg,
-                |s| {
-                    parse_or_default(
-                        Some(s),
-                        "  <cyan>{key}</>: {value}",
-                    )
-                },
-            ),
-            tool_result_ok: tool.result_ok.as_deref().map_or(
-                defaults.tool_result_ok,
-                |s| {
+                )
+            }),
+            tool_arg: tool.arg.as_deref().map_or(defaults.tool_arg, |s| {
+                parse_or_default(Some(s), "  <cyan>{key}</>: {value}")
+            }),
+            tool_result_ok: tool
+                .result_ok
+                .as_deref()
+                .map_or(defaults.tool_result_ok, |s| {
                     parse_or_default(
                         Some(s),
                         "○ <bright_green>Result:</> \
                          <bright_cyan>{name}</>",
                     )
-                },
-            ),
-            tool_result_err: tool.result_err.as_deref().map_or(
-                defaults.tool_result_err,
-                |s| {
+                }),
+            tool_result_err: tool
+                .result_err
+                .as_deref()
+                .map_or(defaults.tool_result_err, |s| {
                     parse_or_default(
                         Some(s),
                         "○ <bright_red>Failed:</> \
                          <bright_cyan>{name}</>",
                     )
-                },
-            ),
-            usage_tokens: usage.tokens.as_deref().map_or(
-                defaults.usage_tokens,
-                |s| {
-                    parse_or_default(
-                        Some(s),
-                        "\n<bright_blue>○</> {total} tokens \
+                }),
+            usage_tokens: usage.tokens.as_deref().map_or(defaults.usage_tokens, |s| {
+                parse_or_default(
+                    Some(s),
+                    "\n<bright_blue>○</> {total} tokens \
                          (in: {input}, out: {output})",
-                    )
-                },
-            ),
+                )
+            }),
         }
     }
 }
 
 fn theme_path() -> Option<PathBuf> {
-    dirs::config_dir()
-        .map(|d| d.join("neuromance").join("theme.toml"))
+    dirs::config_dir().map(|d| d.join("neuromance").join("theme.toml"))
 }
 
 #[cfg(test)]
@@ -513,8 +450,7 @@ mod tests {
 
     #[test]
     fn parse_compound_style() {
-        let t =
-            Template::parse("<bold bright_yellow>hi</>").unwrap();
+        let t = Template::parse("<bold bright_yellow>hi</>").unwrap();
         let rendered = t.render(&[]);
         if std::env::var_os("NO_COLOR").is_some() {
             assert_eq!(rendered, "hi");
@@ -525,18 +461,12 @@ mod tests {
 
     #[test]
     fn parse_mixed_styles_and_vars() {
-        let t = Template::parse(
-            "<bold>{name}</> said <cyan>hello</>",
-        )
-        .unwrap();
+        let t = Template::parse("<bold>{name}</> said <cyan>hello</>").unwrap();
         let rendered = t.render(&[("name", "Bob")]);
         if std::env::var_os("NO_COLOR").is_some() {
             assert_eq!(rendered, "Bob said hello");
         } else {
-            assert_eq!(
-                rendered,
-                "\x1b[1mBob\x1b[0m said \x1b[36mhello\x1b[0m"
-            );
+            assert_eq!(rendered, "\x1b[1mBob\x1b[0m said \x1b[36mhello\x1b[0m");
         }
     }
 
@@ -662,11 +592,10 @@ tokens = "<bright_blue>●</> {total} tok"
         let call = theme.tool_call.render(&[("name", "search")]);
         assert!(call.contains("search"));
 
-        let usage = theme.usage_tokens.render(&[
-            ("total", "100"),
-            ("input", "80"),
-            ("output", "20"),
-        ]);
+        let usage =
+            theme
+                .usage_tokens
+                .render(&[("total", "100"), ("input", "80"), ("output", "20")]);
         assert!(usage.contains("100"));
     }
 

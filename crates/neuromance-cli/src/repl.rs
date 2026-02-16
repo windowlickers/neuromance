@@ -14,10 +14,8 @@ use crate::theme::Theme;
 /// # Errors
 ///
 /// Returns an error if the REPL initialization or message sending fails.
-pub async fn run_repl(
-    initial_conversation_id: Option<String>,
-    theme: &Theme,
-) -> Result<()> {
+#[allow(clippy::significant_drop_tightening, clippy::future_not_send)]
+pub async fn run_repl(initial_conversation_id: Option<String>, theme: &Theme) -> Result<()> {
     println!("{}", theme.repl_title.render(&[]));
     println!("{}", theme.repl_subtitle.render(&[]));
     println!();

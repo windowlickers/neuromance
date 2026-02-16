@@ -22,10 +22,16 @@ neuromance = { version = "0.0.6", path = "../neuromance" }
 neuromance-common = { version = "0.0.6", path = "../neuromance-common" }
 neuromance-client = { version = "0.0.6", path = "../neuromance-client" }
 neuromance-tools = { version = "0.0.6", path = "../neuromance-tools" }
+neuromance-proto = { version = "0.0.6", path = "../neuromance-proto" }
 
 # Async runtime
 tokio = { workspace = true, features = ["full"] }
 futures = { workspace = true }
+
+# gRPC
+tonic = { workspace = true }
+tokio-stream = { workspace = true }
+hyper-util = { workspace = true }
 
 # Serialization
 serde = { workspace = true }

@@ -1,4 +1,4 @@
-//! Unix socket client for communicating with the daemon.
+//! gRPC client for communicating with the daemon.
 
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -7,37 +7,74 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use fs2::FileExt;
-use neuromance_common::protocol::{DaemonRequest, DaemonResponse};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use hyper_util::rt::TokioIo;
+use neuromance_proto::NeuromanceClient;
+use neuromance_proto::proto;
 use tokio::net::UnixStream;
+use tonic::transport::{Channel, Endpoint, Uri};
+use tower::service_fn;
 
-/// Maximum size of a single daemon response line (10 MB).
-const MAX_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
-
-/// Client for communicating with the Neuromance daemon.
+/// Client for communicating with the Neuromance daemon over gRPC.
 pub struct DaemonClient {
-    reader: BufReader<tokio::net::unix::OwnedReadHalf>,
-    writer: tokio::net::unix::OwnedWriteHalf,
+    inner: NeuromanceClient<Channel>,
+}
+
+/// A bidirectional chat stream session.
+pub struct ChatSession {
+    tx: tokio::sync::mpsc::Sender<proto::ChatClientMessage>,
+    rx: tonic::Streaming<proto::ChatEvent>,
+}
+
+impl ChatSession {
+    /// Reads the next event from the server.
+    pub async fn next_event(&mut self) -> Result<Option<proto::ChatEvent>> {
+        use tokio_stream::StreamExt;
+        match self.rx.next().await {
+            Some(Ok(event)) => Ok(Some(event)),
+            Some(Err(e)) => Err(anyhow::anyhow!("Stream error: {e}")),
+            None => Ok(None),
+        }
+    }
+
+    /// Sends a tool approval response.
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    pub async fn send_tool_approval(
+        &mut self,
+        conversation_id: String,
+        tool_call_id: String,
+        approval: neuromance_common::ToolApproval,
+    ) -> Result<()> {
+        let msg = proto::ChatClientMessage {
+            message: Some(proto::chat_client_message::Message::ToolApproval(
+                proto::ToolApprovalResponse {
+                    conversation_id,
+                    tool_call_id,
+                    approval: Some(proto::ToolApprovalDecision::from(&approval)),
+                },
+            )),
+        };
+
+        self.tx
+            .send(msg)
+            .await
+            .map_err(|_| anyhow::anyhow!("Stream closed"))
+    }
 }
 
 impl DaemonClient {
-    /// Waits for socket connection with exponential backoff.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the socket is unavailable after timeout.
-    async fn wait_for_socket(socket_path: &Path, timeout_secs: u64) -> Result<UnixStream> {
+    /// Waits for socket with exponential backoff.
+    async fn wait_for_socket(socket_path: &Path, timeout_secs: u64) -> Result<()> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
         let mut delay = Duration::from_millis(50);
         let max_delay = Duration::from_millis(500);
 
         loop {
-            if let Ok(stream) = UnixStream::connect(socket_path).await {
-                return Ok(stream);
+            if UnixStream::connect(socket_path).await.is_ok() {
+                return Ok(());
             }
 
             if tokio::time::Instant::now() + delay > deadline {
-                anyhow::bail!("Socket unavailable after {timeout_secs}s timeout");
+                anyhow::bail!("Socket unavailable after {timeout_secs}s");
             }
 
             tokio::time::sleep(delay).await;
@@ -45,164 +82,288 @@ impl DaemonClient {
         }
     }
 
+    /// Creates a gRPC channel connected to the Unix socket.
+    async fn create_channel(socket_path: PathBuf) -> Result<Channel> {
+        let channel = Endpoint::try_from("http://[::]:50051")
+            .context("Invalid endpoint")?
+            .connect_with_connector(service_fn(move |_: Uri| {
+                let path = socket_path.clone();
+                async move {
+                    let stream = UnixStream::connect(path).await?;
+                    Ok::<_, std::io::Error>(TokioIo::new(stream))
+                }
+            }))
+            .await
+            .context("Failed to connect to daemon")?;
+
+        Ok(channel)
+    }
+
     /// Connects to the daemon, auto-spawning if needed.
-    ///
-    /// This method handles race conditions by:
-    /// 1. Checking for an existing daemon process via PID file
-    /// 2. Using a lock file to prevent concurrent spawns
-    /// 3. Validating that the PID is actually running before attempting spawn
     ///
     /// # Errors
     ///
     /// Returns an error if connection fails after spawn attempts.
+    #[allow(clippy::significant_drop_in_scrutinee)]
     pub async fn connect() -> Result<Self> {
         let socket_path = Self::socket_path()?;
         let pid_file = Self::pid_file()?;
         let lock_file = Self::lock_file()?;
 
         // Try to connect to existing daemon
-        if let Ok(stream) = UnixStream::connect(&socket_path).await {
-            return Ok(Self::from_stream(stream));
+        if let Ok(channel) = Self::create_channel(socket_path.clone()).await {
+            return Ok(Self {
+                inner: NeuromanceClient::new(channel),
+            });
         }
 
         // Check if daemon process exists via PID file
         if let Some(pid) = Self::read_pid(&pid_file)? {
             if Self::is_process_running(pid) {
-                // Daemon is running but socket not ready yet, wait for it
-                let stream = Self::wait_for_socket(&socket_path, 10)
+                Self::wait_for_socket(&socket_path, 10)
                     .await
-                    .context(format!(
-                        "Daemon process exists (PID {pid}) but socket unavailable"
-                    ))?;
-                return Ok(Self::from_stream(stream));
+                    .context(format!("Daemon (PID {pid}) but socket unavailable"))?;
+                let channel = Self::create_channel(socket_path).await?;
+                return Ok(Self {
+                    inner: NeuromanceClient::new(channel),
+                });
             }
-            // Stale PID file, clean it up
             let _ = std::fs::remove_file(&pid_file);
         }
 
         // Acquire lock to prevent concurrent spawns
         let lock = Self::acquire_spawn_lock(&lock_file)?;
 
-        // Double-check after acquiring lock (another process may have spawned)
-        if let Ok(stream) = UnixStream::connect(&socket_path).await {
-            drop(lock); // Release lock
-            return Ok(Self::from_stream(stream));
+        // Double-check after acquiring lock
+        if let Ok(channel) = Self::create_channel(socket_path.clone()).await {
+            drop(lock);
+            return Ok(Self {
+                inner: NeuromanceClient::new(channel),
+            });
         }
 
         // Spawn daemon
         Self::spawn_daemon()?;
 
-        // Wait for socket to appear (10 second timeout with backoff)
-        let stream = Self::wait_for_socket(&socket_path, 10).await;
+        // Wait for socket
+        Self::wait_for_socket(&socket_path, 10).await?;
 
-        drop(lock); // Release lock
+        drop(lock);
 
-        let stream = stream.context("Failed to connect to daemon after spawn")?;
-        Ok(Self::from_stream(stream))
+        let channel = Self::create_channel(socket_path).await?;
+        Ok(Self {
+            inner: NeuromanceClient::new(channel),
+        })
     }
 
-    /// Creates a client from an existing Unix stream.
-    fn from_stream(stream: UnixStream) -> Self {
-        let (reader, writer) = stream.into_split();
-        Self {
-            reader: BufReader::new(reader),
-            writer,
-        }
+    /// Starts a bidirectional chat session.
+    pub async fn chat(
+        &mut self,
+        conversation_id: Option<String>,
+        content: String,
+    ) -> Result<ChatSession> {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+
+        // Send the initial message
+        let first = proto::ChatClientMessage {
+            message: Some(proto::chat_client_message::Message::SendMessage(
+                proto::SendMessageRequest {
+                    conversation_id: conversation_id.unwrap_or_default(),
+                    content,
+                },
+            )),
+        };
+        tx.send(first)
+            .await
+            .map_err(|_| anyhow::anyhow!("Failed to send initial message"))?;
+
+        let in_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        let response = self
+            .inner
+            .chat(in_stream)
+            .await
+            .map_err(|e| anyhow::anyhow!("Chat RPC failed: {e}"))?;
+
+        Ok(ChatSession {
+            tx,
+            rx: response.into_inner(),
+        })
     }
 
-    /// Sends a request to the daemon.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if sending fails.
-    pub async fn send_request(&mut self, request: &DaemonRequest) -> Result<()> {
-        let json = serde_json::to_string(request)?;
-        self.writer.write_all(json.as_bytes()).await?;
-        self.writer.write_all(b"\n").await?;
-        self.writer.flush().await?;
-        Ok(())
+    /// Creates a new conversation.
+    pub async fn new_conversation(
+        &mut self,
+        model: Option<String>,
+        system_message: Option<String>,
+    ) -> Result<proto::NewConversationResponse> {
+        self.inner
+            .new_conversation(proto::NewConversationRequest {
+                model,
+                system_message,
+            })
+            .await
+            .map(tonic::Response::into_inner)
+            .map_err(|e| anyhow::anyhow!("{e}"))
     }
 
-    /// Reads a single response from the daemon.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if reading or parsing fails.
-    pub async fn read_response(&mut self) -> Result<DaemonResponse> {
-        let mut line = String::new();
-
-        loop {
-            let available = self.reader.fill_buf().await?;
-            if available.is_empty() {
-                if line.is_empty() {
-                    anyhow::bail!("Connection closed by daemon");
-                }
-                break;
-            }
-
-            let newline_pos =
-                available.iter().position(|&b| b == b'\n');
-            let n = newline_pos.map_or(available.len(), |p| p + 1);
-
-            let chunk = std::str::from_utf8(&available[..n])
-                .context("Invalid UTF-8 in daemon response")?;
-            line.push_str(chunk);
-            self.reader.consume(n);
-
-            if line.len() > MAX_RESPONSE_SIZE {
-                anyhow::bail!(
-                    "Daemon response exceeds {MAX_RESPONSE_SIZE} byte limit"
-                );
-            }
-
-            if newline_pos.is_some() {
-                break;
-            }
-        }
-
-        let response = serde_json::from_str(&line)?;
-        Ok(response)
+    /// Lists messages from a conversation.
+    pub async fn list_messages(
+        &mut self,
+        conversation_id: Option<String>,
+        limit: Option<usize>,
+    ) -> Result<proto::ListMessagesResponse> {
+        self.inner
+            .list_messages(proto::ListMessagesRequest {
+                conversation_id: conversation_id.unwrap_or_default(),
+                limit: limit.map(|l| l as u64),
+            })
+            .await
+            .map(tonic::Response::into_inner)
+            .map_err(|e| anyhow::anyhow!("{e}"))
     }
 
-    /// Returns the data directory path.
+    /// Lists all conversations.
+    pub async fn list_conversations(
+        &mut self,
+        limit: Option<usize>,
+    ) -> Result<proto::ListConversationsResponse> {
+        self.inner
+            .list_conversations(proto::ListConversationsRequest {
+                limit: limit.map(|l| l as u64),
+            })
+            .await
+            .map(tonic::Response::into_inner)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    /// Sets a bookmark.
+    pub async fn set_bookmark(
+        &mut self,
+        conversation_id: String,
+        name: String,
+    ) -> Result<proto::SetBookmarkResponse> {
+        self.inner
+            .set_bookmark(proto::SetBookmarkRequest {
+                conversation_id,
+                name,
+            })
+            .await
+            .map(tonic::Response::into_inner)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    /// Removes a bookmark.
+    pub async fn remove_bookmark(&mut self, name: String) -> Result<proto::RemoveBookmarkResponse> {
+        self.inner
+            .remove_bookmark(proto::RemoveBookmarkRequest { name })
+            .await
+            .map(tonic::Response::into_inner)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    /// Deletes a conversation.
+    pub async fn delete_conversation(
+        &mut self,
+        conversation_id: String,
+    ) -> Result<proto::DeleteConversationResponse> {
+        self.inner
+            .delete_conversation(proto::DeleteConversationRequest { conversation_id })
+            .await
+            .map(tonic::Response::into_inner)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    /// Switches a conversation's model.
+    pub async fn switch_model(
+        &mut self,
+        conversation_id: Option<String>,
+        model_nickname: String,
+    ) -> Result<proto::SwitchModelResponse> {
+        self.inner
+            .switch_model(proto::SwitchModelRequest {
+                conversation_id: conversation_id.unwrap_or_default(),
+                model_nickname,
+            })
+            .await
+            .map(tonic::Response::into_inner)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    /// Lists available models.
+    pub async fn list_models(&mut self) -> Result<proto::ListModelsResponse> {
+        self.inner
+            .list_models(proto::ListModelsRequest {})
+            .await
+            .map(tonic::Response::into_inner)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    /// Gets basic daemon status.
+    pub async fn get_status(&mut self) -> Result<proto::GetStatusResponse> {
+        self.inner
+            .get_status(proto::GetStatusRequest {})
+            .await
+            .map(tonic::Response::into_inner)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    /// Gets detailed status.
+    pub async fn get_detailed_status(&mut self) -> Result<proto::GetDetailedStatusResponse> {
+        self.inner
+            .get_detailed_status(proto::GetDetailedStatusRequest {})
+            .await
+            .map(tonic::Response::into_inner)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    /// Health check.
+    pub async fn health_check(&mut self) -> Result<proto::HealthCheckResponse> {
+        let client_version = env!("CARGO_PKG_VERSION").to_string();
+        self.inner
+            .health_check(proto::HealthCheckRequest { client_version })
+            .await
+            .map(tonic::Response::into_inner)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    /// Requests daemon shutdown.
+    pub async fn shutdown(&mut self) -> Result<proto::ShutdownResponse> {
+        self.inner
+            .shutdown(proto::ShutdownRequest {})
+            .await
+            .map(tonic::Response::into_inner)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    // --- Internal helpers (unchanged) ---
+
     fn data_dir() -> Result<PathBuf> {
         dirs::data_local_dir()
             .context("Failed to determine data directory")
             .map(|dir| dir.join("neuromance"))
     }
 
-    /// Returns the socket path.
     fn socket_path() -> Result<PathBuf> {
         Ok(Self::data_dir()?.join("neuromance.sock"))
     }
 
-    /// Returns the PID file path.
     fn pid_file() -> Result<PathBuf> {
         Ok(Self::data_dir()?.join("neuromance.pid"))
     }
 
-    /// Returns the lock file path.
     fn lock_file() -> Result<PathBuf> {
         Ok(Self::data_dir()?.join("neuromance.lock"))
     }
 
-    /// Reads the daemon PID from the PID file.
-    ///
-    /// Returns `None` if the file doesn't exist or is invalid.
     fn read_pid(pid_file: &Path) -> Result<Option<u32>> {
         if !pid_file.exists() {
             return Ok(None);
         }
 
         let content = std::fs::read_to_string(pid_file).context("Failed to read PID file")?;
-
-        let pid = content.trim().parse::<u32>().ok();
-        Ok(pid)
+        Ok(content.trim().parse::<u32>().ok())
     }
 
-    /// Checks if a process with the given PID is running.
-    ///
-    /// Uses `kill -0` which works on both Linux and macOS.
     #[cfg(unix)]
     fn is_process_running(pid: u32) -> bool {
         Command::new("kill")
@@ -215,19 +376,10 @@ impl DaemonClient {
 
     #[cfg(not(unix))]
     fn is_process_running(_pid: u32) -> bool {
-        // Conservative fallback: assume process exists
         true
     }
 
-    /// Acquires an exclusive lock for daemon spawning.
-    ///
-    /// This prevents multiple clients from spawning daemons simultaneously.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if lock file creation or locking fails.
     fn acquire_spawn_lock(lock_file: &Path) -> Result<File> {
-        // Ensure parent directory exists
         if let Some(parent) = lock_file.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -239,24 +391,14 @@ impl DaemonClient {
             .open(lock_file)
             .context("Failed to open lock file")?;
 
-        // Try to acquire exclusive lock (blocking with timeout)
         file.try_lock_exclusive()
-            .context("Failed to acquire spawn lock - another client may be spawning daemon")?;
+            .context("Failed to acquire spawn lock")?;
 
         Ok(file)
     }
 
-    /// Spawns the daemon in the background.
-    ///
-    /// Stderr is redirected to `~/.local/share/neuromance/daemon.log`
-    /// so spawn failures produce diagnostic output.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the daemon executable cannot be found or spawned.
     fn spawn_daemon() -> Result<()> {
-        let stderr_stdio = Self::open_daemon_log()
-            .map_or_else(|_| Stdio::null(), Stdio::from);
+        let stderr_stdio = Self::open_daemon_log().map_or_else(|_| Stdio::null(), Stdio::from);
 
         Command::new("neuromance-daemon")
             .stdin(Stdio::null())
@@ -268,9 +410,6 @@ impl DaemonClient {
         Ok(())
     }
 
-    /// Opens the daemon log file for appending.
-    ///
-    /// Creates the parent directory if it doesn't exist.
     fn open_daemon_log() -> Result<File> {
         let log_path = Self::data_dir()?.join("daemon.log");
 
