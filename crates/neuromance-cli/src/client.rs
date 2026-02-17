@@ -105,7 +105,6 @@ impl DaemonClient {
     /// # Errors
     ///
     /// Returns an error if connection fails after spawn attempts.
-    #[allow(clippy::significant_drop_in_scrutinee)]
     pub async fn connect() -> Result<Self> {
         let socket_path = Self::socket_path()?;
         let pid_file = Self::pid_file()?;
@@ -119,7 +118,8 @@ impl DaemonClient {
         }
 
         // Check if daemon process exists via PID file
-        if let Some(pid) = Self::read_pid(&pid_file)? {
+        let existing_pid = Self::read_pid(&pid_file)?;
+        if let Some(pid) = existing_pid {
             if is_process_running(pid) {
                 Self::wait_for_socket(&socket_path, 10)
                     .await
