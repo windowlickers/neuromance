@@ -389,6 +389,33 @@ impl ConversationManager {
         core.chat_with_tool_loop(messages).await
     }
 
+    /// Drains all pending tool approvals for a conversation,
+    /// sending `Denied` to each.
+    ///
+    /// Call this when a client disconnects to unblock any tool
+    /// approval callbacks waiting in the chat loop.
+    pub fn drain_pending_approvals(&self, conversation_id: &str) {
+        let keys: Vec<(String, String)> = self
+            .pending_approvals
+            .iter()
+            .filter(|entry| entry.key().0 == conversation_id)
+            .map(|entry| entry.key().clone())
+            .collect();
+
+        for key in keys {
+            if let Some((_, tx)) = self.pending_approvals.remove(&key) {
+                let _ = tx.send(ToolApproval::Denied(
+                    "Client disconnected".to_string(),
+                ));
+                debug!(
+                    conversation_id = %key.0,
+                    tool_call_id = %key.1,
+                    "Denied orphaned tool approval"
+                );
+            }
+        }
+    }
+
     /// Responds to a pending tool approval request.
     ///
     /// # Errors
