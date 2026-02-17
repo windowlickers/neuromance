@@ -16,6 +16,17 @@ use crate::display::{
 };
 use crate::theme::Theme;
 
+/// Prompts with a [y/N] confirmation and returns the answer.
+fn confirm(prompt: &str) -> Result<bool> {
+    print!("{prompt} [y/N] ");
+    let _ = std::io::stdout().flush();
+
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+
+    Ok(matches!(input.trim(), "y" | "Y" | "yes" | "YES"))
+}
+
 /// Prompts the user to approve, deny, or quit a tool call.
 fn prompt_tool_approval(
     tool_call: &neuromance_common::ToolCall,
@@ -279,20 +290,14 @@ pub async fn delete_conversation(
     conversation_id: String,
     force: bool,
 ) -> Result<()> {
-    if !force {
-        print!(
-            "Delete conversation '{}'? [y/N] ",
+    if !force
+        && !confirm(&format!(
+            "Delete conversation '{}'?",
             conversation_id.bright_cyan()
-        );
-        let _ = std::io::stdout().flush();
-
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-
-        if !matches!(input.trim(), "y" | "Y" | "yes" | "YES") {
-            println!("Cancelled");
-            return Ok(());
-        }
+        ))?
+    {
+        println!("Cancelled");
+        return Ok(());
     }
 
     let resp = client.delete_conversation(conversation_id).await?;
@@ -340,17 +345,9 @@ pub async fn prune_conversations(client: &mut DaemonClient, all: bool, force: bo
         "i".bright_blue()
     );
 
-    if !force {
-        print!("\nProceed? [y/N] ");
-        let _ = std::io::stdout().flush();
-
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-
-        if !matches!(input.trim(), "y" | "Y" | "yes" | "YES") {
-            println!("Cancelled");
-            return Ok(());
-        }
+    if !force && !confirm("\nProceed?")? {
+        println!("Cancelled");
+        return Ok(());
     }
 
     let result = client.prune_conversations(all).await?;
