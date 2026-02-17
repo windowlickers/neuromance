@@ -36,11 +36,7 @@
         };
 
         # Common build inputs (runtime dependencies)
-        commonBuildInputs = with pkgs; [ openssl ]
-          ++ lib.optionals stdenv.isDarwin [
-            darwin.apple_sdk.frameworks.Security
-            darwin.apple_sdk.frameworks.SystemConfiguration
-          ];
+        commonBuildInputs = with pkgs; [ openssl ];
 
         # Common native build inputs (build-time tools)
         commonNativeBuildInputs = with pkgs; [ pkg-config protobuf ];
