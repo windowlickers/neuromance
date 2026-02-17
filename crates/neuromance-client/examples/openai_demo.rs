@@ -1,59 +1,57 @@
-//! Anthropic Claude API Demo
+//! `OpenAI` Chat Completions API Demo
 //!
-//! This example demonstrates using the Anthropic client with tool calling
-//! and a multi-turn conversation loop, plus optional streaming.
+//! This example demonstrates using the `OpenAI` client (Chat Completions API)
+//! with tool calling and a multi-turn conversation loop. Compatible with
+//! `OpenAI` and any provider exposing a `/chat/completions` endpoint.
 //!
 //! # Usage
 //!
 //! ```bash
-//! # Set your API key
-//! export ANTHROPIC_API_KEY="sk-ant-..."
+//! # With OpenAI
+//! cargo run --example openai_demo -- \
+//!     --api-key sk-... --model gpt-5-mini-2025-08-07
 //!
-//! # Run with defaults (streaming, triggers tool use)
-//! cargo run --example anthropic_demo
+//! # With a local server
+//! cargo run --example openai_demo -- \
+//!     --base-url http://localhost:8080/v1 \
+//!     --model my-model
 //!
-//! # Run with custom message
-//! cargo run --example anthropic_demo -- \
+//! # With a custom prompt
+//! cargo run --example openai_demo -- \
 //!     --message "Add a todo to water the plants"
-//!
-//! # Run non-streaming
-//! cargo run --example anthropic_demo -- --no-stream
-//!
-//! # Use a specific model
-//! cargo run --example anthropic_demo -- \
-//!     --model claude-haiku-4-5-20251001
 //! ```
 
 use std::collections::HashMap;
-use std::io::Write;
 
 use anyhow::Result;
 use clap::Parser;
-use futures::StreamExt;
-use log::info;
 use serde::Deserialize;
 use uuid::Uuid;
 
-use neuromance_client::{AnthropicClient, LLMClient};
+use neuromance_client::{LLMClient, OpenAIClient};
 use neuromance_common::{
     ChatRequest, Config, Function, Message, Parameters, Property, Tool,
-    ToolCall, ToolChoice,
+    ToolChoice,
 };
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Anthropic Claude API Demo")]
+#[command(
+    author,
+    version,
+    about = "OpenAI Chat Completions API Demo"
+)]
 struct Args {
-    /// API key (or set `ANTHROPIC_API_KEY` env var)
-    #[arg(long, env = "ANTHROPIC_API_KEY")]
+    /// Base URL for the API endpoint
+    #[arg(long, default_value = "http://localhost:8080/v1")]
+    base_url: String,
+
+    /// API key for authentication
+    #[arg(long, default_value = "dummy")]
     api_key: String,
 
     /// Model to use for chat completion
-    #[arg(long, default_value = "claude-sonnet-4-5-20250929")]
+    #[arg(long, default_value = "gpt-5-mini-2025-08-07")]
     model: String,
-
-    /// Maximum tokens to generate
-    #[arg(long, default_value = "1024")]
-    max_tokens: u32,
 
     /// The user message to send
     #[arg(
@@ -64,11 +62,7 @@ struct Args {
     )]
     message: String,
 
-    /// Disable streaming (use non-streaming API)
-    #[arg(long)]
-    no_stream: bool,
-
-    /// Temperature for sampling (0.0-1.0)
+    /// Temperature for sampling (0.0-2.0)
     #[arg(long)]
     temperature: Option<f32>,
 }
@@ -259,136 +253,7 @@ fn execute_tool(
     }
 }
 
-// -- Conversation turn handling -------------------------------------------
-
-enum TurnResult {
-    Done,
-    ToolCalls {
-        content: String,
-        tool_calls: Vec<ToolCall>,
-    },
-}
-
-fn print_usage(usage: &neuromance_common::Usage) {
-    println!("Usage:");
-    println!("  Input tokens: {}", usage.prompt_tokens);
-    println!("  Output tokens: {}", usage.completion_tokens);
-    println!("  Total tokens: {}", usage.total_tokens);
-}
-
-async fn send_non_streaming(
-    client: &AnthropicClient,
-    request: &ChatRequest,
-) -> Result<TurnResult> {
-    println!("Sending request...");
-    let response = client.chat(request).await?;
-
-    if response.message.tool_calls.is_empty() {
-        println!();
-        println!("Assistant: {}", response.message.content);
-        println!();
-        if let Some(reason) = response.finish_reason {
-            info!("Finish reason: {reason:?}");
-        }
-        if let Some(ref usage) = response.usage {
-            print_usage(usage);
-        }
-        return Ok(TurnResult::Done);
-    }
-
-    let tool_calls = response.message.tool_calls.to_vec();
-    let content = response.message.content;
-    Ok(TurnResult::ToolCalls {
-        content,
-        tool_calls,
-    })
-}
-
-async fn send_streaming(
-    client: &AnthropicClient,
-    request: &ChatRequest,
-) -> Result<TurnResult> {
-    println!("Sending streaming request...");
-    println!();
-
-    let mut stream = client.chat_stream(request).await?;
-
-    let mut full_content = String::new();
-    let mut tool_calls: Vec<ToolCall> = Vec::new();
-    print!("Assistant: ");
-    std::io::stdout().flush()?;
-
-    while let Some(chunk_result) = stream.next().await {
-        let chunk = chunk_result?;
-
-        if let Some(content) = chunk.delta_content {
-            print!("{content}");
-            full_content.push_str(&content);
-            std::io::stdout().flush()?;
-        }
-
-        if let Some(reasoning) = chunk.delta_reasoning_content {
-            info!("[Thinking: {reasoning}]");
-        }
-
-        if let Some(tcs) = chunk.delta_tool_calls {
-            tool_calls.extend(tcs);
-        }
-
-        if let Some(reason) = &chunk.finish_reason {
-            info!("Stream finished: {reason:?}");
-        }
-
-        if let Some(ref usage) = chunk.usage {
-            println!();
-            print_usage(usage);
-        }
-    }
-    println!();
-
-    if tool_calls.is_empty() {
-        return Ok(TurnResult::Done);
-    }
-
-    Ok(TurnResult::ToolCalls {
-        content: full_content,
-        tool_calls,
-    })
-}
-
-fn process_tool_calls(
-    content: &str,
-    tool_calls: &[ToolCall],
-    conversation_id: Uuid,
-    messages: &mut Vec<Message>,
-    todos: &mut Vec<TodoItem>,
-) -> Result<()> {
-    let mut assistant_msg =
-        Message::assistant(conversation_id, content);
-    assistant_msg.tool_calls.extend(tool_calls.iter().cloned());
-    messages.push(assistant_msg);
-
-    for tc in tool_calls {
-        let args_str = tc.function.arguments_json();
-        println!(
-            "  Tool call: {}({})",
-            tc.function.name, args_str
-        );
-        let result =
-            execute_tool(&tc.function.name, args_str, todos)?;
-        println!("  Result:    {result}");
-
-        let tool_msg = Message::tool(
-            conversation_id,
-            result,
-            tc.id.clone(),
-            tc.function.name.clone(),
-        )?;
-        messages.push(tool_msg);
-    }
-    println!();
-    Ok(())
-}
+// -- Main -----------------------------------------------------------------
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -396,22 +261,21 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    println!("Anthropic Claude Demo");
-    println!("=====================");
+    println!("OpenAI Chat Completions Demo");
+    println!("============================");
+    println!("Base URL: {}", args.base_url);
     println!("Model: {}", args.model);
-    println!("Max tokens: {}", args.max_tokens);
-    println!("Streaming: {}", !args.no_stream);
     println!();
 
-    let mut config = Config::new("anthropic", &args.model)
-        .with_api_key(&args.api_key)
-        .with_max_tokens(args.max_tokens);
+    let mut config = Config::new("openai", &args.model)
+        .with_base_url(&args.base_url)
+        .with_api_key(&args.api_key);
 
     if let Some(temp) = args.temperature {
         config = config.with_temperature(temp);
     }
 
-    let client = AnthropicClient::new(config)?;
+    let client = OpenAIClient::new(config)?;
 
     let conversation_id = Uuid::new_v4();
     let mut messages = vec![
@@ -434,7 +298,6 @@ async fn main() -> Result<()> {
     loop {
         let mut request = ChatRequest::new(messages.clone())
             .with_model(&args.model)
-            .with_max_tokens(args.max_tokens)
             .with_tools(tools.clone())
             .with_tool_choice(ToolChoice::Auto);
 
@@ -442,27 +305,59 @@ async fn main() -> Result<()> {
             request = request.with_temperature(temp);
         }
 
-        let result = if args.no_stream {
-            send_non_streaming(&client, &request).await?
-        } else {
-            send_streaming(&client, &request).await?
-        };
+        println!("Sending request...");
+        let response = client.chat(&request).await?;
 
-        match result {
-            TurnResult::Done => break,
-            TurnResult::ToolCalls {
-                content,
-                tool_calls,
-            } => {
-                process_tool_calls(
-                    &content,
-                    &tool_calls,
-                    conversation_id,
-                    &mut messages,
-                    &mut todos,
-                )?;
+        if response.message.tool_calls.is_empty() {
+            println!();
+            println!("Assistant: {}", response.message.content);
+            println!();
+            if let Some(reason) = response.finish_reason {
+                println!("Finish reason: {reason:?}");
             }
+            if let Some(usage) = response.usage {
+                println!("Usage:");
+                println!(
+                    "  Input tokens: {}",
+                    usage.prompt_tokens
+                );
+                println!(
+                    "  Output tokens: {}",
+                    usage.completion_tokens
+                );
+                println!(
+                    "  Total tokens: {}",
+                    usage.total_tokens
+                );
+            }
+            break;
         }
+
+        let tool_calls = response.message.tool_calls.clone();
+        messages.push(response.message);
+
+        for tc in &tool_calls {
+            let args_str = tc.function.arguments_json();
+            println!(
+                "  Tool call: {}({})",
+                tc.function.name, args_str
+            );
+            let result = execute_tool(
+                &tc.function.name,
+                args_str,
+                &mut todos,
+            )?;
+            println!("  Result:    {result}");
+
+            let tool_msg = Message::tool(
+                conversation_id,
+                result,
+                tc.id.clone(),
+                tc.function.name.clone(),
+            )?;
+            messages.push(tool_msg);
+        }
+        println!();
     }
 
     Ok(())

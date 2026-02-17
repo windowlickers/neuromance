@@ -44,7 +44,6 @@ neuromance-common = { version = "0.0.6", path = "../neuromance-common" }
 clap = { version = "4.0", features = ["derive", "env"] }
 log.workspace = true
 env_logger.workspace = true
-chrono-tz.workspace = true
 once_cell = "1.19"
 wiremock = "0.6"
 proptest = "1.4"
