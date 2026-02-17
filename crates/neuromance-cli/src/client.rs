@@ -351,7 +351,7 @@ impl DaemonClient {
     // --- Internal helpers (unchanged) ---
 
     fn data_dir() -> Result<PathBuf> {
-        dirs::data_local_dir()
+        neuromance_daemon::paths::data_dir()
             .context("Failed to determine data directory")
             .map(|dir| dir.join("neuromance"))
     }

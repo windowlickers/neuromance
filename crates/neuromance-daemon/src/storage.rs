@@ -70,7 +70,7 @@ impl Storage {
     /// - The home directory cannot be determined
     /// - Directory creation fails
     pub fn new() -> Result<Self> {
-        let data_dir = dirs::data_local_dir()
+        let data_dir = neuromance_daemon::paths::data_dir()
             .ok_or_else(|| DaemonError::Storage("Failed to determine data directory".to_string()))?
             .join("neuromance");
 

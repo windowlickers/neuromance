@@ -1440,7 +1440,6 @@ dependencies = [
  "chrono",
  "clap",
  "colored",
- "dirs",
  "env_logger",
  "fs2",
  "hyper-util",
