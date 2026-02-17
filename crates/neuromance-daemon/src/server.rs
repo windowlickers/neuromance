@@ -151,7 +151,10 @@ impl Server {
         self.storage.write_pid(pid)?;
         info!(pid = %pid, "Daemon started");
 
-        // Bind Unix socket
+        // Bind Unix socket then restrict permissions. There's a brief
+        // window before set_permissions where the socket has default mode,
+        // but the socket already lives in a user-owned directory and
+        // unsafe_code is forbidden so we can't use libc::umask directly.
         let listener = tokio::net::UnixListener::bind(socket_path)?;
         std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))?;
         info!(
