@@ -64,8 +64,16 @@ impl ChatSession {
 
 impl DaemonClient {
     /// Waits for socket with exponential backoff.
-    async fn wait_for_socket(socket_path: &Path, timeout_secs: u64) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    ///
+    /// If `child` is provided, checks whether the daemon exited
+    /// early each iteration and surfaces the error from the log.
+    async fn wait_for_socket(
+        socket_path: &Path,
+        timeout_secs: u64,
+        mut child: Option<&mut std::process::Child>,
+    ) -> Result<()> {
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_secs(timeout_secs);
         let mut delay = Duration::from_millis(50);
         let max_delay = Duration::from_millis(500);
 
@@ -74,8 +82,28 @@ impl DaemonClient {
                 return Ok(());
             }
 
+            if let Some(ref mut proc) = child
+                && let Some(status) = proc.try_wait()?
+            {
+                let detail = Self::read_daemon_log_tail()
+                    .unwrap_or_default();
+                let msg = if detail.is_empty() {
+                    format!(
+                        "Daemon exited ({status}) during startup"
+                    )
+                } else {
+                    format!(
+                        "Daemon exited ({status}) during \
+                         startup:\n{detail}"
+                    )
+                };
+                anyhow::bail!(msg);
+            }
+
             if tokio::time::Instant::now() + delay > deadline {
-                anyhow::bail!("Socket unavailable after {timeout_secs}s");
+                anyhow::bail!(
+                    "Socket unavailable after {timeout_secs}s"
+                );
             }
 
             tokio::time::sleep(delay).await;
@@ -121,7 +149,7 @@ impl DaemonClient {
         let existing_pid = Self::read_pid(&pid_file)?;
         if let Some(pid) = existing_pid {
             if is_process_running(pid) {
-                Self::wait_for_socket(&socket_path, 10)
+                Self::wait_for_socket(&socket_path, 10, None)
                     .await
                     .context(format!("Daemon (PID {pid}) but socket unavailable"))?;
                 let channel = Self::create_channel(socket_path).await?;
@@ -144,10 +172,15 @@ impl DaemonClient {
         }
 
         // Spawn daemon
-        Self::spawn_daemon()?;
+        let mut child = Self::spawn_daemon()?;
 
-        // Wait for socket
-        Self::wait_for_socket(&socket_path, 10).await?;
+        // Wait for socket (checks for early daemon exit)
+        Self::wait_for_socket(
+            &socket_path,
+            10,
+            Some(&mut child),
+        )
+        .await?;
 
         drop(lock);
 
@@ -395,17 +428,42 @@ impl DaemonClient {
         Ok(file)
     }
 
-    fn spawn_daemon() -> Result<()> {
+    fn spawn_daemon() -> Result<std::process::Child> {
         let stderr_stdio = Self::open_daemon_log().map_or_else(|_| Stdio::null(), Stdio::from);
 
-        Command::new("neuromance-daemon")
+        let child = Command::new("neuromance-daemon")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(stderr_stdio)
             .spawn()
             .context("Failed to spawn daemon. Is neuromance-daemon in PATH?")?;
 
-        Ok(())
+        Ok(child)
+    }
+
+    /// Reads the last 20 lines of daemon.log, filtered to ERROR
+    /// lines, to surface startup failures.
+    fn read_daemon_log_tail() -> Result<String> {
+        let log_path = Self::data_dir()?.join("daemon.log");
+        let content = std::fs::read_to_string(&log_path)
+            .context("Failed to read daemon log")?;
+        let lines: Vec<&str> = content.lines().collect();
+        let tail = if lines.len() > 20 {
+            &lines[lines.len() - 20..]
+        } else {
+            &lines
+        };
+        let errors: Vec<&str> = tail
+            .iter()
+            .filter(|l| l.contains("ERROR"))
+            .copied()
+            .collect();
+        let result = if errors.is_empty() {
+            tail.join("\n")
+        } else {
+            errors.join("\n")
+        };
+        Ok(result)
     }
 
     fn open_daemon_log() -> Result<File> {
