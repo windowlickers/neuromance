@@ -1,9 +1,8 @@
-//! Domain types for daemon/client communication.
+//! Internal event and domain types for daemon communication.
 //!
-//! Defines internal event types used by the daemon's conversation manager,
-//! domain value objects (`ConversationSummary`, `ModelProfile`, `ErrorCode`),
-//! and the `DaemonResponse` event enum for streaming results through mpsc channels.
-//! The wire protocol is defined separately in `neuromance-proto` using gRPC/protobuf.
+//! Defines the `DaemonResponse` event enum streamed through mpsc channels,
+//! plus domain value objects (`ConversationSummary`, `ModelProfile`, `ErrorCode`)
+//! used throughout the daemon. The wire protocol lives in `neuromance-proto`.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

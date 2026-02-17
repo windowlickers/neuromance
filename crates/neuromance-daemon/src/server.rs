@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use neuromance_common::protocol::DaemonResponse;
+use neuromance_common::events::DaemonResponse;
 use neuromance_proto::proto;
 use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio::time::Instant;
@@ -703,7 +703,7 @@ impl neuromance_proto::Neuromance for GrpcService {
         let current = match loaded {
             Ok(Some((id, conv, bm))) => {
                 let model = self.inner.manager.get_conversation_model(&id);
-                let summary = neuromance_common::protocol::ConversationSummary::from_conversation(
+                let summary = neuromance_common::events::ConversationSummary::from_conversation(
                     &conv, model, bm,
                 );
                 Some(proto::ConversationSummaryProto::from(&summary))

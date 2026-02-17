@@ -70,11 +70,11 @@ pub mod features;
 /// Provides types for defining and executing functions/tools that LLMs can call.
 pub mod tools;
 
-/// Daemon/client communication protocol.
+/// Internal event and domain types for daemon communication.
 ///
-/// Defines the line-delimited JSON protocol for communication between
-/// the `nm` CLI client and the `neuromance-daemon` server.
-pub mod protocol;
+/// Defines event types used by the daemon's conversation manager
+/// and the gRPC server bridge for streaming results through mpsc channels.
+pub mod events;
 
 pub mod agents;
 
@@ -85,7 +85,7 @@ pub use client::{
     ToolChoice, Usage,
 };
 pub use features::{ReasoningLevel, ThinkingMode};
-pub use protocol::{ConversationSummary, DaemonResponse, ErrorCode, ModelProfile};
+pub use events::{ConversationSummary, DaemonResponse, ErrorCode, ModelProfile};
 pub use tools::{
     Function, FunctionCall, ObjectSchema, Parameters, Property, Tool, ToolApproval, ToolCall,
 };

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use neuromance::Core;
 use neuromance_client::{AnthropicClient, LLMClient, OpenAIClient, ResponsesClient};
-use neuromance_common::protocol::{ConversationSummary, DaemonResponse};
+use neuromance_common::events::{ConversationSummary, DaemonResponse};
 use neuromance_common::{Config, Conversation, Message, MessageRole, ToolApproval};
 use neuromance_tools::ToolImplementation;
 use neuromance_tools::mcp::McpManager;

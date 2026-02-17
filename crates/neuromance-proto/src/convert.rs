@@ -3,7 +3,7 @@
 use chrono::{DateTime, Utc};
 use neuromance_common::chat::{Message, MessageRole, ReasoningContent};
 use neuromance_common::client::{InputTokensDetails, OutputTokensDetails, Usage};
-use neuromance_common::protocol::{ConversationSummary, ModelProfile};
+use neuromance_common::events::{ConversationSummary, ModelProfile};
 use neuromance_common::tools::{FunctionCall, ToolApproval, ToolCall};
 use prost_types::Timestamp;
 use smallvec::SmallVec;
@@ -335,7 +335,7 @@ impl From<proto::ModelProfileProto> for ModelProfile {
 
 // --- ErrorCode ---
 
-impl From<proto::ErrorCode> for neuromance_common::protocol::ErrorCode {
+impl From<proto::ErrorCode> for neuromance_common::events::ErrorCode {
     fn from(code: proto::ErrorCode) -> Self {
         match code {
             proto::ErrorCode::ConversationNotFound => Self::ConversationNotFound,
@@ -353,25 +353,25 @@ impl From<proto::ErrorCode> for neuromance_common::protocol::ErrorCode {
     }
 }
 
-impl From<neuromance_common::protocol::ErrorCode> for proto::ErrorCode {
-    fn from(code: neuromance_common::protocol::ErrorCode) -> Self {
+impl From<neuromance_common::events::ErrorCode> for proto::ErrorCode {
+    fn from(code: neuromance_common::events::ErrorCode) -> Self {
         match code {
-            neuromance_common::protocol::ErrorCode::ConversationNotFound => {
+            neuromance_common::events::ErrorCode::ConversationNotFound => {
                 Self::ConversationNotFound
             }
-            neuromance_common::protocol::ErrorCode::ModelNotFound => Self::ModelNotFound,
-            neuromance_common::protocol::ErrorCode::BookmarkNotFound => Self::BookmarkNotFound,
-            neuromance_common::protocol::ErrorCode::BookmarkExists => Self::BookmarkExists,
-            neuromance_common::protocol::ErrorCode::NoActiveConversation => {
+            neuromance_common::events::ErrorCode::ModelNotFound => Self::ModelNotFound,
+            neuromance_common::events::ErrorCode::BookmarkNotFound => Self::BookmarkNotFound,
+            neuromance_common::events::ErrorCode::BookmarkExists => Self::BookmarkExists,
+            neuromance_common::events::ErrorCode::NoActiveConversation => {
                 Self::NoActiveConversation
             }
-            neuromance_common::protocol::ErrorCode::InvalidConversationId => {
+            neuromance_common::events::ErrorCode::InvalidConversationId => {
                 Self::InvalidConversationId
             }
-            neuromance_common::protocol::ErrorCode::LlmError => Self::LlmError,
-            neuromance_common::protocol::ErrorCode::ConfigError => Self::ConfigError,
-            neuromance_common::protocol::ErrorCode::StorageError => Self::StorageError,
-            neuromance_common::protocol::ErrorCode::InvalidRequest => Self::InvalidRequest,
+            neuromance_common::events::ErrorCode::LlmError => Self::LlmError,
+            neuromance_common::events::ErrorCode::ConfigError => Self::ConfigError,
+            neuromance_common::events::ErrorCode::StorageError => Self::StorageError,
+            neuromance_common::events::ErrorCode::InvalidRequest => Self::InvalidRequest,
             _ => Self::Internal,
         }
     }
@@ -561,7 +561,7 @@ mod tests {
 
     #[test]
     fn test_error_code_roundtrip() {
-        use neuromance_common::protocol::ErrorCode as DomainErrorCode;
+        use neuromance_common::events::ErrorCode as DomainErrorCode;
 
         let codes = [
             DomainErrorCode::ConversationNotFound,

@@ -501,7 +501,7 @@ pub fn status_daemon_not_running(json: bool) -> Result<()> {
 fn print_status_human(
     uptime_seconds: u64,
     active_conversations: usize,
-    current_conversation: Option<neuromance_common::protocol::ConversationSummary>,
+    current_conversation: Option<neuromance_common::events::ConversationSummary>,
 ) {
     println!("{} Daemon is running", "✓".bright_green());
     println!("  Uptime: {}", format_duration(uptime_seconds));
@@ -534,7 +534,7 @@ fn print_status_json(
     daemon_running: bool,
     uptime_seconds: Option<u64>,
     active_conversations: usize,
-    current_conversation: Option<&neuromance_common::protocol::ConversationSummary>,
+    current_conversation: Option<&neuromance_common::events::ConversationSummary>,
 ) -> Result<()> {
     let output = if daemon_running {
         json!({
