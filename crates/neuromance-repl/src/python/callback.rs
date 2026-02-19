@@ -35,8 +35,7 @@ pub fn create_py_callback<'py>(
         py,
         None,
         None,
-        move |args: &Bound<PyTuple>,
-              kwargs: Option<&Bound<PyDict>>| {
+        move |args: &Bound<PyTuple>, kwargs: Option<&Bound<PyDict>>| {
             #[allow(clippy::unnecessary_debug_formatting)]
             let args_vec: Vec<String> = args
                 .iter()
@@ -52,9 +51,7 @@ pub fn create_py_callback<'py>(
                     kw.iter()
                         .filter_map(|(k, v)| {
                             let key = k.extract::<String>().ok()?;
-                            let value = v
-                                .extract::<String>()
-                                .unwrap_or_else(|_| format!("{v:?}"));
+                            let value = v.extract::<String>().unwrap_or_else(|_| format!("{v:?}"));
                             Some((key, value))
                         })
                         .collect()
@@ -65,16 +62,12 @@ pub fn create_py_callback<'py>(
             // blocking operations (e.g., waiting for an agent loop response)
             let cb_clone = Arc::clone(&cb);
             let result = args.py().detach(move || {
-                tokio::runtime::Handle::current()
-                    .block_on(cb_clone(args_vec, kwargs_map))
+                tokio::runtime::Handle::current().block_on(cb_clone(args_vec, kwargs_map))
             });
 
             match result {
                 Ok(result) => Ok(result),
-                Err(e) => Err(PyErr::new::<
-                    pyo3::exceptions::PyRuntimeError,
-                    _,
-                >(e)),
+                Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e)),
             }
         },
     )
@@ -98,8 +91,7 @@ pub fn inject_callbacks_if_needed(
     callbacks: &HashMap<String, Arc<PythonCallback>>,
     injected: &mut HashSet<String>,
 ) -> Result<(), ReplError> {
-    let current_names: HashSet<String> =
-        callbacks.keys().cloned().collect();
+    let current_names: HashSet<String> = callbacks.keys().cloned().collect();
 
     // Remove stale entries
     injected.retain(|name| current_names.contains(name));

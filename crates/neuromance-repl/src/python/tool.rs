@@ -93,7 +93,10 @@ impl ToolImplementation for PythonReplTool {
         let result = self.repl.execute(code).await?;
 
         if result.success {
-            log::debug!("Python execution succeeded in {}ms", result.execution_time_ms);
+            log::debug!(
+                "Python execution succeeded in {}ms",
+                result.execution_time_ms
+            );
             if !result.stdout.is_empty() {
                 log::debug!("stdout:\n{}", result.stdout);
             }

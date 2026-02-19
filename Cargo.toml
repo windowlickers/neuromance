@@ -34,6 +34,7 @@ neuromance-tools = { version = "0.0.6", path = "crates/neuromance-tools" }
 neuromance-agent = { version = "0.0.6", path = "crates/neuromance-agent" }
 neuromance = { version = "0.0.6", path = "crates/neuromance" }
 neuromance-runtime = { version = "0.0.6", path = "crates/neuromance-runtime" }
+neuromance-repl = { version = "0.0.6", path = "crates/neuromance-repl" }
 
 # External dependencies
 anyhow = "1.0"

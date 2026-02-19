@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::pedantic)]
 //! Demonstrates recursive REPL environments with depth-limited llm_query.
 //!
 //! Each layer spawns a new Python REPL with:

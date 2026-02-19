@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::pedantic)]
 //! Resource usage benchmarks for PythonRepl.
 //!
 //! Tracks memory, file descriptors, and timing for REPL operations.
@@ -49,11 +49,9 @@
 //! MAX_DEPTH=1000 STEP_SIZE=50 cargo run --example depth_stress_test --features python --release
 //! ```
 
-use criterion::{
-    black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
-};
-use neuromance_repl::python::PythonRepl;
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use neuromance_repl::ReplEnvironment;
+use neuromance_repl::python::PythonRepl;
 use std::collections::HashMap;
 use sysinfo::{Pid, System};
 

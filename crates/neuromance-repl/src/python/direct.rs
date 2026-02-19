@@ -74,10 +74,7 @@ impl PythonRepl {
             let locals = PyDict::new(py);
 
             // Setup restricted builtins
-            let builtins = Self::create_restricted_builtins(
-                py,
-                &config.python_modules,
-            )?;
+            let builtins = Self::create_restricted_builtins(py, &config.python_modules)?;
             globals
                 .set_item("__builtins__", builtins)
                 .map_err(|e| ReplError::InitializationError(e.to_string()))?;
@@ -175,14 +172,11 @@ impl PythonRepl {
             if let Ok(obj) = main_builtins.getattr(*name) {
                 builtins
                     .set_item(*name, obj)
-                    .map_err(|e| {
-                        ReplError::InitializationError(e.to_string())
-                    })?;
+                    .map_err(|e| ReplError::InitializationError(e.to_string()))?;
             }
         }
 
-        let restricted_import =
-            Self::create_filtered_import(py, allowed_modules)?;
+        let restricted_import = Self::create_filtered_import(py, allowed_modules)?;
         builtins
             .set_item("__import__", restricted_import)
             .map_err(|e| ReplError::InitializationError(e.to_string()))?;
@@ -199,8 +193,7 @@ impl PythonRepl {
         py: Python,
         allowed_modules: &[String],
     ) -> Result<Py<PyAny>, ReplError> {
-        let allowed: HashSet<String> =
-            allowed_modules.iter().cloned().collect();
+        let allowed: HashSet<String> = allowed_modules.iter().cloned().collect();
 
         let real_import = py
             .import("builtins")
@@ -213,25 +206,16 @@ impl PythonRepl {
             py,
             Some(c"_restricted_import"),
             None,
-            move |args: &Bound<PyTuple>,
-                  kwargs: Option<&Bound<PyDict>>|
-                  -> PyResult<Py<PyAny>> {
+            move |args: &Bound<PyTuple>, kwargs: Option<&Bound<PyDict>>| -> PyResult<Py<PyAny>> {
                 let py = args.py();
                 let name: String = args.get_item(0)?.extract()?;
                 let top = name.split('.').next().unwrap_or(&name);
                 if !allowed.contains(top) {
-                    return Err(
-                        pyo3::exceptions::PyImportError::new_err(
-                            format!(
-                                "Import of '{name}' is not allowed"
-                            ),
-                        ),
-                    );
+                    return Err(pyo3::exceptions::PyImportError::new_err(format!(
+                        "Import of '{name}' is not allowed"
+                    )));
                 }
-                Ok(real_import
-                    .bind(py)
-                    .call(args, kwargs)?
-                    .unbind())
+                Ok(real_import.bind(py).call(args, kwargs)?.unbind())
             },
         )
         .map_err(|e| ReplError::InitializationError(e.to_string()))?;
@@ -303,12 +287,10 @@ impl PythonRepl {
 
         // Execute the code
         let c_code = CString::new(code).map_err(|e| {
-            ReplError::ExecutionError(
-                format!(
-                    "code contains an interior NUL byte at position {}",
-                    e.nul_position()
-                ),
-            )
+            ReplError::ExecutionError(format!(
+                "code contains an interior NUL byte at position {}",
+                e.nul_position()
+            ))
         })?;
         let exec_result = py.run(c_code.as_c_str(), Some(globals), Some(locals));
 
@@ -592,10 +574,7 @@ mod tests {
         assert!(result.stderr.contains("not allowed"));
 
         // Configured module via import statement works
-        let result = repl
-            .execute("import math\ny = math.pi")
-            .await
-            .unwrap();
+        let result = repl.execute("import math\ny = math.pi").await.unwrap();
         assert!(result.success);
 
         // Submodule of configured module works
@@ -638,10 +617,7 @@ mod tests {
             // eval/exec/compile are not in safe builtins
             ("eval(\"__import__('os')\")", "eval"),
             ("exec('import os')", "exec"),
-            (
-                "compile('import os', '', 'exec')",
-                "compile",
-            ),
+            ("compile('import os', '', 'exec')", "compile"),
             // Reach real __import__ through a pre-loaded module's globals
             (
                 "math.__builtins__['__import__']('os')",
@@ -683,10 +659,7 @@ mod tests {
 
         for (code, label) in &blocked {
             let result = repl.execute(code).await.unwrap();
-            assert!(
-                !result.success,
-                "ESCAPE: {label} succeeded — code: {code}"
-            );
+            assert!(!result.success, "ESCAPE: {label} succeeded — code: {code}");
         }
     }
 

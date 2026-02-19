@@ -1,3 +1,9 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::pedantic,
+    clippy::collapsible_if
+)]
 //! Stress test for nested REPL depth to find resource limits.
 //!
 //! This example progressively creates more nested REPLs until failure,
@@ -18,8 +24,8 @@
 //!   cargo run --example depth_stress_test --features python --release -- \
 //!     --context-file /path/to/large_document.txt
 
-use neuromance_repl::python::PythonRepl;
 use neuromance_repl::ReplEnvironment;
+use neuromance_repl::python::PythonRepl;
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -148,12 +154,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if let Err(e) = repl
                             .inject_function(
                                 "llm_query",
-                                Box::new(move |args: Vec<String>, _kwargs: HashMap<String, String>| {
-                                    let d = depth;
-                                    Box::pin(async move {
-                                        Ok(format!("Response from depth {d}: {:?}", args))
-                                    })
-                                }),
+                                Box::new(
+                                    move |args: Vec<String>, _kwargs: HashMap<String, String>| {
+                                        let d = depth;
+                                        Box::pin(async move {
+                                            Ok(format!("Response from depth {d}: {:?}", args))
+                                        })
+                                    },
+                                ),
                             )
                             .await
                         {

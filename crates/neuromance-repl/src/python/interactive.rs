@@ -219,73 +219,72 @@ impl ReplEnvironment for InteractivePythonRepl {
         let timeout = self.config.base.timeout;
 
         // Execute in blocking task with timeout
-        let result =
-            tokio::time::timeout(
-                timeout,
-                tokio::task::spawn_blocking(move || {
-                    // Start timing INSIDE the blocking task to exclude queue wait time
-                    let start = Instant::now();
+        let result = tokio::time::timeout(
+            timeout,
+            tokio::task::spawn_blocking(move || {
+                // Start timing INSIDE the blocking task to exclude queue wait time
+                let start = Instant::now();
 
-                    Python::attach(|py| {
-                        // Inject callbacks into locals
-                        let callbacks = callbacks_arc.blocking_read();
-                        let locals_guard = locals_arc.blocking_read();
-                        let locals_ref = locals_guard.bind(py);
-                        let mut injected_guard = injected_arc.blocking_write();
+                Python::attach(|py| {
+                    // Inject callbacks into locals
+                    let callbacks = callbacks_arc.blocking_read();
+                    let locals_guard = locals_arc.blocking_read();
+                    let locals_ref = locals_guard.bind(py);
+                    let mut injected_guard = injected_arc.blocking_write();
 
-                        callback::inject_callbacks_if_needed(
-                            py,
-                            locals_ref,
-                            &callbacks,
-                            &mut injected_guard,
-                        )?;
+                    callback::inject_callbacks_if_needed(
+                        py,
+                        locals_ref,
+                        &callbacks,
+                        &mut injected_guard,
+                    )?;
 
-                        drop(callbacks);
-                        drop(injected_guard);
-                        drop(locals_guard);
+                    drop(callbacks);
+                    drop(injected_guard);
+                    drop(locals_guard);
 
-                        // Redirect stdout/stderr to capture output
-                        let streams = redirect_streams(py)?;
+                    // Redirect stdout/stderr to capture output
+                    let streams = redirect_streams(py)?;
 
-                        // Push each line to the console
-                        let console = console_arc.blocking_read();
-                        let console_ref = console.bind(py);
+                    // Push each line to the console
+                    let console = console_arc.blocking_read();
+                    let console_ref = console.bind(py);
 
-                        let mut exec_error = None;
-                        for line in code.lines() {
-                            if let Err(e) = console_ref.call_method1("push", (line,)) {
-                                exec_error = Some(e);
-                                break;
-                            }
-                        }
-
-                        // Push empty line to finalize any incomplete statement
-                        if exec_error.is_none()
-                            && let Err(e) = console_ref.call_method1("push", ("",))
-                        {
+                    let mut exec_error = None;
+                    for line in code.lines() {
+                        if let Err(e) = console_ref.call_method1("push", (line,)) {
                             exec_error = Some(e);
+                            break;
                         }
+                    }
 
-                        // Restore streams and get captured output
-                        let (stdout, stderr) = streams.restore(py)?;
+                    // Push empty line to finalize any incomplete statement
+                    if exec_error.is_none()
+                        && let Err(e) = console_ref.call_method1("push", ("",))
+                    {
+                        exec_error = Some(e);
+                    }
 
-                        if let Some(e) = exec_error {
-                            return Err(ReplError::ExecutionError(e.to_string()));
-                        }
+                    // Restore streams and get captured output
+                    let (stdout, stderr) = streams.restore(py)?;
 
-                        // InteractiveConsole writes tracebacks to stderr
-                        let success = stderr.is_empty();
-                        Ok(ReplResult {
-                            stdout,
-                            stderr,
-                            success,
-                            return_value: None,
-                            execution_time_ms: start.elapsed().as_millis() as u64,
-                        })
+                    if let Some(e) = exec_error {
+                        return Err(ReplError::ExecutionError(e.to_string()));
+                    }
+
+                    // InteractiveConsole writes tracebacks to stderr
+                    let success = stderr.is_empty();
+                    Ok(ReplResult {
+                        stdout,
+                        stderr,
+                        success,
+                        return_value: None,
+                        execution_time_ms: start.elapsed().as_millis() as u64,
                     })
-                }),
-            )
-            .await;
+                })
+            }),
+        )
+        .await;
 
         match result {
             Ok(Ok(repl_result)) => repl_result,

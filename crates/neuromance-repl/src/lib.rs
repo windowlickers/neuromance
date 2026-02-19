@@ -207,7 +207,10 @@ pub trait ReplEnvironment: Send + Sync {
         &self,
         name: &str,
         callback: Box<
-            dyn Fn(Vec<String>, HashMap<String, String>) -> BoxFuture<'static, Result<String, String>>
+            dyn Fn(
+                    Vec<String>,
+                    HashMap<String, String>,
+                ) -> BoxFuture<'static, Result<String, String>>
                 + Send
                 + Sync,
         >,
