@@ -9,33 +9,28 @@
 
 use crate::{ReplConfig, ReplEnvironment, ReplError, ReplResult};
 use async_trait::async_trait;
-use futures::future::BoxFuture;
 use pyo3::prelude::*;
-use pyo3::types::{PyCFunction, PyDict, PyTuple};
+use pyo3::types::PyDict;
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
 
-/// Callback function type for injected functions.
-///
-/// Receives:
-/// - `args`: Positional arguments as strings
-/// - `kwargs`: Keyword arguments as a string-to-string map
-///
-/// Returns a `BoxFuture` to allow async operations within the callback.
-/// Use `Box::pin(async move { ... })` when creating callbacks.
-pub type PythonCallback = Box<
-    dyn Fn(Vec<String>, HashMap<String, String>) -> BoxFuture<'static, Result<String, String>>
-        + Send
-        + Sync,
->;
+use super::PythonReplConfig;
+use super::callback::{self, PythonCallback};
 
-/// Python REPL environment with sandboxing and state persistence.
+/// Python REPL environment with restricted builtins and state persistence.
+///
+/// # Thread Safety
+///
+/// `Py<T>` is `Send + Sync` in `PyO3` — it is a GIL-independent
+/// reference-counted pointer. Actual Python object access requires
+/// `Python::attach()` + `.bind(py)` to re-acquire the GIL. All
+/// mutable state is further protected by `tokio::sync::RwLock`.
 pub struct PythonRepl {
     /// Configuration
-    config: ReplConfig,
+    config: PythonReplConfig,
 
     /// Global namespace (includes builtins and injected functions)
     globals: Arc<RwLock<Py<PyDict>>>,
@@ -57,7 +52,7 @@ impl PythonRepl {
     ///
     /// Returns `ReplError` if Python initialization fails.
     pub fn new() -> Result<Self, ReplError> {
-        Self::with_config(ReplConfig::default())
+        Self::with_config(PythonReplConfig::default())
     }
 
     /// Create a new Python REPL with custom configuration.
@@ -65,7 +60,7 @@ impl PythonRepl {
     /// # Errors
     ///
     /// Returns `ReplError` if Python initialization fails.
-    pub fn with_config(config: ReplConfig) -> Result<Self, ReplError> {
+    pub fn with_config(config: PythonReplConfig) -> Result<Self, ReplError> {
         Python::attach(|py| {
             let globals = PyDict::new(py);
             let locals = PyDict::new(py);
@@ -196,84 +191,6 @@ impl PythonRepl {
         Ok(())
     }
 
-    /// Inject callbacks into Python globals if not already injected.
-    ///
-    /// This method only injects callbacks that are new or have been updated,
-    /// avoiding redundant Python object creation on every `execute()` call.
-    fn inject_callbacks_if_needed(
-        py: Python,
-        globals: &Bound<PyDict>,
-        callbacks: &HashMap<String, Arc<PythonCallback>>,
-        injected_callbacks: &mut HashSet<String>,
-    ) -> Result<(), ReplError> {
-        // Find callbacks that need to be injected (new or updated)
-        let current_callback_names: HashSet<String> = callbacks.keys().cloned().collect();
-
-        // Remove callbacks that no longer exist
-        injected_callbacks.retain(|name| current_callback_names.contains(name));
-
-        // Inject new/updated callbacks
-        for (name, callback) in callbacks {
-            if injected_callbacks.contains(name) {
-                continue; // Already injected, skip
-            }
-
-            let cb = Arc::clone(callback);
-            let py_func = PyCFunction::new_closure(
-                py,
-                None,
-                None,
-                move |args: &Bound<PyTuple>, kwargs: Option<&Bound<PyDict>>| {
-                    #[allow(clippy::unnecessary_debug_formatting)]
-                    let args_vec: Vec<String> = args
-                        .iter()
-                        .map(|arg| {
-                            arg.extract::<String>()
-                                .unwrap_or_else(|_| format!("{arg:?}"))
-                        })
-                        .collect();
-
-                    // Extract keyword arguments into a HashMap
-                    #[allow(clippy::unnecessary_debug_formatting)]
-                    let kwargs_map: HashMap<String, String> = kwargs
-                        .map(|kw| {
-                            kw.iter()
-                                .filter_map(|(k, v)| {
-                                    let key = k.extract::<String>().ok()?;
-                                    let value =
-                                        v.extract::<String>().unwrap_or_else(|_| format!("{v:?}"));
-                                    Some((key, value))
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
-
-                    // Release the GIL before calling the callback, as it may do blocking
-                    // operations (e.g., waiting for a response from the agent loop)
-                    let cb_clone = Arc::clone(&cb);
-                    let result = args.py().detach(move || {
-                        // Block on the async callback future
-                        tokio::runtime::Handle::current().block_on(cb_clone(args_vec, kwargs_map))
-                    });
-
-                    match result {
-                        Ok(result) => Ok(result),
-                        Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e)),
-                    }
-                },
-            )
-            .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
-
-            globals
-                .set_item(name.as_str(), py_func)
-                .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
-
-            injected_callbacks.insert(name.clone());
-        }
-
-        Ok(())
-    }
-
     /// Execute code with output capture.
     fn execute_with_capture(
         py: Python,
@@ -352,7 +269,7 @@ impl ReplEnvironment for PythonRepl {
         let locals = Arc::clone(&self.locals);
         let callbacks = Arc::clone(&self.callbacks);
         let injected_callbacks = Arc::clone(&self.injected_callbacks);
-        let timeout = self.config.timeout;
+        let timeout = self.config.base.timeout;
 
         // Execute in blocking task with timeout
         let result = tokio::time::timeout(
@@ -372,7 +289,7 @@ impl ReplEnvironment for PythonRepl {
                     let callbacks_guard = callbacks.blocking_read();
                     let mut injected_guard = injected_callbacks.blocking_write();
 
-                    Self::inject_callbacks_if_needed(
+                    callback::inject_callbacks_if_needed(
                         py,
                         globals_ref,
                         &callbacks_guard,
@@ -434,7 +351,7 @@ impl ReplEnvironment for PythonRepl {
     }
 
     fn config(&self) -> &ReplConfig {
-        &self.config
+        &self.config.base
     }
 
     fn language_name(&self) -> &'static str {
@@ -843,14 +760,15 @@ for i in range(1, 11):
     #[tokio::test]
     #[serial]
     async fn test_python_repl_config() {
-        let config = ReplConfig {
-            timeout: Duration::from_secs(10),
+        let config = PythonReplConfig {
+            base: ReplConfig {
+                timeout: Duration::from_secs(10),
+            },
             python_modules: vec!["math".to_string(), "json".to_string()],
         };
 
-        let repl = PythonRepl::with_config(config.clone()).unwrap();
+        let repl = PythonRepl::with_config(config).unwrap();
         assert_eq!(repl.config().timeout, Duration::from_secs(10));
-        assert_eq!(repl.config().python_modules.len(), 2);
     }
 
     #[tokio::test]

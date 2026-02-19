@@ -10,7 +10,7 @@
 //! - Less control over execution environment
 //! - No restricted builtins
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -21,7 +21,8 @@ use tokio::sync::RwLock;
 
 use crate::{ReplConfig, ReplEnvironment, ReplError, ReplResult};
 
-use super::PythonCallback;
+use super::PythonReplConfig;
+use super::callback::{self, PythonCallback};
 
 /// Captured stream state for stdout/stderr redirection.
 struct CapturedStreams<'py> {
@@ -100,9 +101,16 @@ impl CapturedStreams<'_> {
 }
 
 /// Python REPL using `InteractiveConsole` for multi-line support.
+///
+/// # Thread Safety
+///
+/// `Py<T>` is `Send + Sync` in `PyO3` — it is a GIL-independent
+/// reference-counted pointer. Actual Python object access requires
+/// `Python::attach()` + `.bind(py)` to re-acquire the GIL. All
+/// mutable state is further protected by `tokio::sync::RwLock`.
 pub struct InteractivePythonRepl {
     /// Configuration
-    config: ReplConfig,
+    config: PythonReplConfig,
 
     /// Python's code.InteractiveConsole instance
     console: Arc<RwLock<Py<PyAny>>>,
@@ -112,6 +120,9 @@ pub struct InteractivePythonRepl {
 
     /// Injected callback functions
     callbacks: Arc<RwLock<HashMap<String, Arc<PythonCallback>>>>,
+
+    /// Tracks which callbacks have been injected into Python locals
+    injected_callbacks: Arc<RwLock<HashSet<String>>>,
 }
 
 impl InteractivePythonRepl {
@@ -121,7 +132,7 @@ impl InteractivePythonRepl {
     ///
     /// Returns `ReplError` if Python initialization fails.
     pub fn new() -> Result<Self, ReplError> {
-        Self::with_config(ReplConfig::default())
+        Self::with_config(PythonReplConfig::default())
     }
 
     /// Create a new interactive Python REPL with custom configuration.
@@ -129,7 +140,7 @@ impl InteractivePythonRepl {
     /// # Errors
     ///
     /// Returns `ReplError` if Python initialization fails.
-    pub fn with_config(config: ReplConfig) -> Result<Self, ReplError> {
+    pub fn with_config(config: PythonReplConfig) -> Result<Self, ReplError> {
         Python::attach(|py| {
             // Import code module
             let code_module = py
@@ -152,7 +163,8 @@ impl InteractivePythonRepl {
                 config,
                 console: Arc::new(RwLock::new(console.unbind())),
                 locals: Arc::new(RwLock::new(locals.unbind())),
-                callbacks: Arc::new(RwLock::new(std::collections::HashMap::new())),
+                callbacks: Arc::new(RwLock::new(HashMap::new())),
+                injected_callbacks: Arc::new(RwLock::new(HashSet::new())),
             })
         })
     }
@@ -191,80 +203,37 @@ impl InteractivePythonRepl {
 impl ReplEnvironment for InteractivePythonRepl {
     #[allow(clippy::cast_possible_truncation)] // Execution time won't exceed u64::MAX ms
     async fn execute(&self, code: &str) -> Result<ReplResult, ReplError> {
-        let start = Instant::now();
-
         let code = code.to_string();
         let console_arc = Arc::clone(&self.console);
         let callbacks_arc = Arc::clone(&self.callbacks);
+        let injected_arc = Arc::clone(&self.injected_callbacks);
         let locals_arc = Arc::clone(&self.locals);
-        let timeout = self.config.timeout;
+        let timeout = self.config.base.timeout;
 
         // Execute in blocking task with timeout
         let result =
             tokio::time::timeout(
                 timeout,
                 tokio::task::spawn_blocking(move || {
+                    // Start timing INSIDE the blocking task to exclude queue wait time
+                    let start = Instant::now();
+
                     Python::attach(|py| {
                         // Inject callbacks into locals
                         let callbacks = callbacks_arc.blocking_read();
                         let locals_guard = locals_arc.blocking_read();
                         let locals_ref = locals_guard.bind(py);
+                        let mut injected_guard = injected_arc.blocking_write();
 
-                        for (name, callback) in callbacks.iter() {
-                            let cb = Arc::clone(callback);
-                            let py_func = pyo3::types::PyCFunction::new_closure(
+                        callback::inject_callbacks_if_needed(
                             py,
-                            None,
-                            None,
-                            move |args: &Bound<pyo3::types::PyTuple>,
-                                  kwargs: Option<&Bound<PyDict>>| {
-                                #[allow(clippy::unnecessary_debug_formatting)]
-                                let args_vec: Vec<String> = args
-                                    .iter()
-                                    .map(|arg| {
-                                        arg.extract::<String>()
-                                            .unwrap_or_else(|_| format!("{arg:?}"))
-                                    })
-                                    .collect();
+                            locals_ref,
+                            &callbacks,
+                            &mut injected_guard,
+                        )?;
 
-                                // Extract keyword arguments into a HashMap
-                                #[allow(clippy::unnecessary_debug_formatting)]
-                                let kwargs_map: HashMap<String, String> = kwargs
-                                    .map(|kw| {
-                                        kw.iter()
-                                            .filter_map(|(k, v)| {
-                                                let key = k.extract::<String>().ok()?;
-                                                let value = v
-                                                    .extract::<String>()
-                                                    .unwrap_or_else(|_| format!("{v:?}"));
-                                                Some((key, value))
-                                            })
-                                            .collect()
-                                    })
-                                    .unwrap_or_default();
-
-                                // Release the GIL and block on the async callback
-                                let cb_clone = Arc::clone(&cb);
-                                let result = args.py().detach(move || {
-                                    tokio::runtime::Handle::current()
-                                        .block_on(cb_clone(args_vec, kwargs_map))
-                                });
-
-                                match result {
-                                    Ok(result) => Ok(result),
-                                    Err(e) => {
-                                        Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
-                                    }
-                                }
-                            },
-                        )
-                        .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
-
-                            locals_ref
-                                .set_item(name.as_str(), py_func)
-                                .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
-                        }
                         drop(callbacks);
+                        drop(injected_guard);
                         drop(locals_guard);
 
                         // Redirect stdout/stderr to capture output
@@ -341,15 +310,20 @@ impl ReplEnvironment for InteractivePythonRepl {
                 *console_arc.blocking_write() = console.unbind();
                 *locals_arc.blocking_write() = locals.unbind();
 
-                Ok(())
+                Ok::<(), ReplError>(())
             })
         })
         .await
-        .map_err(|e| ReplError::ExecutionError(e.to_string()))?
+        .map_err(|e| ReplError::ExecutionError(e.to_string()))??;
+
+        // Clear callback tracking so they'll be re-injected on next execute()
+        self.injected_callbacks.write().await.clear();
+
+        Ok(())
     }
 
     fn config(&self) -> &ReplConfig {
-        &self.config
+        &self.config.base
     }
 
     fn language_name(&self) -> &'static str {

@@ -11,15 +11,15 @@
 //! # Example
 //!
 //! ```rust,no_run
-//! use neuromance_repl::{ReplEnvironment, ReplConfig};
+//! use neuromance_repl::ReplEnvironment;
 //!
 //! # async fn example() -> anyhow::Result<()> {
 //! #[cfg(feature = "python")]
 //! {
-//!     use neuromance_repl::python::PythonRepl;
+//!     use neuromance_repl::python::{PythonRepl, PythonReplConfig};
 //!
 //!     // Configure available modules
-//!     let mut config = ReplConfig::default();
+//!     let mut config = PythonReplConfig::default();
 //!     config.python_modules.push("numpy".to_string());
 //!
 //!     let repl = PythonRepl::with_config(config)?;
@@ -43,12 +43,9 @@ use thiserror::Error;
 #[cfg(feature = "python")]
 pub mod python;
 
-#[cfg(feature = "sandbox")]
-pub mod sandbox;
-
 // Re-export commonly used types for convenience
 #[cfg(feature = "python")]
-pub use python::{InteractivePythonRepl, PythonCallback, PythonRepl};
+pub use python::{InteractivePythonRepl, PythonCallback, PythonRepl, PythonReplConfig};
 
 #[cfg(all(feature = "python", feature = "tools"))]
 pub use python::PythonReplTool;
@@ -63,10 +60,6 @@ pub enum ReplError {
     /// Timeout during execution
     #[error("Execution timeout after {0:?}")]
     Timeout(Duration),
-
-    /// Sandboxing failed
-    #[error("Sandboxing error: {0}")]
-    SandboxError(String),
 
     /// Environment initialization failed
     #[error("Initialization error: {0}")]
@@ -160,27 +153,12 @@ impl std::fmt::Display for ReplResult {
 pub struct ReplConfig {
     /// Maximum execution time per code block
     pub timeout: Duration,
-
-    /// Python modules to import and make available globally.
-    /// Standard library modules are imported if available.
-    /// Third-party packages must be installed in the Python environment.
-    pub python_modules: Vec<String>,
 }
 
 impl Default for ReplConfig {
     fn default() -> Self {
         Self {
             timeout: Duration::from_secs(30),
-            python_modules: vec![
-                "math".to_string(),
-                "random".to_string(),
-                "datetime".to_string(),
-                "json".to_string(),
-                "re".to_string(),
-                "itertools".to_string(),
-                "collections".to_string(),
-                "functools".to_string(),
-            ],
         }
     }
 }
@@ -198,7 +176,7 @@ pub trait ReplEnvironment: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns `ReplError` if execution fails, times out, or sandboxing fails.
+    /// Returns `ReplError` if execution fails or times out.
     async fn execute(&self, code: &str) -> Result<ReplResult, ReplError>;
 
     /// Reset the REPL environment, clearing all state.
@@ -281,7 +259,5 @@ mod tests {
     fn test_repl_config_default() {
         let config = ReplConfig::default();
         assert_eq!(config.timeout, Duration::from_secs(30));
-        assert_eq!(config.python_modules.len(), 8);
-        assert!(config.python_modules.contains(&"math".to_string()));
     }
 }
