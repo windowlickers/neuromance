@@ -10,7 +10,7 @@
 use crate::{ReplConfig, ReplEnvironment, ReplError, ReplResult};
 use async_trait::async_trait;
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyCFunction, PyDict, PyTuple};
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::sync::Arc;
@@ -74,7 +74,10 @@ impl PythonRepl {
             let locals = PyDict::new(py);
 
             // Setup restricted builtins
-            let builtins = Self::create_restricted_builtins(py)?;
+            let builtins = Self::create_restricted_builtins(
+                py,
+                &config.python_modules,
+            )?;
             globals
                 .set_item("__builtins__", builtins)
                 .map_err(|e| ReplError::InitializationError(e.to_string()))?;
@@ -92,8 +95,12 @@ impl PythonRepl {
         })
     }
 
-    /// Create restricted builtins dictionary with safe functions only.
-    fn create_restricted_builtins(py: Python) -> Result<Py<PyDict>, ReplError> {
+    /// Create restricted builtins with a filtered `__import__`
+    /// that only allows modules from the configured allowlist.
+    fn create_restricted_builtins(
+        py: Python,
+        allowed_modules: &[String],
+    ) -> Result<Py<PyDict>, ReplError> {
         let builtins = PyDict::new(py);
 
         // Safe built-in functions
@@ -150,8 +157,6 @@ impl PythonRepl {
             "getattr",
             "setattr",
             "type",
-            // Import system (needed for import statements)
-            "__import__",
             // Exceptions (needed for error handling)
             "Exception",
             "StopIteration",
@@ -170,11 +175,68 @@ impl PythonRepl {
             if let Ok(obj) = main_builtins.getattr(*name) {
                 builtins
                     .set_item(*name, obj)
-                    .map_err(|e| ReplError::InitializationError(e.to_string()))?;
+                    .map_err(|e| {
+                        ReplError::InitializationError(e.to_string())
+                    })?;
             }
         }
 
+        let restricted_import =
+            Self::create_filtered_import(py, allowed_modules)?;
+        builtins
+            .set_item("__import__", restricted_import)
+            .map_err(|e| ReplError::InitializationError(e.to_string()))?;
+
         Ok(builtins.unbind())
+    }
+
+    /// Build a Rust-backed `__import__` replacement that only allows
+    /// modules from the given allowlist.
+    ///
+    /// The allowlist lives in Rust memory so Python code cannot
+    /// tamper with it via `__globals__`, `__closure__`, etc.
+    fn create_filtered_import(
+        py: Python,
+        allowed_modules: &[String],
+    ) -> Result<Py<PyAny>, ReplError> {
+        let allowed: HashSet<String> =
+            allowed_modules.iter().cloned().collect();
+
+        let real_import = py
+            .import("builtins")
+            .map_err(|e| ReplError::InitializationError(e.to_string()))?
+            .getattr("__import__")
+            .map_err(|e| ReplError::InitializationError(e.to_string()))?
+            .unbind();
+
+        let func = PyCFunction::new_closure(
+            py,
+            Some(c"_restricted_import"),
+            None,
+            move |args: &Bound<PyTuple>,
+                  kwargs: Option<&Bound<PyDict>>|
+                  -> PyResult<Py<PyAny>> {
+                let py = args.py();
+                let name: String = args.get_item(0)?.extract()?;
+                let top = name.split('.').next().unwrap_or(&name);
+                if !allowed.contains(top) {
+                    return Err(
+                        pyo3::exceptions::PyImportError::new_err(
+                            format!(
+                                "Import of '{name}' is not allowed"
+                            ),
+                        ),
+                    );
+                }
+                Ok(real_import
+                    .bind(py)
+                    .call(args, kwargs)?
+                    .unbind())
+            },
+        )
+        .map_err(|e| ReplError::InitializationError(e.to_string()))?;
+
+        Ok(func.unbind().into())
     }
 
     /// Add modules from configuration.
@@ -511,13 +573,121 @@ mod tests {
     async fn test_python_repl_restricted_builtins() {
         let repl = PythonRepl::new().unwrap();
 
-        // Should have access to safe builtins
+        // Safe builtins work
         let result = repl.execute("x = len([1, 2, 3])").await.unwrap();
         assert!(result.success);
 
-        // Should NOT have access to dangerous builtins like exec, eval
+        // exec is blocked
         let result = repl.execute("exec('print(1)')").await.unwrap();
         assert!(!result.success);
+
+        // __import__('os') is blocked (direct sandbox escape)
+        let result = repl.execute("__import__('os')").await.unwrap();
+        assert!(!result.success);
+        assert!(result.stderr.contains("not allowed"));
+
+        // import os statement is blocked
+        let result = repl.execute("import os").await.unwrap();
+        assert!(!result.success);
+        assert!(result.stderr.contains("not allowed"));
+
+        // Configured module via import statement works
+        let result = repl
+            .execute("import math\ny = math.pi")
+            .await
+            .unwrap();
+        assert!(result.success);
+
+        // Submodule of configured module works
+        let result = repl
+            .execute("from collections import defaultdict")
+            .await
+            .unwrap();
+        assert!(result.success);
+    }
+
+    /// Systematically attempts every known import sandbox escape vector.
+    #[tokio::test]
+    #[serial]
+    async fn test_import_sandbox_escape_attempts() {
+        let repl = PythonRepl::new().unwrap();
+
+        let blocked = [
+            // Direct __import__ call
+            ("__import__('os')", "direct __import__ call"),
+            // Import statements for disallowed modules
+            ("import os", "import statement"),
+            ("import subprocess", "import subprocess"),
+            ("import shutil", "import shutil"),
+            // from ... import
+            ("from os import system", "from os import"),
+            ("from os.path import join", "from os.path import"),
+            // Dotted import (top-level is checked)
+            ("import os.path", "dotted import"),
+            // __builtins__ dict gives back our restricted import
+            (
+                "__builtins__['__import__']('os')",
+                "__builtins__ dict access",
+            ),
+            // importlib is not in allowed modules
+            ("import importlib", "import importlib"),
+            (
+                "__import__('importlib').import_module('os')",
+                "importlib.import_module",
+            ),
+            // eval/exec/compile are not in safe builtins
+            ("eval(\"__import__('os')\")", "eval"),
+            ("exec('import os')", "exec"),
+            (
+                "compile('import os', '', 'exec')",
+                "compile",
+            ),
+            // Reach real __import__ through a pre-loaded module's globals
+            (
+                "math.__builtins__['__import__']('os')",
+                "module __builtins__ dict",
+            ),
+            (
+                "type(math).__dict__['__builtins__'].__getitem__('__import__')('os')",
+                "type(module).__dict__ chain",
+            ),
+            // Walk MRO to find a class whose __init__.__globals__
+            // has the real builtins
+            (
+                concat!(
+                    "[c for c in ",
+                    "().__class__.__bases__[0].__subclasses__() ",
+                    "if c.__name__ == 'catch_warnings'",
+                    "][0].__init__.__globals__['__import__']('os')",
+                ),
+                "subclass walk to catch_warnings",
+            ),
+            // Patch the allowlist through __globals__
+            (
+                concat!(
+                    "__import__.__globals__['_allowed']",
+                    ".add('os'); import os",
+                ),
+                "patch _allowed via __globals__",
+            ),
+            // Grab the real __import__ from the _b reference
+            (
+                concat!(
+                    "__builtins__['__import__'] = ",
+                    "__import__.__globals__['_b'].__import__; ",
+                    "import os",
+                ),
+                "replace import with real via _b.__import__",
+            ),
+        ];
+
+        for (code, label) in &blocked {
+            let result = repl.execute(code).await.unwrap();
+            assert!(
+                !result.success,
+                "ESCAPE: {label} succeeded — code: {code}"
+            );
+        }
     }
 
     // Known limitation: Function definitions across multiple execute() calls
@@ -851,7 +1021,9 @@ for i in range(1, 11):
     #[tokio::test]
     #[serial]
     async fn test_python_repl_execution_time_accuracy() {
-        let repl = PythonRepl::new().unwrap();
+        let mut config = PythonReplConfig::default();
+        config.python_modules.push("time".to_string());
+        let repl = PythonRepl::with_config(config).unwrap();
 
         // Execute code with a known sleep duration
         let result = repl
