@@ -415,8 +415,10 @@ impl ReplEnvironment for InteractivePythonRepl {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[tokio::test]
+    #[serial]
     async fn test_interactive_basic_execution() {
         let repl = InteractivePythonRepl::new().unwrap();
         let result = repl.execute("x = 10 + 5").await.unwrap();
@@ -427,6 +429,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_interactive_multiline_function() {
         let repl = InteractivePythonRepl::new().unwrap();
 
@@ -445,6 +448,7 @@ result = factorial(5)
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_interactive_state_persistence() {
         let repl = InteractivePythonRepl::new().unwrap();
 
@@ -456,6 +460,7 @@ result = factorial(5)
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_interactive_push() {
         let repl = InteractivePythonRepl::new().unwrap();
 
@@ -477,6 +482,7 @@ result = factorial(5)
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_interactive_stdout_capture() {
         let repl = InteractivePythonRepl::new().unwrap();
         let result = repl.execute("print('hello world')").await.unwrap();
@@ -485,6 +491,7 @@ result = factorial(5)
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_interactive_stderr_capture() {
         let repl = InteractivePythonRepl::new().unwrap();
         let result = repl.execute("1 / 0").await.unwrap();
@@ -493,6 +500,7 @@ result = factorial(5)
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_interactive_multiple_prints() {
         let repl = InteractivePythonRepl::new().unwrap();
         let result = repl
@@ -506,6 +514,7 @@ result = factorial(5)
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_interactive_reset() {
         let repl = InteractivePythonRepl::new().unwrap();
 

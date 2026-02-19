@@ -500,9 +500,11 @@ impl ReplEnvironment for PythonRepl {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::redundant_clone)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::time::Duration;
 
     #[tokio::test]
+    #[serial]
     async fn test_python_repl_basic_execution() {
         let repl = PythonRepl::new().unwrap();
         let result = repl.execute("x = 10 + 5").await.unwrap();
@@ -510,6 +512,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_python_repl_state_persistence() {
         let repl = PythonRepl::new().unwrap();
 
@@ -521,6 +524,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_python_repl_error_handling() {
         let repl = PythonRepl::new().unwrap();
         let result = repl.execute("1 / 0").await.unwrap();
@@ -529,6 +533,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_python_repl_reset() {
         let repl = PythonRepl::new().unwrap();
 
@@ -543,6 +548,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_python_repl_callback_injection() {
         let repl = PythonRepl::new().unwrap();
 
@@ -569,6 +575,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_python_repl_restricted_builtins() {
         let repl = PythonRepl::new().unwrap();
 
@@ -584,6 +591,7 @@ mod tests {
     // Known limitation: Function definitions across multiple execute() calls
     // don't persist. Use InteractivePythonRepl for better multi-line support.
     #[tokio::test]
+    #[serial]
     #[ignore = "Function definitions don't persist across execute() calls"]
     async fn test_python_repl_functions() {
         let repl = PythonRepl::new().unwrap();
@@ -609,6 +617,7 @@ def factorial(n):
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_python_repl_loops() {
         let repl = PythonRepl::new().unwrap();
 
@@ -628,6 +637,7 @@ for i in range(1, 11):
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_python_repl_safe_modules() {
         let repl = PythonRepl::new().unwrap();
 
@@ -648,6 +658,7 @@ for i in range(1, 11):
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_python_repl_list_comprehensions() {
         let repl = PythonRepl::new().unwrap();
 
@@ -662,6 +673,7 @@ for i in range(1, 11):
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_python_repl_dict_operations() {
         let repl = PythonRepl::new().unwrap();
 
@@ -678,6 +690,7 @@ for i in range(1, 11):
     // Known limitation: Complex multi-line exception handling
     // Use InteractivePythonRepl for better Python-native execution.
     #[tokio::test]
+    #[serial]
     #[ignore = "Complex multi-line exception handling not supported"]
     async fn test_python_repl_exception_handling() {
         let repl = PythonRepl::new().unwrap();
@@ -693,6 +706,7 @@ for i in range(1, 11):
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_python_repl_set_variable() {
         let repl = PythonRepl::new().unwrap();
 
@@ -707,6 +721,7 @@ for i in range(1, 11):
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_python_repl_lambda_functions() {
         let repl = PythonRepl::new().unwrap();
 
@@ -718,6 +733,7 @@ for i in range(1, 11):
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_python_repl_multiple_callbacks() {
         let repl = PythonRepl::new().unwrap();
 
@@ -768,6 +784,7 @@ for i in range(1, 11):
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_python_repl_callback_with_kwargs() {
         let repl = PythonRepl::new().unwrap();
 
@@ -817,12 +834,14 @@ for i in range(1, 11):
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_python_repl_language_name() {
         let repl = PythonRepl::new().unwrap();
         assert_eq!(repl.language_name(), "python");
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_python_repl_config() {
         let config = ReplConfig {
             timeout: Duration::from_secs(10),
@@ -835,6 +854,7 @@ for i in range(1, 11):
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_python_repl_callback_injection_efficiency() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -896,6 +916,7 @@ for i in range(1, 11):
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_python_repl_execution_time_accuracy() {
         let repl = PythonRepl::new().unwrap();
 
@@ -934,6 +955,7 @@ x = 42
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_python_repl_fast_execution_timing() {
         let repl = PythonRepl::new().unwrap();
 
