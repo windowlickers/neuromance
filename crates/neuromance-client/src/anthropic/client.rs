@@ -452,7 +452,7 @@ pub fn convert_event_to_chat_chunk(
                 delta_tool_calls: None,
                 finish_reason,
                 usage: Some(Usage {
-                    prompt_tokens: 0, // Not available in delta
+                    prompt_tokens: 0,
                     completion_tokens: usage.output_tokens,
                     total_tokens: usage.output_tokens,
                     cost: None,

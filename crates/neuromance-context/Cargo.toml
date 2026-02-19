@@ -52,6 +52,10 @@ ahash = { version = "0.8", optional = true }
 [dev-dependencies]
 tokio = { workspace = true }
 tracing-subscriber = { workspace = true }
+env_logger = { workspace = true }
+log = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+futures = { workspace = true }
 
 [[example]]
 name = "gguf_metadata"
