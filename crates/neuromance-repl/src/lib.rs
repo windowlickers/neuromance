@@ -64,10 +64,6 @@ pub enum ReplError {
     /// Environment initialization failed
     #[error("Initialization error: {0}")]
     InitializationError(String),
-
-    /// Generic error
-    #[error(transparent)]
-    Other(#[from] anyhow::Error),
 }
 
 /// Result of executing code in a REPL environment.

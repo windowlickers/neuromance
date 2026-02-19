@@ -125,6 +125,14 @@ pub struct InteractivePythonRepl {
     injected_callbacks: Arc<RwLock<HashSet<String>>>,
 }
 
+impl std::fmt::Debug for InteractivePythonRepl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InteractivePythonRepl")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
 impl InteractivePythonRepl {
     /// Create a new interactive Python REPL with default configuration.
     ///

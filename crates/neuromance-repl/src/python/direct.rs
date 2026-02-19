@@ -42,7 +42,15 @@ pub struct PythonRepl {
     callbacks: Arc<RwLock<HashMap<String, Arc<PythonCallback>>>>,
 
     /// Tracks which callbacks have been injected into Python globals
-    injected_callbacks: Arc<RwLock<std::collections::HashSet<String>>>,
+    injected_callbacks: Arc<RwLock<HashSet<String>>>,
+}
+
+impl std::fmt::Debug for PythonRepl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PythonRepl")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PythonRepl {
@@ -232,7 +240,14 @@ impl PythonRepl {
             .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
 
         // Execute the code
-        let c_code = CString::new(code).map_err(|e| ReplError::ExecutionError(e.to_string()))?;
+        let c_code = CString::new(code).map_err(|e| {
+            ReplError::ExecutionError(
+                format!(
+                    "code contains an interior NUL byte at position {}",
+                    e.nul_position()
+                ),
+            )
+        })?;
         let exec_result = py.run(c_code.as_c_str(), Some(globals), Some(locals));
 
         // Restore stdout/stderr
@@ -500,7 +515,7 @@ mod tests {
         let result = repl.execute("x = len([1, 2, 3])").await.unwrap();
         assert!(result.success);
 
-        // Should NOT have access to dangerous builtins like exec, eval, __import__
+        // Should NOT have access to dangerous builtins like exec, eval
         let result = repl.execute("exec('print(1)')").await.unwrap();
         assert!(!result.success);
     }
