@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Resource usage benchmarks for PythonRepl.
 //!
 //! Tracks memory, file descriptors, and timing for REPL operations.
