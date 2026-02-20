@@ -26,6 +26,7 @@
 //!     --provider openai --openai-base-url http://localhost:8080/v1
 //! ```
 
+use std::collections::HashMap;
 use std::io::Write;
 
 use anyhow::Result;
@@ -340,9 +341,10 @@ fn print_metrics(label: &str, metrics: &CacheMetrics) {
 async fn send_streaming(
     client: &dyn LLMClient,
     request: &ChatRequest,
-) -> Result<(String, Option<Usage>)> {
+) -> Result<(String, Option<Usage>, Option<String>)> {
     let mut stream = client.chat_stream(request).await?;
     let mut content = String::new();
+    let mut response_id: Option<String> = None;
     // Accumulate usage across chunks: providers may split
     // input and output token data across different events.
     let mut usage: Option<Usage> = None;
@@ -383,20 +385,23 @@ async fn send_streaming(
                 }
             });
         }
+        if response_id.is_none() {
+            response_id = chunk.response_id.clone();
+        }
     }
     println!("\n");
 
-    Ok((content, usage))
+    Ok((content, usage, response_id))
 }
 
 async fn send_non_streaming(
     client: &dyn LLMClient,
     request: &ChatRequest,
-) -> Result<(String, Option<Usage>)> {
+) -> Result<(String, Option<Usage>, Option<String>)> {
     let response = client.chat(request).await?;
     let content = response.message.content.clone();
     println!("  Assistant: {content}\n");
-    Ok((content, response.usage))
+    Ok((content, response.usage, response.response_id))
 }
 
 /// Run a multi-turn conversation against a single provider.
@@ -406,6 +411,7 @@ async fn run_provider(
     model: &str,
     max_tokens: u32,
     no_stream: bool,
+    use_prev_response_id: bool,
 ) -> Result<CacheMetrics> {
     let bar = "=".repeat(60);
     println!("\n{bar}");
@@ -434,6 +440,7 @@ async fn run_provider(
     let mut messages =
         vec![Message::system(conversation_id, &system)];
     let mut cache_metrics = CacheMetrics::default();
+    let mut prev_response_id: Option<String> = None;
 
     for (i, question) in questions.iter().enumerate() {
         let turn = i + 1;
@@ -448,15 +455,62 @@ async fn run_provider(
             Message::user(conversation_id, *question),
         );
 
-        let request = ChatRequest::new(messages.clone())
-            .with_model(model)
-            .with_max_tokens(max_tokens);
-
-        let (response_text, usage) = if no_stream {
-            send_non_streaming(client, &request).await?
-        } else {
-            send_streaming(client, &request).await?
+        let request = match (
+            use_prev_response_id,
+            prev_response_id.as_ref(),
+        ) {
+            (true, Some(prev_id)) => {
+                println!(
+                    "  (using previous_response_id)\n"
+                );
+                let mut metadata = HashMap::new();
+                metadata.insert(
+                    "previous_response_id".to_string(),
+                    serde_json::Value::String(
+                        prev_id.clone(),
+                    ),
+                );
+                metadata.insert(
+                    "store".to_string(),
+                    serde_json::Value::Bool(true),
+                );
+                ChatRequest::new(vec![Message::user(
+                    conversation_id,
+                    *question,
+                )])
+                .with_model(model)
+                .with_max_tokens(max_tokens)
+                .with_metadata(metadata)
+            }
+            (true, None) => {
+                // First turn: store response for
+                // subsequent previous_response_id use
+                let mut metadata = HashMap::new();
+                metadata.insert(
+                    "store".to_string(),
+                    serde_json::Value::Bool(true),
+                );
+                ChatRequest::new(messages.clone())
+                    .with_model(model)
+                    .with_max_tokens(max_tokens)
+                    .with_metadata(metadata)
+            }
+            _ => ChatRequest::new(messages.clone())
+                .with_model(model)
+                .with_max_tokens(max_tokens),
         };
+
+        let (response_text, usage, resp_id) =
+            if no_stream {
+                send_non_streaming(client, &request)
+                    .await?
+            } else {
+                send_streaming(client, &request).await?
+            };
+
+        if use_prev_response_id {
+            prev_response_id = resp_id;
+        }
 
         if let Some(ref u) = usage {
             let ulabel =
@@ -519,6 +573,7 @@ async fn main() -> Result<()> {
             &args.anthropic_model,
             args.max_tokens,
             args.no_stream,
+            false,
         )
         .await?;
     }
@@ -546,6 +601,7 @@ async fn main() -> Result<()> {
             &args.openai_model,
             args.max_tokens,
             args.no_stream,
+            false,
         )
         .await?;
     }
@@ -573,6 +629,7 @@ async fn main() -> Result<()> {
             &args.openai_model,
             args.max_tokens,
             args.no_stream,
+            true,
         )
         .await?;
     }
