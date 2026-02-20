@@ -408,8 +408,7 @@ impl Theme {
 }
 
 fn theme_path() -> Option<PathBuf> {
-    neuromance_daemon::paths::config_dir()
-        .map(|d| d.join("neuromance").join("theme.toml"))
+    neuromance_daemon::paths::config_dir().map(|d| d.join("neuromance").join("theme.toml"))
 }
 
 #[cfg(test)]

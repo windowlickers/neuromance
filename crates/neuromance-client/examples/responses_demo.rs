@@ -29,8 +29,7 @@ use uuid::Uuid;
 
 use neuromance_client::{LLMClient, ResponsesClient};
 use neuromance_common::{
-    ChatRequest, Config, Function, Message, Parameters, Property, Tool,
-    ToolChoice,
+    ChatRequest, Config, Function, Message, Parameters, Property, Tool, ToolChoice,
 };
 
 #[derive(Parser, Debug)]
@@ -114,13 +113,8 @@ fn create_add_todo_tool() -> Tool {
         r#type: "function".to_string(),
         function: Function {
             name: "add_todo".to_string(),
-            description: "Add a new todo item to the list."
-                .to_string(),
-            parameters: Parameters::new(
-                props,
-                vec!["title".to_string()],
-            )
-            .into(),
+            description: "Add a new todo item to the list.".to_string(),
+            parameters: Parameters::new(props, vec!["title".to_string()]).into(),
         },
     }
 }
@@ -157,28 +151,18 @@ fn create_complete_todo_tool() -> Tool {
         r#type: "function".to_string(),
         function: Function {
             name: "complete_todo".to_string(),
-            description: "Mark a todo item as completed."
-                .to_string(),
-            parameters: Parameters::new(
-                props,
-                vec!["index".to_string()],
-            )
-            .into(),
+            description: "Mark a todo item as completed.".to_string(),
+            parameters: Parameters::new(props, vec!["index".to_string()]).into(),
         },
     }
 }
 
 // -- Tool execution -------------------------------------------------------
 
-fn execute_tool(
-    name: &str,
-    arguments: &str,
-    todos: &mut Vec<TodoItem>,
-) -> Result<String> {
+fn execute_tool(name: &str, arguments: &str, todos: &mut Vec<TodoItem>) -> Result<String> {
     match name {
         "add_todo" => {
-            let args: AddTodoArgs =
-                serde_json::from_str(arguments)?;
+            let args: AddTodoArgs = serde_json::from_str(arguments)?;
             todos.push(TodoItem {
                 title: args.title.clone(),
                 priority: args.priority.clone(),
@@ -192,8 +176,7 @@ fn execute_tool(
             ))
         }
         "list_todos" => {
-            let args: ListTodosArgs =
-                serde_json::from_str(arguments)?;
+            let args: ListTodosArgs = serde_json::from_str(arguments)?;
             if todos.is_empty() {
                 return Ok("No todos yet.".to_string());
             }
@@ -212,17 +195,14 @@ fn execute_tool(
                 ));
             }
             if lines.is_empty() {
-                return Ok(
-                    "All todos are completed (use \
+                return Ok("All todos are completed (use \
                      include_completed=true to see them)."
-                        .to_string(),
-                );
+                    .to_string());
             }
             Ok(lines.join("\n"))
         }
         "complete_todo" => {
-            let args: CompleteTodoArgs =
-                serde_json::from_str(arguments)?;
+            let args: CompleteTodoArgs = serde_json::from_str(arguments)?;
             let idx = args.index;
             if idx == 0 || idx > todos.len() {
                 return Ok(format!(
@@ -233,16 +213,10 @@ fn execute_tool(
             }
             let item = &mut todos[idx - 1];
             if item.done {
-                return Ok(format!(
-                    "Todo #{idx} \"{}\" is already done.",
-                    item.title,
-                ));
+                return Ok(format!("Todo #{idx} \"{}\" is already done.", item.title,));
             }
             item.done = true;
-            Ok(format!(
-                "Completed todo #{idx}: \"{}\"",
-                item.title,
-            ))
+            Ok(format!("Completed todo #{idx}: \"{}\"", item.title,))
         }
         _ => anyhow::bail!("Unknown tool: {name}"),
     }
@@ -308,18 +282,9 @@ async fn main() -> Result<()> {
             }
             if let Some(usage) = response.usage {
                 println!("Usage:");
-                println!(
-                    "  Input tokens: {}",
-                    usage.prompt_tokens
-                );
-                println!(
-                    "  Output tokens: {}",
-                    usage.completion_tokens
-                );
-                println!(
-                    "  Total tokens: {}",
-                    usage.total_tokens
-                );
+                println!("  Input tokens: {}", usage.prompt_tokens);
+                println!("  Output tokens: {}", usage.completion_tokens);
+                println!("  Total tokens: {}", usage.total_tokens);
             }
             break;
         }
@@ -329,15 +294,8 @@ async fn main() -> Result<()> {
 
         for tc in &tool_calls {
             let args_str = tc.function.arguments_json();
-            println!(
-                "  Tool call: {}({})",
-                tc.function.name, args_str
-            );
-            let result = execute_tool(
-                &tc.function.name,
-                args_str,
-                &mut todos,
-            )?;
+            println!("  Tool call: {}({})", tc.function.name, args_str);
+            let result = execute_tool(&tc.function.name, args_str, &mut todos)?;
             println!("  Result:    {result}");
 
             let tool_msg = Message::tool(

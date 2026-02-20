@@ -307,8 +307,7 @@ impl neuromance_proto::Neuromance for GrpcService {
                         conversation_id: cid,
                         content: c,
                     } => {
-                        conv_id_for_cleanup
-                            .get_or_insert_with(|| cid.clone());
+                        conv_id_for_cleanup.get_or_insert_with(|| cid.clone());
                         proto::ChatEvent {
                             conversation_id: cid,
                             event: Some(proto::chat_event::Event::StreamChunk(
@@ -320,8 +319,7 @@ impl neuromance_proto::Neuromance for GrpcService {
                         conversation_id: cid,
                         tool_call,
                     } => {
-                        conv_id_for_cleanup
-                            .get_or_insert_with(|| cid.clone());
+                        conv_id_for_cleanup.get_or_insert_with(|| cid.clone());
                         let event = proto::ChatEvent {
                             conversation_id: cid.clone(),
                             event: Some(proto::chat_event::Event::ToolApprovalRequest(
@@ -351,8 +349,7 @@ impl neuromance_proto::Neuromance for GrpcService {
                         result: res,
                         success,
                     } => {
-                        conv_id_for_cleanup
-                            .get_or_insert_with(|| cid.clone());
+                        conv_id_for_cleanup.get_or_insert_with(|| cid.clone());
                         proto::ChatEvent {
                             conversation_id: cid,
                             event: Some(proto::chat_event::Event::ToolResult(
@@ -368,28 +365,24 @@ impl neuromance_proto::Neuromance for GrpcService {
                         conversation_id: cid,
                         usage,
                     } => {
-                        conv_id_for_cleanup
-                            .get_or_insert_with(|| cid.clone());
+                        conv_id_for_cleanup.get_or_insert_with(|| cid.clone());
                         proto::ChatEvent {
                             conversation_id: cid,
-                            event: Some(proto::chat_event::Event::Usage(
-                                proto::UsageProto::from(&usage),
-                            )),
+                            event: Some(proto::chat_event::Event::Usage(proto::UsageProto::from(
+                                &usage,
+                            ))),
                         }
                     }
                     DaemonResponse::MessageCompleted {
                         conversation_id: cid,
                         message: msg,
                     } => {
-                        conv_id_for_cleanup
-                            .get_or_insert_with(|| cid.clone());
+                        conv_id_for_cleanup.get_or_insert_with(|| cid.clone());
                         proto::ChatEvent {
                             conversation_id: cid,
                             event: Some(proto::chat_event::Event::MessageCompleted(
                                 proto::MessageCompleted {
-                                    message: Some(proto::MessageProto::from(
-                                        msg.as_ref(),
-                                    )),
+                                    message: Some(proto::MessageProto::from(msg.as_ref())),
                                 },
                             )),
                         }

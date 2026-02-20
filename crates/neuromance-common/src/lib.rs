@@ -84,8 +84,8 @@ pub use client::{
     ChatRequest, ChatResponse, Config, FinishReason, ProxyConfig, ReasoningEffort, RetryConfig,
     ToolChoice, Usage,
 };
-pub use features::{ReasoningLevel, ThinkingMode};
 pub use events::{ConversationSummary, DaemonResponse, ErrorCode, ModelProfile};
+pub use features::{ReasoningLevel, ThinkingMode};
 pub use tools::{
     Function, FunctionCall, ObjectSchema, Parameters, Property, Tool, ToolApproval, ToolCall,
 };

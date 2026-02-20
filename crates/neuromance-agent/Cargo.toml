@@ -23,10 +23,10 @@ log = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 
-neuromance = { version = "0.0.6", path = "../neuromance" }
-neuromance-common = { version = "0.0.6", path = "../neuromance-common" }
-neuromance-client = { version = "0.0.6", path = "../neuromance-client" }
-neuromance-tools = { version = "0.0.6", path = "../neuromance-tools" }
+neuromance = { workspace = true }
+neuromance-common = { workspace = true }
+neuromance-client = { workspace = true }
+neuromance-tools = { workspace = true }
 
 
 [dev-dependencies]

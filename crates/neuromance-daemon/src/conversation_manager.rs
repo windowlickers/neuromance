@@ -404,9 +404,7 @@ impl ConversationManager {
 
         for key in keys {
             if let Some((_, tx)) = self.pending_approvals.remove(&key) {
-                let _ = tx.send(ToolApproval::Denied(
-                    "Client disconnected".to_string(),
-                ));
+                let _ = tx.send(ToolApproval::Denied("Client disconnected".to_string()));
                 debug!(
                     conversation_id = %key.0,
                     tool_call_id = %key.1,

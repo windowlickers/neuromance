@@ -28,6 +28,16 @@ keywords = ["llm", "openai", "orchestration"]
 categories = ["api-bindings", "asynchronous", "web-programming"]
 
 [workspace.dependencies]
+# Internal crates
+neuromance-common = { version = "0.0.6", path = "crates/neuromance-common" }
+neuromance-client = { version = "0.0.6", path = "crates/neuromance-client" }
+neuromance-tools = { version = "0.0.6", path = "crates/neuromance-tools" }
+neuromance-agent = { version = "0.0.6", path = "crates/neuromance-agent" }
+neuromance = { version = "0.0.6", path = "crates/neuromance" }
+neuromance-daemon = { version = "0.0.6", path = "crates/neuromance-daemon" }
+neuromance-proto = { version = "0.0.6", path = "crates/neuromance-proto" }
+
+# External dependencies
 anyhow = "1.0"
 base64 = "0.22"
 async-trait = "0.1"

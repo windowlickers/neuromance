@@ -20,9 +20,9 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-neuromance-common = { version = "0.0.6", path = "../neuromance-common" }
-neuromance-daemon = { version = "0.0.6", path = "../neuromance-daemon" }
-neuromance-proto = { version = "0.0.6", path = "../neuromance-proto" }
+neuromance-common = { workspace = true }
+neuromance-daemon = { workspace = true }
+neuromance-proto = { workspace = true }
 rustyline = "17.0.1"
 anyhow = { workspace = true }
 tokio = { workspace = true, features = ["full"] }

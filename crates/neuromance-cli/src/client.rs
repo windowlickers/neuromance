@@ -72,8 +72,7 @@ impl DaemonClient {
         timeout_secs: u64,
         mut child: Option<&mut std::process::Child>,
     ) -> Result<()> {
-        let deadline = tokio::time::Instant::now()
-            + Duration::from_secs(timeout_secs);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
         let mut delay = Duration::from_millis(50);
         let max_delay = Duration::from_millis(500);
 
@@ -85,12 +84,9 @@ impl DaemonClient {
             if let Some(ref mut proc) = child
                 && let Some(status) = proc.try_wait()?
             {
-                let detail = Self::read_daemon_log_tail()
-                    .unwrap_or_default();
+                let detail = Self::read_daemon_log_tail().unwrap_or_default();
                 let msg = if detail.is_empty() {
-                    format!(
-                        "Daemon exited ({status}) during startup"
-                    )
+                    format!("Daemon exited ({status}) during startup")
                 } else {
                     format!(
                         "Daemon exited ({status}) during \
@@ -101,9 +97,7 @@ impl DaemonClient {
             }
 
             if tokio::time::Instant::now() + delay > deadline {
-                anyhow::bail!(
-                    "Socket unavailable after {timeout_secs}s"
-                );
+                anyhow::bail!("Socket unavailable after {timeout_secs}s");
             }
 
             tokio::time::sleep(delay).await;
@@ -175,12 +169,7 @@ impl DaemonClient {
         let mut child = Self::spawn_daemon()?;
 
         // Wait for socket (checks for early daemon exit)
-        Self::wait_for_socket(
-            &socket_path,
-            10,
-            Some(&mut child),
-        )
-        .await?;
+        Self::wait_for_socket(&socket_path, 10, Some(&mut child)).await?;
 
         drop(lock);
 
@@ -445,8 +434,7 @@ impl DaemonClient {
     /// lines, to surface startup failures.
     fn read_daemon_log_tail() -> Result<String> {
         let log_path = Self::data_dir()?.join("daemon.log");
-        let content = std::fs::read_to_string(&log_path)
-            .context("Failed to read daemon log")?;
+        let content = std::fs::read_to_string(&log_path).context("Failed to read daemon log")?;
         let lines: Vec<&str> = content.lines().collect();
         let tail = if lines.len() > 20 {
             &lines[lines.len() - 20..]

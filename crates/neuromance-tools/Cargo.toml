@@ -31,4 +31,4 @@ toml.workspace = true
 rmcp.workspace = true
 url.workspace = true
 
-neuromance-common = { version = "0.0.6", path = "../neuromance-common" }
+neuromance-common = { workspace = true }

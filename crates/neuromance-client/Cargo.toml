@@ -38,7 +38,7 @@ secrecy.workspace = true
 smallvec.workspace = true
 url.workspace = true
 
-neuromance-common = { version = "0.0.6", path = "../neuromance-common" }
+neuromance-common = { workspace = true }
 
 [dev-dependencies]
 clap = { version = "4.0", features = ["derive", "env"] }
