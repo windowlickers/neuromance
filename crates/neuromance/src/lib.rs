@@ -57,4 +57,4 @@ pub use neuromance_common::*;
 pub use neuromance_tools::*;
 
 pub use core::Core;
-pub use events::{CoreEvent, EventCallback, ToolApprovalCallback};
+pub use events::{CoreEvent, EventCallback, ToolApprovalCallback, TurnCallback};

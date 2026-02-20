@@ -9,6 +9,7 @@ use futures::{FutureExt, StreamExt};
 use log::{debug, info, warn};
 
 use neuromance_client::{ClientError, LLMClient};
+use neuromance_common::CacheMetrics;
 use neuromance_common::chat::{Message, MessageRole};
 use neuromance_common::client::{ChatRequest, ChatResponse, ToolChoice};
 use neuromance_common::features::ThinkingMode;
@@ -16,7 +17,7 @@ use neuromance_common::tools::{ToolApproval, ToolCall};
 use neuromance_tools::ToolExecutor;
 
 use crate::error::CoreError;
-use crate::events::{CoreEvent, EventCallback, ToolApprovalCallback};
+use crate::events::{CoreEvent, EventCallback, ToolApprovalCallback, TurnCallback};
 
 /// Core orchestration layer for LLM conversations with tool execution
 ///
@@ -39,12 +40,16 @@ pub struct Core<C: LLMClient> {
     pub tool_approval_callback: Option<ToolApprovalCallback>,
     /// Optional event callback for all Core events
     pub event_callback: Option<EventCallback>,
+    /// Optional turn callback for transforming messages between turns (e.g., compaction)
+    pub turn_callback: Option<TurnCallback>,
     /// Thinking/reasoning mode configuration.
     ///
     /// Controls extended thinking capabilities across providers:
     /// - **Anthropic**: Maps to `thinking.budget_tokens` and interleaved-thinking beta
     /// - **`OpenAI`**: Maps to `max_completion_tokens` for reasoning models
     pub thinking: ThinkingMode,
+    /// Aggregate cache statistics across all requests made through this Core.
+    pub cache_metrics: CacheMetrics,
 }
 
 impl<C: LLMClient> Core<C> {
@@ -58,7 +63,9 @@ impl<C: LLMClient> Core<C> {
             tool_executor: ToolExecutor::new(),
             tool_approval_callback: None,
             event_callback: None,
+            turn_callback: None,
             thinking: ThinkingMode::Default,
+            cache_metrics: CacheMetrics::default(),
         }
     }
 
@@ -128,6 +135,33 @@ impl<C: LLMClient> Core<C> {
         Fut: Future<Output = ()> + Send + 'static,
     {
         self.event_callback = Some(Box::new(move |event| Box::pin(callback(event))));
+        self
+    }
+
+    /// Set callback for transforming messages between turns.
+    ///
+    /// The callback receives the full message history after tool execution and returns
+    /// a (potentially modified) version. This enables use cases like context compaction.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use neuromance::Core;
+    /// # use neuromance_client::openai::OpenAIClient;
+    /// # let client: OpenAIClient = unimplemented!();
+    /// let core = Core::new(client)
+    ///     .with_turn_callback(|messages| async move {
+    ///         // Could compact, filter, or transform messages here
+    ///         Ok(messages)
+    ///     });
+    /// ```
+    #[must_use]
+    pub fn with_turn_callback<F, Fut>(mut self, callback: F) -> Self
+    where
+        F: Fn(Vec<Message>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Vec<Message>>> + Send + 'static,
+    {
+        self.turn_callback = Some(Box::new(move |messages| Box::pin(callback(messages))));
         self
     }
 
@@ -344,7 +378,10 @@ impl<C: LLMClient> Core<C> {
     /// # Errors
     /// Returns an error if the chat request fails or tool execution fails.
     #[allow(clippy::too_many_lines)]
-    pub async fn chat_with_tool_loop(&self, mut messages: Vec<Message>) -> Result<Vec<Message>> {
+    pub async fn chat_with_tool_loop(
+        &mut self,
+        mut messages: Vec<Message>,
+    ) -> Result<Vec<Message>> {
         let mut turn_count = 0;
         let mut pending_tool_calls: HashSet<String> = HashSet::new();
         let start_time = Instant::now();
@@ -383,9 +420,10 @@ impl<C: LLMClient> Core<C> {
                 serde_json::to_string_pretty(&response)?
             );
 
-            // Emit usage event if callback present
+            // Emit usage event and record cache metrics
             if let Some(ref usage) = response.usage {
                 self.emit_event(CoreEvent::Usage(usage.clone())).await;
+                self.cache_metrics.record(usage);
             }
 
             // Extract data we need before consuming the message
@@ -512,6 +550,11 @@ impl<C: LLMClient> Core<C> {
 
             debug!("Completed processing {tool_calls_count} tool calls, continuing conversation");
 
+            // Invoke turn callback (e.g., for context compaction)
+            if let Some(ref callback) = self.turn_callback {
+                messages = callback(messages).await?;
+            }
+
             // Update Arc with new messages after tool execution
             messages_arc = messages.clone().into();
 
@@ -608,6 +651,7 @@ mod tests {
 
         assert!(core.event_callback.is_none());
         assert!(core.tool_approval_callback.is_none());
+        assert!(core.turn_callback.is_none());
 
         // Should not panic
         core.emit_event(CoreEvent::Streaming("test".to_string()))
@@ -649,5 +693,57 @@ mod tests {
         assert_eq!(captured[0], "streaming");
         assert_eq!(captured[1], "tool");
         drop(captured);
+    }
+
+    /// Test that turn callback builder sets the callback
+    #[tokio::test]
+    async fn test_core_with_turn_callback() {
+        let config = Config::new("test", "test-model").with_api_key("test-key");
+        let client = OpenAIClient::new(config).expect("Failed to create client");
+
+        let core = Core::new(client).with_turn_callback(|messages| async move { Ok(messages) });
+
+        assert!(core.turn_callback.is_some());
+    }
+
+    /// Test that turn callback can transform messages
+    #[tokio::test]
+    async fn test_turn_callback_transforms_messages() {
+        let config = Config::new("test", "test-model").with_api_key("test-key");
+        let client = OpenAIClient::new(config).expect("Failed to create client");
+
+        let core = Core::new(client).with_turn_callback(|mut messages| async move {
+            // Append a marker message to prove the callback ran
+            let conv_id = messages
+                .first()
+                .map_or_else(uuid::Uuid::new_v4, |m| m.conversation_id);
+            messages.push(Message::system(conv_id, "[compacted]"));
+            Ok(messages)
+        });
+
+        // Invoke the callback directly to verify transformation
+        let conv_id = uuid::Uuid::new_v4();
+        let input = vec![Message::user(conv_id, "hello")];
+        let output = (core.turn_callback.unwrap())(input).await.unwrap();
+
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[1].content, "[compacted]");
+    }
+
+    /// Test that errors from turn callback propagate correctly
+    #[tokio::test]
+    async fn test_turn_callback_error_propagation() {
+        let config = Config::new("test", "test-model").with_api_key("test-key");
+        let client = OpenAIClient::new(config).expect("Failed to create client");
+
+        let core = Core::new(client).with_turn_callback(|_messages| async move {
+            Err(anyhow::anyhow!("compaction failed"))
+        });
+
+        let input = vec![Message::user(uuid::Uuid::new_v4(), "hello")];
+        let result = (core.turn_callback.unwrap())(input).await;
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().to_string(), "compaction failed");
     }
 }

@@ -17,6 +17,8 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use anyhow::Result;
+use neuromance_common::chat::Message;
 use neuromance_common::client::Usage;
 use neuromance_common::tools::{ToolApproval, ToolCall};
 
@@ -53,3 +55,17 @@ pub enum CoreEvent {
 /// The callback is awaited to allow async I/O operations.
 pub type EventCallback =
     Box<dyn Fn(CoreEvent) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
+/// Async callback for transforming messages between turns.
+///
+/// Unlike `EventCallback` (observational) and `ToolApprovalCallback` (control flow),
+/// this is **transformational** — it receives the full message history and returns
+/// a (potentially modified) version. Uses move semantics (`Vec<Message> -> Result<Vec<Message>>`)
+/// to avoid lifetime issues with async closures.
+///
+/// Primary use case: wiring in context compaction between tool-loop turns.
+pub type TurnCallback = Box<
+    dyn Fn(Vec<Message>) -> Pin<Box<dyn Future<Output = Result<Vec<Message>>> + Send>>
+        + Send
+        + Sync,
+>;
