@@ -721,6 +721,12 @@ pub enum StreamEvent {
         /// The final response object.
         response: ResponsesResponse,
     },
+    /// Response incomplete (e.g., hit max tokens or content filter).
+    #[serde(rename = "response.incomplete")]
+    ResponseIncomplete {
+        /// The final response object (includes usage).
+        response: ResponsesResponse,
+    },
     /// Response failed.
     #[serde(rename = "response.failed")]
     ResponseFailed {

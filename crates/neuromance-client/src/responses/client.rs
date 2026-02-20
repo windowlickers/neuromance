@@ -392,7 +392,8 @@ fn convert_stream_event_to_chunk(
             }))
         }
 
-        StreamEvent::ResponseCompleted { response } => {
+        StreamEvent::ResponseCompleted { response }
+        | StreamEvent::ResponseIncomplete { response } => {
             let has_tool_calls = response
                 .output
                 .iter()
@@ -915,6 +916,46 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 10);
         assert_eq!(usage.completion_tokens, 20);
         assert_eq!(usage.total_tokens, 30);
+    }
+
+    #[test]
+    fn test_stream_response_incomplete_with_usage() {
+        let (model, response_id, fc) = create_shared_state();
+
+        let response = super::super::ResponsesResponse {
+            id: "resp_inc".to_string(),
+            object: "response".to_string(),
+            created_at: 1_700_000_000,
+            model: "gpt-4o".to_string(),
+            status: super::super::ResponseStatus::Incomplete,
+            output: vec![super::super::OutputItem::Message {
+                role: "assistant".to_string(),
+                content: vec![],
+            }],
+            error: None,
+            incomplete_details: Some(super::super::IncompleteDetails {
+                reason: super::super::IncompleteReason::MaxOutputTokens,
+            }),
+            usage: Some(super::super::ResponsesUsage {
+                input_tokens: 100,
+                output_tokens: 512,
+                total_tokens: 612,
+                input_tokens_details: None,
+                output_tokens_details: None,
+            }),
+            metadata: HashMap::new(),
+        };
+
+        let event = StreamEvent::ResponseIncomplete { response };
+
+        let result = convert_stream_event_to_chunk(event, &model, &response_id, &fc);
+        let chunk = result.unwrap().unwrap();
+
+        assert_eq!(chunk.finish_reason, Some(FinishReason::Length));
+        let usage = chunk.usage.unwrap();
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.completion_tokens, 512);
+        assert_eq!(usage.total_tokens, 612);
     }
 
     #[test]
