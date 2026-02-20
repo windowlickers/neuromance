@@ -486,10 +486,15 @@ pub struct AnthropicUsage {
 
 impl From<AnthropicUsage> for Usage {
     fn from(usage: AnthropicUsage) -> Self {
+        // Anthropic's `input_tokens` excludes cached/cache-creation tokens.
+        // Normalize to match OpenAI semantics where `prompt_tokens` is the
+        // total input token count (including cache reads and writes).
+        let total_input =
+            usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
         Self {
-            prompt_tokens: usage.input_tokens,
+            prompt_tokens: total_input,
             completion_tokens: usage.output_tokens,
-            total_tokens: usage.input_tokens + usage.output_tokens,
+            total_tokens: total_input + usage.output_tokens,
             cost: None,
             input_tokens_details: Some(InputTokensDetails {
                 cached_tokens: usage.cache_read_input_tokens,

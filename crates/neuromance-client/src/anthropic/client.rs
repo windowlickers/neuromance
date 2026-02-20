@@ -488,6 +488,9 @@ pub fn convert_event_to_chat_chunk(
         StreamEvent::MessageDelta { delta, usage } => {
             let finish_reason = delta.stop_reason.as_ref().map(|r| r.clone().into());
 
+            // MessageDelta only carries output_tokens; input token data
+            // (including cache stats) arrives in MessageStart.  We emit
+            // a partial Usage here so consumers can merge the two.
             Some(ChatChunk {
                 model: model.to_string(),
                 delta_content: None,
@@ -1494,8 +1497,10 @@ mod tests {
 
         let common_usage = Usage::from(usage);
 
-        assert_eq!(common_usage.prompt_tokens, 1000);
+        // prompt_tokens normalizes to total input: 1000 + 200 + 800
+        assert_eq!(common_usage.prompt_tokens, 2000);
         assert_eq!(common_usage.completion_tokens, 500);
+        assert_eq!(common_usage.total_tokens, 2500);
 
         let details = common_usage
             .input_tokens_details
