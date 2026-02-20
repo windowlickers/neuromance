@@ -130,9 +130,9 @@ impl DaemonConfig {
     ///
     /// Returns an error if the config directory cannot be determined.
     pub fn config_path() -> Result<PathBuf> {
-        let config_dir = neuromance_daemon::paths::config_dir()
-            .ok_or_else(|| DaemonError::Config("Failed to determine config directory".to_string()))?
-            .join("neuromance");
+        let config_dir = neuromance_daemon::paths::neuromance_config_dir().ok_or_else(|| {
+            DaemonError::Config("Failed to determine config directory".to_string())
+        })?;
 
         Ok(config_dir.join("config.toml"))
     }
@@ -258,9 +258,9 @@ impl ToolsConfig {
     ///
     /// Returns an error if the config directory cannot be determined.
     pub fn config_path() -> Result<PathBuf> {
-        let config_dir = neuromance_daemon::paths::config_dir()
-            .ok_or_else(|| DaemonError::Config("Failed to determine config directory".to_string()))?
-            .join("neuromance");
+        let config_dir = neuromance_daemon::paths::neuromance_config_dir().ok_or_else(|| {
+            DaemonError::Config("Failed to determine config directory".to_string())
+        })?;
 
         Ok(config_dir.join("tools.toml"))
     }

@@ -183,10 +183,15 @@
             cargo-outdated
             cargo-audit
             cargo-expand
+            just
           ];
 
           # Environment variables
           RUST_BACKTRACE = "1";
+
+          shellHook = ''
+            export NEUROMANCE_DATA_DIR="$HOME/.local/share/neuromance-dev"
+          '';
         };
 
         # Formatter
