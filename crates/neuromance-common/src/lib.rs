@@ -81,8 +81,8 @@ pub mod agents;
 pub use agents::{AgentContext, AgentMemory, AgentMessage, AgentResponse, AgentState, AgentStats};
 pub use chat::{Conversation, ConversationStatus, Message, MessageRole, ReasoningContent};
 pub use client::{
-    ChatRequest, ChatResponse, Config, FinishReason, ProxyConfig, ReasoningEffort, RetryConfig,
-    ToolChoice, Usage,
+    ChatRequest, ChatResponse, Config, FinishReason, InputTokensDetails, OutputTokensDetails,
+    ProxyConfig, ReasoningEffort, RetryConfig, ToolChoice, Usage,
 };
 pub use events::{ConversationSummary, DaemonResponse, ErrorCode, ModelProfile};
 pub use features::{ReasoningLevel, ThinkingMode};

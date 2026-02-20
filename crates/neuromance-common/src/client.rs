@@ -416,10 +416,16 @@ pub struct Usage {
     /// Estimated cost in USD for this request (if available).
     pub cost: Option<f64>,
     /// Detailed breakdown of input token usage.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        alias = "prompt_tokens_details"
+    )]
     pub input_tokens_details: Option<InputTokensDetails>,
     /// Detailed breakdown of output token usage.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        alias = "completion_tokens_details"
+    )]
     pub output_tokens_details: Option<OutputTokensDetails>,
 }
 
