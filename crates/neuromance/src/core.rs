@@ -247,6 +247,9 @@ impl<C: LLMClient> Core<C> {
         // Most responses have 0-3 tool calls, pre-allocate for 4 to avoid most reallocations
         let mut tool_calls: Vec<ToolCall> = Vec::with_capacity(4);
         let mut finish_reason = None;
+        // Accumulate usage across chunks (Anthropic splits input/output
+        // tokens across message_start and message_delta events)
+        let mut accumulated_usage: Option<neuromance_common::Usage> = None;
 
         while let Some(chunk_result) = stream.next().await {
             let chunk = chunk_result?;
@@ -271,6 +274,30 @@ impl<C: LLMClient> Core<C> {
             // Capture finish reason
             if chunk.finish_reason.is_some() {
                 finish_reason = chunk.finish_reason;
+            }
+
+            // Merge usage: take the max of each field across chunks so
+            // input tokens (from message_start) and output tokens (from
+            // message_delta) are both preserved.
+            if let Some(ref chunk_usage) = chunk.usage {
+                accumulated_usage = Some(match accumulated_usage {
+                    None => chunk_usage.clone(),
+                    Some(mut acc) => {
+                        acc.prompt_tokens = acc.prompt_tokens.max(chunk_usage.prompt_tokens);
+                        acc.completion_tokens =
+                            acc.completion_tokens.max(chunk_usage.completion_tokens);
+                        acc.total_tokens = acc.prompt_tokens + acc.completion_tokens;
+                        if acc.input_tokens_details.is_none() {
+                            acc.input_tokens_details
+                                .clone_from(&chunk_usage.input_tokens_details);
+                        }
+                        if acc.output_tokens_details.is_none() {
+                            acc.output_tokens_details
+                                .clone_from(&chunk_usage.output_tokens_details);
+                        }
+                        acc
+                    }
+                });
             }
 
             // Store metadata from last chunk
@@ -304,7 +331,7 @@ impl<C: LLMClient> Core<C> {
         Ok(ChatResponse {
             message,
             model: last_chunk.model,
-            usage: last_chunk.usage,
+            usage: accumulated_usage,
             finish_reason,
             created_at: last_chunk.created_at,
             response_id: last_chunk.response_id,
