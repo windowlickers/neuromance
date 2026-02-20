@@ -443,6 +443,12 @@ impl From<(&ChatRequest, &Config)> for ResponsesRequest {
             .and_then(|v| v.as_str())
             .map(String::from);
 
+        let store = request
+            .metadata
+            .get("store")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+
         Self::builder()
             .model(
                 request
@@ -451,7 +457,7 @@ impl From<(&ChatRequest, &Config)> for ResponsesRequest {
                     .unwrap_or_else(|| config.model.clone()),
             )
             .input(input_items)
-            .store(Some(false))
+            .store(Some(store))
             .max_output_tokens(request.max_tokens.or(request.max_completion_tokens))
             .instructions(instructions)
             .temperature(request.temperature)
