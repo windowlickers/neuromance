@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Instant;
@@ -383,7 +382,6 @@ impl<C: LLMClient> Core<C> {
         mut messages: Vec<Message>,
     ) -> Result<Vec<Message>> {
         let mut turn_count = 0;
-        let mut pending_tool_calls: HashSet<String> = HashSet::new();
         let start_time = Instant::now();
         let mut messages_arc: Arc<[Message]> = messages.clone().into();
 
@@ -452,9 +450,6 @@ impl<C: LLMClient> Core<C> {
                 let tool_name = &tool_call.function.name;
                 let call_id = &tool_call.id;
 
-                // Track pending tool call
-                pending_tool_calls.insert(tool_call.id.clone());
-
                 debug!("Tool Name: {tool_name} (id: {call_id})");
                 debug!("Tool Arguments: {:?}", tool_call.function.arguments);
 
@@ -499,7 +494,6 @@ impl<C: LLMClient> Core<C> {
                                     tool_call.function.name.clone(),
                                 )?;
                                 messages.push(tool_message);
-                                pending_tool_calls.remove(&tool_call.id);
                             }
                             Err(e) => {
                                 debug!("Tool {tool_name} execution failed: {e}");
@@ -521,7 +515,6 @@ impl<C: LLMClient> Core<C> {
                                     tool_call.function.name.clone(),
                                 )?;
                                 messages.push(error_message);
-                                pending_tool_calls.remove(&tool_call.id);
                             }
                         }
                     }
@@ -535,7 +528,6 @@ impl<C: LLMClient> Core<C> {
                             tool_call.function.name.clone(),
                         )?;
                         messages.push(denial_message);
-                        pending_tool_calls.remove(&tool_call.id);
                     }
                     ToolApproval::Quit => {
                         debug!("User quit during tool approval");
@@ -557,14 +549,6 @@ impl<C: LLMClient> Core<C> {
 
             // Update Arc with new messages after tool execution
             messages_arc = messages.clone().into();
-
-            // Sanity check: ensure all tool calls were handled
-            if !pending_tool_calls.is_empty() {
-                debug!(
-                    "Warning: {} tool calls still pending",
-                    pending_tool_calls.len()
-                );
-            }
 
             // Increment turn count after processing tool calls
             turn_count += 1;

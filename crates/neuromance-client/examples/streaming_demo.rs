@@ -60,7 +60,7 @@ async fn main() -> Result<()> {
         Message::user(conversation_id, &args.message),
     ];
 
-    let request: ChatRequest = (config, messages).into();
+    let request: ChatRequest = (&config, messages).into();
 
     info!("Starting streaming chat...");
     info!("");

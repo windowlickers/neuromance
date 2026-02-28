@@ -629,6 +629,47 @@ pub struct ChatRequest {
     pub metadata: HashMap<String, serde_json::Value>,
 }
 
+fn validate_sampling_params(
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    frequency_penalty: Option<f32>,
+    presence_penalty: Option<f32>,
+) -> anyhow::Result<()> {
+    if let Some(temp) = temperature
+        && !(0.0..=2.0).contains(&temp)
+    {
+        anyhow::bail!(
+            "Temperature must be between 0.0 and 2.0, got {temp}"
+        );
+    }
+
+    if let Some(top_p) = top_p
+        && !(0.0..=1.0).contains(&top_p)
+    {
+        anyhow::bail!(
+            "top_p must be between 0.0 and 1.0, got {top_p}"
+        );
+    }
+
+    if let Some(freq) = frequency_penalty
+        && !(-2.0..=2.0).contains(&freq)
+    {
+        anyhow::bail!(
+            "frequency_penalty must be between -2.0 and 2.0, got {freq}"
+        );
+    }
+
+    if let Some(pres) = presence_penalty
+        && !(-2.0..=2.0).contains(&pres)
+    {
+        anyhow::bail!(
+            "presence_penalty must be between -2.0 and 2.0, got {pres}"
+        );
+    }
+
+    Ok(())
+}
+
 impl fmt::Display for ChatRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match serde_json::to_string(self) {
@@ -679,31 +720,11 @@ impl ChatRequest {
     }
 }
 
-impl From<(&Config, Vec<Message>)> for ChatRequest {
-    fn from((config, messages): (&Config, Vec<Message>)) -> Self {
-        Self {
-            messages: messages.into(),
-            model: Some(config.model.clone()),
-            temperature: config.temperature,
-            max_tokens: config.max_tokens,
-            max_completion_tokens: None,
-            top_p: config.top_p,
-            frequency_penalty: config.frequency_penalty,
-            presence_penalty: config.presence_penalty,
-            stop: config.stop_sequences.clone(),
-            tools: None,
-            tool_choice: None,
-            stream: false,
-            user: None,
-            thinking: ThinkingMode::Default,
-            reasoning_level: ReasoningLevel::Default,
-            metadata: HashMap::new(),
-        }
-    }
-}
-
-impl From<(&Config, Arc<[Message]>)> for ChatRequest {
-    fn from((config, messages): (&Config, Arc<[Message]>)) -> Self {
+impl ChatRequest {
+    fn from_config(
+        config: &Config,
+        messages: Arc<[Message]>,
+    ) -> Self {
         Self {
             messages,
             model: Some(config.model.clone()),
@@ -720,8 +741,20 @@ impl From<(&Config, Arc<[Message]>)> for ChatRequest {
             user: None,
             thinking: ThinkingMode::Default,
             reasoning_level: ReasoningLevel::Default,
-            metadata: HashMap::new(),
+            metadata: config.metadata.clone(),
         }
+    }
+}
+
+impl From<(&Config, Vec<Message>)> for ChatRequest {
+    fn from((config, messages): (&Config, Vec<Message>)) -> Self {
+        Self::from_config(config, messages.into())
+    }
+}
+
+impl From<(&Config, Arc<[Message]>)> for ChatRequest {
+    fn from((config, messages): (&Config, Arc<[Message]>)) -> Self {
+        Self::from_config(config, messages)
     }
 }
 
@@ -973,32 +1006,12 @@ impl ChatRequest {
     /// Returns an error if validation fails (empty messages, invalid `temperature`/`top_p` ranges).
     pub fn validate(&self) -> anyhow::Result<()> {
         self.validate_has_messages()?;
-
-        if let Some(temp) = self.temperature
-            && !(0.0..=2.0).contains(&temp)
-        {
-            anyhow::bail!("Temperature must be between 0.0 and 2.0, got {temp}");
-        }
-
-        if let Some(top_p) = self.top_p
-            && !(0.0..=1.0).contains(&top_p)
-        {
-            anyhow::bail!("top_p must be between 0.0 and 1.0, got {top_p}");
-        }
-
-        if let Some(freq_penalty) = self.frequency_penalty
-            && !(-2.0..=2.0).contains(&freq_penalty)
-        {
-            anyhow::bail!("frequency_penalty must be between -2.0 and 2.0, got {freq_penalty}");
-        }
-
-        if let Some(pres_penalty) = self.presence_penalty
-            && !(-2.0..=2.0).contains(&pres_penalty)
-        {
-            anyhow::bail!("presence_penalty must be between -2.0 and 2.0, got {pres_penalty}");
-        }
-
-        Ok(())
+        validate_sampling_params(
+            self.temperature,
+            self.top_p,
+            self.frequency_penalty,
+            self.presence_penalty,
+        )
     }
 
     /// Returns whether this request has tools configured.
@@ -1405,65 +1418,7 @@ impl Config {
     }
 }
 
-impl From<(Config, Vec<Message>)> for ChatRequest {
-    fn from((config, messages): (Config, Vec<Message>)) -> Self {
-        let mut request = Self::new(messages).with_model(&config.model);
-
-        if let Some(temperature) = config.temperature {
-            request = request.with_temperature(temperature);
-        }
-
-        if let Some(max_tokens) = config.max_tokens {
-            request = request.with_max_tokens(max_tokens);
-        }
-
-        if let Some(top_p) = config.top_p {
-            request.top_p = Some(top_p);
-        }
-
-        if let Some(frequency_penalty) = config.frequency_penalty {
-            request.frequency_penalty = Some(frequency_penalty);
-        }
-
-        if let Some(presence_penalty) = config.presence_penalty {
-            request.presence_penalty = Some(presence_penalty);
-        }
-
-        if let Some(stop_sequences) = config.stop_sequences {
-            request.stop = Some(stop_sequences);
-        }
-
-        request.metadata = config.metadata;
-
-        request
-    }
-}
-
 impl Config {
-    /// Converts this configuration and messages into a chat request.
-    ///
-    /// This is a convenience method that creates a `ChatRequest` with all
-    /// default parameters from this configuration.
-    ///
-    /// # Arguments
-    ///
-    /// * `messages` - The conversation messages
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use neuromance_common::{Config, Message, MessageRole};
-    /// use uuid::Uuid;
-    ///
-    /// let config = Config::new("openai", "gpt-4").with_temperature(0.7);
-    /// let msg = Message::new(Uuid::new_v4(), MessageRole::User, "Hello!");
-    /// let request = config.into_chat_request(vec![msg]);
-    /// ```
-    #[must_use]
-    pub fn into_chat_request(self, messages: Vec<Message>) -> ChatRequest {
-        (self, messages).into()
-    }
-
     /// Validates the configuration parameters.
     ///
     /// Checks that all numeric parameters are within their valid ranges
@@ -1478,29 +1433,12 @@ impl Config {
     /// - `presence_penalty` must be between -2.0 and 2.0
     /// - `proxy.proxy_url` must be a valid http/https URL
     pub fn validate(&self) -> anyhow::Result<()> {
-        if let Some(temp) = self.temperature
-            && !(0.0..=2.0).contains(&temp)
-        {
-            anyhow::bail!("Temperature must be between 0.0 and 2.0, got {temp}");
-        }
-
-        if let Some(top_p) = self.top_p
-            && !(0.0..=1.0).contains(&top_p)
-        {
-            anyhow::bail!("top_p must be between 0.0 and 1.0, got {top_p}");
-        }
-
-        if let Some(freq_penalty) = self.frequency_penalty
-            && !(-2.0..=2.0).contains(&freq_penalty)
-        {
-            anyhow::bail!("frequency_penalty must be between -2.0 and 2.0, got {freq_penalty}");
-        }
-
-        if let Some(pres_penalty) = self.presence_penalty
-            && !(-2.0..=2.0).contains(&pres_penalty)
-        {
-            anyhow::bail!("presence_penalty must be between -2.0 and 2.0, got {pres_penalty}");
-        }
+        validate_sampling_params(
+            self.temperature,
+            self.top_p,
+            self.frequency_penalty,
+            self.presence_penalty,
+        )?;
 
         if let Some(ref proxy) = self.proxy {
             proxy.validate()?;
