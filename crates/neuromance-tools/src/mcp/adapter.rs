@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::ToolImplementation;
-use neuromance_common::{Function, ObjectSchema, Parameters, Property, Tool};
+use neuromance_common::tools::{Function, ObjectSchema, Parameters, Property, Tool};
 use rmcp::model::Tool as McpTool;
 
 use super::client::McpClientWrapper;
@@ -115,9 +115,8 @@ impl ToolImplementation for McpToolAdapter {
         let properties = extract_properties(&schema);
         let required = extract_required(&schema);
 
-        Tool {
-            r#type: "function".to_string(),
-            function: Function {
+        Tool::builder()
+            .function(Function {
                 name: self.full_name(),
                 description: self.mcp_tool.description.as_ref().map_or_else(
                     || {
@@ -129,8 +128,8 @@ impl ToolImplementation for McpToolAdapter {
                     std::string::ToString::to_string,
                 ),
                 parameters: Parameters::new(properties, required).into(),
-            },
-        }
+            })
+            .build()
     }
 
     async fn execute(&self, args: &Value) -> Result<String> {

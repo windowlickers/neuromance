@@ -181,11 +181,12 @@ impl ToolRegistry {
         self.tools.get(name).is_some_and(|t| t.is_auto_approved())
     }
 
-    pub fn remove(&mut self, name: &str) -> Option<Arc<dyn ToolImplementation>> {
+    #[must_use]
+    pub fn remove(&self, name: &str) -> Option<Arc<dyn ToolImplementation>> {
         self.tools.remove(name).map(|(_, tool)| tool)
     }
 
-    pub fn clear(&mut self) {
+    pub fn clear(&self) {
         self.tools.clear();
     }
 
@@ -235,11 +236,12 @@ impl ToolExecutor {
         self.registry.is_tool_auto_approved(name)
     }
 
-    pub fn remove_tool(&mut self, name: &str) -> Option<Arc<dyn ToolImplementation>> {
+    #[must_use]
+    pub fn remove_tool(&self, name: &str) -> Option<Arc<dyn ToolImplementation>> {
         self.registry.remove(name)
     }
 
-    pub fn reset_tools(&mut self) {
+    pub fn reset_tools(&self) {
         self.registry.clear();
     }
 

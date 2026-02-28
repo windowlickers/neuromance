@@ -24,14 +24,13 @@ impl ToolImplementation for BooleanTool {
             Property::string("A brief explanation for the boolean result"),
         );
 
-        Tool {
-            r#type: "function".to_string(),
-            function: Function {
+        Tool::builder()
+            .function(Function {
                 name: "return_bool".to_string(),
                 description: "Return a boolean result (true/false) with an explanation. Use this to provide definitive yes/no answers.".to_string(),
                 parameters: Parameters::new(properties, vec!["result".into(), "reason".into()]).into(),
-            },
-        }
+            })
+            .build()
     }
 
     async fn execute(&self, args: &Value) -> Result<String> {

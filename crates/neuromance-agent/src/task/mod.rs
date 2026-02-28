@@ -78,7 +78,7 @@ impl<C: LLMClient + Send + Sync> AgentTask<C> {
     }
 
     /// Remove Tool from `AgentTask` `ToolRegistry`
-    pub fn remove_tool(&mut self, name: &str) -> Option<Arc<dyn ToolImplementation>> {
+    pub fn remove_tool(&self, name: &str) -> Option<Arc<dyn ToolImplementation>> {
         self.tool_registry.remove(name)
     }
 

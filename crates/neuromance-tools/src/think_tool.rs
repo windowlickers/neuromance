@@ -20,14 +20,13 @@ impl ToolImplementation for ThinkTool {
             Property::string("The agent's internal thought or reasoning process"),
         );
 
-        Tool {
-            r#type: "function".to_string(),
-            function: Function {
+        Tool::builder()
+            .function(Function {
                 name: "think".to_string(),
                 description: "Record your internal thoughts and reasoning. Use this to make your thinking process visible and preserve it in the conversation context.".to_string(),
                 parameters: Parameters::new(properties, vec!["thought".into()]).into(),
-            },
-        }
+            })
+            .build()
     }
 
     async fn execute(&self, args: &Value) -> Result<String> {

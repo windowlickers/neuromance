@@ -19,6 +19,25 @@ pub enum TodoStatus {
     Completed,
 }
 
+impl TodoStatus {
+    const fn symbol(&self) -> &'static str {
+        match self {
+            Self::Pending => "[ ]",
+            Self::InProgress => "[→]",
+            Self::Completed => "[✓]",
+        }
+    }
+}
+
+fn format_todo_list(header: &str, todos: &[TodoItem]) -> String {
+    let mut response = String::from(header);
+    response.push('\n');
+    for todo in todos {
+        let _ = writeln!(response, "{} {}", todo.status.symbol(), todo.content);
+    }
+    response
+}
+
 /// A single todo item
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TodoItem {
@@ -41,26 +60,17 @@ impl TodoReadTool {
     }
 }
 
-impl Default for TodoReadTool {
-    fn default() -> Self {
-        Self {
-            storage: Arc::new(RwLock::new(Vec::new())),
-        }
-    }
-}
-
 #[async_trait]
 impl ToolImplementation for TodoReadTool {
     fn get_definition(&self) -> Tool {
-        Tool {
-            r#type: "function".to_string(),
-            function: Function {
+        Tool::builder()
+            .function(Function {
                 name: "read_todos".to_string(),
                 description: "Read the current todo list to see task progress and what's planned."
                     .to_string(),
                 parameters: Parameters::new(HashMap::new(), vec![]).into(),
-            },
-        }
+            })
+            .build()
     }
 
     async fn execute(&self, _args: &Value) -> Result<String> {
@@ -73,18 +83,10 @@ impl ToolImplementation for TodoReadTool {
             return Ok("TODO LIST: (empty)".to_string());
         }
 
-        let mut response = String::from("TODO LIST:\n");
-        for todo in todos.iter() {
-            let status_symbol = match todo.status {
-                TodoStatus::Pending => "[ ]",
-                TodoStatus::InProgress => "[→]",
-                TodoStatus::Completed => "[✓]",
-            };
-            let _ = writeln!(response, "{status_symbol} {}", todo.content);
-        }
+        let result = format_todo_list("TODO LIST:", &todos);
         drop(todos);
 
-        Ok(response)
+        Ok(result)
     }
 
     fn is_auto_approved(&self) -> bool {
@@ -100,14 +102,6 @@ pub struct TodoWriteTool {
 impl TodoWriteTool {
     pub const fn new(storage: TodoStorage) -> Self {
         Self { storage }
-    }
-}
-
-impl Default for TodoWriteTool {
-    fn default() -> Self {
-        Self {
-            storage: Arc::new(RwLock::new(Vec::new())),
-        }
     }
 }
 
@@ -143,14 +137,13 @@ impl ToolImplementation for TodoWriteTool {
             ),
         );
 
-        Tool {
-            r#type: "function".to_string(),
-            function: Function {
+        Tool::builder()
+            .function(Function {
                 name: "write_todos".to_string(),
                 description: "Update the todo list to track task progress. Each todo should have 'content' (imperative form like 'Fix bug'), 'status' (pending/in_progress/completed), and 'active_form' (present continuous like 'Fixing bug'). Exactly one task must be in_progress.".to_string(),
                 parameters: Parameters::new(props, vec!["todos".into()]).into(),
-            },
-        }
+            })
+            .build()
     }
 
     async fn execute(&self, args: &Value) -> Result<String> {
@@ -176,22 +169,12 @@ impl ToolImplementation for TodoWriteTool {
             ));
         }
 
-        // Update the stored todos
-        self.storage
-            .write()
-            .map_err(|e| anyhow::anyhow!("Failed to write to todo storage: {e}"))?
-            .clone_from(&todos);
+        let response = format_todo_list("TODO LIST UPDATED:", &todos);
 
-        // Format the response
-        let mut response = String::from("TODO LIST UPDATED:\n");
-        for todo in &todos {
-            let status_symbol = match todo.status {
-                TodoStatus::Pending => "[ ]",
-                TodoStatus::InProgress => "[→]",
-                TodoStatus::Completed => "[✓]",
-            };
-            let _ = writeln!(response, "{status_symbol} {}", todo.content);
-        }
+        *self
+            .storage
+            .write()
+            .map_err(|e| anyhow::anyhow!("Failed to write to todo storage: {e}"))? = todos;
 
         Ok(response)
     }
