@@ -18,7 +18,6 @@ workspace = true
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
-chrono = { workspace = true }
 log = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
@@ -38,6 +37,10 @@ tokio = { workspace = true }
 [[example]]
 name = "agent_task_vampire"
 path = "examples/agent_task_vampire.rs"
+
+[[example]]
+name = "sequential_agents"
+path = "examples/sequential_agents.rs"
 
 [[example]]
 name = "sequential_agents_builder"

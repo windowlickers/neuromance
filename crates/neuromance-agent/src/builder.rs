@@ -109,7 +109,7 @@ impl<C: LLMClient> AgentBuilder<C> {
     /// # Arguments
     /// * `tool_choice` - Tool choice strategy (Auto, None, Required, or specific function)
     #[must_use]
-    pub fn with_tool_choice(mut self, tool_choice: ToolChoice) -> Self {
+    pub fn tool_choice(mut self, tool_choice: ToolChoice) -> Self {
         self.tool_choice = tool_choice;
         self
     }
@@ -138,7 +138,6 @@ impl<C: LLMClient> AgentBuilder<C> {
             core: self.core,
             state: AgentState::default(),
             system_prompt: self.system_prompt,
-            user_prompt: self.user_prompt,
             messages,
             tool_choice: self.tool_choice,
         }

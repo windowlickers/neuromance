@@ -39,9 +39,9 @@
 //!
 //! // Build an agent
 //! let mut agent = BaseAgent::builder("research-agent", client)
-//!     .with_system_prompt("You are a research assistant that finds information.")
-//!     .with_user_prompt("Find the population of Tokyo.")
-//!     .build()?;
+//!     .system_prompt("You are a research assistant that finds information.")
+//!     .user_prompt("Find the population of Tokyo.")
+//!     .build();
 //!
 //! // Execute the agent
 //! let response = agent.execute(None).await?;
@@ -64,11 +64,11 @@
 //! let client = OpenAIClient::new(config)?;
 //!
 //! let agent = BaseAgent::builder("task-agent", client)
-//!     .with_system_prompt("You are a task completion agent.")
-//!     .with_user_prompt("Complete the following task: organize these files.")
-//!     .with_max_turns(5)
-//!     .with_auto_approve_tools(true)
-//!     .build()?;
+//!     .system_prompt("You are a task completion agent.")
+//!     .user_prompt("Complete the following task: organize these files.")
+//!     .max_turns(5)
+//!     .auto_approve_tools(true)
+//!     .build();
 //! # Ok(())
 //! # }
 //! ```
@@ -162,7 +162,6 @@ pub struct BaseAgent<C: LLMClient> {
     pub core: Core<C>,
     pub state: AgentState,
     pub system_prompt: Option<String>,
-    pub user_prompt: Option<String>,
     pub messages: Vec<Message>,
     pub tool_choice: ToolChoice,
 }
@@ -175,7 +174,6 @@ impl<C: LLMClient> BaseAgent<C> {
             core,
             state: AgentState::default(),
             system_prompt: None,
-            user_prompt: None,
             messages: Vec::<Message>::new(),
             tool_choice: ToolChoice::Auto,
         }
@@ -212,8 +210,6 @@ impl<C: LLMClient + Send + Sync> Agent for BaseAgent<C> {
 
     async fn execute(&mut self, messages: Option<Vec<Message>>) -> Result<AgentResponse> {
         info!("Agent {} executing", self.id);
-        self.core.auto_approve_tools = true;
-        self.core.max_turns = Some(3);
         self.core.tool_choice = self.tool_choice.clone();
 
         // Use provided messages or fall back to stored messages
@@ -247,13 +243,7 @@ impl<C: LLMClient + Send + Sync> Agent for BaseAgent<C> {
             .iter()
             .rfind(|m| m.role == MessageRole::Assistant)
             .cloned()
-            .unwrap_or_else(|| {
-                Message::new(
-                    self.conversation_id,
-                    MessageRole::Assistant,
-                    "No final response generated".to_string(),
-                )
-            });
+            .ok_or_else(|| anyhow::anyhow!("LLM returned no assistant message"))?;
 
         let tool_responses = messages
             .iter()

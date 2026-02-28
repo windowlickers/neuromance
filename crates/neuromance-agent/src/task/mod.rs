@@ -31,8 +31,6 @@ pub struct AgentTask<C: LLMClient> {
 
 #[derive(Debug, Clone, Default)]
 pub struct TaskState {
-    pub context_gathered: bool,
-    pub action_taken: bool,
     pub verified: bool,
     pub context_response: Option<AgentResponse>,
     pub action_response: Option<AgentResponse>,
@@ -103,13 +101,6 @@ impl<C: LLMClient + Send + Sync> AgentTask<C> {
                 "\n- {}: {}\n",
                 tool.function.name, tool.function.description
             );
-
-            // NOTE parameters seem excessive and context wasting, revisit later
-            //
-            // Add parameter information if available
-            // description.push_str(&format!("  Parameters: {}\n",
-            //     serde_json::to_string_pretty(&tool.function.parameters).unwrap_or_else(|_| "N/A".to_string())
-            // ));
         }
 
         description
@@ -129,9 +120,8 @@ impl<C: LLMClient + Send + Sync> AgentTask<C> {
         // Pass tools information to context agent
         let response = self
             .context_agent
-            .analyze_with_tools(self.task_description.clone(), tools_description)
+            .analyze_with_tools(&self.task_description, &tools_description)
             .await?;
-        self.state.context_gathered = true;
         self.state.context_response = Some(response.clone());
         Ok(response)
     }
@@ -141,7 +131,7 @@ impl<C: LLMClient + Send + Sync> AgentTask<C> {
     /// # Errors
     /// Returns an error if context was not gathered first or action execution fails
     pub async fn take_action(&mut self) -> Result<AgentResponse> {
-        if !self.state.context_gathered {
+        if self.state.context_response.is_none() {
             return Err(anyhow::anyhow!(
                 "Cannot take action before gathering context"
             ));
@@ -169,9 +159,8 @@ impl<C: LLMClient + Send + Sync> AgentTask<C> {
 
         let response = self
             .action_agent
-            .execute_task(self.task_description.clone(), context)
+            .execute_task(&self.task_description, &context)
             .await?;
-        self.state.action_taken = true;
         self.state.action_response = Some(response.clone());
         Ok(response)
     }
@@ -181,7 +170,7 @@ impl<C: LLMClient + Send + Sync> AgentTask<C> {
     /// # Errors
     /// Returns an error if action was not taken first or verification fails
     pub async fn verify(&mut self) -> Result<AgentResponse> {
-        if !self.state.action_taken {
+        if self.state.action_response.is_none() {
             return Err(anyhow::anyhow!("Cannot verify before action is taken"));
         }
 
@@ -194,7 +183,7 @@ impl<C: LLMClient + Send + Sync> AgentTask<C> {
 
         let (verified, response) = self
             .verifier_agent
-            .verify(self.task_description.clone(), action_result)
+            .verify(&self.task_description, &action_result)
             .await?;
 
         self.state.verified = verified;
