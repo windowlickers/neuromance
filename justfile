@@ -6,15 +6,18 @@ ci:
 dev *args:
     cargo build --bin neuromance-daemon
     NEUROMANCE_DATA_DIR=~/.local/share/neuromance-dev \
+    NEUROMANCE_CONFIG_DIR=~/.config/neuromance-dev \
     NEUROMANCE_DAEMON_BIN=./target/debug/neuromance-daemon \
     cargo run --bin neuromance -- {{args}}
 
-# Run the daemon in foreground for debugging (isolated data dir)
+# Run the daemon in foreground for debugging (isolated data and config)
 dev-daemon:
     NEUROMANCE_DATA_DIR=~/.local/share/neuromance-dev \
+    NEUROMANCE_CONFIG_DIR=~/.config/neuromance-dev \
     cargo run --bin neuromance-daemon
 
 # Stop the dev daemon
 dev-stop:
     NEUROMANCE_DATA_DIR=~/.local/share/neuromance-dev \
+    NEUROMANCE_CONFIG_DIR=~/.config/neuromance-dev \
     cargo run --bin neuromance -- daemon stop

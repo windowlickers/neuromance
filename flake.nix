@@ -191,6 +191,7 @@
 
           shellHook = ''
             export NEUROMANCE_DATA_DIR="$HOME/.local/share/neuromance-dev"
+            export NEUROMANCE_CONFIG_DIR="$HOME/.config/neuromance-dev"
           '';
         };
 

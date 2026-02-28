@@ -418,16 +418,19 @@ impl DaemonClient {
 
     fn spawn_daemon() -> Result<std::process::Child> {
         let stderr_stdio = Self::open_daemon_log().map_or_else(|_| Stdio::null(), Stdio::from);
-
-        let daemon_bin = std::env::var("NEUROMANCE_DAEMON_BIN")
-            .unwrap_or_else(|_| "neuromance-daemon".to_string());
+        let daemon_bin = neuromance_daemon::paths::daemon_bin();
 
         let child = Command::new(&daemon_bin)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(stderr_stdio)
             .spawn()
-            .with_context(|| format!("Failed to spawn daemon at '{daemon_bin}'. Is it in PATH?"))?;
+            .with_context(|| {
+                format!(
+                    "Failed to spawn daemon at '{}'. Is it in PATH?",
+                    daemon_bin.display()
+                )
+            })?;
 
         Ok(child)
     }
