@@ -238,44 +238,19 @@ impl PythonRepl {
         globals: &Bound<PyDict>,
         locals: &Bound<PyDict>,
     ) -> Result<(String, String), ReplError> {
-        // Create StringIO for capturing output
-        let io_module = py.import("io")?;
-        let string_io = io_module.getattr("StringIO")?;
+        let streams = super::capture::redirect_streams(py)?;
 
-        let stdout_capture = string_io.call0()?;
-        let stderr_capture = string_io.call0()?;
-
-        // Redirect stdout/stderr
-        let sys_module = py.import("sys")?;
-        let old_stdout = sys_module.getattr("stdout")?;
-        let old_stderr = sys_module.getattr("stderr")?;
-
-        sys_module.setattr("stdout", &stdout_capture)?;
-        sys_module.setattr("stderr", &stderr_capture)?;
-
-        // Execute the code
         let c_code = CString::new(code).map_err(|e| {
             ReplError::ExecutionError(format!(
                 "code contains an interior NUL byte at position {}",
                 e.nul_position()
             ))
         })?;
-        let exec_result = py.run(c_code.as_c_str(), Some(globals), Some(locals));
+        let exec_result =
+            py.run(c_code.as_c_str(), Some(globals), Some(locals));
 
-        // Restore stdout/stderr
-        let _ = sys_module.setattr("stdout", old_stdout);
-        let _ = sys_module.setattr("stderr", old_stderr);
+        let (stdout, stderr) = streams.restore(py)?;
 
-        // Get captured output
-        let stdout = stdout_capture
-            .call_method0("getvalue")?
-            .extract::<String>()?;
-
-        let stderr = stderr_capture
-            .call_method0("getvalue")?
-            .extract::<String>()?;
-
-        // Check execution result
         exec_result?;
 
         Ok((stdout, stderr))

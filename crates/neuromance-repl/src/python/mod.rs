@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use crate::ReplConfig;
 
 pub mod callback;
+mod capture;
 pub mod direct;
 pub mod interactive;
 
