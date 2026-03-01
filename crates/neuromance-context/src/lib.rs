@@ -414,8 +414,7 @@ impl TokenCounter {
         }
 
         // Then try to get template from tokenizer.json
-        if let Ok(tokenizer_str) = serde_json::to_string(tokenizer)
-            && let Ok(tokenizer_json) = serde_json::from_str::<serde_json::Value>(&tokenizer_str)
+        if let Ok(tokenizer_json) = serde_json::to_value(tokenizer)
             && let Some(template) = tokenizer_json.get("chat_template")
             && let Some(template_str) = template.as_str()
         {

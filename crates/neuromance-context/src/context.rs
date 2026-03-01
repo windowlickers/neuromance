@@ -55,7 +55,8 @@ impl Context<Raw> {
 
     /// Transitions to the filtered state by applying filter criteria.
     pub fn filter(mut self, criteria: FilterCriteria) -> Context<Filtered> {
-        self.metadata.add_transformation(Operation::Filter, &criteria);
+        self.metadata
+            .add_transformation(Operation::Filter, &criteria);
         self.updated_at = Utc::now();
         self.conversation = crate::transforms::apply_filter(self.conversation, criteria);
         self.advance()
@@ -147,7 +148,8 @@ impl Context<Filtered> {
 
     /// Skips transformation and moves directly to the transformed state.
     pub fn skip_transform(mut self) -> Context<Transformed> {
-        self.metadata.add_transformation(Operation::SkipTransform, &());
+        self.metadata
+            .add_transformation(Operation::SkipTransform, &());
         self.updated_at = Utc::now();
         self.advance()
     }
