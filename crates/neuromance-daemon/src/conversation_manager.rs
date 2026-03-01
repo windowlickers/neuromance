@@ -580,7 +580,17 @@ impl ConversationManager {
                     .into_iter()
                     .filter_map(|id| match s.load_conversation(&id) {
                         Ok(conv) => {
-                            let bm = s.get_conversation_bookmarks(&id).ok().unwrap_or_default();
+                            let bm = match s.get_conversation_bookmarks(&id) {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    warn!(
+                                        conversation_id = %id,
+                                        error = %e,
+                                        "Failed to load bookmarks for conversation"
+                                    );
+                                    Vec::new()
+                                }
+                            };
                             Some((id, conv, bm))
                         }
                         Err(e) => {
@@ -695,7 +705,13 @@ impl ConversationManager {
                 }
 
                 for (id, _, _) in &to_delete {
-                    let _ = s.remove_bookmarks_for_conversation(id);
+                    if let Err(e) = s.remove_bookmarks_for_conversation(id) {
+                        warn!(
+                            conversation_id = %id,
+                            error = %e,
+                            "Failed to remove bookmarks before deleting conversation"
+                        );
+                    }
                     s.delete_conversation(id)?;
                 }
 
