@@ -59,9 +59,7 @@ pub fn neuromance_config_dir() -> Option<PathBuf> {
 /// Returns a config file path under the neuromance config directory.
 ///
 /// Combines `neuromance_config_dir()` with the given filename.
-pub fn neuromance_config_file(
-    filename: impl AsRef<OsStr>,
-) -> Option<PathBuf> {
+pub fn neuromance_config_file(filename: impl AsRef<OsStr>) -> Option<PathBuf> {
     neuromance_config_dir().map(|d| d.join(filename.as_ref()))
 }
 

@@ -142,13 +142,7 @@ impl<C: LLMClient + Send + Sync> VerifierAgent<C> {
     ) -> Result<(bool, AgentResponse), CoreError> {
         let id = self.agent.conversation_id;
         let messages = vec![
-            Message::system(
-                id,
-                self.agent
-                    .system_prompt
-                    .as_deref()
-                    .unwrap_or_default(),
-            ),
+            Message::system(id, self.agent.system_prompt.as_deref().unwrap_or_default()),
             Message::user(
                 id,
                 format!(
@@ -163,14 +157,11 @@ impl<C: LLMClient + Send + Sync> VerifierAgent<C> {
 
         let tool_def = BooleanTool.get_definition();
 
-        let request =
-            ChatRequest::from((self.agent.core.client.config(), messages))
-                .with_tools(vec![tool_def])
-                .with_tool_choice(
-                    neuromance_common::client::ToolChoice::Function {
-                        name: "return_bool".to_string(),
-                    },
-                );
+        let request = ChatRequest::from((self.agent.core.client.config(), messages))
+            .with_tools(vec![tool_def])
+            .with_tool_choice(neuromance_common::client::ToolChoice::Function {
+                name: "return_bool".to_string(),
+            });
 
         debug!(
             "Chat request:\n {}",
@@ -189,11 +180,8 @@ impl<C: LLMClient + Send + Sync> VerifierAgent<C> {
             && tool_call.function.name == "return_bool"
         {
             let args_str = tool_call.function.arguments_json();
-            if let Ok(args) =
-                serde_json::from_str::<serde_json::Value>(args_str)
-                && let Some(result) = args
-                    .get("result")
-                    .and_then(serde_json::Value::as_bool)
+            if let Ok(args) = serde_json::from_str::<serde_json::Value>(args_str)
+                && let Some(result) = args.get("result").and_then(serde_json::Value::as_bool)
             {
                 let agent_response = AgentResponse {
                     content: response.message,

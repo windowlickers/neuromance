@@ -698,7 +698,8 @@ impl LLMClient for OpenAIClient {
     async fn chat_stream(
         &self,
         request: &ChatRequest,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatChunk, ClientError>> + Send>>, ClientError> {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatChunk, ClientError>> + Send>>, ClientError>
+    {
         self.validate_request(request)?;
 
         let mut openai_request = ChatCompletionRequest::from((request, self.config.as_ref()));

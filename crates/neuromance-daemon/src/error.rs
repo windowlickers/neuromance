@@ -88,28 +88,20 @@ impl From<DaemonError> for neuromance_common::DaemonResponse {
         use neuromance_common::ErrorCode;
 
         let code = match &err {
-            DaemonError::ConversationNotFound(_) => {
-                ErrorCode::ConversationNotFound
-            }
+            DaemonError::ConversationNotFound(_) => ErrorCode::ConversationNotFound,
             DaemonError::ModelNotFound(_) => ErrorCode::ModelNotFound,
             DaemonError::BookmarkNotFound(_) => ErrorCode::BookmarkNotFound,
             DaemonError::BookmarkExists(_) => ErrorCode::BookmarkExists,
-            DaemonError::NoActiveConversation => {
-                ErrorCode::NoActiveConversation
+            DaemonError::NoActiveConversation => ErrorCode::NoActiveConversation,
+            DaemonError::InvalidConversationId(_) => ErrorCode::InvalidConversationId,
+            DaemonError::Core(_) | DaemonError::Client(_) | DaemonError::Tool(_) => {
+                ErrorCode::LlmError
             }
-            DaemonError::InvalidConversationId(_) => {
-                ErrorCode::InvalidConversationId
-            }
-            DaemonError::Core(_)
-            | DaemonError::Client(_)
-            | DaemonError::Tool(_) => ErrorCode::LlmError,
-            DaemonError::Config(_) | DaemonError::Toml(_) => {
-                ErrorCode::ConfigError
-            }
+            DaemonError::Config(_) | DaemonError::Toml(_) => ErrorCode::ConfigError,
             DaemonError::Storage(_) => ErrorCode::StorageError,
-            DaemonError::Io(_)
-            | DaemonError::Json(_)
-            | DaemonError::Other(_) => ErrorCode::Internal,
+            DaemonError::Io(_) | DaemonError::Json(_) | DaemonError::Other(_) => {
+                ErrorCode::Internal
+            }
         };
 
         Self::Error {

@@ -49,6 +49,10 @@ pub struct Core<C: LLMClient> {
     pub thinking: ThinkingMode,
     /// Aggregate cache statistics across all requests made through this Core.
     pub cache_metrics: CacheMetrics,
+    /// Number of tool calls that executed successfully.
+    pub successful_tool_calls: u32,
+    /// Number of tool calls that failed during execution.
+    pub failed_tool_calls: u32,
 }
 
 impl<C: LLMClient> Core<C> {
@@ -65,6 +69,8 @@ impl<C: LLMClient> Core<C> {
             turn_callback: None,
             thinking: ThinkingMode::Default,
             cache_metrics: CacheMetrics::default(),
+            successful_tool_calls: 0,
+            failed_tool_calls: 0,
         }
     }
 
@@ -233,10 +239,7 @@ impl<C: LLMClient> Core<C> {
     }
 
     /// Send a chat request with retry logic for transient failures
-    async fn chat_with_retry(
-        &self,
-        request: &ChatRequest,
-    ) -> Result<ChatResponse, CoreError> {
+    async fn chat_with_retry(&self, request: &ChatRequest) -> Result<ChatResponse, CoreError> {
         let mut last_error = None;
 
         let config = self.client.config();
@@ -245,9 +248,7 @@ impl<C: LLMClient> Core<C> {
             match self.client.chat(request).await {
                 Ok(response) => return Ok(response),
                 Err(e) => {
-                    if attempt < config.retry_config.max_retries
-                        && e.is_retryable()
-                    {
+                    if attempt < config.retry_config.max_retries && e.is_retryable() {
                         debug!(
                             "Request failed (attempt {}), retrying in {:?}: {}",
                             attempt + 1,
@@ -255,8 +256,7 @@ impl<C: LLMClient> Core<C> {
                             e
                         );
                         last_error = Some(e);
-                        tokio::time::sleep(config.retry_config.initial_delay)
-                            .await;
+                        tokio::time::sleep(config.retry_config.initial_delay).await;
                         continue;
                     }
                     last_error = Some(e);
@@ -266,9 +266,7 @@ impl<C: LLMClient> Core<C> {
         }
 
         Err(last_error.map_or_else(
-            || CoreError::NoResponse(
-                "No response received after retries".to_string(),
-            ),
+            || CoreError::NoResponse("No response received after retries".to_string()),
             CoreError::Client,
         ))
     }
@@ -350,18 +348,13 @@ impl<C: LLMClient> Core<C> {
             .messages
             .first()
             .ok_or_else(|| {
-                CoreError::NoResponse(
-                    "Request must contain at least one message".to_string(),
-                )
+                CoreError::NoResponse("Request must contain at least one message".to_string())
             })?
             .conversation_id;
 
         // Construct the final response
-        let last_chunk = response_metadata.ok_or_else(|| {
-            CoreError::NoResponse(
-                "Stream ended without any chunks".to_string(),
-            )
-        })?;
+        let last_chunk = response_metadata
+            .ok_or_else(|| CoreError::NoResponse("Stream ended without any chunks".to_string()))?;
 
         let message = Message {
             id: uuid::Uuid::new_v4(),
@@ -492,6 +485,7 @@ impl<C: LLMClient> Core<C> {
                             Ok(result) => {
                                 debug!("Tool {tool_name} executed successfully");
                                 debug!("Tool result: {result}");
+                                self.successful_tool_calls += 1;
 
                                 // Emit tool result event
                                 self.emit_event(CoreEvent::ToolResult {
@@ -513,6 +507,7 @@ impl<C: LLMClient> Core<C> {
                             }
                             Err(e) => {
                                 debug!("Tool {tool_name} execution failed: {e}");
+                                self.failed_tool_calls += 1;
                                 let error_msg = format!("Tool execution failed: {e}");
 
                                 // Emit tool result event

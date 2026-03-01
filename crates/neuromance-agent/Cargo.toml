@@ -29,9 +29,11 @@ neuromance-tools = { workspace = true }
 
 
 [dev-dependencies]
+chrono = { workspace = true }
 clap = { workspace = true }
 colored = { workspace = true }
 env_logger = { workspace = true }
+futures = { workspace = true }
 tokio = { workspace = true }
 
 [[example]]

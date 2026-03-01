@@ -200,10 +200,7 @@ pub trait LLMClient: Send + Sync {
     fn config(&self) -> &Config;
 
     /// Send a chat completion request to the LLM.
-    async fn chat(
-        &self,
-        request: &ChatRequest,
-    ) -> Result<ChatResponse, ClientError>;
+    async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, ClientError>;
 
     /// Send a streaming chat completion request to the LLM.
     ///
@@ -211,10 +208,7 @@ pub trait LLMClient: Send + Sync {
     async fn chat_stream(
         &self,
         request: &ChatRequest,
-    ) -> Result<
-        Pin<Box<dyn Stream<Item = Result<ChatChunk, ClientError>> + Send>>,
-        ClientError,
-    >;
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatChunk, ClientError>> + Send>>, ClientError>;
 
     /// Check if the client supports tool/function calling.
     fn supports_tools(&self) -> bool;
@@ -258,10 +252,7 @@ pub trait LLMClient: Send + Sync {
     /// # Errors
     ///
     /// Returns an error if validation fails.
-    fn validate_request(
-        &self,
-        request: &ChatRequest,
-    ) -> Result<(), ClientError> {
+    fn validate_request(&self, request: &ChatRequest) -> Result<(), ClientError> {
         request
             .validate_has_messages()
             .map_err(|e| ClientError::InvalidRequest(e.to_string()))?;
@@ -330,10 +321,7 @@ mod tests {
             &self.config
         }
 
-        async fn chat(
-            &self,
-            _request: &ChatRequest,
-        ) -> Result<ChatResponse, ClientError> {
+        async fn chat(&self, _request: &ChatRequest) -> Result<ChatResponse, ClientError> {
             Ok(ChatResponse {
                 message: create_test_message(),
                 model: "mock-model".to_string(),
@@ -348,10 +336,8 @@ mod tests {
         async fn chat_stream(
             &self,
             _request: &ChatRequest,
-        ) -> Result<
-            Pin<Box<dyn Stream<Item = Result<ChatChunk, ClientError>> + Send>>,
-            ClientError,
-        > {
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatChunk, ClientError>> + Send>>, ClientError>
+        {
             use futures::stream;
 
             let chunk = ChatChunk {

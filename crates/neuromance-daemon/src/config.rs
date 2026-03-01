@@ -131,11 +131,7 @@ impl DaemonConfig {
     /// Returns an error if the config directory cannot be determined.
     pub fn config_path() -> Result<PathBuf> {
         neuromance_daemon::paths::neuromance_config_file("config.toml")
-            .ok_or_else(|| {
-                DaemonError::Config(
-                    "Failed to determine config directory".to_string(),
-                )
-            })
+            .ok_or_else(|| DaemonError::Config("Failed to determine config directory".to_string()))
     }
 
     /// Validates the configuration.
@@ -216,9 +212,7 @@ pub struct BuiltinToolsConfig {
 
 impl Default for BuiltinToolsConfig {
     fn default() -> Self {
-        Self {
-            current_time: true,
-        }
+        Self { current_time: true }
     }
 }
 
@@ -255,11 +249,7 @@ impl ToolsConfig {
     /// Returns an error if the config directory cannot be determined.
     pub fn config_path() -> Result<PathBuf> {
         neuromance_daemon::paths::neuromance_config_file("tools.toml")
-            .ok_or_else(|| {
-                DaemonError::Config(
-                    "Failed to determine config directory".to_string(),
-                )
-            })
+            .ok_or_else(|| DaemonError::Config("Failed to determine config directory".to_string()))
     }
 }
 

@@ -541,6 +541,9 @@ pub struct CacheMetrics {
     /// Sum of `cache_creation_tokens` (tokens written to cache).
     #[serde(default)]
     pub total_cache_creation_tokens: u64,
+    /// Sum of `completion_tokens` across all recorded requests.
+    #[serde(default)]
+    pub total_output_tokens: u64,
     /// Number of requests where `cached_tokens > 0`.
     #[serde(default)]
     pub requests_with_cache_hits: u32,
@@ -553,6 +556,7 @@ impl CacheMetrics {
     /// Record token usage from a single LLM response.
     pub fn record(&mut self, usage: &Usage) {
         self.total_input_tokens += u64::from(usage.prompt_tokens);
+        self.total_output_tokens += u64::from(usage.completion_tokens);
         self.total_requests += 1;
 
         if let Some(ref details) = usage.input_tokens_details {
@@ -676,33 +680,25 @@ fn validate_sampling_params(
     if let Some(temp) = temperature
         && !(0.0..=2.0).contains(&temp)
     {
-        anyhow::bail!(
-            "Temperature must be between 0.0 and 2.0, got {temp}"
-        );
+        anyhow::bail!("Temperature must be between 0.0 and 2.0, got {temp}");
     }
 
     if let Some(top_p) = top_p
         && !(0.0..=1.0).contains(&top_p)
     {
-        anyhow::bail!(
-            "top_p must be between 0.0 and 1.0, got {top_p}"
-        );
+        anyhow::bail!("top_p must be between 0.0 and 1.0, got {top_p}");
     }
 
     if let Some(freq) = frequency_penalty
         && !(-2.0..=2.0).contains(&freq)
     {
-        anyhow::bail!(
-            "frequency_penalty must be between -2.0 and 2.0, got {freq}"
-        );
+        anyhow::bail!("frequency_penalty must be between -2.0 and 2.0, got {freq}");
     }
 
     if let Some(pres) = presence_penalty
         && !(-2.0..=2.0).contains(&pres)
     {
-        anyhow::bail!(
-            "presence_penalty must be between -2.0 and 2.0, got {pres}"
-        );
+        anyhow::bail!("presence_penalty must be between -2.0 and 2.0, got {pres}");
     }
 
     Ok(())
@@ -759,10 +755,7 @@ impl ChatRequest {
 }
 
 impl ChatRequest {
-    fn from_config(
-        config: &Config,
-        messages: Arc<[Message]>,
-    ) -> Self {
+    fn from_config(config: &Config, messages: Arc<[Message]>) -> Self {
         Self {
             messages,
             model: Some(config.model.clone()),

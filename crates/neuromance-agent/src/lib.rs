@@ -145,7 +145,9 @@ use uuid::Uuid;
 use neuromance::Core;
 use neuromance::error::CoreError;
 use neuromance_client::LLMClient;
-use neuromance_common::agents::{AgentContext, AgentMemory, AgentResponse, AgentState, AgentStats};
+use neuromance_common::agents::{
+    AgentContext, AgentMemory, AgentMessage, AgentResponse, AgentState, AgentStats,
+};
 use neuromance_common::chat::{Message, MessageRole};
 use neuromance_common::client::ToolChoice;
 
@@ -216,7 +218,7 @@ impl<C: LLMClient + Send + Sync> Agent for BaseAgent<C> {
         self.core.tool_choice = self.tool_choice.clone();
 
         // Use provided messages or fall back to stored messages
-        let messages = messages.unwrap_or_else(|| self.messages.clone());
+        let mut messages = messages.unwrap_or_else(|| self.messages.clone());
 
         // Validate that we have at least system and user messages
         if messages.len() < 2 {
@@ -241,7 +243,31 @@ impl<C: LLMClient + Send + Sync> Agent for BaseAgent<C> {
             )));
         }
 
+        // Inject agent context into the system message
+        if let Some(ctx) = self.state.context_prompt() {
+            messages[0].content.push_str("\n\n");
+            messages[0].content.push_str(&ctx);
+        }
+
+        // Snapshot Core counters before the tool loop
+        let tokens_before = self.core.cache_metrics.total_input_tokens
+            + self.core.cache_metrics.total_output_tokens;
+        let success_before = self.core.successful_tool_calls;
+        let fail_before = self.core.failed_tool_calls;
+
         let messages = self.core.chat_with_tool_loop(messages).await?;
+
+        // Update stats with deltas from this execution
+        self.state.stats.total_messages += messages.len();
+        let tokens_after = self.core.cache_metrics.total_input_tokens
+            + self.core.cache_metrics.total_output_tokens;
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            self.state.stats.tokens_used += (tokens_after - tokens_before) as usize;
+        }
+        self.state.stats.successful_tool_calls +=
+            (self.core.successful_tool_calls - success_before) as usize;
+        self.state.stats.failed_tool_calls += (self.core.failed_tool_calls - fail_before) as usize;
 
         // Extract the final assistant message and tool responses
         let content = messages
@@ -249,24 +275,37 @@ impl<C: LLMClient + Send + Sync> Agent for BaseAgent<C> {
             .rfind(|m| m.role == MessageRole::Assistant)
             .cloned()
             .ok_or_else(|| {
-                CoreError::NoResponse(
-                    "LLM returned no assistant message".to_string(),
-                )
+                CoreError::NoResponse("LLM returned no assistant message".to_string())
             })?;
 
-        let tool_responses = messages
+        let tool_responses: Vec<Message> = messages
             .iter()
             .filter(|m| m.role == MessageRole::Tool)
             .cloned()
             .collect();
 
-        Ok(AgentResponse {
+        let response = AgentResponse {
             content,
             reasoning: None,
             tool_responses,
-        })
+        };
+
+        // Record conversation history
+        let user_content = messages
+            .iter()
+            .find(|m| m.role == MessageRole::User)
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+        self.state
+            .conversation_history
+            .push((AgentMessage::UserInput(user_content), response.clone()));
+
+        Ok(response)
     }
 }
+
+#[cfg(test)]
+mod tests;
 
 #[async_trait]
 pub trait Agent: Send + Sync {
@@ -286,8 +325,6 @@ pub trait Agent: Send + Sync {
     async fn reset(&mut self) -> Result<(), CoreError>;
 
     /// Execute core chat with tools loop
-    async fn execute(
-        &mut self,
-        messages: Option<Vec<Message>>,
-    ) -> Result<AgentResponse, CoreError>;
+    async fn execute(&mut self, messages: Option<Vec<Message>>)
+    -> Result<AgentResponse, CoreError>;
 }

@@ -580,7 +580,8 @@ impl LLMClient for AnthropicClient {
     async fn chat_stream(
         &self,
         request: &ChatRequest,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatChunk, ClientError>> + Send>>, ClientError> {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatChunk, ClientError>> + Send>>, ClientError>
+    {
         self.validate_request(request)?;
 
         let mut anthropic_request = CreateMessageRequest::from((request, self.config.as_ref()));
@@ -650,22 +651,17 @@ impl LLMClient for AnthropicClient {
                                 // Update state from message_start
                                 if let StreamEvent::MessageStart { message: ref msg } = stream_event
                                 {
-                                    *current_model.lock().await =
-                                        Arc::from(msg.model.as_str());
-                                    *response_id.lock().await =
-                                        Arc::from(msg.id.as_str());
+                                    *current_model.lock().await = Arc::from(msg.model.as_str());
+                                    *response_id.lock().await = Arc::from(msg.id.as_str());
                                 }
 
                                 // Get current state for conversion (Arc<str> clone is cheap)
-                                let model_str =
-                                    Arc::clone(&*current_model.lock().await);
-                                let response_id_str =
-                                    Arc::clone(&*response_id.lock().await);
+                                let model_str = Arc::clone(&*current_model.lock().await);
+                                let response_id_str = Arc::clone(&*response_id.lock().await);
 
                                 // Convert to chat chunk
                                 let chunk = {
-                                    let mut guard =
-                                        streaming_tool_calls.lock().await;
+                                    let mut guard = streaming_tool_calls.lock().await;
                                     convert_event_to_chat_chunk(
                                         &stream_event,
                                         &model_str,

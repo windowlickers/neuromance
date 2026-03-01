@@ -62,6 +62,7 @@
 //! ```
 
 use std::collections::HashMap;
+use std::fmt::Write;
 
 use serde::{Deserialize, Serialize};
 
@@ -159,6 +160,70 @@ pub struct AgentContext {
     pub constraints: Vec<String>,
     /// Environment variables available to the agent.
     pub environment: HashMap<String, String>,
+}
+
+impl AgentState {
+    /// Apply a context update to this agent's state.
+    pub fn apply_context_update(&mut self, update: ContextUpdate) {
+        match update {
+            ContextUpdate::SetTask(task) => {
+                self.context.task = Some(task);
+            }
+            ContextUpdate::AddGoal(goal) => {
+                self.context.goals.push(goal);
+            }
+            ContextUpdate::RemoveGoal(ref goal) => {
+                self.context.goals.retain(|g| g != goal);
+            }
+            ContextUpdate::AddConstraint(c) => {
+                self.context.constraints.push(c);
+            }
+            ContextUpdate::RemoveConstraint(ref c) => {
+                self.context.constraints.retain(|x| x != c);
+            }
+            ContextUpdate::SetEnvironmentVariable(k, v) => {
+                self.context.environment.insert(k, v);
+            }
+            ContextUpdate::ClearMemory => {
+                self.memory = AgentMemory::default();
+            }
+        }
+    }
+
+    /// Format context and memory into a prompt section.
+    ///
+    /// Returns `None` if all context fields and memory are empty.
+    #[must_use]
+    pub fn context_prompt(&self) -> Option<String> {
+        let mut parts = String::new();
+
+        if let Some(ref task) = self.context.task {
+            let _ = writeln!(parts, "Current task: {task}");
+        }
+
+        if !self.context.goals.is_empty() {
+            let _ = writeln!(parts, "Goals:");
+            for goal in &self.context.goals {
+                let _ = writeln!(parts, "- {goal}");
+            }
+        }
+
+        if !self.context.constraints.is_empty() {
+            let _ = writeln!(parts, "Constraints:");
+            for c in &self.context.constraints {
+                let _ = writeln!(parts, "- {c}");
+            }
+        }
+
+        if !self.memory.short_term.is_empty() {
+            let _ = writeln!(parts, "Recent context:");
+            for item in &self.memory.short_term {
+                let _ = writeln!(parts, "- {item}");
+            }
+        }
+
+        if parts.is_empty() { None } else { Some(parts) }
+    }
 }
 
 /// Memory storage for agents.

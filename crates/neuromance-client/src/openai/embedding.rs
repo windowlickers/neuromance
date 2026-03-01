@@ -212,8 +212,9 @@ impl OpenAIEmbedding {
 
         // Construct and validate the embeddings URL once at initialization
         let embeddings_url = format!("{base_url}/embeddings");
-        reqwest::Url::parse(&embeddings_url)
-            .map_err(|e| ClientError::ConfigurationError(format!("Invalid base URL '{base_url}': {e}")))?;
+        reqwest::Url::parse(&embeddings_url).map_err(|e| {
+            ClientError::ConfigurationError(format!("Invalid base URL '{base_url}': {e}"))
+        })?;
 
         // Build retry policy from config
         let retry_policy = ExponentialBackoff::builder()
@@ -401,7 +402,10 @@ impl EmbeddingClient for OpenAIEmbedding {
         &self.config
     }
 
-    async fn embed_request(&self, request: &EmbeddingRequest) -> Result<EmbeddingResponse, ClientError> {
+    async fn embed_request(
+        &self,
+        request: &EmbeddingRequest,
+    ) -> Result<EmbeddingResponse, ClientError> {
         let openai_response = self.make_request(request).await?;
 
         let embeddings: Vec<Embedding> = openai_response

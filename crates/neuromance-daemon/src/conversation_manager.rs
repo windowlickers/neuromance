@@ -251,9 +251,7 @@ impl ConversationManager {
             ClientType::Anthropic(client) => {
                 Self::execute_chat_loop(client, messages, config).await
             }
-            ClientType::OpenAI(client) => {
-                Self::execute_chat_loop(client, messages, config).await
-            }
+            ClientType::OpenAI(client) => Self::execute_chat_loop(client, messages, config).await,
             ClientType::Responses(client) => {
                 Self::execute_chat_loop(client, messages, config).await
             }
@@ -475,9 +473,8 @@ impl ConversationManager {
         })?;
 
         // Create config
-        let mut config =
-            Config::new(model_profile.provider.to_string(), &model_profile.model)
-                .with_api_key(api_key);
+        let mut config = Config::new(model_profile.provider.to_string(), &model_profile.model)
+            .with_api_key(api_key);
 
         // Set custom base URL if specified
         if let Some(ref base_url) = model_profile.base_url {

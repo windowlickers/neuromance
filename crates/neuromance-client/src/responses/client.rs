@@ -226,7 +226,8 @@ impl LLMClient for ResponsesClient {
     async fn chat_stream(
         &self,
         request: &ChatRequest,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatChunk, ClientError>> + Send>>, ClientError> {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatChunk, ClientError>> + Send>>, ClientError>
+    {
         self.validate_request(request)?;
 
         let mut responses_request = ResponsesRequest::from((request, self.config.as_ref()));
@@ -288,12 +289,15 @@ impl LLMClient for ResponsesClient {
 
                         // Parse the event
                         match serde_json::from_str::<StreamEvent>(&message.data) {
-                            Ok(stream_event) => convert_stream_event_to_chunk(
-                                stream_event,
-                                &model,
-                                &response_id,
-                                &streaming_function_calls,
-                            ).await,
+                            Ok(stream_event) => {
+                                convert_stream_event_to_chunk(
+                                    stream_event,
+                                    &model,
+                                    &response_id,
+                                    &streaming_function_calls,
+                                )
+                                .await
+                            }
                             Err(e) => {
                                 warn!("Failed to parse streaming event: {e}");
                                 debug!("Problematic event data: {}", message.data);
@@ -480,11 +484,7 @@ async fn convert_stream_event_to_chunk(
             // The primary path (FunctionCallArgumentsDone) uses the complete arguments
             // from that event directly, so these deltas only matter if the API sends
             // OutputItemDone without a preceding FunctionCallArgumentsDone.
-            if let Some(fc) = streaming_function_calls
-                .lock()
-                .await
-                .get_mut(&output_index)
-            {
+            if let Some(fc) = streaming_function_calls.lock().await.get_mut(&output_index) {
                 fc.append_delta(&delta);
             }
             None
@@ -534,10 +534,7 @@ async fn convert_stream_event_to_chunk(
         StreamEvent::OutputItemDone { output_index, .. } => {
             // If this was a function call that wasn't finalized via FunctionCallArgumentsDone,
             // finalize it now
-            let maybe_fc = streaming_function_calls
-                .lock()
-                .await
-                .remove(&output_index);
+            let maybe_fc = streaming_function_calls.lock().await.remove(&output_index);
 
             if let Some(fc) = maybe_fc {
                 let current_model = model.lock().await.clone();
@@ -1096,7 +1093,11 @@ mod tests {
                 text: String::new(),
             },
         };
-        assert!(convert_stream_event_to_chunk(event, &model, &response_id, &fc).await.is_none());
+        assert!(
+            convert_stream_event_to_chunk(event, &model, &response_id, &fc)
+                .await
+                .is_none()
+        );
 
         // ContentPartDone
         let event = StreamEvent::ContentPartDone {
@@ -1106,7 +1107,11 @@ mod tests {
                 text: "done".to_string(),
             },
         };
-        assert!(convert_stream_event_to_chunk(event, &model, &response_id, &fc).await.is_none());
+        assert!(
+            convert_stream_event_to_chunk(event, &model, &response_id, &fc)
+                .await
+                .is_none()
+        );
 
         // OutputTextDone
         let event = StreamEvent::OutputTextDone {
@@ -1114,7 +1119,11 @@ mod tests {
             content_index: 0,
             text: "done".to_string(),
         };
-        assert!(convert_stream_event_to_chunk(event, &model, &response_id, &fc).await.is_none());
+        assert!(
+            convert_stream_event_to_chunk(event, &model, &response_id, &fc)
+                .await
+                .is_none()
+        );
 
         // ReasoningSummaryTextDone
         let event = StreamEvent::ReasoningSummaryTextDone {
@@ -1122,7 +1131,11 @@ mod tests {
             summary_index: 0,
             text: "done".to_string(),
         };
-        assert!(convert_stream_event_to_chunk(event, &model, &response_id, &fc).await.is_none());
+        assert!(
+            convert_stream_event_to_chunk(event, &model, &response_id, &fc)
+                .await
+                .is_none()
+        );
 
         // Unknown
         assert!(

@@ -424,20 +424,16 @@ impl EmbeddingResponse {
 /// Extract a single embedding from a response.
 ///
 /// Used by trait default implementations.
-fn extract_single_embedding(
-    response: &EmbeddingResponse,
-) -> Result<Vec<f32>, ClientError> {
+fn extract_single_embedding(response: &EmbeddingResponse) -> Result<Vec<f32>, ClientError> {
     let embedding = response.first().ok_or_else(|| {
         ClientError::EmbeddingError(
-            "API returned empty response: no embeddings in data array"
-                .to_string(),
+            "API returned empty response: no embeddings in data array".to_string(),
         )
     })?;
 
     if embedding.is_empty() {
         return Err(ClientError::EmbeddingError(
-            "API returned malformed response: embedding vector is empty"
-                .to_string(),
+            "API returned malformed response: embedding vector is empty".to_string(),
         ));
     }
 
@@ -506,7 +502,10 @@ pub trait EmbeddingClient: Send + Sync {
     /// # Returns
     ///
     /// The full embedding response including metadata.
-    async fn embed_request(&self, request: &EmbeddingRequest) -> Result<EmbeddingResponse, ClientError>;
+    async fn embed_request(
+        &self,
+        request: &EmbeddingRequest,
+    ) -> Result<EmbeddingResponse, ClientError>;
 
     /// Generate an embedding for a single text input with user tracking.
     ///
@@ -530,7 +529,11 @@ pub trait EmbeddingClient: Send + Sync {
     ///
     /// * `texts` - The texts to embed
     /// * `user` - User identifier for tracking
-    async fn embed_batch_with_user(&self, texts: &[&str], user: &str) -> Result<Vec<Vec<f32>>, ClientError> {
+    async fn embed_batch_with_user(
+        &self,
+        texts: &[&str],
+        user: &str,
+    ) -> Result<Vec<Vec<f32>>, ClientError> {
         let input: EmbeddingInput = texts.into();
         let request = EmbeddingRequest::new(input).with_user(user);
         let response = self.embed_request(&request).await?;
