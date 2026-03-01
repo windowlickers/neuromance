@@ -13,7 +13,6 @@ use neuromance_common::tools::{Function, Tool};
 use neuromance_tools::ToolImplementation;
 
 use super::PythonRepl;
-use crate::ReplEnvironment;
 
 /// Tool implementation for executing Python code in a REPL environment.
 ///

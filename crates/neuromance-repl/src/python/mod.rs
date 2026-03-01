@@ -7,7 +7,6 @@
 //!
 //! ```rust,no_run
 //! use neuromance_repl::python::{PythonRepl, PythonReplConfig};
-//! use neuromance_repl::ReplEnvironment;
 //! use std::collections::HashMap;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {

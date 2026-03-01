@@ -24,8 +24,7 @@
 //!   cargo run --example depth_stress_test --features python --release -- \
 //!     --context-file /path/to/large_document.txt
 
-use neuromance_repl::ReplEnvironment;
-use neuromance_repl::python::PythonRepl;
+use neuromance_repl::PythonRepl;
 use std::collections::HashMap;
 use std::time::Instant;
 

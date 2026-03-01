@@ -50,8 +50,7 @@
 //! ```
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use neuromance_repl::ReplEnvironment;
-use neuromance_repl::python::PythonRepl;
+use neuromance_repl::PythonRepl;
 use std::collections::HashMap;
 use sysinfo::{Pid, System};
 

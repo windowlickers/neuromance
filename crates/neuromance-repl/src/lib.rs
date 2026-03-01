@@ -1,7 +1,7 @@
 //! REPL (Read-Eval-Print-Loop) environments for LLM tool execution.
 //!
 //! Provides Python execution with restricted builtins, persistent state, configurable modules,
-//! and stdout/stderr capture. Future languages can implement the [`ReplEnvironment`] trait.
+//! and stdout/stderr capture.
 //!
 //! # Features
 //!
@@ -11,8 +11,6 @@
 //! # Example
 //!
 //! ```rust,no_run
-//! use neuromance_repl::ReplEnvironment;
-//!
 //! # async fn example() -> anyhow::Result<()> {
 //! #[cfg(feature = "python")]
 //! {
@@ -33,10 +31,7 @@
 //! # }
 //! ```
 
-use async_trait::async_trait;
-use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -157,78 +152,6 @@ impl Default for ReplConfig {
             timeout: Duration::from_secs(30),
         }
     }
-}
-
-/// Generic trait for REPL environments.
-///
-/// This trait can be implemented for different languages (Python, JavaScript, Lua, etc.)
-/// to provide a unified interface for LLM tool execution.
-#[async_trait]
-pub trait ReplEnvironment: Send + Sync {
-    /// Execute code in the REPL environment.
-    ///
-    /// State persists between calls - variables defined in one execution
-    /// are available in subsequent executions.
-    ///
-    /// # Errors
-    ///
-    /// Returns `ReplError` if execution fails or times out.
-    async fn execute(&self, code: &str) -> Result<ReplResult, ReplError>;
-
-    /// Reset the REPL environment, clearing all state.
-    ///
-    /// # Errors
-    ///
-    /// Returns `ReplError` if reset fails.
-    async fn reset(&self) -> Result<(), ReplError>;
-
-    /// Get the current configuration.
-    fn config(&self) -> &ReplConfig;
-
-    /// Get the language/runtime name (e.g., "python", "javascript").
-    fn language_name(&self) -> &'static str;
-
-    /// Inject a function into the REPL environment.
-    ///
-    /// This allows providing callbacks from Rust that can be called from
-    /// REPL code (e.g., `llm_query()` for recursive LLM calls).
-    ///
-    /// The callback receives:
-    /// - `args`: Positional arguments as strings
-    /// - `kwargs`: Keyword arguments as a string-to-string map
-    ///
-    /// Returns a `BoxFuture` to allow async operations within the callback.
-    /// Use `Box::new(|args, kwargs| Box::pin(async move { ... }))` when creating callbacks.
-    ///
-    /// # Errors
-    ///
-    /// Returns `ReplError` if function injection fails.
-    async fn inject_function(
-        &self,
-        name: &str,
-        callback: Box<
-            dyn Fn(
-                    Vec<String>,
-                    HashMap<String, String>,
-                ) -> BoxFuture<'static, Result<String, String>>
-                + Send
-                + Sync,
-        >,
-    ) -> Result<(), ReplError>;
-
-    /// Get a variable from the REPL environment.
-    ///
-    /// # Errors
-    ///
-    /// Returns `ReplError` if variable doesn't exist or can't be serialized.
-    async fn get_variable(&self, name: &str) -> Result<Option<String>, ReplError>;
-
-    /// Set a variable in the REPL environment.
-    ///
-    /// # Errors
-    ///
-    /// Returns `ReplError` if variable can't be set.
-    async fn set_variable(&self, name: &str, value: &str) -> Result<(), ReplError>;
 }
 
 #[cfg(test)]

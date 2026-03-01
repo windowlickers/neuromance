@@ -7,8 +7,7 @@
 //! - Output capture (stdout/stderr)
 //! - Configurable module imports
 
-use crate::{ReplConfig, ReplEnvironment, ReplError, ReplResult};
-use async_trait::async_trait;
+use crate::{ReplConfig, ReplError, ReplResult};
 use pyo3::prelude::*;
 use pyo3::types::{PyCFunction, PyDict, PyTuple};
 use std::collections::{HashMap, HashSet};
@@ -318,11 +317,15 @@ impl PythonRepl {
     }
 }
 
-#[async_trait]
 #[allow(clippy::significant_drop_tightening)] // Guards are used multiple times
-impl ReplEnvironment for PythonRepl {
+impl PythonRepl {
+    /// Execute code in the REPL. State persists between calls.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ReplError` if execution fails or times out.
     #[allow(clippy::cast_possible_truncation)] // Execution time won't exceed u64::MAX ms
-    async fn execute(&self, code: &str) -> Result<ReplResult, ReplError> {
+    pub async fn execute(&self, code: &str) -> Result<ReplResult, ReplError> {
         let code = code.to_string();
         let globals = Arc::clone(&self.globals);
         let locals = Arc::clone(&self.locals);
@@ -392,7 +395,12 @@ impl ReplEnvironment for PythonRepl {
         }
     }
 
-    async fn reset(&self) -> Result<(), ReplError> {
+    /// Reset the REPL, clearing all state.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ReplError` if reset fails.
+    pub async fn reset(&self) -> Result<(), ReplError> {
         let locals_arc = Arc::clone(&self.locals);
 
         tokio::task::spawn_blocking(move || {
@@ -409,15 +417,24 @@ impl ReplEnvironment for PythonRepl {
         Ok(())
     }
 
-    fn config(&self) -> &ReplConfig {
+    /// Get the current configuration.
+    #[must_use]
+    pub const fn config(&self) -> &ReplConfig {
         &self.config.base
     }
 
-    fn language_name(&self) -> &'static str {
+    /// Get the language name.
+    #[must_use]
+    pub const fn language_name(&self) -> &'static str {
         "python"
     }
 
-    async fn inject_function(&self, name: &str, callback: PythonCallback) -> Result<(), ReplError> {
+    /// Inject a callable function into the REPL environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ReplError` if function injection fails.
+    pub async fn inject_function(&self, name: &str, callback: PythonCallback) -> Result<(), ReplError> {
         self.callbacks
             .write()
             .await
@@ -425,7 +442,12 @@ impl ReplEnvironment for PythonRepl {
         Ok(())
     }
 
-    async fn get_variable(&self, name: &str) -> Result<Option<String>, ReplError> {
+    /// Get a variable's string representation from the REPL.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ReplError` if the variable can't be serialized.
+    pub async fn get_variable(&self, name: &str) -> Result<Option<String>, ReplError> {
         let locals_arc = Arc::clone(&self.locals);
         let name = name.to_string();
 
@@ -451,7 +473,12 @@ impl ReplEnvironment for PythonRepl {
         result.map_err(ReplError::ExecutionError)
     }
 
-    async fn set_variable(&self, name: &str, value: &str) -> Result<(), ReplError> {
+    /// Set a variable in the REPL environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ReplError` if the variable can't be set.
+    pub async fn set_variable(&self, name: &str, value: &str) -> Result<(), ReplError> {
         let locals_arc = Arc::clone(&self.locals);
         let name = name.to_string();
         let value = value.to_string();

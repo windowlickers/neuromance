@@ -7,8 +7,7 @@
 //!
 //! Run with: cargo run --example recursive_llm_query --features python
 
-use neuromance_repl::python::PythonRepl;
-use neuromance_repl::{PythonCallback, ReplEnvironment};
+use neuromance_repl::{PythonCallback, PythonRepl};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 
