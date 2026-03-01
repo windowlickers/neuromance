@@ -1,4 +1,3 @@
-use anyhow::Result;
 use chrono::{DateTime, Utc};
 use neuromance_client::LLMClient;
 use serde::{Deserialize, Serialize};
@@ -6,6 +5,8 @@ use std::marker::PhantomData;
 use uuid::Uuid;
 
 use neuromance_common::Conversation;
+
+use crate::error::TokenCounterError;
 
 pub use crate::compaction::{CompactionConfig, CompactionResult, Compactor};
 pub use crate::metadata::ContextMetadata;
@@ -146,7 +147,7 @@ impl Context<Filtered> {
     pub async fn compact<C: LLMClient>(
         mut self,
         compactor: &Compactor<C>,
-    ) -> Result<(Context<Transformed>, CompactionResult)> {
+    ) -> Result<(Context<Transformed>, CompactionResult), TokenCounterError> {
         let result = compactor.compact(&self.conversation).await?;
 
         // Record the compaction in metadata
@@ -181,7 +182,7 @@ impl Context<Filtered> {
     pub async fn compact_if_needed<C: LLMClient>(
         self,
         compactor: &Compactor<C>,
-    ) -> Result<(Context<Transformed>, Option<CompactionResult>)> {
+    ) -> Result<(Context<Transformed>, Option<CompactionResult>), TokenCounterError> {
         if compactor.needs_compaction(&self.conversation)? {
             let (context, result) = self.compact(compactor).await?;
             Ok((context, Some(result)))

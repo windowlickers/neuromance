@@ -1,8 +1,8 @@
-//! Error types for token counting operations.
+//! Error types for the neuromance-context crate.
 
 use thiserror::Error;
 
-/// Errors that can occur during token counting operations.
+/// Errors that can occur during context management operations.
 #[derive(Error, Debug)]
 pub enum TokenCounterError {
     /// Failed to load the tokenizer
@@ -26,4 +26,20 @@ pub enum TokenCounterError {
     #[cfg(feature = "gguf")]
     #[error("Failed to extract tokenizer from GGUF: {0}")]
     GGUFTokenizerExtraction(String),
+
+    /// Chat template error (missing or failed to render)
+    #[error("Chat template error: {0}")]
+    Template(String),
+
+    /// Invalid regex pattern
+    #[error("Invalid regex pattern: {0}")]
+    Regex(#[from] regex::Error),
+
+    /// Token range out of bounds or invalid
+    #[error("Token range error: {0}")]
+    TokenRange(String),
+
+    /// Compaction failed (LLM call or conversation rebuild)
+    #[error("Compaction failed: {0}")]
+    Compaction(String),
 }
