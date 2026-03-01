@@ -55,7 +55,8 @@ use secrecy::{ExposeSecret, SecretString};
 use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use neuromance_common::chat::{Message, MessageRole};
 use neuromance_common::client::{ChatChunk, ChatRequest, ChatResponse, Config, ProxyConfig, Usage};
@@ -649,30 +650,27 @@ impl LLMClient for AnthropicClient {
                                 // Update state from message_start
                                 if let StreamEvent::MessageStart { message: ref msg } = stream_event
                                 {
-                                    if let Ok(mut model) = current_model.lock() {
-                                        *model = Arc::from(msg.model.as_str());
-                                    }
-                                    if let Ok(mut id) = response_id.lock() {
-                                        *id = Arc::from(msg.id.as_str());
-                                    }
+                                    *current_model.lock().await =
+                                        Arc::from(msg.model.as_str());
+                                    *response_id.lock().await =
+                                        Arc::from(msg.id.as_str());
                                 }
 
                                 // Get current state for conversion (Arc<str> clone is cheap)
-                                let model_str = current_model
-                                    .lock()
-                                    .map_or_else(|_| "".into(), |m| Arc::clone(&m));
-                                let response_id_str = response_id
-                                    .lock()
-                                    .map_or_else(|_| "".into(), |r| Arc::clone(&r));
+                                let model_str =
+                                    Arc::clone(&*current_model.lock().await);
+                                let response_id_str =
+                                    Arc::clone(&*response_id.lock().await);
 
                                 // Convert to chat chunk
                                 let chunk = {
-                                    let mut tool_calls = streaming_tool_calls.lock().ok();
+                                    let mut guard =
+                                        streaming_tool_calls.lock().await;
                                     convert_event_to_chat_chunk(
                                         &stream_event,
                                         &model_str,
                                         &response_id_str,
-                                        tool_calls.as_deref_mut(),
+                                        Some(&mut *guard),
                                     )
                                 };
 

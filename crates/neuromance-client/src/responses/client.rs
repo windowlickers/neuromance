@@ -12,7 +12,8 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use neuromance_common::chat::MessageRole;
 use neuromance_common::client::{ChatChunk, ChatRequest, ChatResponse, Config, Usage};
@@ -292,7 +293,7 @@ impl LLMClient for ResponsesClient {
                                 &model,
                                 &response_id,
                                 &streaming_function_calls,
-                            ),
+                            ).await,
                             Err(e) => {
                                 warn!("Failed to parse streaming event: {e}");
                                 debug!("Problematic event data: {}", message.data);
@@ -359,7 +360,7 @@ async fn extract_error_from_response(
 
 /// Convert a stream event to a `ChatChunk`.
 #[allow(clippy::too_many_lines)]
-fn convert_stream_event_to_chunk(
+async fn convert_stream_event_to_chunk(
     event: StreamEvent,
     model: &Arc<Mutex<String>>,
     response_id: &Arc<Mutex<String>>,
@@ -368,13 +369,9 @@ fn convert_stream_event_to_chunk(
     match event {
         StreamEvent::ResponseCreated { response }
         | StreamEvent::ResponseInProgress { response } => {
-            // Update shared state - use ok() to handle poisoned mutex gracefully
-            if let Ok(mut guard) = model.lock() {
-                guard.clone_from(&response.model);
-            }
-            if let Ok(mut guard) = response_id.lock() {
-                guard.clone_from(&response.id);
-            }
+            // Update shared state
+            model.lock().await.clone_from(&response.model);
+            response_id.lock().await.clone_from(&response.id);
 
             Some(Ok(ChatChunk {
                 model: response.model,
@@ -428,12 +425,8 @@ fn convert_stream_event_to_chunk(
         }
 
         StreamEvent::OutputTextDelta { delta, .. } => {
-            let current_model = model.lock().ok().map(|g| g.clone()).unwrap_or_default();
-            let current_response_id = response_id
-                .lock()
-                .ok()
-                .map(|g| g.clone())
-                .unwrap_or_default();
+            let current_model = model.lock().await.clone();
+            let current_response_id = response_id.lock().await.clone();
 
             Some(Ok(ChatChunk {
                 model: current_model,
@@ -450,12 +443,8 @@ fn convert_stream_event_to_chunk(
         }
 
         StreamEvent::ReasoningSummaryTextDelta { delta, .. } => {
-            let current_model = model.lock().ok().map(|g| g.clone()).unwrap_or_default();
-            let current_response_id = response_id
-                .lock()
-                .ok()
-                .map(|g| g.clone())
-                .unwrap_or_default();
+            let current_model = model.lock().await.clone();
+            let current_response_id = response_id.lock().await.clone();
 
             Some(Ok(ChatChunk {
                 model: current_model,
@@ -473,10 +462,11 @@ fn convert_stream_event_to_chunk(
 
         StreamEvent::OutputItemAdded { output_index, item } => {
             // If this is a function call, start accumulating
-            if let OutputItem::FunctionCall { call_id, name, .. } = item
-                && let Ok(mut guard) = streaming_function_calls.lock()
-            {
-                guard.insert(output_index, StreamingFunctionCall::new(call_id, name));
+            if let OutputItem::FunctionCall { call_id, name, .. } = item {
+                streaming_function_calls
+                    .lock()
+                    .await
+                    .insert(output_index, StreamingFunctionCall::new(call_id, name));
             }
             None
         }
@@ -490,8 +480,10 @@ fn convert_stream_event_to_chunk(
             // The primary path (FunctionCallArgumentsDone) uses the complete arguments
             // from that event directly, so these deltas only matter if the API sends
             // OutputItemDone without a preceding FunctionCallArgumentsDone.
-            if let Ok(mut guard) = streaming_function_calls.lock()
-                && let Some(fc) = guard.get_mut(&output_index)
+            if let Some(fc) = streaming_function_calls
+                .lock()
+                .await
+                .get_mut(&output_index)
             {
                 fc.append_delta(&delta);
             }
@@ -508,17 +500,13 @@ fn convert_stream_event_to_chunk(
             // tool results back in multi-turn conversations.
             let (call_id, function_name) = streaming_function_calls
                 .lock()
-                .ok()
-                .and_then(|mut guard| guard.remove(&output_index))
+                .await
+                .remove(&output_index)
                 .map(|fc| (fc.call_id, fc.name))
                 .unwrap_or_default();
 
-            let current_model = model.lock().ok().map(|g| g.clone()).unwrap_or_default();
-            let current_response_id = response_id
-                .lock()
-                .ok()
-                .map(|g| g.clone())
-                .unwrap_or_default();
+            let current_model = model.lock().await.clone();
+            let current_response_id = response_id.lock().await.clone();
 
             let tool_call = ToolCall {
                 id: call_id,
@@ -548,16 +536,12 @@ fn convert_stream_event_to_chunk(
             // finalize it now
             let maybe_fc = streaming_function_calls
                 .lock()
-                .ok()
-                .and_then(|mut guard| guard.remove(&output_index));
+                .await
+                .remove(&output_index);
 
             if let Some(fc) = maybe_fc {
-                let current_model = model.lock().ok().map(|g| g.clone()).unwrap_or_default();
-                let current_response_id = response_id
-                    .lock()
-                    .ok()
-                    .map(|g| g.clone())
-                    .unwrap_or_default();
+                let current_model = model.lock().await.clone();
+                let current_response_id = response_id.lock().await.clone();
 
                 let tool_call = fc.finalize();
 
@@ -814,15 +798,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_stream_response_created_sets_model_and_role() {
+    #[tokio::test]
+    async fn test_stream_response_created_sets_model_and_role() {
         let (model, response_id, fc) = create_shared_state();
 
         let event = StreamEvent::ResponseCreated {
             response: make_partial_response("resp_abc", "gpt-4o"),
         };
 
-        let result = convert_stream_event_to_chunk(event, &model, &response_id, &fc);
+        let result = convert_stream_event_to_chunk(event, &model, &response_id, &fc).await;
         let chunk = result.unwrap().unwrap();
 
         assert_eq!(chunk.model, "gpt-4o");
@@ -831,15 +815,15 @@ mod tests {
         assert!(chunk.delta_content.is_none());
 
         // Shared state should be updated
-        assert_eq!(*model.lock().unwrap(), "gpt-4o");
-        assert_eq!(*response_id.lock().unwrap(), "resp_abc");
+        assert_eq!(*model.lock().await, "gpt-4o");
+        assert_eq!(*response_id.lock().await, "resp_abc");
     }
 
-    #[test]
-    fn test_stream_text_delta() {
+    #[tokio::test]
+    async fn test_stream_text_delta() {
         let (model, response_id, fc) = create_shared_state();
-        *model.lock().unwrap() = "gpt-4o".to_string();
-        *response_id.lock().unwrap() = "resp_abc".to_string();
+        *model.lock().await = "gpt-4o".to_string();
+        *response_id.lock().await = "resp_abc".to_string();
 
         let event = StreamEvent::OutputTextDelta {
             output_index: 0,
@@ -847,7 +831,7 @@ mod tests {
             delta: "Hello ".to_string(),
         };
 
-        let result = convert_stream_event_to_chunk(event, &model, &response_id, &fc);
+        let result = convert_stream_event_to_chunk(event, &model, &response_id, &fc).await;
         let chunk = result.unwrap().unwrap();
 
         assert_eq!(chunk.delta_content.as_deref(), Some("Hello "));
@@ -856,11 +840,11 @@ mod tests {
         assert!(chunk.delta_role.is_none());
     }
 
-    #[test]
-    fn test_stream_reasoning_delta() {
+    #[tokio::test]
+    async fn test_stream_reasoning_delta() {
         let (model, response_id, fc) = create_shared_state();
-        *model.lock().unwrap() = "o3".to_string();
-        *response_id.lock().unwrap() = "resp_r".to_string();
+        *model.lock().await = "o3".to_string();
+        *response_id.lock().await = "resp_r".to_string();
 
         let event = StreamEvent::ReasoningSummaryTextDelta {
             output_index: 0,
@@ -868,7 +852,7 @@ mod tests {
             delta: "Let me think...".to_string(),
         };
 
-        let result = convert_stream_event_to_chunk(event, &model, &response_id, &fc);
+        let result = convert_stream_event_to_chunk(event, &model, &response_id, &fc).await;
         let chunk = result.unwrap().unwrap();
 
         assert_eq!(
@@ -879,8 +863,8 @@ mod tests {
         assert_eq!(chunk.model, "o3");
     }
 
-    #[test]
-    fn test_stream_response_completed_with_usage() {
+    #[tokio::test]
+    async fn test_stream_response_completed_with_usage() {
         let (model, response_id, fc) = create_shared_state();
 
         let response = super::super::ResponsesResponse {
@@ -907,7 +891,7 @@ mod tests {
 
         let event = StreamEvent::ResponseCompleted { response };
 
-        let result = convert_stream_event_to_chunk(event, &model, &response_id, &fc);
+        let result = convert_stream_event_to_chunk(event, &model, &response_id, &fc).await;
         let chunk = result.unwrap().unwrap();
 
         assert_eq!(chunk.finish_reason, Some(FinishReason::Stop));
@@ -917,8 +901,8 @@ mod tests {
         assert_eq!(usage.total_tokens, 30);
     }
 
-    #[test]
-    fn test_stream_response_incomplete_with_usage() {
+    #[tokio::test]
+    async fn test_stream_response_incomplete_with_usage() {
         let (model, response_id, fc) = create_shared_state();
 
         let response = super::super::ResponsesResponse {
@@ -947,7 +931,7 @@ mod tests {
 
         let event = StreamEvent::ResponseIncomplete { response };
 
-        let result = convert_stream_event_to_chunk(event, &model, &response_id, &fc);
+        let result = convert_stream_event_to_chunk(event, &model, &response_id, &fc).await;
         let chunk = result.unwrap().unwrap();
 
         assert_eq!(chunk.finish_reason, Some(FinishReason::Length));
@@ -957,8 +941,8 @@ mod tests {
         assert_eq!(usage.total_tokens, 612);
     }
 
-    #[test]
-    fn test_stream_response_failed() {
+    #[tokio::test]
+    async fn test_stream_response_failed() {
         let (model, response_id, fc) = create_shared_state();
 
         let mut partial = make_partial_response("resp_fail", "gpt-4o");
@@ -970,16 +954,16 @@ mod tests {
 
         let event = StreamEvent::ResponseFailed { response: partial };
 
-        let result = convert_stream_event_to_chunk(event, &model, &response_id, &fc);
+        let result = convert_stream_event_to_chunk(event, &model, &response_id, &fc).await;
         let err = result.unwrap().unwrap_err();
         assert!(err.to_string().contains("Internal server error"));
     }
 
-    #[test]
-    fn test_stream_function_call_flow() {
+    #[tokio::test]
+    async fn test_stream_function_call_flow() {
         let (model, response_id, fc) = create_shared_state();
-        *model.lock().unwrap() = "gpt-4o".to_string();
-        *response_id.lock().unwrap() = "resp_fc".to_string();
+        *model.lock().await = "gpt-4o".to_string();
+        *response_id.lock().await = "resp_fc".to_string();
 
         // 1. OutputItemAdded with function call
         let added_event = StreamEvent::OutputItemAdded {
@@ -990,7 +974,7 @@ mod tests {
                 arguments: String::new(),
             },
         };
-        let result = convert_stream_event_to_chunk(added_event, &model, &response_id, &fc);
+        let result = convert_stream_event_to_chunk(added_event, &model, &response_id, &fc).await;
         assert!(result.is_none());
 
         // 2. First arguments delta
@@ -999,7 +983,7 @@ mod tests {
             call_id: String::new(),
             delta: r#"{"loc"#.to_string(),
         };
-        let result = convert_stream_event_to_chunk(delta1, &model, &response_id, &fc);
+        let result = convert_stream_event_to_chunk(delta1, &model, &response_id, &fc).await;
         assert!(result.is_none());
 
         // 3. Second arguments delta
@@ -1008,7 +992,7 @@ mod tests {
             call_id: String::new(),
             delta: r#"ation":"SF"}"#.to_string(),
         };
-        let result = convert_stream_event_to_chunk(delta2, &model, &response_id, &fc);
+        let result = convert_stream_event_to_chunk(delta2, &model, &response_id, &fc).await;
         assert!(result.is_none());
 
         // 4. FunctionCallArgumentsDone
@@ -1018,7 +1002,7 @@ mod tests {
             arguments: r#"{"location":"SF"}"#.to_string(),
             sequence_number: 0,
         };
-        let result = convert_stream_event_to_chunk(done_event, &model, &response_id, &fc);
+        let result = convert_stream_event_to_chunk(done_event, &model, &response_id, &fc).await;
         let chunk = result.unwrap().unwrap();
 
         let tool_calls = chunk.delta_tool_calls.unwrap();
@@ -1028,11 +1012,11 @@ mod tests {
         assert_eq!(tool_calls[0].function.arguments, r#"{"location":"SF"}"#);
     }
 
-    #[test]
-    fn test_stream_function_call_finalized_on_output_item_done() {
+    #[tokio::test]
+    async fn test_stream_function_call_finalized_on_output_item_done() {
         let (model, response_id, fc) = create_shared_state();
-        *model.lock().unwrap() = "gpt-4o".to_string();
-        *response_id.lock().unwrap() = "resp_fc2".to_string();
+        *model.lock().await = "gpt-4o".to_string();
+        *response_id.lock().await = "resp_fc2".to_string();
 
         // 1. OutputItemAdded
         let added = StreamEvent::OutputItemAdded {
@@ -1043,7 +1027,7 @@ mod tests {
                 arguments: String::new(),
             },
         };
-        convert_stream_event_to_chunk(added, &model, &response_id, &fc);
+        convert_stream_event_to_chunk(added, &model, &response_id, &fc).await;
 
         // No deltas — empty args
 
@@ -1056,7 +1040,7 @@ mod tests {
                 arguments: String::new(),
             },
         };
-        let result = convert_stream_event_to_chunk(done, &model, &response_id, &fc);
+        let result = convert_stream_event_to_chunk(done, &model, &response_id, &fc).await;
         let chunk = result.unwrap().unwrap();
 
         let tool_calls = chunk.delta_tool_calls.unwrap();
@@ -1067,8 +1051,8 @@ mod tests {
         assert_eq!(tool_calls[0].function.arguments, "{}");
     }
 
-    #[test]
-    fn test_stream_output_item_done_no_pending_function_call() {
+    #[tokio::test]
+    async fn test_stream_output_item_done_no_pending_function_call() {
         let (model, response_id, fc) = create_shared_state();
 
         // OutputItemDone for a message item (no pending function call)
@@ -1079,12 +1063,12 @@ mod tests {
                 content: vec![],
             },
         };
-        let result = convert_stream_event_to_chunk(done, &model, &response_id, &fc);
+        let result = convert_stream_event_to_chunk(done, &model, &response_id, &fc).await;
         assert!(result.is_none());
     }
 
-    #[test]
-    fn test_stream_error_event() {
+    #[tokio::test]
+    async fn test_stream_error_event() {
         let (model, response_id, fc) = create_shared_state();
 
         let event = StreamEvent::Error {
@@ -1095,13 +1079,13 @@ mod tests {
             },
         };
 
-        let result = convert_stream_event_to_chunk(event, &model, &response_id, &fc);
+        let result = convert_stream_event_to_chunk(event, &model, &response_id, &fc).await;
         let err = result.unwrap().unwrap_err();
         assert!(err.to_string().contains("Invalid model specified"));
     }
 
-    #[test]
-    fn test_stream_unknown_events_return_none() {
+    #[tokio::test]
+    async fn test_stream_unknown_events_return_none() {
         let (model, response_id, fc) = create_shared_state();
 
         // ContentPartAdded
@@ -1112,7 +1096,7 @@ mod tests {
                 text: String::new(),
             },
         };
-        assert!(convert_stream_event_to_chunk(event, &model, &response_id, &fc).is_none());
+        assert!(convert_stream_event_to_chunk(event, &model, &response_id, &fc).await.is_none());
 
         // ContentPartDone
         let event = StreamEvent::ContentPartDone {
@@ -1122,7 +1106,7 @@ mod tests {
                 text: "done".to_string(),
             },
         };
-        assert!(convert_stream_event_to_chunk(event, &model, &response_id, &fc).is_none());
+        assert!(convert_stream_event_to_chunk(event, &model, &response_id, &fc).await.is_none());
 
         // OutputTextDone
         let event = StreamEvent::OutputTextDone {
@@ -1130,7 +1114,7 @@ mod tests {
             content_index: 0,
             text: "done".to_string(),
         };
-        assert!(convert_stream_event_to_chunk(event, &model, &response_id, &fc).is_none());
+        assert!(convert_stream_event_to_chunk(event, &model, &response_id, &fc).await.is_none());
 
         // ReasoningSummaryTextDone
         let event = StreamEvent::ReasoningSummaryTextDone {
@@ -1138,11 +1122,12 @@ mod tests {
             summary_index: 0,
             text: "done".to_string(),
         };
-        assert!(convert_stream_event_to_chunk(event, &model, &response_id, &fc).is_none());
+        assert!(convert_stream_event_to_chunk(event, &model, &response_id, &fc).await.is_none());
 
         // Unknown
         assert!(
             convert_stream_event_to_chunk(StreamEvent::Unknown, &model, &response_id, &fc)
+                .await
                 .is_none()
         );
     }
