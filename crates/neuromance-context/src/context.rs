@@ -10,7 +10,7 @@ use crate::error::TokenCounterError;
 
 pub use crate::compaction::{CompactionConfig, CompactionResult, Compactor};
 pub use crate::metadata::ContextMetadata;
-pub use crate::state::{ContextState, Filtered, Raw, Ready, Transformed, Validated};
+pub use crate::state::{ContextState, Filtered, Raw, Ready, Transformed};
 pub use crate::transforms::{FilterCriteria, TransformPipeline};
 
 /// Main context container that tracks a conversation through state transitions.
@@ -208,27 +208,6 @@ impl Context<Filtered> {
 }
 
 impl Context<Transformed> {
-    /// Transitions to the validated state after validating the conversation.
-    pub fn validate(mut self) -> Context<Validated> {
-        self.metadata.add_transformation("validate", &());
-        self.updated_at = Utc::now();
-
-        // Apply validation logic (to be implemented in transforms module)
-        // For now, validation is a no-op but could check message ordering,
-        // required fields, etc.
-
-        Context {
-            id: self.id,
-            conversation: self.conversation,
-            metadata: self.metadata,
-            created_at: self.created_at,
-            updated_at: self.updated_at,
-            state: PhantomData,
-        }
-    }
-}
-
-impl Context<Validated> {
     /// Transitions to the ready state, indicating the context is prepared for LLM execution.
     pub fn ready(mut self) -> Context<Ready> {
         self.metadata.add_transformation("ready", &());
@@ -298,14 +277,12 @@ mod tests {
         let conv = Conversation::new();
         let context = Context::new(conv);
 
-        // Test full state machine flow
         let context = context
             .filter(FilterCriteria::default())
             .transform()
-            .validate()
             .ready();
 
-        assert_eq!(context.metadata().transformation_count(), 4);
+        assert_eq!(context.metadata().transformation_count(), 3);
     }
 
     #[test]
@@ -313,14 +290,12 @@ mod tests {
         let conv = Conversation::new();
         let context = Context::new(conv);
 
-        // filter -> skip_transform -> validate -> ready = 4 transformations
         let context = context
             .filter(FilterCriteria::default())
             .skip_transform()
-            .validate()
             .ready();
 
-        assert_eq!(context.metadata().transformation_count(), 4);
+        assert_eq!(context.metadata().transformation_count(), 3);
     }
 
     #[test]
@@ -332,7 +307,6 @@ mod tests {
         let final_conv = context
             .filter(FilterCriteria::default())
             .transform()
-            .validate()
             .ready()
             .into_conversation();
 
