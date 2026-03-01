@@ -160,19 +160,19 @@
           neuromance = flake-utils.lib.mkApp {
             drv = neuromance-cli;
             exePath = "/bin/neuromance";
-          };
+          } // { meta.description = "Neuromance CLI"; };
           nx = flake-utils.lib.mkApp {
             drv = neuromance-cli;
             exePath = "/bin/nx";
-          };
+          } // { meta.description = "Neuromance CLI (nx shorthand)"; };
           daemon = flake-utils.lib.mkApp {
             drv = neuromance-daemon;
             exePath = "/bin/neuromance-daemon";
-          };
+          } // { meta.description = "Neuromance daemon"; };
           default = flake-utils.lib.mkApp {
             drv = neuromance-cli;
             exePath = "/bin/nx";
-          };
+          } // { meta.description = "Neuromance CLI (nx shorthand)"; };
         };
 
         devShells.default = craneLib.devShell {
