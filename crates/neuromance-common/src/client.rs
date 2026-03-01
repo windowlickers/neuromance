@@ -13,6 +13,44 @@ use crate::chat::Message;
 use crate::features::{ReasoningLevel, ThinkingMode};
 use crate::tools::Tool;
 
+/// LLM provider identifier.
+///
+/// Used in `ModelProfile` to select the correct client implementation.
+/// Deserializes from lowercase strings (e.g., `"anthropic"`, `"openai"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Provider {
+    /// Anthropic (Claude models)
+    Anthropic,
+    /// `OpenAI` Chat Completions API
+    OpenAI,
+    /// `OpenAI` Responses API
+    Responses,
+}
+
+impl fmt::Display for Provider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Anthropic => write!(f, "anthropic"),
+            Self::OpenAI => write!(f, "openai"),
+            Self::Responses => write!(f, "responses"),
+        }
+    }
+}
+
+impl FromStr for Provider {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "anthropic" => Ok(Self::Anthropic),
+            "openai" => Ok(Self::OpenAI),
+            "responses" => Ok(Self::Responses),
+            other => Err(format!("unknown provider: {other}")),
+        }
+    }
+}
+
 /// Controls how the model selects which tool to call, if any.
 ///
 /// This enum provides fine-grained control over tool selection behavior,

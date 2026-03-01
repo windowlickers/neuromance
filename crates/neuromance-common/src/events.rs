@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::chat::Message;
-use crate::client::Usage;
+use crate::client::{Provider, Usage};
 use crate::tools::ToolCall;
 
 /// Machine-readable error codes for programmatic error handling.
@@ -166,8 +166,8 @@ pub struct ModelProfile {
     /// User-friendly nickname for this model (e.g., "sonnet", "gpt4")
     pub nickname: String,
 
-    /// Provider name (e.g., "anthropic", "openai")
-    pub provider: String,
+    /// LLM provider
+    pub provider: Provider,
 
     /// Full model identifier (e.g., "claude-sonnet-4-5-20250929")
     pub model: String,
@@ -233,7 +233,7 @@ mod tests {
     fn test_model_profile_serialization() {
         let profile = ModelProfile {
             nickname: "sonnet".to_string(),
-            provider: "anthropic".to_string(),
+            provider: Provider::Anthropic,
             model: "claude-sonnet-4-5-20250929".to_string(),
             api_key_env: "ANTHROPIC_API_KEY".to_string(),
             base_url: None,

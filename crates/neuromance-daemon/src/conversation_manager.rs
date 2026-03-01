@@ -12,7 +12,7 @@ use neuromance::Core;
 use neuromance::error::CoreError;
 use neuromance_client::{AnthropicClient, LLMClient, OpenAIClient, ResponsesClient};
 use neuromance_common::events::{ConversationSummary, DaemonResponse};
-use neuromance_common::{Config, Conversation, Message, MessageRole, ToolApproval};
+use neuromance_common::{Config, Conversation, Message, MessageRole, Provider, ToolApproval};
 use neuromance_tools::ToolImplementation;
 use neuromance_tools::mcp::McpManager;
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -476,7 +476,8 @@ impl ConversationManager {
 
         // Create config
         let mut config =
-            Config::new(&model_profile.provider, &model_profile.model).with_api_key(api_key);
+            Config::new(model_profile.provider.to_string(), &model_profile.model)
+                .with_api_key(api_key);
 
         // Set custom base URL if specified
         if let Some(ref base_url) = model_profile.base_url {
@@ -484,24 +485,18 @@ impl ConversationManager {
         }
 
         // Create client based on provider
-        let client = match model_profile.provider.as_str() {
-            "anthropic" => {
+        let client = match model_profile.provider {
+            Provider::Anthropic => {
                 let client = AnthropicClient::new(config)?;
                 ClientType::Anthropic(client)
             }
-            "openai" => {
+            Provider::OpenAI => {
                 let client = OpenAIClient::new(config)?;
                 ClientType::OpenAI(client)
             }
-            "responses" => {
+            Provider::Responses => {
                 let client = ResponsesClient::new(config)?;
                 ClientType::Responses(client)
-            }
-            _ => {
-                return Err(DaemonError::Config(format!(
-                    "Unsupported provider: {}",
-                    model_profile.provider
-                )));
             }
         };
 

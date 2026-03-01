@@ -309,7 +309,7 @@ thinking_budget = 20000
         let config: DaemonConfig = toml::from_str(sample_config_toml()).unwrap();
 
         let model = config.get_model("sonnet").unwrap();
-        assert_eq!(model.provider, "anthropic");
+        assert_eq!(model.provider, neuromance_common::Provider::Anthropic);
         assert_eq!(model.model, "claude-sonnet-4-5-20250929");
 
         assert!(config.get_model("nonexistent").is_err());

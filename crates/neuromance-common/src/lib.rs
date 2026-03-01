@@ -82,7 +82,7 @@ pub use agents::{AgentContext, AgentMemory, AgentMessage, AgentResponse, AgentSt
 pub use chat::{Conversation, ConversationStatus, Message, MessageRole, ReasoningContent};
 pub use client::{
     CacheMetrics, ChatRequest, ChatResponse, Config, FinishReason, InputTokensDetails,
-    OutputTokensDetails, ProxyConfig, ReasoningEffort, RetryConfig, ToolChoice, Usage,
+    OutputTokensDetails, Provider, ProxyConfig, ReasoningEffort, RetryConfig, ToolChoice, Usage,
 };
 pub use events::{ConversationSummary, DaemonResponse, ErrorCode, ModelProfile};
 pub use features::{ReasoningLevel, ThinkingMode};

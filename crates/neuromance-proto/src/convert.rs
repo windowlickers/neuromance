@@ -313,7 +313,7 @@ impl From<&ModelProfile> for proto::ModelProfileProto {
     fn from(mp: &ModelProfile) -> Self {
         Self {
             nickname: mp.nickname.clone(),
-            provider: mp.provider.clone(),
+            provider: mp.provider.to_string(),
             model: mp.model.clone(),
             api_key_env: mp.api_key_env.clone(),
             base_url: mp.base_url.clone(),
@@ -321,15 +321,17 @@ impl From<&ModelProfile> for proto::ModelProfileProto {
     }
 }
 
-impl From<proto::ModelProfileProto> for ModelProfile {
-    fn from(mp: proto::ModelProfileProto) -> Self {
-        Self {
+impl TryFrom<proto::ModelProfileProto> for ModelProfile {
+    type Error = String;
+
+    fn try_from(mp: proto::ModelProfileProto) -> Result<Self, Self::Error> {
+        Ok(Self {
             nickname: mp.nickname,
-            provider: mp.provider,
+            provider: mp.provider.parse()?,
             model: mp.model,
             api_key_env: mp.api_key_env,
             base_url: mp.base_url,
-        }
+        })
     }
 }
 
@@ -489,16 +491,18 @@ mod tests {
 
     #[test]
     fn test_model_profile_roundtrip() {
+        use neuromance_common::Provider;
+
         let mp = ModelProfile {
             nickname: "sonnet".to_string(),
-            provider: "anthropic".to_string(),
+            provider: Provider::Anthropic,
             model: "claude-sonnet-4-5-20250929".to_string(),
             api_key_env: "ANTHROPIC_API_KEY".to_string(),
             base_url: None,
         };
 
         let proto_mp = proto::ModelProfileProto::from(&mp);
-        let back = ModelProfile::from(proto_mp);
+        let back = ModelProfile::try_from(proto_mp).unwrap();
 
         assert_eq!(mp.nickname, back.nickname);
         assert_eq!(mp.provider, back.provider);
