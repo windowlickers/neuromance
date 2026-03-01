@@ -3,13 +3,13 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio::fs;
 
 use crate::factory::ToolFactory;
-use crate::{ToolImplementation, ToolRegistry};
+use crate::{ToolError, ToolImplementation, ToolRegistry};
 use neuromance_common::tools::{Function, Parameters, Property, Tool};
 
 /// Maximum bytes returned by a single Read invocation.
@@ -54,31 +54,35 @@ impl ToolImplementation for ReadTool {
             .build()
     }
 
-    async fn execute(&self, args: &Value) -> Result<String> {
+    async fn execute(&self, args: &Value) -> Result<String, ToolError> {
         let obj = args
             .as_object()
-            .ok_or_else(|| anyhow!("expected object arguments"))?;
+            .ok_or_else(|| ToolError::InvalidArguments("expected object arguments".into()))?;
 
         let path_str = obj
             .get("path")
             .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("missing 'path' parameter"))?;
+            .ok_or_else(|| ToolError::InvalidArguments("missing 'path' parameter".into()))?;
         let path = PathBuf::from(path_str);
         if !path.is_absolute() {
-            bail!("'path' must be absolute, got: {}", path.display());
+            return Err(ToolError::InvalidArguments(format!(
+                "'path' must be absolute, got: {}",
+                path.display()
+            )));
         }
 
         let offset = parse_positive_u64(obj.get("offset"), "offset")?.unwrap_or(1);
         if offset == 0 {
-            bail!("'offset' must be >= 1");
+            return Err(ToolError::InvalidArguments("'offset' must be >= 1".into()));
         }
         let limit = parse_positive_u64(obj.get("limit"), "limit")?;
 
-        let raw = fs::read(&path)
-            .await
-            .with_context(|| format!("failed to read file '{}'", path.display()))?;
-        let content = std::str::from_utf8(&raw)
-            .with_context(|| format!("file '{}' is not valid UTF-8", path.display()))?;
+        let raw = fs::read(&path).await.map_err(|e| {
+            ToolError::execution(format!("failed to read file '{}': {e}", path.display()))
+        })?;
+        let content = std::str::from_utf8(&raw).map_err(|e| {
+            ToolError::execution(format!("file '{}' is not valid UTF-8: {e}", path.display()))
+        })?;
 
         let lines: Vec<&str> = content.lines().collect();
         let total_lines = lines.len();
@@ -86,7 +90,9 @@ impl ToolImplementation for ReadTool {
             .unwrap_or(usize::MAX)
             .saturating_sub(1);
         if start >= total_lines && total_lines > 0 {
-            bail!("'offset' {offset} is past EOF (file has {total_lines} lines)");
+            return Err(ToolError::InvalidArguments(format!(
+                "'offset' {offset} is past EOF (file has {total_lines} lines)"
+            )));
         }
 
         let take = limit.map_or_else(
@@ -107,13 +113,13 @@ impl ToolImplementation for ReadTool {
     }
 }
 
-fn parse_positive_u64(v: Option<&Value>, name: &str) -> Result<Option<u64>> {
+fn parse_positive_u64(v: Option<&Value>, name: &str) -> Result<Option<u64>, ToolError> {
     match v {
         None | Some(Value::Null) => Ok(None),
         Some(val) => {
-            let n = val
-                .as_u64()
-                .ok_or_else(|| anyhow!("'{name}' must be a positive integer"))?;
+            let n = val.as_u64().ok_or_else(|| {
+                ToolError::InvalidArguments(format!("'{name}' must be a positive integer"))
+            })?;
             Ok(Some(n))
         }
     }

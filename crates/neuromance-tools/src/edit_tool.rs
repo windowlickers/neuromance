@@ -2,13 +2,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio::fs;
 
 use crate::factory::ToolFactory;
-use crate::{ToolImplementation, ToolRegistry};
+use crate::{ToolError, ToolImplementation, ToolRegistry};
 use neuromance_common::tools::{Function, Parameters, Property, Tool};
 
 /// Performs exact-string replacement on a file's contents.
@@ -57,65 +57,75 @@ impl ToolImplementation for EditTool {
             .build()
     }
 
-    async fn execute(&self, args: &Value) -> Result<String> {
+    async fn execute(&self, args: &Value) -> Result<String, ToolError> {
         let obj = args
             .as_object()
-            .ok_or_else(|| anyhow!("expected object arguments"))?;
+            .ok_or_else(|| ToolError::InvalidArguments("expected object arguments".into()))?;
 
         let path_str = obj
             .get("path")
             .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("missing 'path' parameter"))?;
+            .ok_or_else(|| ToolError::InvalidArguments("missing 'path' parameter".into()))?;
         let old_string = obj
             .get("old_string")
             .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("missing 'old_string' parameter"))?;
+            .ok_or_else(|| ToolError::InvalidArguments("missing 'old_string' parameter".into()))?;
         let new_string = obj
             .get("new_string")
             .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("missing 'new_string' parameter"))?;
+            .ok_or_else(|| ToolError::InvalidArguments("missing 'new_string' parameter".into()))?;
         let replace_all = obj
             .get("replace_all")
             .and_then(Value::as_bool)
             .unwrap_or(false);
 
         if old_string.is_empty() {
-            bail!("'old_string' must not be empty");
+            return Err(ToolError::InvalidArguments(
+                "'old_string' must not be empty".into(),
+            ));
         }
         if old_string == new_string {
-            bail!("'old_string' and 'new_string' are identical (no-op)");
+            return Err(ToolError::InvalidArguments(
+                "'old_string' and 'new_string' are identical (no-op)".into(),
+            ));
         }
 
         let path = PathBuf::from(path_str);
         if !path.is_absolute() {
-            bail!("'path' must be absolute, got: {}", path.display());
+            return Err(ToolError::InvalidArguments(format!(
+                "'path' must be absolute, got: {}",
+                path.display()
+            )));
         }
 
-        let original = fs::read_to_string(&path)
-            .await
-            .with_context(|| format!("failed to read file '{}'", path.display()))?;
+        let original = fs::read_to_string(&path).await.map_err(|e| {
+            ToolError::execution(format!("failed to read file '{}': {e}", path.display()))
+        })?;
 
         let count = original.matches(old_string).count();
         if count == 0 {
-            bail!("'old_string' not found in {}", path.display());
+            return Err(ToolError::InvalidArguments(format!(
+                "'old_string' not found in {}",
+                path.display()
+            )));
         }
 
         let updated = if replace_all {
             original.replace(old_string, new_string)
         } else {
             if count > 1 {
-                bail!(
+                return Err(ToolError::InvalidArguments(format!(
                     "'old_string' found {count} times in {} but replace_all is false; \
                      either provide more context or set replace_all=true",
                     path.display()
-                );
+                )));
             }
             original.replacen(old_string, new_string, 1)
         };
 
-        fs::write(&path, &updated)
-            .await
-            .with_context(|| format!("failed to write file '{}'", path.display()))?;
+        fs::write(&path, &updated).await.map_err(|e| {
+            ToolError::execution(format!("failed to write file '{}': {e}", path.display()))
+        })?;
 
         let replaced = if replace_all { count } else { 1 };
         let plural = if replaced == 1 { "" } else { "s" };

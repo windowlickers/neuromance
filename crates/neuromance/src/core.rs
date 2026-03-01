@@ -15,7 +15,7 @@ use neuromance_common::chat::{Message, MessageRole};
 use neuromance_common::client::{ChatRequest, ChatResponse, ToolChoice};
 use neuromance_common::features::ThinkingMode;
 use neuromance_common::tools::{ToolApproval, ToolCall};
-use neuromance_tools::ToolExecutor;
+use neuromance_tools::{ToolExecutor, ToolExecutorError};
 
 use crate::error::CoreError;
 use crate::events::{CoreEvent, ToolApprovalCallback, TurnCallback};
@@ -400,7 +400,7 @@ impl<C: LLMClient> Core<C> {
                     match approval {
                         ToolApproval::Approved => {
                             debug!("Executing tool: {tool_name}");
-                            let exec_outcome: Result<Result<String, anyhow::Error>, CoreError> = tokio::select! {
+                            let exec_outcome: Result<Result<String, ToolExecutorError>, CoreError> = tokio::select! {
                                 biased;
                                 () = cancel.cancelled() => Err(CoreError::Cancelled("tool execution".to_string())),
                                 r = self.tool_executor.execute_tool(tool_call) => Ok(r),

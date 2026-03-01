@@ -5,12 +5,11 @@
 
 use std::sync::Arc;
 
-use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use neuromance_common::tools::{Function, Tool};
-use neuromance_tools::ToolImplementation;
+use neuromance_tools::{ToolError, ToolImplementation};
 
 use super::PythonRepl;
 
@@ -81,15 +80,19 @@ impl ToolImplementation for PythonReplTool {
         Tool::builder().function(function).build()
     }
 
-    async fn execute(&self, args: &Value) -> Result<String> {
-        let code = args["code"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("Missing 'code' argument"))?;
+    async fn execute(&self, args: &Value) -> Result<String, ToolError> {
+        let code = args["code"].as_str().ok_or_else(|| {
+            ToolError::InvalidArguments("Missing 'code' argument".into())
+        })?;
 
         log::debug!("Executing Python code:\n```python\n{code}\n```");
 
         // Execute in REPL
-        let result = self.repl.execute(code).await?;
+        let result = self
+            .repl
+            .execute(code)
+            .await
+            .map_err(|e| ToolError::Execution(e.into()))?;
 
         if result.success {
             log::debug!(

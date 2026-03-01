@@ -2,13 +2,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio::fs;
 
 use crate::factory::ToolFactory;
-use crate::{ToolImplementation, ToolRegistry};
+use crate::{ToolError, ToolImplementation, ToolRegistry};
 use neuromance_common::tools::{Function, Parameters, Property, Tool};
 
 /// Creates or overwrites a file with the given UTF-8 content.
@@ -41,39 +41,45 @@ impl ToolImplementation for WriteTool {
             .build()
     }
 
-    async fn execute(&self, args: &Value) -> Result<String> {
+    async fn execute(&self, args: &Value) -> Result<String, ToolError> {
         let obj = args
             .as_object()
-            .ok_or_else(|| anyhow!("expected object arguments"))?;
+            .ok_or_else(|| ToolError::InvalidArguments("expected object arguments".into()))?;
 
         let path_str = obj
             .get("path")
             .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("missing 'path' parameter"))?;
+            .ok_or_else(|| ToolError::InvalidArguments("missing 'path' parameter".into()))?;
         let content = obj
             .get("content")
             .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("missing 'content' parameter"))?;
+            .ok_or_else(|| ToolError::InvalidArguments("missing 'content' parameter".into()))?;
 
         let path = PathBuf::from(path_str);
         if !path.is_absolute() {
-            bail!("'path' must be absolute, got: {}", path.display());
+            return Err(ToolError::InvalidArguments(format!(
+                "'path' must be absolute, got: {}",
+                path.display()
+            )));
         }
 
-        let parent = path
-            .parent()
-            .ok_or_else(|| anyhow!("'path' has no parent directory: {}", path.display()))?;
+        let parent = path.parent().ok_or_else(|| {
+            ToolError::InvalidArguments(format!(
+                "'path' has no parent directory: {}",
+                path.display()
+            ))
+        })?;
         if !parent.is_dir() {
-            bail!(
+            return Err(ToolError::InvalidArguments(format!(
                 "parent directory does not exist: {} (parent of {})",
                 parent.display(),
                 path.display()
-            );
+            )));
         }
 
-        fs::write(&path, content)
-            .await
-            .with_context(|| format!("failed to write file '{}'", path.display()))?;
+        fs::write(&path, content).await.map_err(|e| {
+            ToolError::execution(format!("failed to write file '{}': {e}", path.display()))
+        })?;
 
         Ok(format!(
             "wrote {} bytes to {}",

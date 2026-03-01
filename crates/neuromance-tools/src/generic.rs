@@ -1,11 +1,10 @@
 use std::collections::HashMap;
 
-use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
-use crate::ToolImplementation;
+use crate::{ToolError, ToolImplementation};
 use neuromance_common::tools::{Function, Parameters, Tool};
 
 pub struct CurrentTimeTool;
@@ -22,7 +21,7 @@ impl ToolImplementation for CurrentTimeTool {
             .build()
     }
 
-    async fn execute(&self, _args: &Value) -> Result<String> {
+    async fn execute(&self, _args: &Value) -> Result<String, ToolError> {
         let now: DateTime<Utc> = Utc::now();
         Ok(format!(
             "Current time: {}",

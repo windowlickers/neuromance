@@ -5,14 +5,14 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio::process::Command;
 use tokio::time::timeout;
 
 use crate::factory::ToolFactory;
-use crate::{ToolImplementation, ToolRegistry};
+use crate::{ToolError, ToolImplementation, ToolRegistry};
 use neuromance_common::tools::{Function, Parameters, Property, Tool};
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
@@ -64,21 +64,21 @@ impl ToolImplementation for BashTool {
             .build()
     }
 
-    async fn execute(&self, args: &Value) -> Result<String> {
+    async fn execute(&self, args: &Value) -> Result<String, ToolError> {
         let obj = args
             .as_object()
-            .ok_or_else(|| anyhow!("expected object arguments"))?;
+            .ok_or_else(|| ToolError::InvalidArguments("expected object arguments".into()))?;
 
         let command = obj
             .get("command")
             .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("missing 'command' parameter"))?;
+            .ok_or_else(|| ToolError::InvalidArguments("missing 'command' parameter".into()))?;
 
         let timeout_ms = match obj.get("timeout_ms") {
             None | Some(Value::Null) => DEFAULT_TIMEOUT_MS,
-            Some(v) => v
-                .as_u64()
-                .ok_or_else(|| anyhow!("'timeout_ms' must be a positive integer"))?,
+            Some(v) => v.as_u64().ok_or_else(|| {
+                ToolError::InvalidArguments("'timeout_ms' must be a positive integer".into())
+            })?,
         };
         let timeout_ms = timeout_ms.clamp(1, MAX_TIMEOUT_MS);
 
@@ -96,17 +96,23 @@ impl ToolImplementation for BashTool {
         if let Some(cwd) = obj.get("cwd").and_then(Value::as_str) {
             let cwd = PathBuf::from(cwd);
             if !cwd.is_absolute() {
-                bail!("'cwd' must be absolute, got: {}", cwd.display());
+                return Err(ToolError::InvalidArguments(format!(
+                    "'cwd' must be absolute, got: {}",
+                    cwd.display()
+                )));
             }
             if !cwd.is_dir() {
-                bail!("'cwd' is not a directory: {}", cwd.display());
+                return Err(ToolError::InvalidArguments(format!(
+                    "'cwd' is not a directory: {}",
+                    cwd.display()
+                )));
             }
             cmd.current_dir(cwd);
         }
 
-        let child = cmd
-            .spawn()
-            .with_context(|| format!("failed to spawn shell for command: {command}"))?;
+        let child = cmd.spawn().map_err(|e| {
+            ToolError::execution(format!("failed to spawn shell for command: {command}: {e}"))
+        })?;
 
         match timeout(Duration::from_millis(timeout_ms), child.wait_with_output()).await {
             Ok(Ok(output)) => Ok(format_output(
@@ -115,7 +121,7 @@ impl ToolImplementation for BashTool {
                 &output.stderr,
                 None,
             )),
-            Ok(Err(e)) => Err(anyhow!("error running command: {e}")),
+            Ok(Err(e)) => Err(ToolError::execution(format!("error running command: {e}"))),
             Err(_) => Ok(format_output(
                 -1,
                 &[],

@@ -23,11 +23,10 @@
 //! ## Example: Creating and Executing a Custom Tool
 //!
 //! ```rust
-//! use neuromance_tools::{ToolImplementation, ToolExecutor};
+//! use neuromance_tools::{ToolImplementation, ToolExecutor, ToolError};
 //! use neuromance_common::tools::{Tool, Function};
 //! use serde_json::{json, Value};
 //! use async_trait::async_trait;
-//! use anyhow::Result;
 //!
 //! // Define a custom tool
 //! struct GreetingTool;
@@ -54,7 +53,7 @@
 //!         }
 //!     }
 //!
-//!     async fn execute(&self, args: &Value) -> Result<String> {
+//!     async fn execute(&self, args: &Value) -> Result<String, ToolError> {
 //!         let name = args["name"].as_str().unwrap_or("stranger");
 //!         Ok(format!("Hello, {}!", name))
 //!     }
@@ -64,14 +63,13 @@
 //!     }
 //! }
 //!
-//! # async fn example() -> Result<()> {
+//! # async fn example() {
 //! // Register and use the tool
 //! let mut executor = ToolExecutor::new();
 //! executor.add_tool(GreetingTool);
 //!
 //! // Get all tool definitions to send to the LLM
 //! let tools = executor.get_all_tools();
-//! # Ok(())
 //! # }
 //! ```
 //!
@@ -116,7 +114,6 @@
 
 use std::sync::Arc;
 
-use anyhow::Result;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use serde_json::Value;
@@ -125,6 +122,7 @@ use neuromance_common::tools::{FunctionCall, Tool, ToolCall};
 
 mod bash_tool;
 mod edit_tool;
+mod error;
 pub mod factory;
 pub mod generic;
 pub mod mcp;
@@ -133,6 +131,7 @@ mod read_tool;
 mod write_tool;
 pub use bash_tool::{BashTool, BashToolFactory};
 pub use edit_tool::{EditTool, EditToolFactory};
+pub use error::{ToolError, ToolExecutorError};
 pub use factory::{ToolConfig, ToolFactory, ToolFactoryRegistry};
 pub use read_tool::{ReadTool, ReadToolFactory};
 pub use write_tool::{WriteTool, WriteToolFactory};
@@ -141,7 +140,7 @@ pub use write_tool::{WriteTool, WriteToolFactory};
 pub trait ToolImplementation: Send + Sync {
     fn get_definition(&self) -> Tool;
 
-    async fn execute(&self, args: &Value) -> Result<String>;
+    async fn execute(&self, args: &Value) -> Result<String, ToolError>;
 
     fn is_auto_approved(&self) -> bool {
         false
@@ -257,26 +256,33 @@ impl ToolExecutor {
     /// cancels the in-flight tool at its next `.await`.
     ///
     /// # Errors
-    /// Returns an error if the tool is not found or if execution fails.
-    pub async fn execute_tool(&self, tool_call: &ToolCall) -> Result<String> {
+    /// Returns [`ToolExecutorError::UnknownTool`] if the tool is not found,
+    /// or [`ToolExecutorError::Tool`] if execution fails.
+    pub async fn execute_tool(
+        &self,
+        tool_call: &ToolCall,
+    ) -> Result<String, ToolExecutorError> {
         let function = &tool_call.function;
 
         let tool = self
             .registry
             .get(&function.name)
-            .ok_or_else(|| anyhow::anyhow!("Unknown tool: '{}'", function.name))?;
+            .ok_or_else(|| {
+                ToolExecutorError::UnknownTool(function.name.clone())
+            })?;
 
-        let args = Self::parse_arguments(function)?;
+        let args = Self::parse_arguments(function);
 
-        tool.execute(&args).await
+        Ok(tool.execute(&args).await?)
     }
 
-    fn parse_arguments(arguments: &FunctionCall) -> Result<Value> {
+    fn parse_arguments(arguments: &FunctionCall) -> Value {
         let json = arguments.arguments_json();
         if json == "{}" {
-            Ok(Value::Object(serde_json::Map::new()))
+            Value::Object(serde_json::Map::new())
         } else {
-            serde_json::from_str(json).or_else(|_| Ok(Value::String(json.to_owned())))
+            serde_json::from_str(json)
+                .unwrap_or_else(|_| Value::String(json.to_owned()))
         }
     }
 }
@@ -304,49 +310,49 @@ mod tests {
 
     #[test]
     fn test_parse_arguments_empty() {
-        let result = ToolExecutor::parse_arguments(&fc("")).unwrap();
+        let result = ToolExecutor::parse_arguments(&fc(""));
         assert_eq!(result, json!({}));
     }
 
     #[test]
     fn test_parse_arguments_json_object() {
         let f = fc(r#"{"key": "value", "number": 42}"#);
-        let result = ToolExecutor::parse_arguments(&f).unwrap();
+        let result = ToolExecutor::parse_arguments(&f);
         assert_eq!(result, json!({"key": "value", "number": 42}));
     }
 
     #[test]
     fn test_parse_arguments_json_array() {
         let f = fc(r#"["item1", "item2", "item3"]"#);
-        let result = ToolExecutor::parse_arguments(&f).unwrap();
+        let result = ToolExecutor::parse_arguments(&f);
         assert_eq!(result, json!(["item1", "item2", "item3"]));
     }
 
     #[test]
     fn test_parse_arguments_string_fallback() {
         let f = fc("plain text argument");
-        let result = ToolExecutor::parse_arguments(&f).unwrap();
+        let result = ToolExecutor::parse_arguments(&f);
         assert_eq!(result, json!("plain text argument"));
     }
 
     #[test]
     fn test_parse_arguments_invalid_json_fallback() {
         let f = fc(r#"{"incomplete json"#);
-        let result = ToolExecutor::parse_arguments(&f).unwrap();
+        let result = ToolExecutor::parse_arguments(&f);
         assert_eq!(result, json!(r#"{"incomplete json"#));
     }
 
     #[test]
     fn test_parse_arguments_number_string() {
         let f = fc("42");
-        let result = ToolExecutor::parse_arguments(&f).unwrap();
+        let result = ToolExecutor::parse_arguments(&f);
         assert_eq!(result, json!(42));
     }
 
     #[test]
     fn test_parse_arguments_boolean_string() {
         let f = fc("true");
-        let result = ToolExecutor::parse_arguments(&f).unwrap();
+        let result = ToolExecutor::parse_arguments(&f);
         assert_eq!(result, json!(true));
     }
 }

@@ -135,7 +135,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::ToolImplementation;
+    use crate::{ToolError, ToolImplementation};
     use neuromance_common::tools::{Function, Parameters, Tool};
 
     struct DummyTool {
@@ -154,7 +154,7 @@ mod tests {
                 .build()
         }
 
-        async fn execute(&self, _args: &Value) -> Result<String> {
+        async fn execute(&self, _args: &Value) -> Result<String, ToolError> {
             Ok("ok".to_string())
         }
     }

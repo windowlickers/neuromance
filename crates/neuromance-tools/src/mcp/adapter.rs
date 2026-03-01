@@ -1,10 +1,9 @@
-use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::ToolImplementation;
+use crate::{ToolError, ToolImplementation};
 use neuromance_common::tools::{Function, ObjectSchema, Parameters, Property, Tool};
 use rmcp::model::Tool as McpTool;
 
@@ -132,22 +131,28 @@ impl ToolImplementation for McpToolAdapter {
             .build()
     }
 
-    async fn execute(&self, args: &Value) -> Result<String> {
+    async fn execute(&self, args: &Value) -> Result<String, ToolError> {
+        let args_str = serde_json::to_string_pretty(args)
+            .map_err(|e| ToolError::Execution(e.into()))?;
         log::info!(
             "Executing MCP tool '{}' on server '{}' with args: {}",
             self.tool_name,
             self.server_id,
-            serde_json::to_string_pretty(args)?
+            args_str
         );
 
-        let result = self.client.call_tool(&self.tool_name, args.clone()).await?;
+        let result = self
+            .client
+            .call_tool(&self.tool_name, args.clone())
+            .await
+            .map_err(|e| ToolError::Execution(e.into()))?;
 
         // Check if there was an error
         if result.is_error.unwrap_or(false) {
-            return Err(anyhow::anyhow!(
+            return Err(ToolError::execution(format!(
                 "MCP tool execution failed: {:?}",
                 result.content
-            ));
+            )));
         }
 
         // Extract the content from the response
