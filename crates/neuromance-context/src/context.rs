@@ -57,33 +57,15 @@ impl Context<Raw> {
     pub fn filter(mut self, criteria: FilterCriteria) -> Context<Filtered> {
         self.metadata.add_transformation("filter", &criteria);
         self.updated_at = Utc::now();
-
-        // Apply filtering logic (to be implemented in transforms module)
-        let filtered_conversation = crate::transforms::apply_filter(self.conversation, criteria);
-
-        Context {
-            id: self.id,
-            conversation: filtered_conversation,
-            metadata: self.metadata,
-            created_at: self.created_at,
-            updated_at: self.updated_at,
-            state: PhantomData,
-        }
+        self.conversation = crate::transforms::apply_filter(self.conversation, criteria);
+        self.advance()
     }
 
     /// Skips filtering and moves directly to the filtered state.
     pub fn skip_filter(mut self) -> Context<Filtered> {
         self.metadata.add_transformation("skip_filter", &());
         self.updated_at = Utc::now();
-
-        Context {
-            id: self.id,
-            conversation: self.conversation,
-            metadata: self.metadata,
-            created_at: self.created_at,
-            updated_at: self.updated_at,
-            state: PhantomData,
-        }
+        self.advance()
     }
 }
 
@@ -92,18 +74,8 @@ impl Context<Filtered> {
     pub fn transform(mut self) -> Context<Transformed> {
         self.metadata.add_transformation("transform", &());
         self.updated_at = Utc::now();
-
-        // Apply transformation logic (to be implemented in transforms module)
-        let transformed_conversation = crate::transforms::apply_transform(self.conversation);
-
-        Context {
-            id: self.id,
-            conversation: transformed_conversation,
-            metadata: self.metadata,
-            created_at: self.created_at,
-            updated_at: self.updated_at,
-            state: PhantomData,
-        }
+        self.conversation = crate::transforms::apply_transform(self.conversation);
+        self.advance()
     }
 
     /// Transitions to the transformed state by applying a custom transform pipeline.
@@ -111,18 +83,9 @@ impl Context<Filtered> {
         self.metadata
             .add_transformation("transform_with_pipeline", &());
         self.updated_at = Utc::now();
-
-        let transformed_conversation =
+        self.conversation =
             crate::transforms::apply_transform_pipeline(self.conversation, pipeline);
-
-        Context {
-            id: self.id,
-            conversation: transformed_conversation,
-            metadata: self.metadata,
-            created_at: self.created_at,
-            updated_at: self.updated_at,
-            state: PhantomData,
-        }
+        self.advance()
     }
 
     /// Compacts the conversation using an LLM to summarize older messages.
@@ -162,17 +125,8 @@ impl Context<Filtered> {
             }),
         );
         self.updated_at = Utc::now();
-
-        let context = Context {
-            id: self.id,
-            conversation: result.conversation.clone(),
-            metadata: self.metadata,
-            created_at: self.created_at,
-            updated_at: self.updated_at,
-            state: PhantomData,
-        };
-
-        Ok((context, result))
+        self.conversation = result.conversation.clone();
+        Ok((self.advance(), result))
     }
 
     /// Compacts the conversation only if it exceeds the token threshold.
@@ -191,19 +145,11 @@ impl Context<Filtered> {
         }
     }
 
-    /// Skips transformation and moves directly to validation.
+    /// Skips transformation and moves directly to the transformed state.
     pub fn skip_transform(mut self) -> Context<Transformed> {
         self.metadata.add_transformation("skip_transform", &());
         self.updated_at = Utc::now();
-
-        Context {
-            id: self.id,
-            conversation: self.conversation,
-            metadata: self.metadata,
-            created_at: self.created_at,
-            updated_at: self.updated_at,
-            state: PhantomData,
-        }
+        self.advance()
     }
 }
 
@@ -212,7 +158,13 @@ impl Context<Transformed> {
     pub fn ready(mut self) -> Context<Ready> {
         self.metadata.add_transformation("ready", &());
         self.updated_at = Utc::now();
+        self.advance()
+    }
+}
 
+impl<S: ContextState> Context<S> {
+    /// Changes the state marker without touching any fields.
+    fn advance<N: ContextState>(self) -> Context<N> {
         Context {
             id: self.id,
             conversation: self.conversation,
@@ -222,9 +174,7 @@ impl Context<Transformed> {
             state: PhantomData,
         }
     }
-}
 
-impl<S: ContextState> Context<S> {
     /// Returns a reference to the underlying conversation.
     pub fn conversation(&self) -> &Conversation {
         &self.conversation
