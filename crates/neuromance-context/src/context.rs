@@ -9,7 +9,7 @@ use neuromance_common::Conversation;
 use crate::error::TokenCounterError;
 
 pub use crate::compaction::{CompactionConfig, CompactionResult, Compactor};
-pub use crate::metadata::ContextMetadata;
+pub use crate::metadata::{ContextMetadata, Operation};
 pub use crate::state::{ContextState, Filtered, Raw, Ready, Transformed};
 pub use crate::transforms::{FilterCriteria, TransformPipeline};
 
@@ -55,7 +55,7 @@ impl Context<Raw> {
 
     /// Transitions to the filtered state by applying filter criteria.
     pub fn filter(mut self, criteria: FilterCriteria) -> Context<Filtered> {
-        self.metadata.add_transformation("filter", &criteria);
+        self.metadata.add_transformation(Operation::Filter, &criteria);
         self.updated_at = Utc::now();
         self.conversation = crate::transforms::apply_filter(self.conversation, criteria);
         self.advance()
@@ -63,7 +63,7 @@ impl Context<Raw> {
 
     /// Skips filtering and moves directly to the filtered state.
     pub fn skip_filter(mut self) -> Context<Filtered> {
-        self.metadata.add_transformation("skip_filter", &());
+        self.metadata.add_transformation(Operation::SkipFilter, &());
         self.updated_at = Utc::now();
         self.advance()
     }
@@ -72,7 +72,7 @@ impl Context<Raw> {
 impl Context<Filtered> {
     /// Transitions to the transformed state by applying default transformation operations.
     pub fn transform(mut self) -> Context<Transformed> {
-        self.metadata.add_transformation("transform", &());
+        self.metadata.add_transformation(Operation::Transform, &());
         self.updated_at = Utc::now();
         self.conversation = crate::transforms::apply_transform(self.conversation);
         self.advance()
@@ -81,7 +81,7 @@ impl Context<Filtered> {
     /// Transitions to the transformed state by applying a custom transform pipeline.
     pub fn transform_with(mut self, pipeline: &TransformPipeline) -> Context<Transformed> {
         self.metadata
-            .add_transformation("transform_with_pipeline", &());
+            .add_transformation(Operation::TransformWithPipeline, &());
         self.updated_at = Utc::now();
         self.conversation =
             crate::transforms::apply_transform_pipeline(self.conversation, pipeline);
@@ -115,7 +115,7 @@ impl Context<Filtered> {
 
         // Record the compaction in metadata
         self.metadata.add_transformation(
-            "compact",
+            Operation::Compact,
             &serde_json::json!({
                 "strategy": format!("{:?}", compactor.config().strategy),
                 "original_tokens": result.original_tokens,
@@ -147,7 +147,7 @@ impl Context<Filtered> {
 
     /// Skips transformation and moves directly to the transformed state.
     pub fn skip_transform(mut self) -> Context<Transformed> {
-        self.metadata.add_transformation("skip_transform", &());
+        self.metadata.add_transformation(Operation::SkipTransform, &());
         self.updated_at = Utc::now();
         self.advance()
     }
@@ -156,7 +156,7 @@ impl Context<Filtered> {
 impl Context<Transformed> {
     /// Transitions to the ready state, indicating the context is prepared for LLM execution.
     pub fn ready(mut self) -> Context<Ready> {
-        self.metadata.add_transformation("ready", &());
+        self.metadata.add_transformation(Operation::Ready, &());
         self.updated_at = Utc::now();
         self.advance()
     }

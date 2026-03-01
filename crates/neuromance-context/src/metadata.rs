@@ -7,6 +7,19 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// The fixed set of operations the context state machine can perform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Operation {
+    Filter,
+    SkipFilter,
+    Transform,
+    TransformWithPipeline,
+    Compact,
+    SkipTransform,
+    Ready,
+}
+
 /// Metadata tracking all transformations applied to a context.
 ///
 /// This maintains a history of all state transitions and transformations,
@@ -30,9 +43,9 @@ impl ContextMetadata {
     }
 
     /// Adds a transformation record to the history.
-    pub fn add_transformation<T: Serialize>(&mut self, operation: impl Into<String>, details: &T) {
+    pub fn add_transformation<T: Serialize>(&mut self, operation: Operation, details: &T) {
         let record = TransformationRecord {
-            operation: operation.into(),
+            operation,
             timestamp: Utc::now(),
             details: serde_json::to_value(details).ok(),
         };
@@ -65,14 +78,14 @@ impl ContextMetadata {
     }
 
     /// Checks if a specific operation has been applied.
-    pub fn has_operation(&self, operation: &str) -> bool {
+    pub fn has_operation(&self, operation: Operation) -> bool {
         self.transformations
             .iter()
             .any(|r| r.operation == operation)
     }
 
     /// Gets all records for a specific operation.
-    pub fn get_operation_records(&self, operation: &str) -> Vec<&TransformationRecord> {
+    pub fn get_operation_records(&self, operation: Operation) -> Vec<&TransformationRecord> {
         self.transformations
             .iter()
             .filter(|r| r.operation == operation)
@@ -89,8 +102,8 @@ impl Default for ContextMetadata {
 /// Record of a single transformation applied to a context.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransformationRecord {
-    /// Name of the operation performed
-    pub operation: String,
+    /// The operation performed
+    pub operation: Operation,
 
     /// When this transformation was applied
     pub timestamp: DateTime<Utc>,
@@ -101,9 +114,9 @@ pub struct TransformationRecord {
 
 impl TransformationRecord {
     /// Creates a new transformation record.
-    pub fn new(operation: impl Into<String>) -> Self {
+    pub fn new(operation: Operation) -> Self {
         Self {
-            operation: operation.into(),
+            operation,
             timestamp: Utc::now(),
             details: None,
         }
@@ -130,10 +143,10 @@ mod tests {
     #[test]
     fn test_add_transformation() {
         let mut metadata = ContextMetadata::new();
-        metadata.add_transformation("filter", &"test");
+        metadata.add_transformation(Operation::Filter, &"test");
 
         assert_eq!(metadata.transformation_count(), 1);
-        assert_eq!(metadata.transformations()[0].operation, "filter");
+        assert_eq!(metadata.transformations()[0].operation, Operation::Filter);
     }
 
     #[test]
@@ -150,34 +163,34 @@ mod tests {
     #[test]
     fn test_has_operation() {
         let mut metadata = ContextMetadata::new();
-        metadata.add_transformation("filter", &());
-        metadata.add_transformation("transform", &());
+        metadata.add_transformation(Operation::Filter, &());
+        metadata.add_transformation(Operation::Transform, &());
 
-        assert!(metadata.has_operation("filter"));
-        assert!(metadata.has_operation("transform"));
-        assert!(!metadata.has_operation("validate"));
+        assert!(metadata.has_operation(Operation::Filter));
+        assert!(metadata.has_operation(Operation::Transform));
+        assert!(!metadata.has_operation(Operation::Ready));
     }
 
     #[test]
     fn test_get_operation_records() {
         let mut metadata = ContextMetadata::new();
-        metadata.add_transformation("filter", &1);
-        metadata.add_transformation("filter", &2);
-        metadata.add_transformation("transform", &3);
+        metadata.add_transformation(Operation::Filter, &1);
+        metadata.add_transformation(Operation::Filter, &2);
+        metadata.add_transformation(Operation::Transform, &3);
 
-        let filter_records = metadata.get_operation_records("filter");
+        let filter_records = metadata.get_operation_records(Operation::Filter);
         assert_eq!(filter_records.len(), 2);
 
-        let transform_records = metadata.get_operation_records("transform");
+        let transform_records = metadata.get_operation_records(Operation::Transform);
         assert_eq!(transform_records.len(), 1);
     }
 
     #[test]
     fn test_transformation_record() {
-        let record =
-            TransformationRecord::new("test").with_details(serde_json::json!({"foo": "bar"}));
+        let record = TransformationRecord::new(Operation::Filter)
+            .with_details(serde_json::json!({"foo": "bar"}));
 
-        assert_eq!(record.operation, "test");
+        assert_eq!(record.operation, Operation::Filter);
         assert!(record.details.is_some());
     }
 }
