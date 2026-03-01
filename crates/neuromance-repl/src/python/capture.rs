@@ -46,8 +46,16 @@ impl CapturedStreams<'_> {
         py: Python<'_>,
     ) -> Result<(String, String), ReplError> {
         let sys_module = py.import("sys")?;
-        let _ = sys_module.setattr("stdout", &self.old_stdout);
-        let _ = sys_module.setattr("stderr", &self.old_stderr);
+        if let Err(e) =
+            sys_module.setattr("stdout", &self.old_stdout)
+        {
+            log::warn!("failed to restore sys.stdout: {e}");
+        }
+        if let Err(e) =
+            sys_module.setattr("stderr", &self.old_stderr)
+        {
+            log::warn!("failed to restore sys.stderr: {e}");
+        }
 
         let stdout = self
             .stdout_capture
