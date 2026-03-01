@@ -12,12 +12,19 @@ use pyo3::prelude::*;
 use pyo3::types::{PyCFunction, PyDict, PyTuple};
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tokio::sync::RwLock;
 
 use super::PythonReplConfig;
 use super::callback::{self, PythonCallback};
+
+/// Mutable state consolidated behind a single `Mutex`.
+struct PythonState {
+    globals: Py<PyDict>,
+    locals: Py<PyDict>,
+    callbacks: HashMap<String, Arc<PythonCallback>>,
+    injected_callbacks: HashSet<String>,
+}
 
 /// Python REPL environment with restricted builtins and state persistence.
 ///
@@ -26,22 +33,12 @@ use super::callback::{self, PythonCallback};
 /// `Py<T>` is `Send + Sync` in `PyO3` — it is a GIL-independent
 /// reference-counted pointer. Actual Python object access requires
 /// `Python::attach()` + `.bind(py)` to re-acquire the GIL. All
-/// mutable state is further protected by `tokio::sync::RwLock`.
+/// mutable state is consolidated in a single `std::sync::Mutex`
+/// (not `tokio::sync::Mutex`) because all Python work runs inside
+/// `spawn_blocking` and the GIL already serializes Python access.
 pub struct PythonRepl {
-    /// Configuration
     config: PythonReplConfig,
-
-    /// Global namespace (includes builtins and injected functions)
-    globals: Arc<RwLock<Py<PyDict>>>,
-
-    /// Local namespace (user variables persist here)
-    locals: Arc<RwLock<Py<PyDict>>>,
-
-    /// Injected callback functions
-    callbacks: Arc<RwLock<HashMap<String, Arc<PythonCallback>>>>,
-
-    /// Tracks which callbacks have been injected into Python globals
-    injected_callbacks: Arc<RwLock<HashSet<String>>>,
+    state: Arc<Mutex<PythonState>>,
 }
 
 impl std::fmt::Debug for PythonRepl {
@@ -81,10 +78,12 @@ impl PythonRepl {
 
             Ok(Self {
                 config,
-                globals: Arc::new(RwLock::new(globals.unbind())),
-                locals: Arc::new(RwLock::new(locals.unbind())),
-                callbacks: Arc::new(RwLock::new(HashMap::new())),
-                injected_callbacks: Arc::new(RwLock::new(HashSet::new())),
+                state: Arc::new(Mutex::new(PythonState {
+                    globals: globals.unbind(),
+                    locals: locals.unbind(),
+                    callbacks: HashMap::new(),
+                    injected_callbacks: HashSet::new(),
+                })),
             })
         })
     }
@@ -257,7 +256,6 @@ impl PythonRepl {
     }
 }
 
-#[allow(clippy::significant_drop_tightening)] // Guards are used multiple times
 impl PythonRepl {
     /// Execute code in the REPL. State persists between calls.
     ///
@@ -267,60 +265,47 @@ impl PythonRepl {
     #[allow(clippy::cast_possible_truncation)] // Execution time won't exceed u64::MAX ms
     pub async fn execute(&self, code: &str) -> Result<ReplResult, ReplError> {
         let code = code.to_string();
-        let globals = Arc::clone(&self.globals);
-        let locals = Arc::clone(&self.locals);
-        let callbacks = Arc::clone(&self.callbacks);
-        let injected_callbacks = Arc::clone(&self.injected_callbacks);
+        let state = Arc::clone(&self.state);
         let timeout = self.config.base.timeout;
 
-        // Execute in blocking task with timeout
         let result = tokio::time::timeout(
             timeout,
             tokio::task::spawn_blocking(move || {
-                // Start timing INSIDE the blocking task to exclude queue wait time
                 let start = Instant::now();
 
                 Python::attach(|py| {
-                    let globals_dict = globals.blocking_write();
-                    let globals_ref = globals_dict.bind(py);
+                    let s = &mut *state
+                        .lock()
+                        .map_err(|_| ReplError::StatePoisoned)?;
 
-                    let locals_dict = locals.blocking_write();
-                    let locals_ref = locals_dict.bind(py);
-
-                    // Inject callbacks only if they're new or updated
-                    let callbacks_guard = callbacks.blocking_read();
-                    let mut injected_guard = injected_callbacks.blocking_write();
+                    let globals_ref = s.globals.bind(py);
+                    let locals_ref = s.locals.bind(py);
 
                     callback::inject_callbacks_if_needed(
                         py,
                         globals_ref,
-                        &callbacks_guard,
-                        &mut injected_guard,
+                        &s.callbacks,
+                        &mut s.injected_callbacks,
                     )?;
 
-                    drop(callbacks_guard);
-                    drop(injected_guard);
-
-                    // Execute code with output capture
-                    match Self::execute_with_capture(py, &code, globals_ref, locals_ref) {
-                        Ok((stdout, stderr)) => {
-                            // Note: The changes are made to the PyDict that locals_ref points to,
-                            // which is the same PyDict stored in locals_dict (our Py<PyDict>)
-                            // So no need to "save back" - the Py object is already modified
-                            Ok(ReplResult {
-                                stdout,
-                                stderr,
-                                success: true,
-                                return_value: None,
-                                execution_time_ms: start.elapsed().as_millis() as u64,
-                            })
-                        }
+                    match Self::execute_with_capture(
+                        py, &code, globals_ref, locals_ref,
+                    ) {
+                        Ok((stdout, stderr)) => Ok(ReplResult {
+                            stdout,
+                            stderr,
+                            success: true,
+                            return_value: None,
+                            execution_time_ms: start.elapsed().as_millis()
+                                as u64,
+                        }),
                         Err(e) => Ok(ReplResult {
                             stdout: String::new(),
                             stderr: e.to_string(),
                             success: false,
                             return_value: None,
-                            execution_time_ms: start.elapsed().as_millis() as u64,
+                            execution_time_ms: start.elapsed().as_millis()
+                                as u64,
                         }),
                     }
                 })
@@ -341,19 +326,19 @@ impl PythonRepl {
     ///
     /// Returns `ReplError` if reset fails.
     pub async fn reset(&self) -> Result<(), ReplError> {
-        let locals_arc = Arc::clone(&self.locals);
+        let state = Arc::clone(&self.state);
 
         tokio::task::spawn_blocking(move || {
             Python::attach(|py| {
-                *locals_arc.blocking_write() = PyDict::new(py).unbind();
-            });
+                let mut guard =
+                    state.lock().map_err(|_| ReplError::StatePoisoned)?;
+                guard.locals = PyDict::new(py).unbind();
+                guard.injected_callbacks.clear();
+                drop(guard);
+                Ok(())
+            })
         })
-        .await?;
-
-        // Clear callback tracking so they'll be re-injected on next execute()
-        self.injected_callbacks.write().await.clear();
-
-        Ok(())
+        .await?
     }
 
     /// Get the current configuration.
@@ -372,11 +357,16 @@ impl PythonRepl {
     ///
     /// # Errors
     ///
-    /// Returns `ReplError` if function injection fails.
-    pub async fn inject_function(&self, name: &str, callback: PythonCallback) -> Result<(), ReplError> {
-        self.callbacks
-            .write()
-            .await
+    /// Returns `ReplError` if the state mutex is poisoned.
+    pub fn inject_function(
+        &self,
+        name: &str,
+        callback: PythonCallback,
+    ) -> Result<(), ReplError> {
+        self.state
+            .lock()
+            .map_err(|_| ReplError::StatePoisoned)?
+            .callbacks
             .insert(name.to_string(), Arc::new(callback));
         Ok(())
     }
@@ -386,14 +376,18 @@ impl PythonRepl {
     /// # Errors
     ///
     /// Returns `ReplError` if the variable can't be serialized.
-    pub async fn get_variable(&self, name: &str) -> Result<Option<String>, ReplError> {
-        let locals_arc = Arc::clone(&self.locals);
+    pub async fn get_variable(
+        &self,
+        name: &str,
+    ) -> Result<Option<String>, ReplError> {
+        let state = Arc::clone(&self.state);
         let name = name.to_string();
 
         tokio::task::spawn_blocking(move || {
-            let locals = locals_arc.blocking_read();
+            let guard =
+                state.lock().map_err(|_| ReplError::StatePoisoned)?;
             Python::attach(|py| {
-                let locals_dict = locals.bind(py);
+                let locals_dict = guard.locals.bind(py);
                 match locals_dict.get_item(&name)? {
                     Some(value) => {
                         let str_repr = value.str()?;
@@ -411,17 +405,24 @@ impl PythonRepl {
     /// # Errors
     ///
     /// Returns `ReplError` if the variable can't be set.
-    pub async fn set_variable(&self, name: &str, value: &str) -> Result<(), ReplError> {
-        let locals_arc = Arc::clone(&self.locals);
+    pub async fn set_variable(
+        &self,
+        name: &str,
+        value: &str,
+    ) -> Result<(), ReplError> {
+        let state = Arc::clone(&self.state);
         let name = name.to_string();
         let value = value.to_string();
 
         tokio::task::spawn_blocking(move || {
-            let locals = locals_arc.blocking_write();
+            let guard =
+                state.lock().map_err(|_| ReplError::StatePoisoned)?;
             Python::attach(|py| {
-                let locals_dict = locals.bind(py);
+                let locals_dict = guard.locals.bind(py);
                 let py_value = pyo3::IntoPyObject::into_pyobject(value, py)
-                    .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
+                    .map_err(|e| {
+                        ReplError::ExecutionError(e.to_string())
+                    })?;
                 locals_dict.set_item(&name, py_value)?;
                 Ok(())
             })
@@ -500,7 +501,6 @@ mod tests {
                 })
             }),
         )
-        .await
         .unwrap();
 
         let _ = repl.execute("result = double('21')").await.unwrap();
@@ -784,7 +784,6 @@ for i in range(1, 11):
                 })
             }),
         )
-        .await
         .unwrap();
 
         repl.inject_function(
@@ -800,7 +799,6 @@ for i in range(1, 11):
                 })
             }),
         )
-        .await
         .unwrap();
 
         let _ = repl.execute("result = add('10', '5')").await.unwrap();
@@ -835,7 +833,6 @@ for i in range(1, 11):
                 })
             }),
         )
-        .await
         .unwrap();
 
         // Test with positional arg only
@@ -909,7 +906,6 @@ for i in range(1, 11):
                 })
             }),
         )
-        .await
         .unwrap();
 
         // Execute multiple times - callback should only be injected once
@@ -932,11 +928,6 @@ for i in range(1, 11):
 
         // After reset, callbacks should be re-injected on next execute
         repl.reset().await.unwrap();
-        let injected_count = repl.injected_callbacks.read().await.len();
-        assert_eq!(
-            injected_count, 0,
-            "Injected callbacks should be cleared after reset"
-        );
 
         // Execute again - callback should be re-injected
         let _ = repl

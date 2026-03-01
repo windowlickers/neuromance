@@ -76,7 +76,6 @@ fn make_recursive_callback(depth: u32, max_depth: u32) -> PythonCallback {
 
             // Inject llm_query with incremented depth into the child REPL
             repl.inject_function("llm_query", make_recursive_callback(depth + 1, max_depth))
-                .await
                 .map_err(|e| format!("Failed to inject llm_query: {e}"))?;
             println!(
                 "{indent}  -> Injected 'llm_query' (depth={}) into child REPL",
@@ -133,8 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Inject the recursive llm_query starting at depth 0
     root_repl
-        .inject_function("llm_query", make_recursive_callback(0, MAX_DEPTH))
-        .await?;
+        .inject_function("llm_query", make_recursive_callback(0, MAX_DEPTH))?;
 
     println!("--- Test 1: Simple query (no recursion) ---\n");
     let result = root_repl
@@ -231,7 +229,6 @@ for topic in ['Introduction', 'Chapter 1', 'Conclusion']:
                         "llm_query",
                         make_deeply_recursive_callback(depth + 1, max_depth),
                     )
-                    .await
                     .map_err(|e| format!("Inject failed: {e}"))?;
 
                 // Execute Python code that calls llm_query AGAIN
@@ -265,8 +262,7 @@ result = f"Depth {}: processed '{}' -> {{deeper_result}}"
     }
 
     deep_repl
-        .inject_function("llm_query", make_deeply_recursive_callback(0, MAX_DEPTH))
-        .await?;
+        .inject_function("llm_query", make_deeply_recursive_callback(0, MAX_DEPTH))?;
 
     let result = deep_repl
         .execute("final = llm_query('Start the recursion', context='initial context')")

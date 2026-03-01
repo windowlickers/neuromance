@@ -150,20 +150,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     if with_callbacks {
                         let depth = i;
-                        if let Err(e) = repl
-                            .inject_function(
-                                "llm_query",
-                                Box::new(
-                                    move |args: Vec<String>, _kwargs: HashMap<String, String>| {
-                                        let d = depth;
-                                        Box::pin(async move {
-                                            Ok(format!("Response from depth {d}: {:?}", args))
-                                        })
-                                    },
-                                ),
-                            )
-                            .await
-                        {
+                        if let Err(e) = repl.inject_function(
+                            "llm_query",
+                            Box::new(
+                                move |args: Vec<String>, _kwargs: HashMap<String, String>| {
+                                    let d = depth;
+                                    Box::pin(async move {
+                                        Ok(format!("Response from depth {d}: {:?}", args))
+                                    })
+                                },
+                            ),
+                        ) {
                             eprintln!("\nCallback injection failed at depth {i}: {e}");
                             failed = true;
                             break;

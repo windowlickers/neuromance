@@ -168,7 +168,6 @@ fn bench_resource_usage_by_depth(c: &mut Criterion) {
                                         Box::pin(async move { Ok(format!("depth_{i}")) })
                                     }),
                                 )
-                                .await
                                 .expect("Inject failed");
 
                                 let _ = repl
@@ -213,24 +212,19 @@ fn bench_resource_usage_by_depth(c: &mut Criterion) {
 
 /// Benchmark callback injection overhead
 fn bench_callback_injection(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
-
     let mut group = c.benchmark_group("callback_injection");
 
     // Single callback
     group.bench_function("single_callback", |b| {
         let repl = PythonRepl::new().expect("Failed to create REPL");
         b.iter(|| {
-            rt.block_on(async {
-                repl.inject_function(
-                    "test_fn",
-                    Box::new(|_args, _kwargs: HashMap<String, String>| {
-                        Box::pin(async move { Ok("result".to_string()) })
-                    }),
-                )
-                .await
-                .expect("Inject failed");
-            });
+            repl.inject_function(
+                "test_fn",
+                Box::new(|_args, _kwargs: HashMap<String, String>| {
+                    Box::pin(async move { Ok("result".to_string()) })
+                }),
+            )
+            .expect("Inject failed");
         })
     });
 
@@ -238,18 +232,15 @@ fn bench_callback_injection(c: &mut Criterion) {
     group.bench_function("ten_callbacks", |b| {
         b.iter(|| {
             let repl = PythonRepl::new().expect("Failed to create REPL");
-            rt.block_on(async {
-                for i in 0..10 {
-                    repl.inject_function(
-                        &format!("fn_{i}"),
-                        Box::new(move |_args, _kwargs: HashMap<String, String>| {
-                            Box::pin(async move { Ok(format!("result_{i}")) })
-                        }),
-                    )
-                    .await
-                    .expect("Inject failed");
-                }
-            });
+            for i in 0..10 {
+                repl.inject_function(
+                    &format!("fn_{i}"),
+                    Box::new(move |_args, _kwargs: HashMap<String, String>| {
+                        Box::pin(async move { Ok(format!("result_{i}")) })
+                    }),
+                )
+                .expect("Inject failed");
+            }
             black_box(repl)
         })
     });
@@ -277,16 +268,13 @@ fn bench_execution_throughput(c: &mut Criterion) {
     // With callback invocation
     group.bench_function("with_callback_call", |b| {
         let repl = PythonRepl::new().expect("Failed to create REPL");
-        rt.block_on(async {
-            repl.inject_function(
-                "get_value",
-                Box::new(|_args, _kwargs: HashMap<String, String>| {
-                    Box::pin(async move { Ok("42".to_string()) })
-                }),
-            )
-            .await
-            .expect("Inject failed");
-        });
+        repl.inject_function(
+            "get_value",
+            Box::new(|_args, _kwargs: HashMap<String, String>| {
+                Box::pin(async move { Ok("42".to_string()) })
+            }),
+        )
+        .expect("Inject failed");
 
         b.iter(|| {
             rt.block_on(async {

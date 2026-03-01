@@ -64,6 +64,10 @@ pub enum ReplError {
     /// Tokio task join failure
     #[error("Task join error: {0}")]
     TaskJoin(#[from] tokio::task::JoinError),
+
+    /// REPL state mutex was poisoned by a prior panic
+    #[error("REPL state poisoned by a prior panic")]
+    StatePoisoned,
 }
 
 /// Result of executing code in a REPL environment.

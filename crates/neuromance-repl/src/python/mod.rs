@@ -20,7 +20,7 @@
 //!     Box::pin(async move {
 //!         Ok(format!("Response to: {}", args[0]))
 //!     })
-//! })).await?;
+//! }))?;
 //!
 //! repl.execute("result = llm_query('summarize')").await?;
 //! # Ok(())
