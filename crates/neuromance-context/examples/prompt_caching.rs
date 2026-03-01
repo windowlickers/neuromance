@@ -35,12 +35,8 @@ use futures::StreamExt;
 use log::info;
 use uuid::Uuid;
 
-use neuromance_client::{
-    AnthropicClient, ChatCompletionsClient, LLMClient, ResponsesClient,
-};
-use neuromance_common::{
-    CacheMetrics, ChatRequest, Config, Message, Usage,
-};
+use neuromance_client::{AnthropicClient, ChatCompletionsClient, LLMClient, ResponsesClient};
+use neuromance_common::{CacheMetrics, ChatRequest, Config, Message, Usage};
 
 #[derive(Debug, Clone, ValueEnum)]
 enum Provider {
@@ -51,11 +47,7 @@ enum Provider {
 }
 
 #[derive(Parser, Debug)]
-#[command(
-    author,
-    version,
-    about = "Prompt caching demo across LLM providers"
-)]
+#[command(author, version, about = "Prompt caching demo across LLM providers")]
 struct Args {
     /// Which provider(s) to test
     #[arg(long, value_enum, default_value = "all")]
@@ -270,9 +262,7 @@ Your knowledge covers:
 
     let mut buf = String::with_capacity(8192);
     buf.push_str(preamble);
-    buf.push_str(
-        "\n\n## Reference: Common Architecture Patterns\n\n",
-    );
+    buf.push_str("\n\n## Reference: Common Architecture Patterns\n\n");
     for (name, desc) in patterns {
         buf.push_str(&format!("### {name}\n{desc}\n\n"));
     }
@@ -282,44 +272,26 @@ Your knowledge covers:
 fn print_usage(label: &str, usage: &Usage) {
     println!("  {label}:");
     println!("    Input tokens:  {}", usage.prompt_tokens);
-    println!(
-        "    Output tokens: {}",
-        usage.completion_tokens
-    );
+    println!("    Output tokens: {}", usage.completion_tokens);
     if let Some(ref d) = usage.input_tokens_details {
         if d.cached_tokens > 0 {
             println!(
                 "    Cached tokens: {} ({:.0}% of input)",
                 d.cached_tokens,
-                usage
-                    .cache_hit_ratio()
-                    .unwrap_or(0.0)
-                    * 100.0,
+                usage.cache_hit_ratio().unwrap_or(0.0) * 100.0,
             );
         }
         if d.cache_creation_tokens > 0 {
-            println!(
-                "    Cache write:   {} tokens",
-                d.cache_creation_tokens
-            );
+            println!("    Cache write:   {} tokens", d.cache_creation_tokens);
         }
     }
 }
 
 fn print_metrics(label: &str, metrics: &CacheMetrics) {
     println!("\n--- {label}: Aggregate Cache Metrics ---");
-    println!(
-        "  Total requests:      {}",
-        metrics.total_requests
-    );
-    println!(
-        "  Total input tokens:  {}",
-        metrics.total_input_tokens
-    );
-    println!(
-        "  Total cached tokens: {}",
-        metrics.total_cached_tokens
-    );
+    println!("  Total requests:      {}", metrics.total_requests);
+    println!("  Total input tokens:  {}", metrics.total_input_tokens);
+    println!("  Total cached tokens: {}", metrics.total_cached_tokens);
     println!(
         "  Cache creation:      {} tokens",
         metrics.total_cache_creation_tokens
@@ -363,23 +335,17 @@ async fn send_streaming(
             usage = Some(match usage {
                 None => chunk_usage.clone(),
                 Some(mut acc) => {
-                    acc.prompt_tokens = acc
-                        .prompt_tokens
-                        .max(chunk_usage.prompt_tokens);
-                    acc.completion_tokens = acc
-                        .completion_tokens
-                        .max(chunk_usage.completion_tokens);
-                    acc.total_tokens =
-                        acc.prompt_tokens + acc.completion_tokens;
+                    acc.prompt_tokens = acc.prompt_tokens.max(chunk_usage.prompt_tokens);
+                    acc.completion_tokens =
+                        acc.completion_tokens.max(chunk_usage.completion_tokens);
+                    acc.total_tokens = acc.prompt_tokens + acc.completion_tokens;
                     if acc.input_tokens_details.is_none() {
-                        acc.input_tokens_details.clone_from(
-                            &chunk_usage.input_tokens_details,
-                        );
+                        acc.input_tokens_details
+                            .clone_from(&chunk_usage.input_tokens_details);
                     }
                     if acc.output_tokens_details.is_none() {
-                        acc.output_tokens_details.clone_from(
-                            &chunk_usage.output_tokens_details,
-                        );
+                        acc.output_tokens_details
+                            .clone_from(&chunk_usage.output_tokens_details);
                     }
                     acc
                 }
@@ -423,10 +389,7 @@ async fn run_provider(
     let conversation_id = Uuid::new_v4();
     let system = system_prompt();
 
-    info!(
-        "[{label}] System prompt length: ~{} chars",
-        system.len()
-    );
+    info!("[{label}] System prompt length: ~{} chars", system.len());
 
     let questions = [
         "Briefly compare the Saga pattern (choreography vs \
@@ -437,59 +400,37 @@ async fn run_provider(
          would you set up chaos engineering for this system?",
     ];
 
-    let mut messages =
-        vec![Message::system(conversation_id, &system)];
+    let mut messages = vec![Message::system(conversation_id, &system)];
     let mut cache_metrics = CacheMetrics::default();
     let mut prev_response_id: Option<String> = None;
 
     for (i, question) in questions.iter().enumerate() {
         let turn = i + 1;
-        println!(
-            "--- [{label}] Turn {turn}/{} ---",
-            questions.len()
-        );
+        println!("--- [{label}] Turn {turn}/{} ---", questions.len());
         println!("  User: {question}");
         println!();
 
-        messages.push(
-            Message::user(conversation_id, *question),
-        );
+        messages.push(Message::user(conversation_id, *question));
 
-        let request = match (
-            use_prev_response_id,
-            prev_response_id.as_ref(),
-        ) {
+        let request = match (use_prev_response_id, prev_response_id.as_ref()) {
             (true, Some(prev_id)) => {
-                println!(
-                    "  (using previous_response_id)\n"
-                );
+                println!("  (using previous_response_id)\n");
                 let mut metadata = HashMap::new();
                 metadata.insert(
                     "previous_response_id".to_string(),
-                    serde_json::Value::String(
-                        prev_id.clone(),
-                    ),
+                    serde_json::Value::String(prev_id.clone()),
                 );
-                metadata.insert(
-                    "store".to_string(),
-                    serde_json::Value::Bool(true),
-                );
-                ChatRequest::new(vec![Message::user(
-                    conversation_id,
-                    *question,
-                )])
-                .with_model(model)
-                .with_max_tokens(max_tokens)
-                .with_metadata(metadata)
+                metadata.insert("store".to_string(), serde_json::Value::Bool(true));
+                ChatRequest::new(vec![Message::user(conversation_id, *question)])
+                    .with_model(model)
+                    .with_max_tokens(max_tokens)
+                    .with_metadata(metadata)
             }
             (true, None) => {
                 // First turn: store response for
                 // subsequent previous_response_id use
                 let mut metadata = HashMap::new();
-                metadata.insert(
-                    "store".to_string(),
-                    serde_json::Value::Bool(true),
-                );
+                metadata.insert("store".to_string(), serde_json::Value::Bool(true));
                 ChatRequest::new(messages.clone())
                     .with_model(model)
                     .with_max_tokens(max_tokens)
@@ -500,29 +441,23 @@ async fn run_provider(
                 .with_max_tokens(max_tokens),
         };
 
-        let (response_text, usage, resp_id) =
-            if no_stream {
-                send_non_streaming(client, &request)
-                    .await?
-            } else {
-                send_streaming(client, &request).await?
-            };
+        let (response_text, usage, resp_id) = if no_stream {
+            send_non_streaming(client, &request).await?
+        } else {
+            send_streaming(client, &request).await?
+        };
 
         if use_prev_response_id {
             prev_response_id = resp_id;
         }
 
         if let Some(ref u) = usage {
-            let ulabel =
-                format!("[{label}] Turn {turn} usage");
+            let ulabel = format!("[{label}] Turn {turn} usage");
             print_usage(&ulabel, u);
             cache_metrics.record(u);
         }
 
-        messages.push(Message::assistant(
-            conversation_id,
-            &response_text,
-        ));
+        messages.push(Message::assistant(conversation_id, &response_text));
     }
 
     print_metrics(label, &cache_metrics);
@@ -537,31 +472,22 @@ async fn main() -> Result<()> {
     println!("Prompt Caching Demo");
     println!("===================\n");
 
-    let run_anthropic = matches!(
-        args.provider,
-        Provider::Anthropic | Provider::All
-    );
-    let run_openai = matches!(
-        args.provider,
-        Provider::Openai | Provider::All
-    );
-    let run_responses = matches!(
-        args.provider,
-        Provider::Responses | Provider::All
-    );
+    let run_anthropic = matches!(args.provider, Provider::Anthropic | Provider::All);
+    let run_openai = matches!(args.provider, Provider::Openai | Provider::All);
+    let run_responses = matches!(args.provider, Provider::Responses | Provider::All);
 
     // -- Anthropic --
     if run_anthropic {
-        let api_key = args.anthropic_api_key.as_deref()
-            .ok_or_else(|| anyhow::anyhow!(
+        let api_key = args.anthropic_api_key.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
                 "Anthropic API key required \
                  (--anthropic-api-key or ANTHROPIC_API_KEY)"
-            ))?;
+            )
+        })?;
 
-        let mut config =
-            Config::new("anthropic", &args.anthropic_model)
-                .with_api_key(api_key)
-                .with_max_tokens(args.max_tokens);
+        let mut config = Config::new("anthropic", &args.anthropic_model)
+            .with_api_key(api_key)
+            .with_max_tokens(args.max_tokens);
         if let Some(ref url) = args.anthropic_base_url {
             config = config.with_base_url(url);
         }
@@ -580,16 +506,16 @@ async fn main() -> Result<()> {
 
     // -- OpenAI Chat Completions --
     if run_openai {
-        let api_key = args.openai_api_key.as_deref()
-            .ok_or_else(|| anyhow::anyhow!(
+        let api_key = args.openai_api_key.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
                 "OpenAI API key required \
                  (--openai-api-key or OPENAI_API_KEY)"
-            ))?;
+            )
+        })?;
 
-        let mut config =
-            Config::new("openai", &args.openai_model)
-                .with_api_key(api_key)
-                .with_max_tokens(args.max_tokens);
+        let mut config = Config::new("openai", &args.openai_model)
+            .with_api_key(api_key)
+            .with_max_tokens(args.max_tokens);
         if let Some(ref url) = args.openai_base_url {
             config = config.with_base_url(url);
         }
@@ -608,16 +534,16 @@ async fn main() -> Result<()> {
 
     // -- OpenAI Responses --
     if run_responses {
-        let api_key = args.openai_api_key.as_deref()
-            .ok_or_else(|| anyhow::anyhow!(
+        let api_key = args.openai_api_key.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
                 "OpenAI API key required for Responses API \
                  (--openai-api-key or OPENAI_API_KEY)"
-            ))?;
+            )
+        })?;
 
-        let mut config =
-            Config::new("responses", &args.openai_model)
-                .with_api_key(api_key)
-                .with_max_tokens(args.max_tokens);
+        let mut config = Config::new("responses", &args.openai_model)
+            .with_api_key(api_key)
+            .with_max_tokens(args.max_tokens);
         if let Some(ref url) = args.openai_base_url {
             config = config.with_base_url(url);
         }

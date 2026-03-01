@@ -31,7 +31,6 @@
 //! # }
 //! ```
 
-use anyhow::{Context, Result};
 use hf_hub::{Repo, RepoType, api::tokio::ApiBuilder};
 use tracing::{debug, error};
 use minijinja::Environment;
@@ -122,7 +121,7 @@ impl ModelConfig {
     ///
     /// Returns an error if the GGUF file cannot be read or parsed.
     #[cfg(feature = "gguf")]
-    pub fn from_gguf(gguf_path: impl Into<PathBuf>) -> Result<Self> {
+    pub fn from_gguf(gguf_path: impl Into<PathBuf>) -> Result<Self, TokenCounterError> {
         let path = gguf_path.into();
         let info = gguf::GGUFModelInfo::from_file(&path)?;
 
@@ -156,19 +155,20 @@ impl ModelConfig {
     }
 
     /// Returns the cache directory, defaulting to ~/.cache/neuromance/tokenizers if not set.
-    fn get_cache_dir(&self) -> Result<PathBuf> {
+    fn get_cache_dir(&self) -> Result<PathBuf, TokenCounterError> {
         if let Some(cache_dir) = &self.cache_dir {
             return Ok(cache_dir.clone());
         }
 
-        // Default to ~/.cache/neuromance/tokenizers
-        let cache_home = dirs::cache_dir().context("Failed to determine cache directory")?;
+        let cache_home = dirs::cache_dir().ok_or_else(|| {
+            TokenCounterError::TokenizerLoad("Failed to determine cache directory".to_string())
+        })?;
 
         Ok(cache_home.join("neuromance").join("tokenizers"))
     }
 
     /// Returns the path to the cached tokenizer file for this model.
-    fn get_cached_tokenizer_path(&self) -> Result<PathBuf> {
+    fn get_cached_tokenizer_path(&self) -> Result<PathBuf, TokenCounterError> {
         let cache_dir = self.get_cache_dir()?;
 
         // Create subdirectory structure: cache_dir/repo/model/tokenizer.json
@@ -180,7 +180,7 @@ impl ModelConfig {
     }
 
     /// Returns the path to the cached chat template file for this model.
-    fn get_cached_chat_template_path(&self) -> Result<PathBuf> {
+    fn get_cached_chat_template_path(&self) -> Result<PathBuf, TokenCounterError> {
         let cache_dir = self.get_cache_dir()?;
         let repo_path = self.model_repo.replace('/', "-");
         let template_path = cache_dir.join(&repo_path).join("chat_template.jinja");
@@ -319,7 +319,7 @@ impl TokenCounter {
     /// # Errors
     ///
     /// Returns an error if the tokenizer cannot be downloaded or loaded.
-    pub async fn new(config: ModelConfig) -> Result<Self> {
+    pub async fn new(config: ModelConfig) -> Result<Self, TokenCounterError> {
         let tokenizer = if let Some(local_path) = &config.local_tokenizer_path {
             Self::load_local_tokenizer(local_path)?
         } else {
@@ -341,61 +341,58 @@ impl TokenCounter {
     /// If the `gguf` feature is enabled and the path ends with .gguf, attempts to
     /// extract the tokenizer from GGUF metadata. Otherwise, loads a standard
     /// tokenizer.json file.
-    fn load_local_tokenizer(path: &Path) -> Result<Tokenizer> {
+    fn load_local_tokenizer(path: &Path) -> Result<Tokenizer, TokenCounterError> {
         #[cfg(feature = "gguf")]
         if path.extension().and_then(|s| s.to_str()) == Some("gguf") {
             debug!("Detected GGUF file, attempting to extract tokenizer");
-            return gguf::GGUFModelInfo::extract_tokenizer(path)
-                .map_err(|e| TokenCounterError::GGUFTokenizerExtraction(e.to_string()).into());
+            return gguf::GGUFModelInfo::extract_tokenizer(path);
         }
 
         debug!("Loading standard tokenizer.json");
-        Tokenizer::from_file(path)
-            .map_err(|e| TokenCounterError::TokenizerLoad(e.to_string()).into())
+        Tokenizer::from_file(path).map_err(|e| TokenCounterError::TokenizerLoad(e.to_string()))
     }
 
     /// Downloads and loads a tokenizer from Hugging Face.
     ///
     /// This method checks the cache first and only downloads if the tokenizer is not cached.
-    async fn download_and_load_tokenizer(config: &ModelConfig) -> Result<Tokenizer> {
-        // Check if tokenizer is already cached
+    async fn download_and_load_tokenizer(
+        config: &ModelConfig,
+    ) -> Result<Tokenizer, TokenCounterError> {
         let cached_path = config.get_cached_tokenizer_path()?;
 
         if cached_path.exists() {
-            // Load from cache
             return Tokenizer::from_file(&cached_path)
-                .map_err(|e| TokenCounterError::TokenizerLoad(e.to_string()).into());
+                .map_err(|e| TokenCounterError::TokenizerLoad(e.to_string()));
         }
 
-        // Build the API client
         let mut api_builder = ApiBuilder::new();
         if let Some(token) = &config.hf_token {
             api_builder = api_builder.with_token(Some(token.clone()));
         }
-        let api = api_builder
-            .build()
-            .context("Failed to build HF API client")?;
+        let api = api_builder.build().map_err(|e| {
+            TokenCounterError::HuggingFaceDownload(format!("Failed to build HF API client: {e}"))
+        })?;
 
-        // Get the model repository
         let repo = api.repo(Repo::new(config.model_repo.clone(), RepoType::Model));
 
-        // Download the tokenizer.json file
-        let tokenizer_path = repo
-            .get("tokenizer.json")
-            .await
-            .context("Failed to download tokenizer.json from Hugging Face")?;
+        let tokenizer_path = repo.get("tokenizer.json").await.map_err(|e| {
+            TokenCounterError::HuggingFaceDownload(format!(
+                "Failed to download tokenizer.json: {e}"
+            ))
+        })?;
 
-        // Create cache directory structure
         if let Some(parent) = cached_path.parent() {
-            fs::create_dir_all(parent).context("Failed to create cache directory")?;
+            fs::create_dir_all(parent).map_err(|e| {
+                TokenCounterError::TokenizerLoad(format!("Failed to create cache directory: {e}"))
+            })?;
         }
 
-        // Copy to cache
-        fs::copy(&tokenizer_path, &cached_path).context("Failed to cache tokenizer file")?;
+        fs::copy(&tokenizer_path, &cached_path).map_err(|e| {
+            TokenCounterError::TokenizerLoad(format!("Failed to cache tokenizer file: {e}"))
+        })?;
 
-        // Load the tokenizer from cache
         Tokenizer::from_file(&cached_path)
-            .map_err(|e| TokenCounterError::TokenizerLoad(e.to_string()).into())
+            .map_err(|e| TokenCounterError::TokenizerLoad(e.to_string()))
     }
 
     /// Loads the chat template for a model.
@@ -539,7 +536,7 @@ impl TokenCounter {
     /// # Errors
     ///
     /// Returns an error if tokenization fails.
-    pub fn count_tokens(&self, text: &str) -> Result<usize> {
+    pub fn count_tokens(&self, text: &str) -> Result<usize, TokenCounterError> {
         let encoding = self
             .tokenizer
             .encode(text, false)
@@ -555,7 +552,10 @@ impl TokenCounter {
     /// # Errors
     ///
     /// Returns an error if tokenization fails for any message.
-    pub fn count_conversation_tokens(&self, conversation: &Conversation) -> Result<usize> {
+    pub fn count_conversation_tokens(
+        &self,
+        conversation: &Conversation,
+    ) -> Result<usize, TokenCounterError> {
         let mut total = 0;
 
         for message in conversation.get_messages() {
@@ -572,7 +572,7 @@ impl TokenCounter {
     /// # Errors
     ///
     /// Returns an error if tokenization fails.
-    pub fn count_message_tokens(&self, message: &Message) -> Result<usize> {
+    pub fn count_message_tokens(&self, message: &Message) -> Result<usize, TokenCounterError> {
         // Count the main content
         let mut total = self.count_tokens(&message.content)?;
 
@@ -619,7 +619,7 @@ impl TokenCounter {
     /// # Errors
     ///
     /// Returns an error if tokenization fails.
-    pub fn tokenize_with_positions(&self, text: &str) -> Result<TokenizedText> {
+    pub fn tokenize_with_positions(&self, text: &str) -> Result<TokenizedText, TokenCounterError> {
         let encoding = self
             .tokenizer
             .encode(text, false)
@@ -656,9 +656,9 @@ impl TokenCounter {
         &self,
         text: &str,
         pattern: &str,
-    ) -> Result<Vec<SearchMatch>> {
+    ) -> Result<Vec<SearchMatch>, TokenCounterError> {
         let tokenized = self.tokenize_with_positions(text)?;
-        let regex = Regex::new(pattern).context("Invalid regex pattern")?;
+        let regex = Regex::new(pattern)?;
 
         let mut matches = Vec::new();
 
@@ -710,29 +710,27 @@ impl TokenCounter {
     /// Returns an error if:
     /// - The tokenizer has no chat template defined
     /// - The template rendering fails
-    pub fn format_conversation_with_template(&self, conversation: &Conversation) -> Result<String> {
-        let template_str = self
-            .get_chat_template()
-            .context("No chat template found in tokenizer")?;
+    pub fn format_conversation_with_template(
+        &self,
+        conversation: &Conversation,
+    ) -> Result<String, TokenCounterError> {
+        let template_str = self.get_chat_template().ok_or_else(|| {
+            TokenCounterError::Template("No chat template found in tokenizer".to_string())
+        })?;
 
-        // Create minijinja environment with Jinja2 compatibility
         let mut env = Environment::new();
-
-        // Add Jinja2 compatibility layer (string methods, namespace, raise_exception, etc.)
         jinja_compat::configure_environment(&mut env);
 
-        // Add custom function: strftime_now
-        // This function formats the current date/time according to a format string
         env.add_function("strftime_now", |format: String| -> String {
             use chrono::Local;
             let now = Local::now();
             now.format(&format).to_string()
         });
 
-        env.add_template("chat", template_str)
-            .context("Failed to add chat template")?;
+        env.add_template("chat", template_str).map_err(|e| {
+            TokenCounterError::Template(format!("Failed to add chat template: {e}"))
+        })?;
 
-        // Convert messages to the format expected by chat templates
         let messages: Vec<serde_json::Value> = conversation
             .get_messages()
             .iter()
@@ -742,7 +740,7 @@ impl TokenCounter {
                     MessageRole::User => "user",
                     MessageRole::Assistant => "assistant",
                     MessageRole::Tool => "tool",
-                    _ => "user", // Default to user for any new role types
+                    _ => "user",
                 };
 
                 let mut message_obj = serde_json::json!({
@@ -750,7 +748,6 @@ impl TokenCounter {
                     "content": msg.content.clone(),
                 });
 
-                // Add tool-specific fields if present
                 if let Some(tool_call_id) = &msg.tool_call_id {
                     message_obj["tool_call_id"] = serde_json::json!(tool_call_id);
                 }
@@ -758,7 +755,6 @@ impl TokenCounter {
                     message_obj["name"] = serde_json::json!(name);
                 }
 
-                // Add tool calls if present
                 if !msg.tool_calls.is_empty() {
                     let tool_calls: Vec<serde_json::Value> = msg
                         .tool_calls
@@ -781,29 +777,25 @@ impl TokenCounter {
             })
             .collect();
 
-        // Render the template
-        let tmpl = env.get_template("chat")?;
+        let tmpl = env
+            .get_template("chat")
+            .map_err(|e| TokenCounterError::Template(e.to_string()))?;
 
-        // Extract special tokens from tokenizer for template context
-        // These are commonly used in chat templates (e.g., Mistral models)
         let bos_token = self.get_special_token("bos_token").unwrap_or_default();
         let eos_token = self.get_special_token("eos_token").unwrap_or_default();
 
-        // Prepare context with all expected variables
-        // This template expects: messages, tools (optional), builtin_tools (optional),
-        // model_identity (optional), reasoning_effort (optional), bos_token, eos_token
         let context = serde_json::json!({
             "messages": messages,
             "add_generation_prompt": false,
-            "tools": serde_json::Value::Array(vec![]), // Empty tools array
-            "builtin_tools": serde_json::Value::Array(vec![]), // Empty builtin_tools array
+            "tools": serde_json::Value::Array(vec![]),
+            "builtin_tools": serde_json::Value::Array(vec![]),
             "bos_token": bos_token,
             "eos_token": eos_token,
         });
 
-        let rendered = tmpl
-            .render(&context)
-            .map_err(|e| anyhow::anyhow!("Failed to render chat template: {}", e))?;
+        let rendered = tmpl.render(&context).map_err(|e| {
+            TokenCounterError::Template(format!("Failed to render chat template: {e}"))
+        })?;
 
         Ok(rendered)
     }
@@ -853,7 +845,7 @@ impl TokenCounter {
     pub fn count_conversation_tokens_with_template(
         &self,
         conversation: &Conversation,
-    ) -> Result<usize> {
+    ) -> Result<usize, TokenCounterError> {
         let formatted = self.format_conversation_with_template(conversation)?;
         self.count_tokens(&formatted)
     }
@@ -868,24 +860,23 @@ impl TokenCounter {
         text: &str,
         start_token: usize,
         end_token: usize,
-    ) -> Result<String> {
+    ) -> Result<String, TokenCounterError> {
         let tokenized = self.tokenize_with_positions(text)?;
 
         if start_token >= tokenized.tokens.len() || end_token > tokenized.tokens.len() {
-            anyhow::bail!(
-                "Token range {}-{} out of bounds (text has {} tokens)",
+            return Err(TokenCounterError::TokenRange(format!(
+                "{}-{} out of bounds (text has {} tokens)",
                 start_token,
                 end_token,
                 tokenized.tokens.len()
-            );
+            )));
         }
 
         if start_token >= end_token {
-            anyhow::bail!(
-                "Invalid token range: start ({}) must be less than end ({})",
-                start_token,
-                end_token
-            );
+            return Err(TokenCounterError::TokenRange(format!(
+                "start ({}) must be less than end ({})",
+                start_token, end_token
+            )));
         }
 
         let char_start = tokenized.tokens[start_token].char_start;

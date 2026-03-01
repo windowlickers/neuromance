@@ -8,7 +8,7 @@
 //! ```no_run
 //! use neuromance_context::gguf::GGUFModelInfo;
 //!
-//! # fn example() -> anyhow::Result<()> {
+//! # fn example() -> Result<(), neuromance_context::TokenCounterError> {
 //! let info = GGUFModelInfo::from_file("model.gguf")?;
 //! println!("Model: {:?}", info.model_name);
 //! println!("Context length: {:?}", info.context_length);
@@ -18,7 +18,6 @@
 //! ```
 
 use crate::TokenCounterError;
-use anyhow::{Context, Result};
 use candle_core::quantized::gguf_file;
 use tracing::{debug, warn};
 use std::collections::HashMap;
@@ -95,9 +94,10 @@ impl GGUFModelInfo {
     /// # Errors
     ///
     /// Returns an error if the file cannot be opened or is not a valid GGUF file.
-    pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
-        let mut file = File::open(path.as_ref())
-            .with_context(|| format!("Failed to open GGUF file: {:?}", path.as_ref()))?;
+    pub fn from_file(path: impl AsRef<Path>) -> Result<Self, TokenCounterError> {
+        let mut file = File::open(path.as_ref()).map_err(|e| {
+            TokenCounterError::GGUFRead(format!("Failed to open {:?}: {e}", path.as_ref()))
+        })?;
 
         let content = gguf_file::Content::read(&mut file)
             .map_err(|e| TokenCounterError::GGUFRead(e.to_string()))?;
@@ -164,9 +164,10 @@ impl GGUFModelInfo {
     ///
     /// Returns an error if the GGUF file doesn't contain tokenizer vocabulary data
     /// or if the tokenizer cannot be constructed.
-    pub fn extract_tokenizer(path: impl AsRef<Path>) -> Result<Tokenizer> {
-        let mut file = File::open(path.as_ref())
-            .with_context(|| format!("Failed to open GGUF file: {:?}", path.as_ref()))?;
+    pub fn extract_tokenizer(path: impl AsRef<Path>) -> Result<Tokenizer, TokenCounterError> {
+        let mut file = File::open(path.as_ref()).map_err(|e| {
+            TokenCounterError::GGUFRead(format!("Failed to open {:?}: {e}", path.as_ref()))
+        })?;
 
         let content = gguf_file::Content::read(&mut file)
             .map_err(|e| TokenCounterError::GGUFRead(e.to_string()))?;
@@ -281,28 +282,36 @@ impl GGUFModelInfo {
             .collect()
     }
 
-    fn extract_vocab_tokens(content: &gguf_file::Content) -> Result<Vec<String>> {
-        // Try to get tokens array from metadata
+    fn extract_vocab_tokens(
+        content: &gguf_file::Content,
+    ) -> Result<Vec<String>, TokenCounterError> {
         let tokens_value = content
             .metadata
             .get("tokenizer.ggml.tokens")
-            .context("No tokenizer.ggml.tokens found in GGUF metadata")?;
+            .ok_or_else(|| {
+                TokenCounterError::GGUFTokenizerExtraction(
+                    "No tokenizer.ggml.tokens in GGUF metadata".to_string(),
+                )
+            })?;
 
-        // Extract string array
         if let gguf_file::Value::Array(arr) = tokens_value {
-            let tokens: Result<Vec<String>> = arr
-                .iter()
+            arr.iter()
                 .map(|v| {
                     if let gguf_file::Value::String(s) = v {
                         Ok(s.to_string())
                     } else {
-                        anyhow::bail!("Expected string in tokens array, got {:?}", v)
+                        Err(TokenCounterError::GGUFTokenizerExtraction(format!(
+                            "Expected string in tokens array, \
+                                 got {:?}",
+                            v
+                        )))
                     }
                 })
-                .collect();
-            tokens
+                .collect()
         } else {
-            anyhow::bail!("tokenizer.ggml.tokens is not an array")
+            Err(TokenCounterError::GGUFTokenizerExtraction(
+                "tokenizer.ggml.tokens is not an array".to_string(),
+            ))
         }
     }
 
@@ -329,32 +338,26 @@ impl GGUFModelInfo {
     fn build_bpe_tokenizer(
         tokens: Vec<String>,
         merges: Vec<(String, String)>,
-    ) -> Result<Tokenizer> {
+    ) -> Result<Tokenizer, TokenCounterError> {
         use tokenizers::models::bpe::BpeBuilder;
 
-        // Build vocabulary map (token -> id) using AHashMap as required by tokenizers
         let vocab: ahash::AHashMap<String, u32> = tokens
             .iter()
             .enumerate()
             .map(|(idx, token)| (token.clone(), idx as u32))
             .collect();
 
-        // Build BPE model
-        // Note: The `vocab_and_merges` method expects merges as Vec<(String, String)>
-        // where the order of the vector determines merge priority
         let bpe = BpeBuilder::new()
             .vocab_and_merges(vocab, merges)
             .build()
             .map_err(|e| {
-                anyhow::anyhow!("Failed to build BPE tokenizer from GGUF vocabulary: {}", e)
+                TokenCounterError::GGUFTokenizerExtraction(format!(
+                    "Failed to build BPE tokenizer from GGUF \
+                     vocabulary: {e}"
+                ))
             })?;
 
-        let tokenizer = Tokenizer::new(bpe);
-
-        // TODO: Add pre-tokenizer, decoder, post-processor based on model type
-        // For now, this is a basic tokenizer that may need additional configuration
-
-        Ok(tokenizer)
+        Ok(Tokenizer::new(bpe))
     }
 }
 

@@ -28,7 +28,6 @@
 //! # }
 //! ```
 
-use anyhow::{Context, Result};
 use tracing::{debug, info};
 use neuromance_client::LLMClient;
 use neuromance_common::chat::{Conversation, Message, MessageRole};
@@ -37,6 +36,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::TokenCounter;
+use crate::error::TokenCounterError;
 
 /// Strategy for compacting conversations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -205,11 +205,11 @@ impl<C: LLMClient> Compactor<C> {
     ///
     /// Returns a `CompactionResult` containing the compacted conversation
     /// and metadata about the compaction process.
-    pub async fn compact(&self, conversation: &Conversation) -> Result<CompactionResult> {
-        let original_tokens = self
-            .token_counter
-            .count_conversation_tokens(conversation)
-            .context("Failed to count original conversation tokens")?;
+    pub async fn compact(
+        &self,
+        conversation: &Conversation,
+    ) -> Result<CompactionResult, TokenCounterError> {
+        let original_tokens = self.token_counter.count_conversation_tokens(conversation)?;
 
         info!(
             "Compaction requested: {} tokens, target: {} tokens",
@@ -253,7 +253,7 @@ impl<C: LLMClient> Compactor<C> {
         &self,
         conversation: &Conversation,
         original_tokens: usize,
-    ) -> Result<CompactionResult> {
+    ) -> Result<CompactionResult, TokenCounterError> {
         let messages = conversation.get_messages();
 
         if messages.is_empty() {
@@ -298,8 +298,7 @@ impl<C: LLMClient> Compactor<C> {
 
         let compacted_tokens = self
             .token_counter
-            .count_conversation_tokens(&compacted_conversation)
-            .context("Failed to count compacted conversation tokens")?;
+            .count_conversation_tokens(&compacted_conversation)?;
 
         info!(
             "Compaction complete: {} -> {} tokens ({} messages summarized)",
@@ -323,7 +322,7 @@ impl<C: LLMClient> Compactor<C> {
         &self,
         conversation: &Conversation,
         original_tokens: usize,
-    ) -> Result<CompactionResult> {
+    ) -> Result<CompactionResult, TokenCounterError> {
         let messages = conversation.get_messages();
 
         if messages.is_empty() {
@@ -372,8 +371,7 @@ impl<C: LLMClient> Compactor<C> {
 
         let compacted_tokens = self
             .token_counter
-            .count_conversation_tokens(&compacted_conversation)
-            .context("Failed to count compacted conversation tokens")?;
+            .count_conversation_tokens(&compacted_conversation)?;
 
         Ok(CompactionResult {
             conversation: compacted_conversation,
@@ -390,7 +388,7 @@ impl<C: LLMClient> Compactor<C> {
         &self,
         conversation: &Conversation,
         original_tokens: usize,
-    ) -> Result<CompactionResult> {
+    ) -> Result<CompactionResult, TokenCounterError> {
         let messages = conversation.get_messages();
 
         if messages.is_empty() {
@@ -419,8 +417,7 @@ impl<C: LLMClient> Compactor<C> {
 
         let compacted_tokens = self
             .token_counter
-            .count_conversation_tokens(&compacted_conversation)
-            .context("Failed to count compacted conversation tokens")?;
+            .count_conversation_tokens(&compacted_conversation)?;
 
         Ok(CompactionResult {
             conversation: compacted_conversation,
@@ -466,7 +463,7 @@ impl<C: LLMClient> Compactor<C> {
     }
 
     /// Generates a summary of the given messages using the LLM.
-    async fn generate_summary(&self, messages: &[&Message]) -> Result<String> {
+    async fn generate_summary(&self, messages: &[&Message]) -> Result<String, TokenCounterError> {
         if messages.is_empty() {
             return Ok(String::new());
         }
@@ -476,45 +473,39 @@ impl<C: LLMClient> Compactor<C> {
 
         debug!("Generating summary for {} messages", messages.len());
 
-        // Create a user message for the summary request
         let summary_message = Message::new(uuid::Uuid::new_v4(), MessageRole::User, prompt);
 
         let summary_request = ChatRequest::new(vec![summary_message])
             .with_model(self.client.config().model.clone())
-            .with_temperature(0.3); // Lower temperature for more consistent summaries
+            .with_temperature(0.3);
 
-        let response = self
-            .client
-            .chat(&summary_request)
-            .await
-            .context("Failed to generate summary")?;
+        let response = self.client.chat(&summary_request).await.map_err(|e| {
+            TokenCounterError::Compaction(format!("Failed to generate summary: {e}"))
+        })?;
 
         Ok(response.message.content.clone())
     }
 
     /// Summarizes multiple chunk summaries into a final summary.
-    async fn summarize_summaries(&self, summaries: &[String]) -> Result<String> {
+    async fn summarize_summaries(&self, summaries: &[String]) -> Result<String, TokenCounterError> {
         let combined = summaries.join("\n\n---\n\n");
         let prompt = format!(
-            "Combine and consolidate the following conversation summaries into a single, \
-             coherent summary. Remove redundancy and preserve the most important information:\n\n\
-             {}\n\n\
-             Consolidated Summary:",
+            "Combine and consolidate the following conversation \
+             summaries into a single, coherent summary. Remove \
+             redundancy and preserve the most important \
+             information:\n\n{}\n\nConsolidated Summary:",
             combined
         );
 
-        // Create a user message for the consolidation request
         let consolidation_message = Message::new(uuid::Uuid::new_v4(), MessageRole::User, prompt);
 
         let request = ChatRequest::new(vec![consolidation_message])
             .with_model(self.client.config().model.clone())
             .with_temperature(0.3);
 
-        let response = self
-            .client
-            .chat(&request)
-            .await
-            .context("Failed to consolidate summaries")?;
+        let response = self.client.chat(&request).await.map_err(|e| {
+            TokenCounterError::Compaction(format!("Failed to consolidate summaries: {e}"))
+        })?;
 
         Ok(response.message.content.clone())
     }
@@ -593,45 +584,48 @@ Summary:"#,
         system_msg: Option<&Message>,
         summary: &str,
         recent_msgs: &[&Message],
-    ) -> Result<Conversation> {
+    ) -> Result<Conversation, TokenCounterError> {
         let mut new_conversation = Conversation::new();
         new_conversation.id = original.id;
         new_conversation.title = original.title.clone();
         new_conversation.description = original.description.clone();
         new_conversation.metadata = original.metadata.clone();
 
-        // Add system message if present
+        let map_conv_err = |e: anyhow::Error| TokenCounterError::Compaction(e.to_string());
+
         if let Some(system) = system_msg {
-            new_conversation.add_message(system.clone())?;
+            new_conversation
+                .add_message(system.clone())
+                .map_err(map_conv_err)?;
         }
 
-        // Add summary as a system message (context injection)
         if !summary.is_empty() {
             let summary_msg = Message::new(
                 original.id,
                 MessageRole::System,
                 format!(
-                    "[Conversation Summary - Previous messages have been summarized]\n\n{}",
+                    "[Conversation Summary - Previous messages \
+                     have been summarized]\n\n{}",
                     summary
                 ),
             );
-            new_conversation.add_message(summary_msg)?;
+            new_conversation
+                .add_message(summary_msg)
+                .map_err(map_conv_err)?;
         }
 
-        // Add recent messages
         for msg in recent_msgs {
-            new_conversation.add_message((*msg).clone())?;
+            new_conversation
+                .add_message((*msg).clone())
+                .map_err(map_conv_err)?;
         }
 
         Ok(new_conversation)
     }
 
     /// Checks if a conversation needs compaction based on the current configuration.
-    pub fn needs_compaction(&self, conversation: &Conversation) -> Result<bool> {
-        let tokens = self
-            .token_counter
-            .count_conversation_tokens(conversation)
-            .context("Failed to count conversation tokens")?;
+    pub fn needs_compaction(&self, conversation: &Conversation) -> Result<bool, TokenCounterError> {
+        let tokens = self.token_counter.count_conversation_tokens(conversation)?;
 
         let threshold = self
             .config
@@ -648,7 +642,10 @@ Summary:"#,
     /// so that messages from any conversation can be compacted.
     ///
     /// Returns the original messages unchanged if compaction is not needed.
-    pub async fn compact_messages(&self, messages: Vec<Message>) -> Result<Vec<Message>> {
+    pub async fn compact_messages(
+        &self,
+        messages: Vec<Message>,
+    ) -> Result<Vec<Message>, TokenCounterError> {
         if messages.is_empty() {
             return Ok(messages);
         }
@@ -694,10 +691,8 @@ Summary:"#,
     }
 
     /// Returns the current token count for a conversation.
-    pub fn count_tokens(&self, conversation: &Conversation) -> Result<usize> {
-        self.token_counter
-            .count_conversation_tokens(conversation)
-            .context("Failed to count conversation tokens")
+    pub fn count_tokens(&self, conversation: &Conversation) -> Result<usize, TokenCounterError> {
+        self.token_counter.count_conversation_tokens(conversation)
     }
 }
 
