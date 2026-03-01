@@ -33,36 +33,18 @@ struct CapturedStreams<'py> {
 
 /// Redirect `sys.stdout` and `sys.stderr` to `StringIO` captures, returning the old streams.
 fn redirect_streams(py: Python<'_>) -> Result<CapturedStreams<'_>, ReplError> {
-    let io_module = py
-        .import("io")
-        .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
-    let string_io = io_module
-        .getattr("StringIO")
-        .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
+    let io_module = py.import("io")?;
+    let string_io = io_module.getattr("StringIO")?;
 
-    let stdout_capture = string_io
-        .call0()
-        .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
-    let stderr_capture = string_io
-        .call0()
-        .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
+    let stdout_capture = string_io.call0()?;
+    let stderr_capture = string_io.call0()?;
 
-    let sys_module = py
-        .import("sys")
-        .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
-    let old_stdout = sys_module
-        .getattr("stdout")
-        .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
-    let old_stderr = sys_module
-        .getattr("stderr")
-        .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
+    let sys_module = py.import("sys")?;
+    let old_stdout = sys_module.getattr("stdout")?;
+    let old_stderr = sys_module.getattr("stderr")?;
 
-    sys_module
-        .setattr("stdout", &stdout_capture)
-        .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
-    sys_module
-        .setattr("stderr", &stderr_capture)
-        .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
+    sys_module.setattr("stdout", &stdout_capture)?;
+    sys_module.setattr("stderr", &stderr_capture)?;
 
     Ok(CapturedStreams {
         stdout_capture,
@@ -75,25 +57,19 @@ fn redirect_streams(py: Python<'_>) -> Result<CapturedStreams<'_>, ReplError> {
 impl CapturedStreams<'_> {
     /// Restore `sys.stdout` and `sys.stderr` and extract captured strings.
     fn restore(self, py: Python<'_>) -> Result<(String, String), ReplError> {
-        let sys_module = py
-            .import("sys")
-            .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
+        let sys_module = py.import("sys")?;
         let _ = sys_module.setattr("stdout", &self.old_stdout);
         let _ = sys_module.setattr("stderr", &self.old_stderr);
 
         let stdout = self
             .stdout_capture
-            .call_method0("getvalue")
-            .map_err(|e| ReplError::ExecutionError(e.to_string()))?
-            .extract::<String>()
-            .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
+            .call_method0("getvalue")?
+            .extract::<String>()?;
 
         let stderr = self
             .stderr_capture
-            .call_method0("getvalue")
-            .map_err(|e| ReplError::ExecutionError(e.to_string()))?
-            .extract::<String>()
-            .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
+            .call_method0("getvalue")?
+            .extract::<String>()?;
 
         Ok((stdout, stderr))
     }
@@ -150,21 +126,15 @@ impl InteractivePythonRepl {
     pub fn with_config(config: PythonReplConfig) -> Result<Self, ReplError> {
         Python::attach(|py| {
             // Import code module
-            let code_module = py
-                .import("code")
-                .map_err(|e| ReplError::InitializationError(e.to_string()))?;
+            let code_module = py.import("code")?;
 
             // Create local namespace
             let locals = PyDict::new(py);
 
             // Create InteractiveConsole instance
-            let interactive_console = code_module
-                .getattr("InteractiveConsole")
-                .map_err(|e| ReplError::InitializationError(e.to_string()))?;
+            let interactive_console = code_module.getattr("InteractiveConsole")?;
 
-            let console = interactive_console
-                .call1((locals.clone(),))
-                .map_err(|e| ReplError::InitializationError(e.to_string()))?;
+            let console = interactive_console.call1((locals.clone(),))?;
 
             Ok(Self {
                 config,
@@ -193,15 +163,12 @@ impl InteractivePythonRepl {
                 let console = console_arc.blocking_read();
                 let console_ref = console.bind(py);
 
-                console_ref
-                    .call_method1("push", (line,))
-                    .map_err(|e| ReplError::ExecutionError(e.to_string()))?
-                    .extract::<bool>()
-                    .map_err(|e| ReplError::ExecutionError(e.to_string()))
+                Ok(console_ref
+                    .call_method1("push", (line,))?
+                    .extract::<bool>()?)
             })
         })
-        .await
-        .map_err(|e| ReplError::ExecutionError(e.to_string()))?
+        .await?
     }
 }
 
@@ -272,7 +239,7 @@ impl InteractivePythonRepl {
                     let (stdout, stderr) = streams.restore(py)?;
 
                     if let Some(e) = exec_error {
-                        return Err(ReplError::ExecutionError(e.to_string()));
+                        return Err(e.into());
                     }
 
                     // InteractiveConsole writes tracebacks to stderr
@@ -291,7 +258,7 @@ impl InteractivePythonRepl {
 
         match result {
             Ok(Ok(repl_result)) => repl_result,
-            Ok(Err(e)) => Err(ReplError::ExecutionError(format!("{e:?}"))),
+            Ok(Err(e)) => Err(e.into()),
             Err(_) => Err(ReplError::Timeout(timeout)),
         }
     }
@@ -308,18 +275,12 @@ impl InteractivePythonRepl {
         // Reset by creating a new InteractiveConsole in blocking task
         tokio::task::spawn_blocking(move || {
             Python::attach(|py| {
-                let code_module = py
-                    .import("code")
-                    .map_err(|e| ReplError::InitializationError(e.to_string()))?;
+                let code_module = py.import("code")?;
 
                 let locals = PyDict::new(py);
-                let interactive_console = code_module
-                    .getattr("InteractiveConsole")
-                    .map_err(|e| ReplError::InitializationError(e.to_string()))?;
+                let interactive_console = code_module.getattr("InteractiveConsole")?;
 
-                let console = interactive_console
-                    .call1((locals.clone(),))
-                    .map_err(|e| ReplError::InitializationError(e.to_string()))?;
+                let console = interactive_console.call1((locals.clone(),))?;
 
                 // Update both console and locals
                 *console_arc.blocking_write() = console.unbind();
@@ -328,8 +289,7 @@ impl InteractivePythonRepl {
                 Ok::<(), ReplError>(())
             })
         })
-        .await
-        .map_err(|e| ReplError::ExecutionError(e.to_string()))??;
+        .await??;
 
         // Clear callback tracking so they'll be re-injected on next execute()
         self.injected_callbacks.write().await.clear();
@@ -371,26 +331,20 @@ impl InteractivePythonRepl {
         let locals_arc = Arc::clone(&self.locals);
         let name = name.to_string();
 
-        let result = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let locals = locals_arc.blocking_read();
             Python::attach(|py| {
                 let locals_dict = locals.bind(py);
-                match locals_dict.get_item(&name) {
-                    Ok(Some(value)) => {
-                        let str_repr = value.str().map_err(|e| e.to_string())?;
-                        Ok(Some(
-                            str_repr.extract::<String>().map_err(|e| e.to_string())?,
-                        ))
+                match locals_dict.get_item(&name)? {
+                    Some(value) => {
+                        let str_repr = value.str()?;
+                        Ok(Some(str_repr.extract::<String>()?))
                     }
-                    Ok(None) => Ok(None),
-                    Err(e) => Err(e.to_string()),
+                    None => Ok(None),
                 }
             })
         })
-        .await
-        .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
-
-        result.map_err(ReplError::ExecutionError)
+        .await?
     }
 
     /// Set a variable in the REPL environment.
@@ -409,13 +363,11 @@ impl InteractivePythonRepl {
                 let locals_dict = locals.bind(py);
                 let py_value = pyo3::IntoPyObject::into_pyobject(value, py)
                     .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
-                locals_dict
-                    .set_item(&name, py_value)
-                    .map_err(|e| ReplError::ExecutionError(e.to_string()))
+                locals_dict.set_item(&name, py_value)?;
+                Ok(())
             })
         })
-        .await
-        .map_err(|e| ReplError::ExecutionError(e.to_string()))?
+        .await?
     }
 }
 

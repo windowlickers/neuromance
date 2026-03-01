@@ -56,9 +56,14 @@ pub enum ReplError {
     #[error("Execution timeout after {0:?}")]
     Timeout(Duration),
 
-    /// Environment initialization failed
-    #[error("Initialization error: {0}")]
-    InitializationError(String),
+    /// Python runtime error
+    #[cfg(feature = "python")]
+    #[error("Python error: {0}")]
+    Python(#[from] pyo3::PyErr),
+
+    /// Tokio task join failure
+    #[error("Task join error: {0}")]
+    TaskJoin(#[from] tokio::task::JoinError),
 }
 
 /// Result of executing code in a REPL environment.

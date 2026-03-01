@@ -25,13 +25,13 @@ pub type PythonCallback = Box<
 ///
 /// # Errors
 ///
-/// Returns `ReplError::ExecutionError` if the `PyCFunction` closure cannot be created.
+/// Returns `ReplError::Python` if the `PyCFunction` closure cannot be created.
 pub fn create_py_callback<'py>(
     py: Python<'py>,
     callback: &Arc<PythonCallback>,
 ) -> Result<Bound<'py, PyCFunction>, ReplError> {
     let cb = Arc::clone(callback);
-    PyCFunction::new_closure(
+    Ok(PyCFunction::new_closure(
         py,
         None,
         None,
@@ -70,8 +70,7 @@ pub fn create_py_callback<'py>(
                 Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e)),
             }
         },
-    )
-    .map_err(|e| ReplError::ExecutionError(e.to_string()))
+    )?)
 }
 
 /// Inject callbacks into a Python dict if not already injected.
@@ -82,7 +81,7 @@ pub fn create_py_callback<'py>(
 ///
 /// # Errors
 ///
-/// Returns `ReplError::ExecutionError` if a callback cannot be
+/// Returns `ReplError::Python` if a callback cannot be
 /// created or injected into the target dict.
 #[allow(clippy::implicit_hasher)]
 pub fn inject_callbacks_if_needed(
@@ -103,9 +102,7 @@ pub fn inject_callbacks_if_needed(
 
         let py_func = create_py_callback(py, callback)?;
 
-        target
-            .set_item(name.as_str(), py_func)
-            .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
+        target.set_item(name.as_str(), py_func)?;
 
         injected.insert(name.clone());
     }

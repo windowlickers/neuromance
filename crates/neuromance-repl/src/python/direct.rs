@@ -74,9 +74,7 @@ impl PythonRepl {
 
             // Setup restricted builtins
             let builtins = Self::create_restricted_builtins(py, &config.python_modules)?;
-            globals
-                .set_item("__builtins__", builtins)
-                .map_err(|e| ReplError::InitializationError(e.to_string()))?;
+            globals.set_item("__builtins__", builtins)?;
 
             // Add configured modules
             Self::add_modules(py, &globals, &config.python_modules)?;
@@ -163,22 +161,16 @@ impl PythonRepl {
             "AttributeError",
         ];
 
-        let main_builtins = py
-            .import("builtins")
-            .map_err(|e| ReplError::InitializationError(e.to_string()))?;
+        let main_builtins = py.import("builtins")?;
 
         for name in &safe_builtins {
             if let Ok(obj) = main_builtins.getattr(*name) {
-                builtins
-                    .set_item(*name, obj)
-                    .map_err(|e| ReplError::InitializationError(e.to_string()))?;
+                builtins.set_item(*name, obj)?;
             }
         }
 
         let restricted_import = Self::create_filtered_import(py, allowed_modules)?;
-        builtins
-            .set_item("__import__", restricted_import)
-            .map_err(|e| ReplError::InitializationError(e.to_string()))?;
+        builtins.set_item("__import__", restricted_import)?;
 
         Ok(builtins.unbind())
     }
@@ -195,10 +187,8 @@ impl PythonRepl {
         let allowed: HashSet<String> = allowed_modules.iter().cloned().collect();
 
         let real_import = py
-            .import("builtins")
-            .map_err(|e| ReplError::InitializationError(e.to_string()))?
-            .getattr("__import__")
-            .map_err(|e| ReplError::InitializationError(e.to_string()))?
+            .import("builtins")?
+            .getattr("__import__")?
             .unbind();
 
         let func = PyCFunction::new_closure(
@@ -216,8 +206,7 @@ impl PythonRepl {
                 }
                 Ok(real_import.bind(py).call(args, kwargs)?.unbind())
             },
-        )
-        .map_err(|e| ReplError::InitializationError(e.to_string()))?;
+        )?;
 
         Ok(func.unbind().into())
     }
@@ -231,9 +220,7 @@ impl PythonRepl {
         for module_name in modules {
             match py.import(module_name.as_str()) {
                 Ok(module) => {
-                    globals
-                        .set_item(module_name.as_str(), module)
-                        .map_err(|e| ReplError::InitializationError(e.to_string()))?;
+                    globals.set_item(module_name.as_str(), module)?;
                 }
                 Err(e) => {
                     log::warn!("Failed to import Python module '{module_name}': {e}");
@@ -252,37 +239,19 @@ impl PythonRepl {
         locals: &Bound<PyDict>,
     ) -> Result<(String, String), ReplError> {
         // Create StringIO for capturing output
-        let io_module = py
-            .import("io")
-            .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
-        let string_io = io_module
-            .getattr("StringIO")
-            .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
+        let io_module = py.import("io")?;
+        let string_io = io_module.getattr("StringIO")?;
 
-        let stdout_capture = string_io
-            .call0()
-            .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
-        let stderr_capture = string_io
-            .call0()
-            .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
+        let stdout_capture = string_io.call0()?;
+        let stderr_capture = string_io.call0()?;
 
         // Redirect stdout/stderr
-        let sys_module = py
-            .import("sys")
-            .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
-        let old_stdout = sys_module
-            .getattr("stdout")
-            .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
-        let old_stderr = sys_module
-            .getattr("stderr")
-            .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
+        let sys_module = py.import("sys")?;
+        let old_stdout = sys_module.getattr("stdout")?;
+        let old_stderr = sys_module.getattr("stderr")?;
 
-        sys_module
-            .setattr("stdout", &stdout_capture)
-            .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
-        sys_module
-            .setattr("stderr", &stderr_capture)
-            .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
+        sys_module.setattr("stdout", &stdout_capture)?;
+        sys_module.setattr("stderr", &stderr_capture)?;
 
         // Execute the code
         let c_code = CString::new(code).map_err(|e| {
@@ -299,19 +268,15 @@ impl PythonRepl {
 
         // Get captured output
         let stdout = stdout_capture
-            .call_method0("getvalue")
-            .map_err(|e| ReplError::ExecutionError(e.to_string()))?
-            .extract::<String>()
-            .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
+            .call_method0("getvalue")?
+            .extract::<String>()?;
 
         let stderr = stderr_capture
-            .call_method0("getvalue")
-            .map_err(|e| ReplError::ExecutionError(e.to_string()))?
-            .extract::<String>()
-            .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
+            .call_method0("getvalue")?
+            .extract::<String>()?;
 
         // Check execution result
-        exec_result.map_err(|e| ReplError::ExecutionError(e.to_string()))?;
+        exec_result?;
 
         Ok((stdout, stderr))
     }
@@ -390,7 +355,7 @@ impl PythonRepl {
 
         match result {
             Ok(Ok(repl_result)) => repl_result,
-            Ok(Err(e)) => Err(ReplError::ExecutionError(format!("{e:?}"))),
+            Ok(Err(e)) => Err(e.into()),
             Err(_) => Err(ReplError::Timeout(timeout)),
         }
     }
@@ -408,8 +373,7 @@ impl PythonRepl {
                 *locals_arc.blocking_write() = PyDict::new(py).unbind();
             });
         })
-        .await
-        .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
+        .await?;
 
         // Clear callback tracking so they'll be re-injected on next execute()
         self.injected_callbacks.write().await.clear();
@@ -451,26 +415,20 @@ impl PythonRepl {
         let locals_arc = Arc::clone(&self.locals);
         let name = name.to_string();
 
-        let result = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let locals = locals_arc.blocking_read();
             Python::attach(|py| {
                 let locals_dict = locals.bind(py);
-                match locals_dict.get_item(&name) {
-                    Ok(Some(value)) => {
-                        let str_repr = value.str().map_err(|e| e.to_string())?;
-                        Ok(Some(
-                            str_repr.extract::<String>().map_err(|e| e.to_string())?,
-                        ))
+                match locals_dict.get_item(&name)? {
+                    Some(value) => {
+                        let str_repr = value.str()?;
+                        Ok(Some(str_repr.extract::<String>()?))
                     }
-                    Ok(None) => Ok(None),
-                    Err(e) => Err(e.to_string()),
+                    None => Ok(None),
                 }
             })
         })
-        .await
-        .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
-
-        result.map_err(ReplError::ExecutionError)
+        .await?
     }
 
     /// Set a variable in the REPL environment.
@@ -489,13 +447,11 @@ impl PythonRepl {
                 let locals_dict = locals.bind(py);
                 let py_value = pyo3::IntoPyObject::into_pyobject(value, py)
                     .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
-                locals_dict
-                    .set_item(&name, py_value)
-                    .map_err(|e| ReplError::ExecutionError(e.to_string()))
+                locals_dict.set_item(&name, py_value)?;
+                Ok(())
             })
         })
-        .await
-        .map_err(|e| ReplError::ExecutionError(e.to_string()))?
+        .await?
     }
 }
 
