@@ -52,6 +52,14 @@ python = ["pyo3"]
 tools = ["neuromance-common", "neuromance-tools"]
 full = ["python", "tools"]
 
+[[example]]
+name = "recursive_llm_query"
+required-features = ["python"]
+
+[[example]]
+name = "depth_stress_test"
+required-features = ["python"]
+
 [[bench]]
 name = "repl_resources"
 harness = false
