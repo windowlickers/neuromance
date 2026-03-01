@@ -1,6 +1,6 @@
-use anyhow::Result;
 use log::debug;
 
+use neuromance::error::CoreError;
 use neuromance_client::LLMClient;
 use neuromance_common::agents::AgentResponse;
 use neuromance_common::chat::Message;
@@ -40,7 +40,7 @@ impl<C: LLMClient + Send + Sync> ContextAgent<C> {
         &mut self,
         task_description: &str,
         tools_description: &str,
-    ) -> Result<AgentResponse> {
+    ) -> Result<AgentResponse, CoreError> {
         let system_prompt = self.agent.system_prompt.as_deref().unwrap_or_default();
         let enhanced_system_prompt = format!("{system_prompt}\n\n{tools_description}");
 
@@ -95,7 +95,7 @@ impl<C: LLMClient + Send + Sync> ActionAgent<C> {
         &mut self,
         task_description: &str,
         context: &str,
-    ) -> Result<AgentResponse> {
+    ) -> Result<AgentResponse, CoreError> {
         let id = self.agent.conversation_id;
         let messages = vec![
             Message::system(id, self.agent.system_prompt.as_deref().unwrap_or_default()),
@@ -139,28 +139,38 @@ impl<C: LLMClient + Send + Sync> VerifierAgent<C> {
         &self,
         task_description: &str,
         action_result: &str,
-    ) -> Result<(bool, AgentResponse)> {
+    ) -> Result<(bool, AgentResponse), CoreError> {
         let id = self.agent.conversation_id;
         let messages = vec![
-            Message::system(id, self.agent.system_prompt.as_deref().unwrap_or_default()),
+            Message::system(
+                id,
+                self.agent
+                    .system_prompt
+                    .as_deref()
+                    .unwrap_or_default(),
+            ),
             Message::user(
                 id,
                 format!(
                     "Original Task: {task_description}\n\n\
                     Result:\n{action_result}\n\n\
-                    Did the agent successfully complete the task? Use the \
-                    return_bool tool to provide your verification result.",
+                    Did the agent successfully complete the task? \
+                    Use the return_bool tool to provide your \
+                    verification result.",
                 ),
             ),
         ];
 
         let tool_def = BooleanTool.get_definition();
 
-        let request = ChatRequest::from((self.agent.core.client.config(), messages))
-            .with_tools(vec![tool_def])
-            .with_tool_choice(neuromance_common::client::ToolChoice::Function {
-                name: "return_bool".to_string(),
-            });
+        let request =
+            ChatRequest::from((self.agent.core.client.config(), messages))
+                .with_tools(vec![tool_def])
+                .with_tool_choice(
+                    neuromance_common::client::ToolChoice::Function {
+                        name: "return_bool".to_string(),
+                    },
+                );
 
         debug!(
             "Chat request:\n {}",
@@ -179,8 +189,11 @@ impl<C: LLMClient + Send + Sync> VerifierAgent<C> {
             && tool_call.function.name == "return_bool"
         {
             let args_str = tool_call.function.arguments_json();
-            if let Ok(args) = serde_json::from_str::<serde_json::Value>(args_str)
-                && let Some(result) = args.get("result").and_then(serde_json::Value::as_bool)
+            if let Ok(args) =
+                serde_json::from_str::<serde_json::Value>(args_str)
+                && let Some(result) = args
+                    .get("result")
+                    .and_then(serde_json::Value::as_bool)
             {
                 let agent_response = AgentResponse {
                     content: response.message,
@@ -195,8 +208,10 @@ impl<C: LLMClient + Send + Sync> VerifierAgent<C> {
             }
         }
 
-        Err(anyhow::anyhow!(
-            "Verifier agent did not return expected boolean tool call"
+        Err(CoreError::NoResponse(
+            "Verifier agent did not return expected boolean \
+             tool call"
+                .to_string(),
         ))
     }
 }

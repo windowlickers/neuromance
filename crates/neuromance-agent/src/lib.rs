@@ -138,12 +138,12 @@
 //!
 //! This state can be serialized for persistence or debugging.
 
-use anyhow::Result;
 use async_trait::async_trait;
 use log::info;
 use uuid::Uuid;
 
 use neuromance::Core;
+use neuromance::error::CoreError;
 use neuromance_client::LLMClient;
 use neuromance_common::agents::{AgentContext, AgentMemory, AgentResponse, AgentState, AgentStats};
 use neuromance_common::chat::{Message, MessageRole};
@@ -198,7 +198,7 @@ impl<C: LLMClient + Send + Sync> Agent for BaseAgent<C> {
         &mut self.state
     }
 
-    async fn reset(&mut self) -> Result<()> {
+    async fn reset(&mut self) -> Result<(), CoreError> {
         self.state.conversation_history.clear();
         self.state.memory = AgentMemory::default();
         self.state.context = AgentContext::default();
@@ -208,7 +208,10 @@ impl<C: LLMClient + Send + Sync> Agent for BaseAgent<C> {
         Ok(())
     }
 
-    async fn execute(&mut self, messages: Option<Vec<Message>>) -> Result<AgentResponse> {
+    async fn execute(
+        &mut self,
+        messages: Option<Vec<Message>>,
+    ) -> Result<AgentResponse, CoreError> {
         info!("Agent {} executing", self.id);
         self.core.tool_choice = self.tool_choice.clone();
 
@@ -217,23 +220,25 @@ impl<C: LLMClient + Send + Sync> Agent for BaseAgent<C> {
 
         // Validate that we have at least system and user messages
         if messages.len() < 2 {
-            return Err(anyhow::anyhow!(
-                "Agent requires at least a system message and user message to execute"
+            return Err(CoreError::InvalidInput(
+                "Agent requires at least a system message and \
+                 user message to execute"
+                    .to_string(),
             ));
         }
 
         if messages[0].role != MessageRole::System {
-            return Err(anyhow::anyhow!(
+            return Err(CoreError::InvalidInput(format!(
                 "First message must be a system message, found: {:?}",
                 messages[0].role
-            ));
+            )));
         }
 
         if messages[1].role != MessageRole::User {
-            return Err(anyhow::anyhow!(
+            return Err(CoreError::InvalidInput(format!(
                 "Second message must be a user message, found: {:?}",
                 messages[1].role
-            ));
+            )));
         }
 
         let messages = self.core.chat_with_tool_loop(messages).await?;
@@ -243,7 +248,11 @@ impl<C: LLMClient + Send + Sync> Agent for BaseAgent<C> {
             .iter()
             .rfind(|m| m.role == MessageRole::Assistant)
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("LLM returned no assistant message"))?;
+            .ok_or_else(|| {
+                CoreError::NoResponse(
+                    "LLM returned no assistant message".to_string(),
+                )
+            })?;
 
         let tool_responses = messages
             .iter()
@@ -274,8 +283,11 @@ pub trait Agent: Send + Sync {
     ///
     /// # Returns
     /// A result indicating success or failure of the reset operation
-    async fn reset(&mut self) -> Result<()>;
+    async fn reset(&mut self) -> Result<(), CoreError>;
 
     /// Execute core chat with tools loop
-    async fn execute(&mut self, messages: Option<Vec<Message>>) -> Result<AgentResponse>;
+    async fn execute(
+        &mut self,
+        messages: Option<Vec<Message>>,
+    ) -> Result<AgentResponse, CoreError>;
 }

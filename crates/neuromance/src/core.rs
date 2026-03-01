@@ -7,7 +7,7 @@ use chrono::Utc;
 use futures::{FutureExt, StreamExt};
 use log::{debug, info, warn};
 
-use neuromance_client::{ClientError, LLMClient};
+use neuromance_client::LLMClient;
 use neuromance_common::CacheMetrics;
 use neuromance_common::chat::{Message, MessageRole};
 use neuromance_common::client::{ChatRequest, ChatResponse, ToolChoice};
@@ -233,7 +233,10 @@ impl<C: LLMClient> Core<C> {
     }
 
     /// Send a chat request with retry logic for transient failures
-    async fn chat_with_retry(&self, request: &ChatRequest) -> Result<ChatResponse> {
+    async fn chat_with_retry(
+        &self,
+        request: &ChatRequest,
+    ) -> Result<ChatResponse, CoreError> {
         let mut last_error = None;
 
         let config = self.client.config();
@@ -242,12 +245,9 @@ impl<C: LLMClient> Core<C> {
             match self.client.chat(request).await {
                 Ok(response) => return Ok(response),
                 Err(e) => {
-                    // Check if this is a retryable error
-                    let is_retryable = e
-                        .downcast_ref::<ClientError>()
-                        .is_some_and(ClientError::is_retryable);
-
-                    if attempt < config.retry_config.max_retries && is_retryable {
+                    if attempt < config.retry_config.max_retries
+                        && e.is_retryable()
+                    {
                         debug!(
                             "Request failed (attempt {}), retrying in {:?}: {}",
                             attempt + 1,
@@ -255,21 +255,29 @@ impl<C: LLMClient> Core<C> {
                             e
                         );
                         last_error = Some(e);
-                        tokio::time::sleep(config.retry_config.initial_delay).await;
+                        tokio::time::sleep(config.retry_config.initial_delay)
+                            .await;
                         continue;
                     }
-                    // Non-retryable error or max attempts reached
                     last_error = Some(e);
                     break;
                 }
             }
         }
 
-        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("No response received after retries")))
+        Err(last_error.map_or_else(
+            || CoreError::NoResponse(
+                "No response received after retries".to_string(),
+            ),
+            CoreError::Client,
+        ))
     }
 
     /// Send a streaming chat request and accumulate the response
-    async fn chat_stream_accumulated(&self, request: &ChatRequest) -> Result<ChatResponse> {
+    async fn chat_stream_accumulated(
+        &self,
+        request: &ChatRequest,
+    ) -> Result<ChatResponse, CoreError> {
         let mut stream = self.client.chat_stream(request).await?;
 
         // Pre-allocate capacity for typical streaming responses
@@ -341,12 +349,19 @@ impl<C: LLMClient> Core<C> {
         let conversation_id = request
             .messages
             .first()
-            .ok_or_else(|| anyhow::anyhow!("Request must contain at least one message"))?
+            .ok_or_else(|| {
+                CoreError::NoResponse(
+                    "Request must contain at least one message".to_string(),
+                )
+            })?
             .conversation_id;
 
         // Construct the final response
-        let last_chunk =
-            response_metadata.ok_or_else(|| anyhow::anyhow!("Stream ended without any chunks"))?;
+        let last_chunk = response_metadata.ok_or_else(|| {
+            CoreError::NoResponse(
+                "Stream ended without any chunks".to_string(),
+            )
+        })?;
 
         let message = Message {
             id: uuid::Uuid::new_v4(),
@@ -380,7 +395,7 @@ impl<C: LLMClient> Core<C> {
     pub async fn chat_with_tool_loop(
         &mut self,
         mut messages: Vec<Message>,
-    ) -> Result<Vec<Message>> {
+    ) -> Result<Vec<Message>, CoreError> {
         let mut turn_count = 0;
         let start_time = Instant::now();
         let mut messages_arc: Arc<[Message]> = messages.clone().into();
@@ -492,7 +507,8 @@ impl<C: LLMClient> Core<C> {
                                     result,
                                     tool_call.id.clone(),
                                     tool_call.function.name.clone(),
-                                )?;
+                                )
+                                .map_err(|e| CoreError::ToolError(e.to_string()))?;
                                 messages.push(tool_message);
                             }
                             Err(e) => {
@@ -513,29 +529,28 @@ impl<C: LLMClient> Core<C> {
                                     error_msg,
                                     tool_call.id.clone(),
                                     tool_call.function.name.clone(),
-                                )?;
+                                )
+                                .map_err(|e| CoreError::ToolError(e.to_string()))?;
                                 messages.push(error_message);
                             }
                         }
                     }
                     ToolApproval::Denied(reason) => {
                         debug!("Tool {tool_name} denied: {reason}");
-                        // Tool not approved
                         let denial_message = Message::tool(
                             conversation_id,
                             format!("Tool execution denied: {reason}"),
                             tool_call.id.clone(),
                             tool_call.function.name.clone(),
-                        )?;
+                        )
+                        .map_err(|e| CoreError::ToolError(e.to_string()))?;
                         messages.push(denial_message);
                     }
                     ToolApproval::Quit => {
                         debug!("User quit during tool approval");
-                        // User requested to quit
-                        return Err(CoreError::Other(anyhow::anyhow!(
-                            "User quit during tool approval"
-                        ))
-                        .into());
+                        return Err(CoreError::UserQuit(
+                            "User quit during tool approval".to_string(),
+                        ));
                     }
                 }
             }
@@ -544,7 +559,9 @@ impl<C: LLMClient> Core<C> {
 
             // Invoke turn callback (e.g., for context compaction)
             if let Some(ref callback) = self.turn_callback {
-                messages = callback(messages).await?;
+                messages = callback(messages)
+                    .await
+                    .map_err(|e| CoreError::TurnCallback(e.into()))?;
             }
 
             // Update Arc with new messages after tool execution
@@ -559,8 +576,7 @@ impl<C: LLMClient> Core<C> {
             {
                 return Err(CoreError::MaxTurnsExceeded(format!(
                     "Exceeded maximum turns: {turn_count} (configured max: {max})"
-                ))
-                .into());
+                )));
             }
         }
     }

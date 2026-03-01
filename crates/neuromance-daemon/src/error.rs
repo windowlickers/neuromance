@@ -1,5 +1,7 @@
 //! Error types for the Neuromance daemon.
 
+use neuromance::error::CoreError;
+use neuromance_client::ClientError;
 use thiserror::Error;
 
 /// Errors that can occur in the daemon.
@@ -43,11 +45,11 @@ pub enum DaemonError {
 
     /// Core orchestration error.
     #[error("Core error: {0}")]
-    Core(String),
+    Core(Box<CoreError>),
 
     /// Client error.
     #[error("Client error: {0}")]
-    Client(String),
+    Client(Box<ClientError>),
 
     /// Tool execution error.
     #[error("Tool error: {0}")]
@@ -69,9 +71,15 @@ pub enum DaemonError {
 /// Result type alias using `DaemonError`.
 pub type Result<T> = std::result::Result<T, DaemonError>;
 
-impl From<anyhow::Error> for DaemonError {
-    fn from(err: anyhow::Error) -> Self {
-        Self::Other(format!("{err:?}"))
+impl From<CoreError> for DaemonError {
+    fn from(err: CoreError) -> Self {
+        Self::Core(Box::new(err))
+    }
+}
+
+impl From<ClientError> for DaemonError {
+    fn from(err: ClientError) -> Self {
+        Self::Client(Box::new(err))
     }
 }
 
@@ -80,20 +88,28 @@ impl From<DaemonError> for neuromance_common::DaemonResponse {
         use neuromance_common::ErrorCode;
 
         let code = match &err {
-            DaemonError::ConversationNotFound(_) => ErrorCode::ConversationNotFound,
+            DaemonError::ConversationNotFound(_) => {
+                ErrorCode::ConversationNotFound
+            }
             DaemonError::ModelNotFound(_) => ErrorCode::ModelNotFound,
             DaemonError::BookmarkNotFound(_) => ErrorCode::BookmarkNotFound,
             DaemonError::BookmarkExists(_) => ErrorCode::BookmarkExists,
-            DaemonError::NoActiveConversation => ErrorCode::NoActiveConversation,
-            DaemonError::InvalidConversationId(_) => ErrorCode::InvalidConversationId,
-            DaemonError::Core(_) | DaemonError::Client(_) | DaemonError::Tool(_) => {
-                ErrorCode::LlmError
+            DaemonError::NoActiveConversation => {
+                ErrorCode::NoActiveConversation
             }
-            DaemonError::Config(_) | DaemonError::Toml(_) => ErrorCode::ConfigError,
+            DaemonError::InvalidConversationId(_) => {
+                ErrorCode::InvalidConversationId
+            }
+            DaemonError::Core(_)
+            | DaemonError::Client(_)
+            | DaemonError::Tool(_) => ErrorCode::LlmError,
+            DaemonError::Config(_) | DaemonError::Toml(_) => {
+                ErrorCode::ConfigError
+            }
             DaemonError::Storage(_) => ErrorCode::StorageError,
-            DaemonError::Io(_) | DaemonError::Json(_) | DaemonError::Other(_) => {
-                ErrorCode::Internal
-            }
+            DaemonError::Io(_)
+            | DaemonError::Json(_)
+            | DaemonError::Other(_) => ErrorCode::Internal,
         };
 
         Self::Error {

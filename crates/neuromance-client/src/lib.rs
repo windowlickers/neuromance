@@ -13,7 +13,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
 use async_trait::async_trait;
 use futures::Stream;
 use reqwest_middleware::ClientWithMiddleware;
@@ -105,7 +104,7 @@ pub(crate) struct ClientResources {
 pub(crate) fn build_client_resources(
     config: Config,
     default_base_url: &str,
-) -> Result<ClientResources> {
+) -> Result<ClientResources, ClientError> {
     let api_key = config
         .api_key
         .clone()
@@ -144,8 +143,11 @@ pub(crate) fn build_client_resources(
     let reqwest_client = match config.timeout_seconds {
         Some(timeout) => reqwest::Client::builder()
             .timeout(Duration::from_secs(timeout))
-            .build()?,
-        None => reqwest::Client::builder().build()?,
+            .build()
+            .map_err(ClientError::NetworkError)?,
+        None => reqwest::Client::builder()
+            .build()
+            .map_err(ClientError::NetworkError)?,
     };
 
     // Create client with retry middleware
@@ -198,7 +200,10 @@ pub trait LLMClient: Send + Sync {
     fn config(&self) -> &Config;
 
     /// Send a chat completion request to the LLM.
-    async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse>;
+    async fn chat(
+        &self,
+        request: &ChatRequest,
+    ) -> Result<ChatResponse, ClientError>;
 
     /// Send a streaming chat completion request to the LLM.
     ///
@@ -206,7 +211,10 @@ pub trait LLMClient: Send + Sync {
     async fn chat_stream(
         &self,
         request: &ChatRequest,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatChunk>> + Send>>>;
+    ) -> Result<
+        Pin<Box<dyn Stream<Item = Result<ChatChunk, ClientError>> + Send>>,
+        ClientError,
+    >;
 
     /// Check if the client supports tool/function calling.
     fn supports_tools(&self) -> bool;
@@ -221,23 +229,23 @@ pub trait LLMClient: Send + Sync {
     /// # Errors
     ///
     /// Returns an error if any parameter is out of range.
-    fn validate_config(&self, config: Config) -> Result<()> {
+    fn validate_config(&self, config: Config) -> Result<(), ClientError> {
         if config
             .temperature
             .is_some_and(|t| !(0.0..=2.0).contains(&t))
         {
-            return Err(ClientError::InvalidTemperature.into());
+            return Err(ClientError::InvalidTemperature);
         }
 
         if config.top_p.is_some_and(|p| !(0.0..=1.0).contains(&p)) {
-            return Err(ClientError::InvalidTopP.into());
+            return Err(ClientError::InvalidTopP);
         }
 
         if config
             .frequency_penalty
             .is_some_and(|f| !(-2.0..=2.0).contains(&f))
         {
-            return Err(ClientError::InvalidFrequencyPenalty.into());
+            return Err(ClientError::InvalidFrequencyPenalty);
         }
 
         Ok(())
@@ -250,17 +258,20 @@ pub trait LLMClient: Send + Sync {
     /// # Errors
     ///
     /// Returns an error if validation fails.
-    fn validate_request(&self, request: &ChatRequest) -> Result<()> {
+    fn validate_request(
+        &self,
+        request: &ChatRequest,
+    ) -> Result<(), ClientError> {
         request
             .validate_has_messages()
             .map_err(|e| ClientError::InvalidRequest(e.to_string()))?;
 
         if !self.supports_tools() && request.has_tools() {
-            return Err(ClientError::ToolsNotSupported.into());
+            return Err(ClientError::ToolsNotSupported);
         }
 
         if !self.supports_streaming() && request.is_streaming() {
-            return Err(ClientError::StreamingNotSupported.into());
+            return Err(ClientError::StreamingNotSupported);
         }
 
         Ok(())
@@ -319,7 +330,10 @@ mod tests {
             &self.config
         }
 
-        async fn chat(&self, _request: &ChatRequest) -> Result<ChatResponse> {
+        async fn chat(
+            &self,
+            _request: &ChatRequest,
+        ) -> Result<ChatResponse, ClientError> {
             Ok(ChatResponse {
                 message: create_test_message(),
                 model: "mock-model".to_string(),
@@ -334,10 +348,12 @@ mod tests {
         async fn chat_stream(
             &self,
             _request: &ChatRequest,
-        ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatChunk>> + Send>>> {
+        ) -> Result<
+            Pin<Box<dyn Stream<Item = Result<ChatChunk, ClientError>> + Send>>,
+            ClientError,
+        > {
             use futures::stream;
 
-            // Create a simple mock stream with one chunk
             let chunk = ChatChunk {
                 model: "mock-model".to_string(),
                 delta_content: Some("Hello".to_string()),
@@ -409,8 +425,7 @@ mod tests {
         let result = client.validate_request(&request);
         assert!(result.is_err());
         let error = result.unwrap_err();
-        let client_error = error.downcast_ref::<ClientError>().unwrap();
-        assert!(matches!(client_error, ClientError::InvalidRequest(_)));
+        assert!(matches!(error, ClientError::InvalidRequest(_)));
     }
 
     #[test]
@@ -464,8 +479,7 @@ mod tests {
         let result = client.validate_request(&request);
         assert!(result.is_err());
         let error = result.unwrap_err();
-        let client_error = error.downcast_ref::<ClientError>().unwrap();
-        assert!(matches!(client_error, ClientError::ToolsNotSupported));
+        assert!(matches!(error, ClientError::ToolsNotSupported));
     }
 
     #[test]
@@ -519,8 +533,7 @@ mod tests {
         let result = client.validate_request(&request);
         assert!(result.is_err());
         let error = result.unwrap_err();
-        let client_error = error.downcast_ref::<ClientError>().unwrap();
-        assert!(matches!(client_error, ClientError::StreamingNotSupported));
+        assert!(matches!(error, ClientError::StreamingNotSupported));
     }
 
     #[test]

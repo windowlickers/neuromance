@@ -28,7 +28,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
 use async_trait::async_trait;
 use base64::prelude::*;
 use log::{debug, error, warn};
@@ -200,7 +199,7 @@ impl OpenAIEmbedding {
     /// - The base URL is invalid
     /// - Dimensions are specified for a model that doesn't support them
     /// - Dimensions are outside the valid range for the model
-    pub fn new(config: EmbeddingConfig) -> Result<Self> {
+    pub fn new(config: EmbeddingConfig) -> Result<Self, ClientError> {
         // Validate dimensions if specified
         if let Some(dimensions) = config.dimensions {
             Self::validate_dimensions(&config.model, dimensions)?;
@@ -214,7 +213,7 @@ impl OpenAIEmbedding {
         // Construct and validate the embeddings URL once at initialization
         let embeddings_url = format!("{base_url}/embeddings");
         reqwest::Url::parse(&embeddings_url)
-            .map_err(|e| anyhow::anyhow!("Invalid base URL '{base_url}': {e}"))?;
+            .map_err(|e| ClientError::ConfigurationError(format!("Invalid base URL '{base_url}': {e}")))?;
 
         // Build retry policy from config
         let retry_policy = ExponentialBackoff::builder()
@@ -246,7 +245,7 @@ impl OpenAIEmbedding {
     }
 
     /// Validate dimensions against the model's constraints.
-    fn validate_dimensions(model: &str, dimensions: u32) -> Result<()> {
+    fn validate_dimensions(model: &str, dimensions: u32) -> Result<(), ClientError> {
         match get_dimension_constraints(model) {
             Some(constraints) => {
                 constraints.validate(dimensions, model)?;
@@ -254,8 +253,7 @@ impl OpenAIEmbedding {
             }
             None => Err(ClientError::ConfigurationError(format!(
                 "Model '{model}' does not support dimension reduction"
-            ))
-            .into()),
+            ))),
         }
     }
 
@@ -305,8 +303,7 @@ impl OpenAIEmbedding {
         if let Some(dims) = request.dimensions {
             // Only validate request-level dimensions (config dimensions already validated in new())
             if self.config.dimensions.is_none() {
-                Self::validate_dimensions(&self.config.model, dims)
-                    .map_err(|e| ClientError::ConfigurationError(e.to_string()))?;
+                Self::validate_dimensions(&self.config.model, dims)?;
             }
         }
 
@@ -404,7 +401,7 @@ impl EmbeddingClient for OpenAIEmbedding {
         &self.config
     }
 
-    async fn embed_request(&self, request: &EmbeddingRequest) -> Result<EmbeddingResponse> {
+    async fn embed_request(&self, request: &EmbeddingRequest) -> Result<EmbeddingResponse, ClientError> {
         let openai_response = self.make_request(request).await?;
 
         let embeddings: Vec<Embedding> = openai_response
@@ -678,10 +675,7 @@ mod tests {
         let result = client.embed_request(&EmbeddingRequest::new("test")).await;
         assert!(result.is_err());
 
-        let err = result
-            .unwrap_err()
-            .downcast::<ClientError>()
-            .expect("Expected ClientError");
+        let err = result.unwrap_err();
         assert!(err.is_rate_limit_error());
         assert_eq!(err.retry_after(), Some(Duration::from_secs(30)));
     }

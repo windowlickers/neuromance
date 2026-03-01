@@ -1,7 +1,7 @@
 use std::fmt::Write;
 use std::sync::Arc;
 
-use anyhow::Result;
+use neuromance::error::CoreError;
 use neuromance_tools::{ToolImplementation, ToolRegistry};
 use uuid::Uuid;
 
@@ -110,7 +110,9 @@ impl<C: LLMClient + Send + Sync> AgentTask<C> {
     ///
     /// # Errors
     /// Returns an error if context analysis fails
-    pub async fn gather_context(&mut self) -> Result<AgentResponse> {
+    pub async fn gather_context(
+        &mut self,
+    ) -> Result<AgentResponse, CoreError> {
         // Get all available tools from the registry
         let available_tools = self.get_all_tools();
 
@@ -130,10 +132,12 @@ impl<C: LLMClient + Send + Sync> AgentTask<C> {
     ///
     /// # Errors
     /// Returns an error if context was not gathered first or action execution fails
-    pub async fn take_action(&mut self) -> Result<AgentResponse> {
+    pub async fn take_action(
+        &mut self,
+    ) -> Result<AgentResponse, CoreError> {
         if self.state.context_response.is_none() {
-            return Err(anyhow::anyhow!(
-                "Cannot take action before gathering context"
+            return Err(CoreError::InvalidInput(
+                "Cannot take action before gathering context".to_string(),
             ));
         }
 
@@ -169,9 +173,13 @@ impl<C: LLMClient + Send + Sync> AgentTask<C> {
     ///
     /// # Errors
     /// Returns an error if action was not taken first or verification fails
-    pub async fn verify(&mut self) -> Result<AgentResponse> {
+    pub async fn verify(
+        &mut self,
+    ) -> Result<AgentResponse, CoreError> {
         if self.state.action_response.is_none() {
-            return Err(anyhow::anyhow!("Cannot verify before action is taken"));
+            return Err(CoreError::InvalidInput(
+                "Cannot verify before action is taken".to_string(),
+            ));
         }
 
         let action_result = self
@@ -195,7 +203,9 @@ impl<C: LLMClient + Send + Sync> AgentTask<C> {
     ///
     /// # Errors
     /// Returns an error if any phase of the task pipeline fails
-    pub async fn execute_full(&mut self) -> Result<TaskResponse> {
+    pub async fn execute_full(
+        &mut self,
+    ) -> Result<TaskResponse, CoreError> {
         // Phase 1: Gather context
         let context_response = self.gather_context().await?;
 
@@ -217,7 +227,7 @@ impl<C: LLMClient + Send + Sync> AgentTask<C> {
     ///
     /// # Errors
     /// Returns an error if any agent reset fails
-    pub async fn reset(&mut self) -> Result<()> {
+    pub async fn reset(&mut self) -> Result<(), CoreError> {
         self.context_agent.agent.reset().await?;
         self.action_agent.agent.reset().await?;
         self.verifier_agent.agent.reset().await?;

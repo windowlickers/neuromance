@@ -102,7 +102,6 @@
 //! - Zeros memory on drop to minimize exposure window
 //! - Requires explicit `expose_secret()` calls for access
 
-use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures::stream::{Stream, StreamExt};
@@ -404,6 +403,7 @@ impl OpenAIClient {
     ///
     /// ```no_run
     /// use neuromance_client::OpenAIClient;
+    /// use neuromance_client::ClientError;
     /// use neuromance_common::client::Config;
     ///
     /// let config = Config::new("openai", "gpt-4")
@@ -411,7 +411,7 @@ impl OpenAIClient {
     ///     .with_base_url("https://api.openai.com/v1");
     ///
     /// let client = OpenAIClient::new(config)?;
-    /// # Ok::<(), anyhow::Error>(())
+    /// # Ok::<(), ClientError>(())
     /// ```
     ///
     /// # Proxy Configuration
@@ -421,6 +421,7 @@ impl OpenAIClient {
     ///
     /// ```no_run
     /// use neuromance_client::OpenAIClient;
+    /// use neuromance_client::ClientError;
     /// use neuromance_common::client::{Config, ProxyConfig};
     ///
     /// let config = Config::new("openai", "gpt-4")
@@ -432,13 +433,13 @@ impl OpenAIClient {
     ///     });
     ///
     /// let client = OpenAIClient::new(config)?;
-    /// # Ok::<(), anyhow::Error>(())
+    /// # Ok::<(), ClientError>(())
     /// ```
     ///
     /// # Errors
     ///
     /// Returns an error if the API key is missing or HTTP client creation fails.
-    pub fn new(config: Config) -> Result<Self> {
+    pub fn new(config: Config) -> Result<Self, ClientError> {
         let r = build_client_resources(config, "https://api.openai.com/v1")?;
 
         Ok(Self {
@@ -637,7 +638,7 @@ impl LLMClient for OpenAIClient {
         true
     }
 
-    async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse> {
+    async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, ClientError> {
         self.validate_request(request)?;
 
         let mut openai_request = ChatCompletionRequest::from((request, self.config.as_ref()));
@@ -697,7 +698,7 @@ impl LLMClient for OpenAIClient {
     async fn chat_stream(
         &self,
         request: &ChatRequest,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatChunk>> + Send>>> {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatChunk, ClientError>> + Send>>, ClientError> {
         self.validate_request(request)?;
 
         let mut openai_request = ChatCompletionRequest::from((request, self.config.as_ref()));
@@ -766,7 +767,7 @@ impl LLMClient for OpenAIClient {
                         Err(e) => {
                             warn!("Failed to parse streaming chunk: {e}");
                             debug!("Problematic chunk data: {}", message.data);
-                            Some(Err(ClientError::SerializationError(e).into()))
+                            Some(Err(ClientError::SerializationError(e)))
                         }
                     }
                 }
@@ -779,7 +780,7 @@ impl LLMClient for OpenAIClient {
                         }
                         other_error => {
                             error!("Stream error: {other_error}");
-                            Some(Err(other_error.into()))
+                            Some(Err(other_error))
                         }
                     }
                 }

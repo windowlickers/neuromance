@@ -45,7 +45,6 @@
 //! # }
 //! ```
 
-use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
 use futures::stream::{Stream, StreamExt};
@@ -154,7 +153,7 @@ impl AnthropicClient {
     /// # Errors
     ///
     /// Returns an error if the API key is missing or HTTP client creation fails.
-    pub fn new(config: Config) -> Result<Self> {
+    pub fn new(config: Config) -> Result<Self, ClientError> {
         let r = build_client_resources(config, DEFAULT_BASE_URL)?;
 
         Ok(Self {
@@ -537,7 +536,7 @@ impl LLMClient for AnthropicClient {
         true
     }
 
-    async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse> {
+    async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, ClientError> {
         self.validate_request(request)?;
 
         let mut anthropic_request = CreateMessageRequest::from((request, self.config.as_ref()));
@@ -580,7 +579,7 @@ impl LLMClient for AnthropicClient {
     async fn chat_stream(
         &self,
         request: &ChatRequest,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatChunk>> + Send>>> {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatChunk, ClientError>> + Send>>, ClientError> {
         self.validate_request(request)?;
 
         let mut anthropic_request = CreateMessageRequest::from((request, self.config.as_ref()));
@@ -682,7 +681,7 @@ impl LLMClient for AnthropicClient {
                             Err(e) => {
                                 warn!("Failed to parse streaming event: {e}");
                                 debug!("Problematic event data: {}", message.data);
-                                Some(Err(ClientError::SerializationError(e).into()))
+                                Some(Err(ClientError::SerializationError(e)))
                             }
                         }
                     }
@@ -693,7 +692,7 @@ impl LLMClient for AnthropicClient {
                         }
                         other_error => {
                             error!("Stream error: {other_error}");
-                            Some(Err(other_error.into()))
+                            Some(Err(other_error))
                         }
                     },
                 }

@@ -23,9 +23,10 @@
 //! # }
 //! ```
 
-use anyhow::Result;
 use async_trait::async_trait;
 use secrecy::SecretString;
+
+use crate::error::ClientError;
 use serde::{Deserialize, Serialize};
 use typed_builder::TypedBuilder;
 
@@ -423,14 +424,20 @@ impl EmbeddingResponse {
 /// Extract a single embedding from a response.
 ///
 /// Used by trait default implementations.
-fn extract_single_embedding(response: &EmbeddingResponse) -> Result<Vec<f32>> {
+fn extract_single_embedding(
+    response: &EmbeddingResponse,
+) -> Result<Vec<f32>, ClientError> {
     let embedding = response.first().ok_or_else(|| {
-        anyhow::anyhow!("API returned empty response: no embeddings in data array")
+        ClientError::EmbeddingError(
+            "API returned empty response: no embeddings in data array"
+                .to_string(),
+        )
     })?;
 
     if embedding.is_empty() {
-        return Err(anyhow::anyhow!(
+        return Err(ClientError::EmbeddingError(
             "API returned malformed response: embedding vector is empty"
+                .to_string(),
         ));
     }
 
@@ -466,7 +473,7 @@ pub trait EmbeddingClient: Send + Sync {
     /// # Returns
     ///
     /// The embedding vector for the input text.
-    async fn embed(&self, text: &str) -> Result<Vec<f32>> {
+    async fn embed(&self, text: &str) -> Result<Vec<f32>, ClientError> {
         let request = EmbeddingRequest::new(text);
         let response = self.embed_request(&request).await?;
         extract_single_embedding(&response)
@@ -483,7 +490,7 @@ pub trait EmbeddingClient: Send + Sync {
     /// # Returns
     ///
     /// A vector of embedding vectors, in the same order as the inputs.
-    async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+    async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, ClientError> {
         let input: EmbeddingInput = texts.into();
         let request = EmbeddingRequest::new(input);
         let response = self.embed_request(&request).await?;
@@ -499,7 +506,7 @@ pub trait EmbeddingClient: Send + Sync {
     /// # Returns
     ///
     /// The full embedding response including metadata.
-    async fn embed_request(&self, request: &EmbeddingRequest) -> Result<EmbeddingResponse>;
+    async fn embed_request(&self, request: &EmbeddingRequest) -> Result<EmbeddingResponse, ClientError>;
 
     /// Generate an embedding for a single text input with user tracking.
     ///
@@ -509,7 +516,7 @@ pub trait EmbeddingClient: Send + Sync {
     ///
     /// * `text` - The text to embed
     /// * `user` - User identifier for tracking
-    async fn embed_with_user(&self, text: &str, user: &str) -> Result<Vec<f32>> {
+    async fn embed_with_user(&self, text: &str, user: &str) -> Result<Vec<f32>, ClientError> {
         let request = EmbeddingRequest::new(text).with_user(user);
         let response = self.embed_request(&request).await?;
         extract_single_embedding(&response)
@@ -523,7 +530,7 @@ pub trait EmbeddingClient: Send + Sync {
     ///
     /// * `texts` - The texts to embed
     /// * `user` - User identifier for tracking
-    async fn embed_batch_with_user(&self, texts: &[&str], user: &str) -> Result<Vec<Vec<f32>>> {
+    async fn embed_batch_with_user(&self, texts: &[&str], user: &str) -> Result<Vec<Vec<f32>>, ClientError> {
         let input: EmbeddingInput = texts.into();
         let request = EmbeddingRequest::new(input).with_user(user);
         let response = self.embed_request(&request).await?;

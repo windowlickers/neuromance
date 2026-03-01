@@ -2,7 +2,6 @@
 //!
 //! This module provides a client for interacting with the `OpenAI` Responses API.
 
-use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures::stream::{Stream, StreamExt};
@@ -67,7 +66,7 @@ impl ResponsesClient {
     /// # Errors
     ///
     /// Returns an error if the API key is missing or HTTP client creation fails.
-    pub fn new(config: Config) -> Result<Self> {
+    pub fn new(config: Config) -> Result<Self, ClientError> {
         let r = build_client_resources(config, DEFAULT_BASE_URL)?;
 
         Ok(Self {
@@ -183,7 +182,7 @@ impl LLMClient for ResponsesClient {
         true
     }
 
-    async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse> {
+    async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, ClientError> {
         self.validate_request(request)?;
 
         let mut responses_request = ResponsesRequest::from((request, self.config.as_ref()));
@@ -226,7 +225,7 @@ impl LLMClient for ResponsesClient {
     async fn chat_stream(
         &self,
         request: &ChatRequest,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatChunk>> + Send>>> {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatChunk, ClientError>> + Send>>, ClientError> {
         self.validate_request(request)?;
 
         let mut responses_request = ResponsesRequest::from((request, self.config.as_ref()));
@@ -297,7 +296,7 @@ impl LLMClient for ResponsesClient {
                             Err(e) => {
                                 warn!("Failed to parse streaming event: {e}");
                                 debug!("Problematic event data: {}", message.data);
-                                Some(Err(ClientError::SerializationError(e).into()))
+                                Some(Err(ClientError::SerializationError(e)))
                             }
                         }
                     }
@@ -312,12 +311,12 @@ impl LLMClient for ResponsesClient {
                                 // Extract error details from response body
                                 let error = extract_error_from_response(status, response).await;
                                 error!("API error: {error}");
-                                Some(Err(error.into()))
+                                Some(Err(error))
                             }
                             other => {
                                 let error = ClientError::EventSourceError(other);
                                 error!("Stream error: {error}");
-                                Some(Err(error.into()))
+                                Some(Err(error))
                             }
                         }
                     }
@@ -365,7 +364,7 @@ fn convert_stream_event_to_chunk(
     model: &Arc<Mutex<String>>,
     response_id: &Arc<Mutex<String>>,
     streaming_function_calls: &Arc<Mutex<HashMap<u32, StreamingFunctionCall>>>,
-) -> Option<Result<ChatChunk>> {
+) -> Option<Result<ChatChunk, ClientError>> {
     match event {
         StreamEvent::ResponseCreated { response }
         | StreamEvent::ResponseInProgress { response } => {
@@ -425,7 +424,7 @@ fn convert_stream_event_to_chunk(
                 .error
                 .map_or_else(|| "Unknown error".to_string(), |e| e.message);
             warn!("Response failed: {error_msg}");
-            Some(Err(ClientError::RequestError(error_msg).into()))
+            Some(Err(ClientError::RequestError(error_msg)))
         }
 
         StreamEvent::OutputTextDelta { delta, .. } => {
@@ -583,7 +582,7 @@ fn convert_stream_event_to_chunk(
                 "Stream error from API: {} - {}",
                 error.error_type, error.message
             );
-            Some(Err(ClientError::RequestError(error.message).into()))
+            Some(Err(ClientError::RequestError(error.message)))
         }
 
         // Events we don't need to emit chunks for

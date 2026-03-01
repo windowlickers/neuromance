@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 use neuromance::Core;
+use neuromance::error::CoreError;
 use neuromance_client::{AnthropicClient, LLMClient, OpenAIClient, ResponsesClient};
 use neuromance_common::events::{ConversationSummary, DaemonResponse};
 use neuromance_common::{Config, Conversation, Message, MessageRole, ToolApproval};
@@ -250,12 +251,13 @@ impl ConversationManager {
             ClientType::Anthropic(client) => {
                 Self::execute_chat_loop(client, messages, config).await
             }
-            ClientType::OpenAI(client) => Self::execute_chat_loop(client, messages, config).await,
+            ClientType::OpenAI(client) => {
+                Self::execute_chat_loop(client, messages, config).await
+            }
             ClientType::Responses(client) => {
                 Self::execute_chat_loop(client, messages, config).await
             }
-        }
-        .map_err(|e| DaemonError::Core(e.to_string()))?;
+        }?;
 
         debug!(
             conversation_id = %id,
@@ -300,7 +302,7 @@ impl ConversationManager {
         client: C,
         messages: Vec<Message>,
         config: ChatLoopConfig,
-    ) -> anyhow::Result<Vec<Message>>
+    ) -> std::result::Result<Vec<Message>, CoreError>
     where
         C: LLMClient + Send + Sync,
     {
@@ -484,18 +486,15 @@ impl ConversationManager {
         // Create client based on provider
         let client = match model_profile.provider.as_str() {
             "anthropic" => {
-                let client =
-                    AnthropicClient::new(config).map_err(|e| DaemonError::Client(e.to_string()))?;
+                let client = AnthropicClient::new(config)?;
                 ClientType::Anthropic(client)
             }
             "openai" => {
-                let client =
-                    OpenAIClient::new(config).map_err(|e| DaemonError::Client(e.to_string()))?;
+                let client = OpenAIClient::new(config)?;
                 ClientType::OpenAI(client)
             }
             "responses" => {
-                let client =
-                    ResponsesClient::new(config).map_err(|e| DaemonError::Client(e.to_string()))?;
+                let client = ResponsesClient::new(config)?;
                 ClientType::Responses(client)
             }
             _ => {
