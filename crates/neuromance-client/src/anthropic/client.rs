@@ -63,7 +63,8 @@ use neuromance_common::client::{ChatChunk, ChatRequest, ChatResponse, Config, Pr
 use neuromance_common::tools::{FunctionCall, ToolCall};
 
 use crate::error::ClientError;
-use crate::{LLMClient, NoRetryPolicy, add_proxy_headers, build_client_resources};
+use crate::transport::add_proxy_headers;
+use crate::{LLMClient, NoRetryPolicy, build_client_resources};
 
 use super::{
     ANTHROPIC_VERSION, ContentBlockStart, CreateMessageRequest, DEFAULT_BASE_URL, Delta,

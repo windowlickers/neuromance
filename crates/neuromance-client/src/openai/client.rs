@@ -124,7 +124,8 @@ use crate::error::{ClientError, ErrorResponse};
 use crate::openai::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, OpenAIMessage,
 };
-use crate::{LLMClient, NoRetryPolicy, add_proxy_headers, build_client_resources};
+use crate::transport::add_proxy_headers;
+use crate::{LLMClient, NoRetryPolicy, build_client_resources};
 
 /// Type-state marker types for compile-time validation.
 ///
