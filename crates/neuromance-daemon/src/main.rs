@@ -17,7 +17,7 @@ use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
 use neuromance_tools::ToolImplementation;
-use neuromance_tools::generic::{CalculatorTool, CurrentTimeTool};
+use neuromance_tools::generic::CurrentTimeTool;
 use neuromance_tools::mcp::{McpConfig, McpManager};
 
 use crate::config::{BuiltinToolsConfig, DaemonConfig, ToolsConfig};
@@ -72,9 +72,6 @@ fn collect_builtin_tools(config: &BuiltinToolsConfig) -> Vec<Arc<dyn ToolImpleme
 
     if config.current_time {
         tools.push(Arc::new(CurrentTimeTool));
-    }
-    if config.calculator {
-        tools.push(Arc::new(CalculatorTool));
     }
 
     tools

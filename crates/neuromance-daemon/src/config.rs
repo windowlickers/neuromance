@@ -212,17 +212,12 @@ pub struct BuiltinToolsConfig {
     /// Enable `get_current_time` tool (safe, read-only)
     #[serde(default = "default_true")]
     pub current_time: bool,
-
-    /// Enable calculator tool (demo-quality implementation)
-    #[serde(default)]
-    pub calculator: bool,
 }
 
 impl Default for BuiltinToolsConfig {
     fn default() -> Self {
         Self {
             current_time: true,
-            calculator: false,
         }
     }
 }
@@ -382,7 +377,6 @@ api_key_env = "OPENAI_API_KEY"
         let toml = r#"
 [builtin]
 current_time = true
-calculator = true
 
 [settings]
 max_retries = 5
@@ -398,7 +392,6 @@ auto_approve = false
 
         let config: ToolsConfig = toml::from_str(toml).unwrap();
         assert!(config.builtin.current_time);
-        assert!(config.builtin.calculator);
         assert_eq!(config.settings.max_retries, 5);
         assert_eq!(config.servers.len(), 1);
         assert_eq!(config.servers[0].id, "filesystem");
@@ -408,20 +401,6 @@ auto_approve = false
     fn test_tools_config_defaults() {
         let config: ToolsConfig = toml::from_str("").unwrap();
         assert!(config.builtin.current_time);
-        assert!(!config.builtin.calculator);
-        assert!(config.servers.is_empty());
-    }
-
-    #[test]
-    fn test_builtin_only_tools_config() {
-        let toml = r"
-[builtin]
-calculator = true
-        ";
-
-        let config: ToolsConfig = toml::from_str(toml).unwrap();
-        assert!(config.builtin.current_time);
-        assert!(config.builtin.calculator);
         assert!(config.servers.is_empty());
     }
 }
