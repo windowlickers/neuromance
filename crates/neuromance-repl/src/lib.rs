@@ -18,7 +18,7 @@
 //!
 //!     // Configure available modules
 //!     let mut config = PythonReplConfig::default();
-//!     config.python_modules.push("numpy".to_string());
+//!     config.python_modules.push("numpy".into());
 //!
 //!     let repl = PythonRepl::with_config(config)?;
 //!

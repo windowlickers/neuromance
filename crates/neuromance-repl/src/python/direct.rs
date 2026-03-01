@@ -10,6 +10,7 @@
 use crate::{ReplConfig, ReplError, ReplResult};
 use pyo3::prelude::*;
 use pyo3::types::{PyCFunction, PyDict, PyTuple};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::sync::{Arc, Mutex};
@@ -92,7 +93,7 @@ impl PythonRepl {
     /// that only allows modules from the configured allowlist.
     fn create_restricted_builtins(
         py: Python,
-        allowed_modules: &[String],
+        allowed_modules: &[Cow<'static, str>],
     ) -> Result<Py<PyDict>, ReplError> {
         let builtins = PyDict::new(py);
 
@@ -181,9 +182,10 @@ impl PythonRepl {
     /// tamper with it via `__globals__`, `__closure__`, etc.
     fn create_filtered_import(
         py: Python,
-        allowed_modules: &[String],
+        allowed_modules: &[Cow<'static, str>],
     ) -> Result<Py<PyAny>, ReplError> {
-        let allowed: HashSet<String> = allowed_modules.iter().cloned().collect();
+        let allowed: HashSet<Cow<'static, str>> =
+            allowed_modules.iter().cloned().collect();
 
         let real_import = py
             .import("builtins")?
@@ -214,12 +216,12 @@ impl PythonRepl {
     fn add_modules(
         py: Python,
         globals: &Bound<PyDict>,
-        modules: &[String],
+        modules: &[Cow<'static, str>],
     ) -> Result<(), ReplError> {
         for module_name in modules {
-            match py.import(module_name.as_str()) {
+            match py.import(module_name.as_ref()) {
                 Ok(module) => {
-                    globals.set_item(module_name.as_str(), module)?;
+                    globals.set_item(module_name.as_ref(), module)?;
                 }
                 Err(e) => {
                     log::warn!("Failed to import Python module '{module_name}': {e}");
@@ -877,7 +879,7 @@ for i in range(1, 11):
             base: ReplConfig {
                 timeout: Duration::from_secs(10),
             },
-            python_modules: vec!["math".to_string(), "json".to_string()],
+            python_modules: vec!["math".into(), "json".into()],
         };
 
         let repl = PythonRepl::with_config(config).unwrap();
@@ -944,7 +946,7 @@ for i in range(1, 11):
     #[serial]
     async fn test_python_repl_execution_time_accuracy() {
         let mut config = PythonReplConfig::default();
-        config.python_modules.push("time".to_string());
+        config.python_modules.push("time".into());
         let repl = PythonRepl::with_config(config).unwrap();
 
         // Execute code with a known sleep duration

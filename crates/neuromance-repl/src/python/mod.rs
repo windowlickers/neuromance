@@ -11,7 +11,7 @@
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let mut config = PythonReplConfig::default();
-//! config.python_modules.push("numpy".to_string());
+//! config.python_modules.push("numpy".into());
 //!
 //! let repl = PythonRepl::with_config(config)?;
 //!
@@ -26,6 +26,8 @@
 //! # Ok(())
 //! # }
 //! ```
+
+use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
 
@@ -61,7 +63,7 @@ pub struct PythonReplConfig {
     /// Python modules to import and make available globally.
     /// Standard library modules are imported if available.
     /// Third-party packages must be installed in the Python environment.
-    pub python_modules: Vec<String>,
+    pub python_modules: Vec<Cow<'static, str>>,
 }
 
 impl Default for PythonReplConfig {
@@ -69,14 +71,14 @@ impl Default for PythonReplConfig {
         Self {
             base: ReplConfig::default(),
             python_modules: vec![
-                "math".to_string(),
-                "random".to_string(),
-                "datetime".to_string(),
-                "json".to_string(),
-                "re".to_string(),
-                "itertools".to_string(),
-                "collections".to_string(),
-                "functools".to_string(),
+                Cow::Borrowed("math"),
+                Cow::Borrowed("random"),
+                Cow::Borrowed("datetime"),
+                Cow::Borrowed("json"),
+                Cow::Borrowed("re"),
+                Cow::Borrowed("itertools"),
+                Cow::Borrowed("collections"),
+                Cow::Borrowed("functools"),
             ],
         }
     }
