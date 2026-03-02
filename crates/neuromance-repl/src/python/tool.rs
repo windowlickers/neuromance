@@ -3,12 +3,13 @@
 //! This module provides a [`ToolImplementation`] for the Python REPL, allowing
 //! LLMs to execute Python code as a tool call.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use neuromance_common::tools::{Function, Tool};
+use neuromance_common::tools::{Function, Parameters, Property, Tool};
 use neuromance_tools::{ToolError, ToolImplementation};
 
 use super::PythonRepl;
@@ -54,6 +55,15 @@ impl PythonReplTool {
 #[async_trait]
 impl ToolImplementation for PythonReplTool {
     fn get_definition(&self) -> Tool {
+        let mut properties = HashMap::new();
+        properties.insert(
+            "code".to_string(),
+            Property::string(
+                "The Python code to execute. Can include multiple \
+                 statements and definitions. Use print() to see output.",
+            ),
+        );
+
         let function = Function {
             name: "execute_python".to_string(),
             description: "Execute Python code in a persistent REPL environment. \
@@ -65,24 +75,19 @@ impl ToolImplementation for PythonReplTool {
                  Expression values are NOT automatically displayed - assign to variables \
                  or print() them explicitly. Returns stdout, stderr, and execution status."
                 .to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "code": {
-                        "type": "string",
-                        "description": "The Python code to execute. Can include multiple statements and definitions. Use print() to see output."
-                    }
-                },
-                "required": ["code"]
-            }),
+            parameters: Parameters::new(properties, vec!["code".into()]).into(),
         };
 
         Tool::builder().function(function).build()
     }
 
     async fn execute(&self, args: &Value) -> Result<String, ToolError> {
-        let code = args["code"].as_str().ok_or_else(|| {
-            ToolError::InvalidArguments("Missing 'code' argument".into())
+        let obj = args
+            .as_object()
+            .ok_or_else(|| ToolError::InvalidArguments("Expected object arguments".into()))?;
+
+        let code = obj.get("code").and_then(|v| v.as_str()).ok_or_else(|| {
+            ToolError::InvalidArguments("Missing or invalid 'code' argument".into())
         })?;
 
         log::debug!("Executing Python code:\n```python\n{code}\n```");

@@ -14,9 +14,7 @@ pub(super) struct CapturedStreams<'py> {
 
 /// Redirect `sys.stdout` and `sys.stderr` to `StringIO`
 /// captures, returning the old streams.
-pub(super) fn redirect_streams(
-    py: Python<'_>,
-) -> Result<CapturedStreams<'_>, ReplError> {
+pub(super) fn redirect_streams(py: Python<'_>) -> Result<CapturedStreams<'_>, ReplError> {
     let io_module = py.import("io")?;
     let string_io = io_module.getattr("StringIO")?;
 
@@ -41,19 +39,12 @@ pub(super) fn redirect_streams(
 impl CapturedStreams<'_> {
     /// Restore `sys.stdout` / `sys.stderr` and return the
     /// captured (stdout, stderr) strings.
-    pub(super) fn restore(
-        self,
-        py: Python<'_>,
-    ) -> Result<(String, String), ReplError> {
+    pub(super) fn restore(self, py: Python<'_>) -> Result<(String, String), ReplError> {
         let sys_module = py.import("sys")?;
-        if let Err(e) =
-            sys_module.setattr("stdout", &self.old_stdout)
-        {
+        if let Err(e) = sys_module.setattr("stdout", &self.old_stdout) {
             log::warn!("failed to restore sys.stdout: {e}");
         }
-        if let Err(e) =
-            sys_module.setattr("stderr", &self.old_stderr)
-        {
+        if let Err(e) = sys_module.setattr("stderr", &self.old_stderr) {
             log::warn!("failed to restore sys.stderr: {e}");
         }
 

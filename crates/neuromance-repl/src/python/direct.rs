@@ -11,20 +11,93 @@ use crate::{ReplConfig, ReplError, ReplResult};
 use pyo3::prelude::*;
 use pyo3::types::{PyCFunction, PyDict, PyTuple};
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::ffi::CString;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use super::PythonReplConfig;
 use super::callback::{self, PythonCallback};
+use super::state::{SharedState, WithShared};
+
+/// Safe Python builtins allowed in the restricted environment.
+const SAFE_PYTHON_BUILTINS: &[&str] = &[
+    // Type constructors
+    "bool",
+    "bytes",
+    "bytearray",
+    "complex",
+    "dict",
+    "float",
+    "frozenset",
+    "int",
+    "list",
+    "set",
+    "str",
+    "tuple",
+    // Utility functions
+    "abs",
+    "all",
+    "any",
+    "bin",
+    "chr",
+    "dir",
+    "divmod",
+    "enumerate",
+    "filter",
+    "format",
+    "hex",
+    "id",
+    "isinstance",
+    "issubclass",
+    "iter",
+    "len",
+    "map",
+    "max",
+    "min",
+    "next",
+    "oct",
+    "ord",
+    "pow",
+    "print",
+    "range",
+    "repr",
+    "reversed",
+    "round",
+    "slice",
+    "sorted",
+    "sum",
+    "zip",
+    // Type checking
+    "callable",
+    "hasattr",
+    "getattr",
+    "setattr",
+    "type",
+    // Exceptions (needed for error handling)
+    "Exception",
+    "StopIteration",
+    "ValueError",
+    "TypeError",
+    "KeyError",
+    "IndexError",
+    "AttributeError",
+];
 
 /// Mutable state consolidated behind a single `Mutex`.
 struct PythonState {
     globals: Py<PyDict>,
-    locals: Py<PyDict>,
-    callbacks: HashMap<String, Arc<PythonCallback>>,
-    injected_callbacks: HashSet<String>,
+    shared: SharedState,
+}
+
+impl WithShared for PythonState {
+    fn shared(&self) -> &SharedState {
+        &self.shared
+    }
+
+    fn shared_mut(&mut self) -> &mut SharedState {
+        &mut self.shared
+    }
 }
 
 /// Python REPL environment with restricted builtins and state persistence.
@@ -81,9 +154,7 @@ impl PythonRepl {
                 config,
                 state: Arc::new(Mutex::new(PythonState {
                     globals: globals.unbind(),
-                    locals: locals.unbind(),
-                    callbacks: HashMap::new(),
-                    injected_callbacks: HashSet::new(),
+                    shared: SharedState::new(locals.unbind()),
                 })),
             })
         })
@@ -96,74 +167,9 @@ impl PythonRepl {
         allowed_modules: &[Cow<'static, str>],
     ) -> Result<Py<PyDict>, ReplError> {
         let builtins = PyDict::new(py);
-
-        // Safe built-in functions
-        let safe_builtins = [
-            // Type constructors
-            "bool",
-            "bytes",
-            "bytearray",
-            "complex",
-            "dict",
-            "float",
-            "frozenset",
-            "int",
-            "list",
-            "set",
-            "str",
-            "tuple",
-            // Utility functions
-            "abs",
-            "all",
-            "any",
-            "bin",
-            "chr",
-            "dir",
-            "divmod",
-            "enumerate",
-            "filter",
-            "format",
-            "hex",
-            "id",
-            "isinstance",
-            "issubclass",
-            "iter",
-            "len",
-            "map",
-            "max",
-            "min",
-            "next",
-            "oct",
-            "ord",
-            "pow",
-            "print",
-            "range",
-            "repr",
-            "reversed",
-            "round",
-            "slice",
-            "sorted",
-            "sum",
-            "zip",
-            // Type checking
-            "callable",
-            "hasattr",
-            "getattr",
-            "setattr",
-            "type",
-            // Exceptions (needed for error handling)
-            "Exception",
-            "StopIteration",
-            "ValueError",
-            "TypeError",
-            "KeyError",
-            "IndexError",
-            "AttributeError",
-        ];
-
         let main_builtins = py.import("builtins")?;
 
-        for name in &safe_builtins {
+        for name in SAFE_PYTHON_BUILTINS {
             if let Ok(obj) = main_builtins.getattr(*name) {
                 builtins.set_item(*name, obj)?;
             }
@@ -184,13 +190,9 @@ impl PythonRepl {
         py: Python,
         allowed_modules: &[Cow<'static, str>],
     ) -> Result<Py<PyAny>, ReplError> {
-        let allowed: HashSet<Cow<'static, str>> =
-            allowed_modules.iter().cloned().collect();
+        let allowed: HashSet<Cow<'static, str>> = allowed_modules.iter().cloned().collect();
 
-        let real_import = py
-            .import("builtins")?
-            .getattr("__import__")?
-            .unbind();
+        let real_import = py.import("builtins")?.getattr("__import__")?.unbind();
 
         let func = PyCFunction::new_closure(
             py,
@@ -247,8 +249,7 @@ impl PythonRepl {
                 e.nul_position()
             ))
         })?;
-        let exec_result =
-            py.run(c_code.as_c_str(), Some(globals), Some(locals));
+        let exec_result = py.run(c_code.as_c_str(), Some(globals), Some(locals));
 
         let (stdout, stderr) = streams.restore(py)?;
 
@@ -276,38 +277,32 @@ impl PythonRepl {
                 let start = Instant::now();
 
                 Python::attach(|py| {
-                    let s = &mut *state
-                        .lock()
-                        .map_err(|_| ReplError::StatePoisoned)?;
+                    let s = &mut *state.lock().map_err(|_| ReplError::StatePoisoned)?;
 
                     let globals_ref = s.globals.bind(py);
-                    let locals_ref = s.locals.bind(py);
+                    let locals_ref = s.shared.locals.bind(py);
 
                     callback::inject_callbacks_if_needed(
                         py,
                         globals_ref,
-                        &s.callbacks,
-                        &mut s.injected_callbacks,
+                        &s.shared.callbacks,
+                        &mut s.shared.injected_callbacks,
                     )?;
 
-                    match Self::execute_with_capture(
-                        py, &code, globals_ref, locals_ref,
-                    ) {
+                    match Self::execute_with_capture(py, &code, globals_ref, locals_ref) {
                         Ok((stdout, stderr)) => Ok(ReplResult {
                             stdout,
                             stderr,
                             success: true,
                             return_value: None,
-                            execution_time_ms: start.elapsed().as_millis()
-                                as u64,
+                            execution_time_ms: start.elapsed().as_millis() as u64,
                         }),
                         Err(e) => Ok(ReplResult {
                             stdout: String::new(),
                             stderr: e.to_string(),
                             success: false,
                             return_value: None,
-                            execution_time_ms: start.elapsed().as_millis()
-                                as u64,
+                            execution_time_ms: start.elapsed().as_millis() as u64,
                         }),
                     }
                 })
@@ -332,10 +327,9 @@ impl PythonRepl {
 
         tokio::task::spawn_blocking(move || {
             Python::attach(|py| {
-                let mut guard =
-                    state.lock().map_err(|_| ReplError::StatePoisoned)?;
-                guard.locals = PyDict::new(py).unbind();
-                guard.injected_callbacks.clear();
+                let mut guard = state.lock().map_err(|_| ReplError::StatePoisoned)?;
+                guard.shared.locals = PyDict::new(py).unbind();
+                guard.shared.injected_callbacks.clear();
                 drop(guard);
                 Ok(())
             })
@@ -360,17 +354,8 @@ impl PythonRepl {
     /// # Errors
     ///
     /// Returns `ReplError` if the state mutex is poisoned.
-    pub fn inject_function(
-        &self,
-        name: &str,
-        callback: PythonCallback,
-    ) -> Result<(), ReplError> {
-        self.state
-            .lock()
-            .map_err(|_| ReplError::StatePoisoned)?
-            .callbacks
-            .insert(name.to_string(), Arc::new(callback));
-        Ok(())
+    pub fn inject_function(&self, name: &str, callback: PythonCallback) -> Result<(), ReplError> {
+        super::inject_function(&self.state, name, callback)
     }
 
     /// Get a variable's string representation from the REPL.
@@ -378,28 +363,8 @@ impl PythonRepl {
     /// # Errors
     ///
     /// Returns `ReplError` if the variable can't be serialized.
-    pub async fn get_variable(
-        &self,
-        name: &str,
-    ) -> Result<Option<String>, ReplError> {
-        let state = Arc::clone(&self.state);
-        let name = name.to_string();
-
-        tokio::task::spawn_blocking(move || {
-            let guard =
-                state.lock().map_err(|_| ReplError::StatePoisoned)?;
-            Python::attach(|py| {
-                let locals_dict = guard.locals.bind(py);
-                match locals_dict.get_item(&name)? {
-                    Some(value) => {
-                        let str_repr = value.str()?;
-                        Ok(Some(str_repr.extract::<String>()?))
-                    }
-                    None => Ok(None),
-                }
-            })
-        })
-        .await?
+    pub async fn get_variable(&self, name: &str) -> Result<Option<String>, ReplError> {
+        super::get_variable(&self.state, name).await
     }
 
     /// Set a variable in the REPL environment.
@@ -407,29 +372,8 @@ impl PythonRepl {
     /// # Errors
     ///
     /// Returns `ReplError` if the variable can't be set.
-    pub async fn set_variable(
-        &self,
-        name: &str,
-        value: &str,
-    ) -> Result<(), ReplError> {
-        let state = Arc::clone(&self.state);
-        let name = name.to_string();
-        let value = value.to_string();
-
-        tokio::task::spawn_blocking(move || {
-            let guard =
-                state.lock().map_err(|_| ReplError::StatePoisoned)?;
-            Python::attach(|py| {
-                let locals_dict = guard.locals.bind(py);
-                let py_value = pyo3::IntoPyObject::into_pyobject(value, py)
-                    .map_err(|e| {
-                        ReplError::ExecutionError(e.to_string())
-                    })?;
-                locals_dict.set_item(&name, py_value)?;
-                Ok(())
-            })
-        })
-        .await?
+    pub async fn set_variable(&self, name: &str, value: &str) -> Result<(), ReplError> {
+        super::set_variable(&self.state, name, value).await
     }
 }
 
@@ -438,6 +382,7 @@ impl PythonRepl {
 mod tests {
     use super::*;
     use serial_test::serial;
+    use std::collections::HashMap;
     use std::time::Duration;
 
     #[tokio::test]

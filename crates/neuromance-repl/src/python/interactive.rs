@@ -10,7 +10,6 @@
 //! - Less control over execution environment
 //! - No restricted builtins
 
-use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -22,13 +21,22 @@ use crate::{ReplConfig, ReplError, ReplResult};
 use super::PythonReplConfig;
 use super::callback::{self, PythonCallback};
 use super::capture::redirect_streams;
+use super::state::{SharedState, WithShared};
 
 /// Mutable state consolidated behind a single `Mutex`.
 struct InteractivePythonState {
     console: Py<PyAny>,
-    locals: Py<PyDict>,
-    callbacks: HashMap<String, Arc<PythonCallback>>,
-    injected_callbacks: HashSet<String>,
+    shared: SharedState,
+}
+
+impl WithShared for InteractivePythonState {
+    fn shared(&self) -> &SharedState {
+        &self.shared
+    }
+
+    fn shared_mut(&mut self) -> &mut SharedState {
+        &mut self.shared
+    }
 }
 
 /// Python REPL using `InteractiveConsole` for multi-line support.
@@ -86,9 +94,7 @@ impl InteractivePythonRepl {
                 config,
                 state: Arc::new(Mutex::new(InteractivePythonState {
                     console: console.unbind(),
-                    locals: locals.unbind(),
-                    callbacks: HashMap::new(),
-                    injected_callbacks: HashSet::new(),
+                    shared: SharedState::new(locals.unbind()),
                 })),
             })
         })
@@ -106,8 +112,7 @@ impl InteractivePythonRepl {
         let line = line.to_string();
 
         tokio::task::spawn_blocking(move || {
-            let guard =
-                state.lock().map_err(|_| ReplError::StatePoisoned)?;
+            let guard = state.lock().map_err(|_| ReplError::StatePoisoned)?;
             Python::attach(|py| {
                 let console_ref = guard.console.bind(py);
 
@@ -138,17 +143,15 @@ impl InteractivePythonRepl {
                 let start = Instant::now();
 
                 Python::attach(|py| {
-                    let s = &mut *state
-                        .lock()
-                        .map_err(|_| ReplError::StatePoisoned)?;
+                    let s = &mut *state.lock().map_err(|_| ReplError::StatePoisoned)?;
 
-                    let locals_ref = s.locals.bind(py);
+                    let locals_ref = s.shared.locals.bind(py);
 
                     callback::inject_callbacks_if_needed(
                         py,
                         locals_ref,
-                        &s.callbacks,
-                        &mut s.injected_callbacks,
+                        &s.shared.callbacks,
+                        &mut s.shared.injected_callbacks,
                     )?;
 
                     let streams = redirect_streams(py)?;
@@ -157,17 +160,14 @@ impl InteractivePythonRepl {
 
                     let mut exec_error = None;
                     for line in code.lines() {
-                        if let Err(e) =
-                            console_ref.call_method1("push", (line,))
-                        {
+                        if let Err(e) = console_ref.call_method1("push", (line,)) {
                             exec_error = Some(e);
                             break;
                         }
                     }
 
                     if exec_error.is_none()
-                        && let Err(e) =
-                            console_ref.call_method1("push", ("",))
+                        && let Err(e) = console_ref.call_method1("push", ("",))
                     {
                         exec_error = Some(e);
                     }
@@ -184,8 +184,7 @@ impl InteractivePythonRepl {
                         stderr,
                         success,
                         return_value: None,
-                        execution_time_ms: start.elapsed().as_millis()
-                            as u64,
+                        execution_time_ms: start.elapsed().as_millis() as u64,
                     })
                 })
             }),
@@ -209,19 +208,16 @@ impl InteractivePythonRepl {
 
         tokio::task::spawn_blocking(move || {
             Python::attach(|py| {
-                let mut guard =
-                    state.lock().map_err(|_| ReplError::StatePoisoned)?;
+                let mut guard = state.lock().map_err(|_| ReplError::StatePoisoned)?;
 
                 let code_module = py.import("code")?;
                 let locals = PyDict::new(py);
-                let interactive_console =
-                    code_module.getattr("InteractiveConsole")?;
-                let console =
-                    interactive_console.call1((locals.clone(),))?;
+                let interactive_console = code_module.getattr("InteractiveConsole")?;
+                let console = interactive_console.call1((locals.clone(),))?;
 
                 guard.console = console.unbind();
-                guard.locals = locals.unbind();
-                guard.injected_callbacks.clear();
+                guard.shared.locals = locals.unbind();
+                guard.shared.injected_callbacks.clear();
                 drop(guard);
 
                 Ok(())
@@ -247,17 +243,8 @@ impl InteractivePythonRepl {
     /// # Errors
     ///
     /// Returns `ReplError` if the state mutex is poisoned.
-    pub fn inject_function(
-        &self,
-        name: &str,
-        callback: PythonCallback,
-    ) -> Result<(), ReplError> {
-        self.state
-            .lock()
-            .map_err(|_| ReplError::StatePoisoned)?
-            .callbacks
-            .insert(name.to_string(), Arc::new(callback));
-        Ok(())
+    pub fn inject_function(&self, name: &str, callback: PythonCallback) -> Result<(), ReplError> {
+        super::inject_function(&self.state, name, callback)
     }
 
     /// Get a variable's string representation from the REPL.
@@ -265,28 +252,8 @@ impl InteractivePythonRepl {
     /// # Errors
     ///
     /// Returns `ReplError` if the variable can't be serialized.
-    pub async fn get_variable(
-        &self,
-        name: &str,
-    ) -> Result<Option<String>, ReplError> {
-        let state = Arc::clone(&self.state);
-        let name = name.to_string();
-
-        tokio::task::spawn_blocking(move || {
-            let guard =
-                state.lock().map_err(|_| ReplError::StatePoisoned)?;
-            Python::attach(|py| {
-                let locals_dict = guard.locals.bind(py);
-                match locals_dict.get_item(&name)? {
-                    Some(value) => {
-                        let str_repr = value.str()?;
-                        Ok(Some(str_repr.extract::<String>()?))
-                    }
-                    None => Ok(None),
-                }
-            })
-        })
-        .await?
+    pub async fn get_variable(&self, name: &str) -> Result<Option<String>, ReplError> {
+        super::get_variable(&self.state, name).await
     }
 
     /// Set a variable in the REPL environment.
@@ -294,30 +261,8 @@ impl InteractivePythonRepl {
     /// # Errors
     ///
     /// Returns `ReplError` if the variable can't be set.
-    pub async fn set_variable(
-        &self,
-        name: &str,
-        value: &str,
-    ) -> Result<(), ReplError> {
-        let state = Arc::clone(&self.state);
-        let name = name.to_string();
-        let value = value.to_string();
-
-        tokio::task::spawn_blocking(move || {
-            let guard =
-                state.lock().map_err(|_| ReplError::StatePoisoned)?;
-            Python::attach(|py| {
-                let locals_dict = guard.locals.bind(py);
-                let py_value =
-                    pyo3::IntoPyObject::into_pyobject(value, py)
-                        .map_err(|e| {
-                            ReplError::ExecutionError(e.to_string())
-                        })?;
-                locals_dict.set_item(&name, py_value)?;
-                Ok(())
-            })
-        })
-        .await?
+    pub async fn set_variable(&self, name: &str, value: &str) -> Result<(), ReplError> {
+        super::set_variable(&self.state, name, value).await
     }
 }
 

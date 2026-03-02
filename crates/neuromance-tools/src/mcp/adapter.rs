@@ -132,8 +132,8 @@ impl ToolImplementation for McpToolAdapter {
     }
 
     async fn execute(&self, args: &Value) -> Result<String, ToolError> {
-        let args_str = serde_json::to_string_pretty(args)
-            .map_err(|e| ToolError::Execution(e.into()))?;
+        let args_str =
+            serde_json::to_string_pretty(args).map_err(|e| ToolError::Execution(e.into()))?;
         log::info!(
             "Executing MCP tool '{}' on server '{}' with args: {}",
             self.tool_name,

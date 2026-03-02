@@ -131,8 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root_repl = PythonRepl::new()?;
 
     // Inject the recursive llm_query starting at depth 0
-    root_repl
-        .inject_function("llm_query", make_recursive_callback(0, MAX_DEPTH))?;
+    root_repl.inject_function("llm_query", make_recursive_callback(0, MAX_DEPTH))?;
 
     println!("--- Test 1: Simple query (no recursion) ---\n");
     let result = root_repl
@@ -261,8 +260,7 @@ result = f"Depth {}: processed '{}' -> {{deeper_result}}"
         })
     }
 
-    deep_repl
-        .inject_function("llm_query", make_deeply_recursive_callback(0, MAX_DEPTH))?;
+    deep_repl.inject_function("llm_query", make_deeply_recursive_callback(0, MAX_DEPTH))?;
 
     let result = deep_repl
         .execute("final = llm_query('Start the recursion', context='initial context')")

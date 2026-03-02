@@ -258,18 +258,13 @@ impl ToolExecutor {
     /// # Errors
     /// Returns [`ToolExecutorError::UnknownTool`] if the tool is not found,
     /// or [`ToolExecutorError::Tool`] if execution fails.
-    pub async fn execute_tool(
-        &self,
-        tool_call: &ToolCall,
-    ) -> Result<String, ToolExecutorError> {
+    pub async fn execute_tool(&self, tool_call: &ToolCall) -> Result<String, ToolExecutorError> {
         let function = &tool_call.function;
 
         let tool = self
             .registry
             .get(&function.name)
-            .ok_or_else(|| {
-                ToolExecutorError::UnknownTool(function.name.clone())
-            })?;
+            .ok_or_else(|| ToolExecutorError::UnknownTool(function.name.clone()))?;
 
         let args = Self::parse_arguments(function);
 
@@ -281,8 +276,7 @@ impl ToolExecutor {
         if json == "{}" {
             Value::Object(serde_json::Map::new())
         } else {
-            serde_json::from_str(json)
-                .unwrap_or_else(|_| Value::String(json.to_owned()))
+            serde_json::from_str(json).unwrap_or_else(|_| Value::String(json.to_owned()))
         }
     }
 }

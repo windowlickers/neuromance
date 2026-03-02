@@ -90,10 +90,8 @@ pub fn inject_callbacks_if_needed(
     callbacks: &HashMap<String, Arc<PythonCallback>>,
     injected: &mut HashSet<String>,
 ) -> Result<(), ReplError> {
-    let current_names: HashSet<String> = callbacks.keys().cloned().collect();
-
-    // Remove stale entries
-    injected.retain(|name| current_names.contains(name));
+    // Remove stale entries (callbacks that were removed since last injection)
+    injected.retain(|name| callbacks.contains_key(name));
 
     for (name, callback) in callbacks {
         if injected.contains(name) {

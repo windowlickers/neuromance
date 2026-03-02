@@ -152,14 +152,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let depth = i;
                         if let Err(e) = repl.inject_function(
                             "llm_query",
-                            Box::new(
-                                move |args: Vec<String>, _kwargs: HashMap<String, String>| {
-                                    let d = depth;
-                                    Box::pin(async move {
-                                        Ok(format!("Response from depth {d}: {:?}", args))
-                                    })
-                                },
-                            ),
+                            Box::new(move |args: Vec<String>, _kwargs: HashMap<String, String>| {
+                                let d = depth;
+                                Box::pin(async move {
+                                    Ok(format!("Response from depth {d}: {:?}", args))
+                                })
+                            }),
                         ) {
                             eprintln!("\nCallback injection failed at depth {i}: {e}");
                             failed = true;

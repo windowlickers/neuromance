@@ -28,15 +28,18 @@
 //! ```
 
 use std::borrow::Cow;
+use std::sync::{Arc, Mutex};
 
+use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::ReplConfig;
+use crate::{ReplConfig, ReplError};
 
 pub mod callback;
 mod capture;
 pub mod direct;
 pub mod interactive;
+pub(crate) mod state;
 
 #[cfg(feature = "tools")]
 pub mod tool;
@@ -45,10 +48,75 @@ pub mod tool;
 pub use callback::PythonCallback;
 pub use direct::PythonRepl;
 pub use interactive::InteractivePythonRepl;
+pub(crate) use state::WithShared;
 
 // Re-export tool implementation
 #[cfg(feature = "tools")]
 pub use tool::PythonReplTool;
+
+/// Register a callback, marking it for re-injection if it replaces
+/// an existing one with the same name.
+#[allow(clippy::significant_drop_tightening)]
+pub(crate) fn inject_function<S: WithShared>(
+    state: &Arc<Mutex<S>>,
+    name: &str,
+    callback: PythonCallback,
+) -> Result<(), ReplError> {
+    let mut guard = state.lock().map_err(|_| ReplError::StatePoisoned)?;
+    let shared = guard.shared_mut();
+    shared.injected_callbacks.remove(name);
+    shared
+        .callbacks
+        .insert(name.to_string(), Arc::new(callback));
+    Ok(())
+}
+
+/// Get a variable's string representation from the locals dict.
+pub(crate) async fn get_variable<S: WithShared + Send + 'static>(
+    state: &Arc<Mutex<S>>,
+    name: &str,
+) -> Result<Option<String>, ReplError> {
+    let state = Arc::clone(state);
+    let name = name.to_string();
+
+    tokio::task::spawn_blocking(move || {
+        let guard = state.lock().map_err(|_| ReplError::StatePoisoned)?;
+        Python::attach(|py| {
+            let locals_dict = guard.shared().locals.bind(py);
+            match locals_dict.get_item(&name)? {
+                Some(value) => {
+                    let str_repr = value.str()?;
+                    Ok(Some(str_repr.extract::<String>()?))
+                }
+                None => Ok(None),
+            }
+        })
+    })
+    .await?
+}
+
+/// Set a variable in the locals dict.
+pub(crate) async fn set_variable<S: WithShared + Send + 'static>(
+    state: &Arc<Mutex<S>>,
+    name: &str,
+    value: &str,
+) -> Result<(), ReplError> {
+    let state = Arc::clone(state);
+    let name = name.to_string();
+    let value = value.to_string();
+
+    tokio::task::spawn_blocking(move || {
+        let guard = state.lock().map_err(|_| ReplError::StatePoisoned)?;
+        Python::attach(|py| {
+            let locals_dict = guard.shared().locals.bind(py);
+            let py_value = pyo3::IntoPyObject::into_pyobject(value, py)
+                .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
+            locals_dict.set_item(&name, py_value)?;
+            Ok(())
+        })
+    })
+    .await?
+}
 
 /// Python-specific REPL configuration.
 ///
