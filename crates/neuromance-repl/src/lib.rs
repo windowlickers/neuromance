@@ -148,21 +148,6 @@ impl std::fmt::Display for ReplResult {
     }
 }
 
-/// Configuration for REPL execution.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReplConfig {
-    /// Maximum execution time per code block
-    pub timeout: Duration,
-}
-
-impl Default for ReplConfig {
-    fn default() -> Self {
-        Self {
-            timeout: Duration::from_secs(30),
-        }
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -184,11 +169,5 @@ mod tests {
         let display = format!("{error}");
         assert!(display.contains("Error"));
         assert!(display.contains("SyntaxError"));
-    }
-
-    #[test]
-    fn test_repl_config_default() {
-        let config = ReplConfig::default();
-        assert_eq!(config.timeout, Duration::from_secs(30));
     }
 }

@@ -29,11 +29,12 @@
 
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::{ReplConfig, ReplError};
+use crate::ReplError;
 
 pub mod callback;
 mod capture;
@@ -118,15 +119,11 @@ pub(crate) async fn set_variable<S: WithShared + Send + 'static>(
     .await?
 }
 
-/// Python-specific REPL configuration.
-///
-/// Extends [`ReplConfig`] with Python-specific settings like
-/// which modules to pre-import into the execution environment.
+/// Python REPL configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PythonReplConfig {
-    /// Base REPL configuration (timeout, etc.)
-    #[serde(flatten)]
-    pub base: ReplConfig,
+    /// Maximum execution time per code block
+    pub timeout: Duration,
 
     /// Python modules to import and make available globally.
     /// Standard library modules are imported if available.
@@ -137,7 +134,7 @@ pub struct PythonReplConfig {
 impl Default for PythonReplConfig {
     fn default() -> Self {
         Self {
-            base: ReplConfig::default(),
+            timeout: Duration::from_secs(30),
             python_modules: vec![
                 Cow::Borrowed("math"),
                 Cow::Borrowed("random"),

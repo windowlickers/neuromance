@@ -7,7 +7,7 @@
 //! - Output capture (stdout/stderr)
 //! - Configurable module imports
 
-use crate::{ReplConfig, ReplError, ReplResult};
+use crate::{ReplError, ReplResult};
 use pyo3::prelude::*;
 use pyo3::types::{PyCFunction, PyDict, PyTuple};
 use std::borrow::Cow;
@@ -269,7 +269,7 @@ impl PythonRepl {
     pub async fn execute(&self, code: &str) -> Result<ReplResult, ReplError> {
         let code = code.to_string();
         let state = Arc::clone(&self.state);
-        let timeout = self.config.base.timeout;
+        let timeout = self.config.timeout;
 
         let result = tokio::time::timeout(
             timeout,
@@ -339,8 +339,8 @@ impl PythonRepl {
 
     /// Get the current configuration.
     #[must_use]
-    pub const fn config(&self) -> &ReplConfig {
-        &self.config.base
+    pub const fn config(&self) -> &PythonReplConfig {
+        &self.config
     }
 
     /// Get the language name.
@@ -821,9 +821,7 @@ for i in range(1, 11):
     #[serial]
     async fn test_python_repl_config() {
         let config = PythonReplConfig {
-            base: ReplConfig {
-                timeout: Duration::from_secs(10),
-            },
+            timeout: Duration::from_secs(10),
             python_modules: vec!["math".into(), "json".into()],
         };
 

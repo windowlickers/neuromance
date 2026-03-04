@@ -16,7 +16,7 @@ use std::time::Instant;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use crate::{ReplConfig, ReplError, ReplResult};
+use crate::{ReplError, ReplResult};
 
 use super::PythonReplConfig;
 use super::callback::{self, PythonCallback};
@@ -135,7 +135,7 @@ impl InteractivePythonRepl {
     pub async fn execute(&self, code: &str) -> Result<ReplResult, ReplError> {
         let code = code.to_string();
         let state = Arc::clone(&self.state);
-        let timeout = self.config.base.timeout;
+        let timeout = self.config.timeout;
 
         let result = tokio::time::timeout(
             timeout,
@@ -228,8 +228,8 @@ impl InteractivePythonRepl {
 
     /// Get the current configuration.
     #[must_use]
-    pub const fn config(&self) -> &ReplConfig {
-        &self.config.base
+    pub const fn config(&self) -> &PythonReplConfig {
+        &self.config
     }
 
     /// Get the language name.
