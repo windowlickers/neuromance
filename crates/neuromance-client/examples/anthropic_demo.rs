@@ -224,10 +224,10 @@ fn execute_tool(name: &str, arguments: &str, todos: &mut Vec<TodoItem>) -> Resul
             }
             let item = &mut todos[idx - 1];
             if item.done {
-                return Ok(format!("Todo #{idx} \"{}\" is already done.", item.title,));
+                return Ok(format!("Todo #{idx} \"{}\" is already done.", item.title));
             }
             item.done = true;
-            Ok(format!("Completed todo #{idx}: \"{}\"", item.title,))
+            Ok(format!("Completed todo #{idx}: \"{}\"", item.title))
         }
         _ => anyhow::bail!("Unknown tool: {name}"),
     }

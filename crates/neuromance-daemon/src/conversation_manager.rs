@@ -604,7 +604,7 @@ impl ConversationManager {
                     })
                     .collect();
 
-                loaded.sort_by(|a, b| b.1.updated_at.cmp(&a.1.updated_at));
+                loaded.sort_by_key(|b| std::cmp::Reverse(b.1.updated_at));
 
                 if let Some(limit) = limit {
                     loaded.truncate(limit);

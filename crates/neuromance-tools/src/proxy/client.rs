@@ -13,8 +13,8 @@ use secrecy::{ExposeSecret, SecretString};
 /// Default connection timeout (30 seconds).
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Default total request timeout (60 seconds).
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
+/// Default total request timeout (1 minute).
+const DEFAULT_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Configuration for a tokenizer proxy used by tools.
 ///
@@ -441,7 +441,7 @@ mod tests {
             sealed_token: SecretString::new("token".to_string().into()),
             target_host_header: None,
             connect_timeout: Some(Duration::from_secs(10)),
-            timeout: Some(Duration::from_secs(120)),
+            timeout: Some(Duration::from_mins(2)),
         };
 
         // Just verify it builds successfully with custom timeouts
