@@ -1,142 +1,32 @@
 //! # neuromance-agent
 //!
-//! Agent framework for autonomous task execution with LLMs.
+//! Agent framework for autonomous multi-turn task execution with LLMs.
 //!
-//! This crate provides high-level abstractions for building autonomous agents that can
-//! execute multi-step tasks, maintain state and memory, and use tools to accomplish goals.
-//! Agents wrap the lower-level [`neuromance::Core`] functionality with task management,
-//! state persistence, and sequential execution capabilities.
+//! Agents wrap [`neuromance::Core`] with state management, memory, and
+//! sequential tool-using execution.
 //!
-//! ## Core Components
+//! ## Quick Start
 //!
-//! - [`Agent`]: Trait defining the agent interface with state management and execution
-//! - [`BaseAgent`]: Default implementation with conversation history and tool support
-//! - [`AgentBuilder`]: Fluent builder for constructing agents with custom configuration
-//! - [`AgentTask`]: Task abstraction for defining agent objectives and validation
-//!
-//! ## Agent State Management
-//!
-//! Agents maintain several types of state (from [`neuromance_common::agents`]):
-//!
-//! - **Conversation History**: Full message history and responses
-//! - **Memory**: Short-term and long-term memory with working memory for active data
-//! - **Context**: Task definition, goals, constraints, and environment variables
-//! - **Statistics**: Execution metrics like token usage and tool call counts
-//!
-//! ## Example: Creating and Running an Agent
-//!
-//! ```rust,ignore
-//! use neuromance_agent::{BaseAgent, Agent};
-//! use neuromance::Core;
-//! use neuromance_client::ChatCompletionsClient;
-//! use neuromance_common::{Config, Message};
+//! ```rust,no_run
+//! use neuromance::{ChatCompletionsClient, Config};
+//! use neuromance_agent::{Agent, AgentBuilder};
 //!
 //! # async fn example() -> anyhow::Result<()> {
-//! // Create an LLM client
-//! let config = Config::new("openai", "gpt-4")
-//!     .with_api_key("sk-...");
+//! let config = Config::new("openai", "gpt-4").with_api_key("sk-...");
 //! let client = ChatCompletionsClient::new(config)?;
 //!
-//! // Build an agent
-//! let mut agent = BaseAgent::builder("research-agent", client)
-//!     .system_prompt("You are a research assistant that finds information.")
+//! let mut agent = AgentBuilder::new("research", client)
+//!     .system_prompt("You are a research assistant.")
 //!     .user_prompt("Find the population of Tokyo.")
-//!     .build();
-//!
-//! // Execute the agent
-//! let response = agent.execute(None).await?;
-//! println!("Agent response: {}", response.content.content);
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! ## Example: Using the Agent Builder
-//!
-//! The [`AgentBuilder`] provides a fluent API for agent configuration:
-//!
-//! ```rust,ignore
-//! use neuromance_agent::BaseAgent;
-//! use neuromance_client::ChatCompletionsClient;
-//! use neuromance_common::Config;
-//!
-//! # async fn example() -> anyhow::Result<()> {
-//! let config = Config::new("openai", "gpt-4o-mini");
-//! let client = ChatCompletionsClient::new(config)?;
-//!
-//! let agent = BaseAgent::builder("task-agent", client)
-//!     .system_prompt("You are a task completion agent.")
-//!     .user_prompt("Complete the following task: organize these files.")
 //!     .max_turns(5)
 //!     .auto_approve_tools(true)
 //!     .build();
+//!
+//! let response = agent.execute(None).await?;
+//! println!("{}", response.content.content);
 //! # Ok(())
 //! # }
 //! ```
-//!
-//! ## Task-Based Execution
-//!
-//! The [`task`] module provides task abstractions for defining agent objectives:
-//!
-//! ```rust,ignore
-//! use neuromance_agent::{AgentTask, BaseAgent};
-//! use neuromance_common::Message;
-//!
-//! # async fn example() -> anyhow::Result<()> {
-//! # let mut agent = unimplemented!();
-//! // Define a task with validation
-//! let task = AgentTask::new("research_task")
-//!     .with_description("Research the history of Rust programming language")
-//!     .with_validation(|response| {
-//!         // Custom validation logic
-//!         Ok(response.content.content.len() > 100)
-//!     });
-//!
-//! // Execute the task
-//! let response = task.execute(&mut agent).await?;
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! ## Agent Lifecycle
-//!
-//! Agents follow a standard lifecycle:
-//!
-//! 1. **Creation**: Built with configuration and system/user prompts
-//! 2. **Execution**: Process messages through LLM with tool support
-//! 3. **State Updates**: Maintain conversation history and statistics
-//! 4. **Reset**: Clear state for fresh execution (via [`Agent::reset`])
-//!
-//! ## Tool Integration
-//!
-//! Agents automatically integrate with [`neuromance_tools`] for tool execution.
-//! Tools can be added to the agent's [`Core`] instance and will be available
-//! during execution:
-//!
-//! ```rust,ignore
-//! use neuromance_agent::BaseAgent;
-//! use neuromance_tools::{ToolExecutor, ThinkTool};
-//!
-//! # async fn example() -> anyhow::Result<()> {
-//! # let client = unimplemented!();
-//! let mut agent = BaseAgent::new("agent-id".to_string(), Core::new(client));
-//!
-//! // Add tools to the agent's core
-//! agent.core.tool_executor.add_tool(ThinkTool);
-//!
-//! // Tools are now available during execution
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! ## Memory and Context
-//!
-//! Agents maintain structured state via [`AgentState`]:
-//!
-//! - **Memory**: Stores short-term context and long-term knowledge
-//! - **Context**: Task definition, goals, constraints, environment
-//! - **Stats**: Execution metrics for monitoring and debugging
-//!
-//! This state can be serialized for persistence or debugging.
 
 use async_trait::async_trait;
 use log::info;
@@ -145,17 +35,21 @@ use uuid::Uuid;
 use neuromance::Core;
 use neuromance::error::CoreError;
 use neuromance_client::LLMClient;
-use neuromance_common::agents::{
-    AgentContext, AgentMemory, AgentMessage, AgentResponse, AgentState, AgentStats,
-};
 use neuromance_common::chat::{Message, MessageRole};
 use neuromance_common::client::ToolChoice;
 
 pub mod builder;
 pub mod task;
 
+// --- Agent core ---
 pub use builder::AgentBuilder;
 pub use task::{AgentTask, TaskResponse, TaskState};
+
+// --- Agent state types (live in neuromance-common so they can be shared,
+//     surfaced here so agent consumers only need this crate) ---
+pub use neuromance_common::agents::{
+    AgentContext, AgentMemory, AgentMessage, AgentResponse, AgentState, AgentStats, ContextUpdate,
+};
 
 /// Base agent implementation with common functionality
 pub struct BaseAgent<C: LLMClient> {
@@ -217,10 +111,8 @@ impl<C: LLMClient + Send + Sync> Agent for BaseAgent<C> {
         info!("Agent {} executing", self.id);
         self.core.tool_choice = self.tool_choice.clone();
 
-        // Use provided messages or fall back to stored messages
         let mut messages = messages.unwrap_or_else(|| self.messages.clone());
 
-        // Validate that we have at least system and user messages
         if messages.len() < 2 {
             return Err(CoreError::InvalidInput(
                 "Agent requires at least a system message and \
@@ -243,13 +135,11 @@ impl<C: LLMClient + Send + Sync> Agent for BaseAgent<C> {
             )));
         }
 
-        // Inject agent context into the system message
         if let Some(ctx) = self.state.context_prompt() {
             messages[0].content.push_str("\n\n");
             messages[0].content.push_str(&ctx);
         }
 
-        // Snapshot Core counters before the tool loop
         let tokens_before = self.core.cache_metrics.total_input_tokens
             + self.core.cache_metrics.total_output_tokens;
         let success_before = self.core.successful_tool_calls;
@@ -257,7 +147,6 @@ impl<C: LLMClient + Send + Sync> Agent for BaseAgent<C> {
 
         let messages = self.core.chat_with_tool_loop(messages).await?;
 
-        // Update stats with deltas from this execution
         self.state.stats.total_messages += messages.len();
         let tokens_after = self.core.cache_metrics.total_input_tokens
             + self.core.cache_metrics.total_output_tokens;
@@ -269,7 +158,6 @@ impl<C: LLMClient + Send + Sync> Agent for BaseAgent<C> {
             (self.core.successful_tool_calls - success_before) as usize;
         self.state.stats.failed_tool_calls += (self.core.failed_tool_calls - fail_before) as usize;
 
-        // Extract the final assistant message and tool responses
         let content = messages
             .iter()
             .rfind(|m| m.role == MessageRole::Assistant)
@@ -290,7 +178,6 @@ impl<C: LLMClient + Send + Sync> Agent for BaseAgent<C> {
             tool_responses,
         };
 
-        // Record conversation history
         let user_content = messages
             .iter()
             .find(|m| m.role == MessageRole::User)
@@ -319,9 +206,6 @@ pub trait Agent: Send + Sync {
     fn state_mut(&mut self) -> &mut AgentState;
 
     /// Resets the agent to its initial state.
-    ///
-    /// # Returns
-    /// A result indicating success or failure of the reset operation
     async fn reset(&mut self) -> Result<(), CoreError>;
 
     /// Execute core chat with tools loop
