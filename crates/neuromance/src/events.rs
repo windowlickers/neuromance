@@ -1,18 +1,20 @@
-//! Event types for Core orchestration
+//! Event types for Core orchestration.
 //!
-//! This module defines events that Core emits during conversation execution,
-//! enabling flexible handling of streaming content, tool execution, and usage tracking.
+//! [`Core::run`](crate::Core::run) returns a [`Stream`](futures::Stream) of these events.
+//! Most are observational — deltas, tool results, usage. [`CoreEvent::ApprovalRequest`]
+//! is bi-directional: Core pauses until the consumer answers via the attached
+//! `oneshot::Sender`.
 //!
-//! ## Events vs. Tool Approval
+//! ## Approval: stream event or stored callback
 //!
-//! Events are **observability** - fire-and-forget notifications about what's happening.
-//! Tool approval is **control flow** - the system waits for a decision before proceeding.
+//! Two ways to answer tool-approval requests:
 //!
-//! This is why `ToolApprovalCallback` is separate from `EventCallback`:
-//! - Events return `()` and are non-blocking notifications
-//! - Tool approval returns `ToolApproval` and blocks execution until resolved
+//! 1. **Stream event** (default) — match [`CoreEvent::ApprovalRequest`] and
+//!    `responder.send(ToolApproval::...)`.
+//! 2. **Stored callback** — set [`Core::with_tool_approval_callback`] and Core
+//!    answers internally; [`CoreEvent::ApprovalRequest`] is never yielded.
 //!
-//! Both are async to allow I/O operations (e.g., updating shared state or prompting users).
+//! [`Core::with_tool_approval_callback`]: crate::Core::with_tool_approval_callback
 
 use std::future::Future;
 use std::pin::Pin;
@@ -21,49 +23,62 @@ use anyhow::Result;
 use neuromance_common::chat::Message;
 use neuromance_common::client::Usage;
 use neuromance_common::tools::{ToolApproval, ToolCall};
+use tokio::sync::oneshot;
 
-/// Type alias for async tool approval callback functions
-pub type ToolApprovalCallback =
-    Box<dyn Fn(&ToolCall) -> Pin<Box<dyn Future<Output = ToolApproval> + Send>> + Send + Sync>;
-
-/// Events emitted by Core during conversation execution
+/// Events emitted by [`Core::run`](crate::Core::run).
 ///
-/// These are one-way notifications for observability. Core does not wait for
-/// or react to the callback's completion beyond awaiting it.
-#[derive(Debug, Clone)]
+/// Terminal event is always [`CoreEvent::Completed`]; drain the stream until
+/// you see it to collect the final message history.
+#[derive(Debug)]
 pub enum CoreEvent {
-    /// Streaming content chunk received from LLM
-    Streaming(String),
+    /// Streaming content chunk received from the LLM.
+    Delta(String),
 
-    /// Tool execution completed with result
+    /// A tool finished executing.
     ToolResult {
-        /// Name of the tool that was executed
+        /// Name of the tool that was executed.
         name: String,
-        /// Result or error message from execution
+        /// Stringified result or error message.
         result: String,
-        /// Whether execution succeeded
+        /// Whether execution succeeded.
         success: bool,
     },
 
-    /// Token usage information from LLM response
+    /// Token usage reported by the LLM for a single turn.
     Usage(Usage),
+
+    /// The model requested a tool call that is not auto-approved.
+    ///
+    /// Answer by sending a [`ToolApproval`] on `responder`. If the sender is
+    /// dropped, Core treats it as a denial.
+    ///
+    /// Only yielded when no [`Core::with_tool_approval_callback`] is set —
+    /// otherwise Core answers internally.
+    ///
+    /// [`Core::with_tool_approval_callback`]: crate::Core::with_tool_approval_callback
+    ApprovalRequest {
+        /// The tool call awaiting approval.
+        tool_call: ToolCall,
+        /// Send a [`ToolApproval`] here to unblock execution.
+        responder: oneshot::Sender<ToolApproval>,
+    },
+
+    /// Terminal event. The conversation loop finished; payload is the full
+    /// message history including assistant and tool messages produced this run.
+    Completed(Vec<Message>),
 }
 
-/// Async callback for receiving Core events
+/// Async callback for approving tool calls.
 ///
-/// Returns `()` because events are notifications, not control flow decisions.
-/// The callback is awaited to allow async I/O operations.
-pub type EventCallback =
-    Box<dyn Fn(CoreEvent) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+/// Escape hatch for consumers who prefer stored callbacks over reacting to
+/// [`CoreEvent::ApprovalRequest`] in the stream. See module docs.
+pub type ToolApprovalCallback =
+    Box<dyn Fn(&ToolCall) -> Pin<Box<dyn Future<Output = ToolApproval> + Send>> + Send + Sync>;
 
 /// Async callback for transforming messages between turns.
 ///
-/// Unlike `EventCallback` (observational) and `ToolApprovalCallback` (control flow),
-/// this is **transformational** — it receives the full message history and returns
-/// a (potentially modified) version. Uses move semantics (`Vec<Message> -> Result<Vec<Message>>`)
-/// to avoid lifetime issues with async closures.
-///
-/// Primary use case: wiring in context compaction between tool-loop turns.
+/// Receives the full message history after tool execution and returns a
+/// (potentially modified) version. Primary use case: context compaction.
 pub type TurnCallback = Box<
     dyn Fn(Vec<Message>) -> Pin<Box<dyn Future<Output = Result<Vec<Message>>> + Send>>
         + Send

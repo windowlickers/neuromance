@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use clap::Parser;
+use futures::StreamExt;
 use log::info;
 use uuid::Uuid;
 
@@ -71,30 +72,8 @@ async fn main() -> Result<()> {
     // total amount of tool calls the LLM can make basically
     core.max_turns = Some(args.max_turns);
 
-    // set streaming enabled and setup CoreEvent callback to print chunks as they arrive
-    core = core
-        .with_streaming()
-        .with_event_callback(|event| async move {
-            match event {
-                CoreEvent::Streaming(chunk) => {
-                    print!("{chunk}");
-                    #[allow(clippy::unwrap_used)]
-                    {
-                        std::io::stdout().flush().unwrap();
-                    }
-                }
-                CoreEvent::ToolResult {
-                    name,
-                    result,
-                    success,
-                } => {
-                    info!("Tool '{name}' completed with success={success}: {result}");
-                }
-                CoreEvent::Usage(usage) => {
-                    info!("Token usage: {} total tokens", usage.total_tokens);
-                }
-            }
-        });
+    // enable streaming
+    core = core.with_streaming();
 
     // declare the time tool
     let time_tool: Arc<dyn ToolImplementation> = Arc::new(CurrentTimeTool);
@@ -121,13 +100,40 @@ async fn main() -> Result<()> {
 
     let start_time = Instant::now();
 
-    // use the core's chat_with_tool_loop for automatic tool handling
     info!("Starting streaming conversation with automatic tool execution...");
     info!("");
     println!("Assistant: ");
 
     let original_message_count = messages.len();
-    let final_messages = core.chat_with_tool_loop(messages.clone()).await?;
+    let mut final_messages: Vec<Message> = Vec::new();
+    let mut stream = Box::pin(core.run(messages.clone()));
+    while let Some(event) = stream.next().await {
+        match event? {
+            CoreEvent::Delta(chunk) => {
+                print!("{chunk}");
+                #[allow(clippy::unwrap_used)]
+                {
+                    std::io::stdout().flush().unwrap();
+                }
+            }
+            CoreEvent::ToolResult {
+                name,
+                result,
+                success,
+            } => {
+                info!("Tool '{name}' completed with success={success}: {result}");
+            }
+            CoreEvent::Usage(usage) => {
+                info!("Token usage: {} total tokens", usage.total_tokens);
+            }
+            CoreEvent::ApprovalRequest { .. } => {
+                // Auto-approve is on, so this shouldn't fire in this example.
+            }
+            CoreEvent::Completed(msgs) => {
+                final_messages = msgs;
+            }
+        }
+    }
 
     let total_duration = start_time.elapsed();
 

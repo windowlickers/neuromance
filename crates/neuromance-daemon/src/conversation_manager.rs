@@ -8,6 +8,7 @@ use std::env;
 use std::sync::Arc;
 
 use dashmap::DashMap;
+use futures::StreamExt;
 use neuromance::Core;
 use neuromance::error::CoreError;
 use neuromance_client::{AnthropicClient, ChatCompletionsClient, LLMClient, ResponsesClient};
@@ -320,45 +321,6 @@ impl ConversationManager {
             core.tool_executor.add_tool_arc(tool);
         }
 
-        core = core.with_event_callback(move |event| {
-            let tx = tx.clone();
-            let conv_id = conv_id.clone();
-            async move {
-                match event {
-                    neuromance::CoreEvent::Streaming(content) => {
-                        let _ = tx
-                            .send(DaemonResponse::StreamChunk {
-                                conversation_id: conv_id,
-                                content,
-                            })
-                            .await;
-                    }
-                    neuromance::CoreEvent::ToolResult {
-                        name,
-                        result,
-                        success,
-                    } => {
-                        let _ = tx
-                            .send(DaemonResponse::ToolResult {
-                                conversation_id: conv_id,
-                                tool_name: name,
-                                result,
-                                success,
-                            })
-                            .await;
-                    }
-                    neuromance::CoreEvent::Usage(usage) => {
-                        let _ = tx
-                            .send(DaemonResponse::Usage {
-                                conversation_id: conv_id,
-                                usage,
-                            })
-                            .await;
-                    }
-                }
-            }
-        });
-
         let conv_id_for_approval = config.conversation_id;
         let response_tx = config.response_tx;
         let pending_approvals = config.pending_approvals;
@@ -388,7 +350,49 @@ impl ConversationManager {
             }
         });
 
-        core.chat_with_tool_loop(messages).await
+        let mut stream = Box::pin(core.run(messages));
+        while let Some(event) = stream.next().await {
+            match event? {
+                neuromance::CoreEvent::Delta(content) => {
+                    let _ = tx
+                        .send(DaemonResponse::StreamChunk {
+                            conversation_id: conv_id.clone(),
+                            content,
+                        })
+                        .await;
+                }
+                neuromance::CoreEvent::ToolResult {
+                    name,
+                    result,
+                    success,
+                } => {
+                    let _ = tx
+                        .send(DaemonResponse::ToolResult {
+                            conversation_id: conv_id.clone(),
+                            tool_name: name,
+                            result,
+                            success,
+                        })
+                        .await;
+                }
+                neuromance::CoreEvent::Usage(usage) => {
+                    let _ = tx
+                        .send(DaemonResponse::Usage {
+                            conversation_id: conv_id.clone(),
+                            usage,
+                        })
+                        .await;
+                }
+                neuromance::CoreEvent::ApprovalRequest { .. } => {
+                    // Approval callback is set above, so Core answers internally
+                    // and this variant is never yielded.
+                }
+                neuromance::CoreEvent::Completed(msgs) => return Ok(msgs),
+            }
+        }
+        Err(CoreError::NoResponse(
+            "Stream ended without Completed event".to_string(),
+        ))
     }
 
     /// Drains all pending tool approvals for a conversation,

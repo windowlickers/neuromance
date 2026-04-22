@@ -3,9 +3,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
+use async_stream::try_stream;
 use chrono::Utc;
-use futures::{FutureExt, StreamExt};
-use log::{debug, info, warn};
+use futures::{Stream, StreamExt};
+use log::{debug, info};
+use tokio::sync::oneshot;
 
 use neuromance_client::LLMClient;
 use neuromance_common::CacheMetrics;
@@ -16,36 +18,30 @@ use neuromance_common::tools::{ToolApproval, ToolCall};
 use neuromance_tools::ToolExecutor;
 
 use crate::error::CoreError;
-use crate::events::{CoreEvent, EventCallback, ToolApprovalCallback, TurnCallback};
+use crate::events::{CoreEvent, ToolApprovalCallback, TurnCallback};
 
-/// Core orchestration layer for LLM conversations with tool execution
+/// Core orchestration layer for LLM conversations with tool execution.
 ///
-/// Core manages the conversation loop, including streaming, tool execution,
-/// and event emission. It uses an event-driven architecture where a single
-/// event callback receives all events (streaming, tool results, usage, etc.).
+/// [`Core::run`] returns a [`Stream`] of [`CoreEvent`]s. The stream borrows
+/// `&mut Core` for its lifetime and terminates with [`CoreEvent::Completed`].
 pub struct Core<C: LLMClient> {
     pub client: C,
-    /// Enable streaming mode for chat responses
+    /// Enable streaming mode for chat responses.
     pub streaming: bool,
     /// Total number of tool calls the LLM can make before returning to the user.
     pub max_turns: Option<u32>,
-    /// Execute all tools regardless of their `auto_approve` value
+    /// Execute all tools regardless of their `auto_approve` value.
     pub auto_approve_tools: bool,
-    /// how the model selects which tool to call, if any.
+    /// How the model selects which tool to call, if any.
     pub tool_choice: ToolChoice,
-    /// Holds tools in `ToolRegistry` and executes tools
+    /// Holds tools in `ToolRegistry` and executes tools.
     pub tool_executor: ToolExecutor,
-    /// Optional bi-directional callback for Tool approval
+    /// Optional stored callback for tool approval. When set, Core answers
+    /// approvals internally and never yields [`CoreEvent::ApprovalRequest`].
     pub tool_approval_callback: Option<ToolApprovalCallback>,
-    /// Optional event callback for all Core events
-    pub event_callback: Option<EventCallback>,
-    /// Optional turn callback for transforming messages between turns (e.g., compaction)
+    /// Optional turn callback for transforming messages between turns (e.g., compaction).
     pub turn_callback: Option<TurnCallback>,
     /// Thinking/reasoning mode configuration.
-    ///
-    /// Controls extended thinking capabilities across providers:
-    /// - **Anthropic**: Maps to `thinking.budget_tokens` and interleaved-thinking beta
-    /// - **`OpenAI`**: Maps to `max_completion_tokens` for reasoning models
     pub thinking: ThinkingMode,
     /// Aggregate cache statistics across all requests made through this Core.
     pub cache_metrics: CacheMetrics,
@@ -65,7 +61,6 @@ impl<C: LLMClient> Core<C> {
             tool_choice: ToolChoice::Auto,
             tool_executor: ToolExecutor::new(),
             tool_approval_callback: None,
-            event_callback: None,
             turn_callback: None,
             thinking: ThinkingMode::Default,
             cache_metrics: CacheMetrics::default(),
@@ -74,8 +69,11 @@ impl<C: LLMClient> Core<C> {
         }
     }
 
-    /// Set callback for tool approval decisions
-    /// Use when a tool is not auto-approved and `auto_approve_tools` is false.
+    /// Set callback for tool approval decisions.
+    ///
+    /// Escape hatch for consumers who prefer stored callbacks over reacting to
+    /// [`CoreEvent::ApprovalRequest`] in the stream. When set, Core answers
+    /// approvals internally and never yields [`CoreEvent::ApprovalRequest`].
     ///
     /// # Example
     ///
@@ -85,10 +83,8 @@ impl<C: LLMClient> Core<C> {
     /// # let client: ChatCompletionsClient = unimplemented!();
     /// let core = Core::new(client)
     ///     .with_tool_approval_callback(|tool_call| {
-    ///         // Clone to move into async block (avoids lifetime issues)
     ///         let tool_call = tool_call.clone();
     ///         async move {
-    ///             // Could prompt user, check policy, etc.
     ///             println!("Tool requested: {}", tool_call.function.name);
     ///             ToolApproval::Approved
     ///         }
@@ -105,61 +101,7 @@ impl<C: LLMClient> Core<C> {
         self
     }
 
-    /// Callback for all `CoreEvents`
-    /// This callback receives notifications about streaming content, tool execution
-    /// results, and token usage.
-    ///
-    /// # Events
-    /// - [`CoreEvent::Streaming`] - Content chunks as they arrive from the LLM
-    /// - [`CoreEvent::ToolResult`] - Results from tool execution (success or failure)
-    /// - [`CoreEvent::Usage`] - Token usage information from LLM responses
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// # use neuromance::{Core, CoreEvent};
-    /// # use neuromance_client::chat_completions::ChatCompletionsClient;
-    /// # let client: ChatCompletionsClient = unimplemented!();
-    /// let core = Core::new(client)
-    ///     .with_event_callback(|event| async move {
-    ///         match event {
-    ///             CoreEvent::Streaming(chunk) => print!("{}", chunk),
-    ///             CoreEvent::ToolResult { name, result, success } => {
-    ///                 println!("Tool '{}' completed: {}", name, result);
-    ///             }
-    ///             CoreEvent::Usage(usage) => {
-    ///                 println!("Tokens used: {}", usage.total_tokens);
-    ///             }
-    ///         }
-    ///     });
-    /// ```
-    #[must_use]
-    pub fn with_event_callback<F, Fut>(mut self, callback: F) -> Self
-    where
-        F: Fn(CoreEvent) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
-    {
-        self.event_callback = Some(Box::new(move |event| Box::pin(callback(event))));
-        self
-    }
-
     /// Set callback for transforming messages between turns.
-    ///
-    /// The callback receives the full message history after tool execution and returns
-    /// a (potentially modified) version. This enables use cases like context compaction.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// # use neuromance::Core;
-    /// # use neuromance_client::chat_completions::ChatCompletionsClient;
-    /// # let client: ChatCompletionsClient = unimplemented!();
-    /// let core = Core::new(client)
-    ///     .with_turn_callback(|messages| async move {
-    ///         // Could compact, filter, or transform messages here
-    ///         Ok(messages)
-    ///     });
-    /// ```
     #[must_use]
     pub fn with_turn_callback<F, Fut>(mut self, callback: F) -> Self
     where
@@ -170,18 +112,14 @@ impl<C: LLMClient> Core<C> {
         self
     }
 
-    /// Enable streaming mode
+    /// Enable streaming mode.
     #[must_use]
     pub const fn with_streaming(mut self) -> Self {
         self.streaming = true;
         self
     }
 
-    /// Set extended thinking budget (Anthropic Claude models)
-    ///
-    /// When set, enables Claude's extended thinking capability with the specified
-    /// token budget for reasoning. The model will use up to this many tokens for
-    /// internal reasoning before responding.
+    /// Set extended thinking budget (Anthropic Claude models).
     #[must_use]
     pub const fn with_thinking_budget(mut self, budget: u32) -> Self {
         self.thinking = ThinkingMode::Extended {
@@ -191,11 +129,6 @@ impl<C: LLMClient> Core<C> {
     }
 
     /// Enable interleaved thinking between tool calls with the given budget.
-    ///
-    /// When enabled, the model can think between tool calls, allowing more sophisticated
-    /// reasoning after receiving tool results.
-    /// - **Anthropic**: Enables the interleaved-thinking beta feature
-    /// - **`OpenAI`**: Falls back to extended thinking behavior (not directly supported)
     #[must_use]
     pub const fn with_interleaved_thinking(mut self, budget: u32) -> Self {
         self.thinking = ThinkingMode::Interleaved {
@@ -205,43 +138,15 @@ impl<C: LLMClient> Core<C> {
     }
 
     /// Set the thinking mode directly.
-    ///
-    /// This is the most flexible way to configure extended thinking capabilities.
-    /// See [`ThinkingMode`] for available options.
     #[must_use]
     pub const fn with_thinking_mode(mut self, mode: ThinkingMode) -> Self {
         self.thinking = mode;
         self
     }
 
-    /// Emit an event, catching any panics from the callback
-    async fn emit_event(&self, event: CoreEvent) {
-        if let Some(ref callback) = self.event_callback {
-            // Use catch_unwind to prevent callback panics from propagating
-            match std::panic::AssertUnwindSafe(callback(event.clone()))
-                .catch_unwind()
-                .await
-            {
-                Ok(()) => {}
-                Err(e) => {
-                    // Log the panic but continue execution
-                    let panic_msg = e.downcast_ref::<&str>().map_or_else(
-                        || {
-                            e.downcast_ref::<String>()
-                                .map_or_else(|| "Unknown panic".to_string(), String::clone)
-                        },
-                        |s| (*s).to_string(),
-                    );
-                    warn!("Event callback panicked while processing {event:?}: {panic_msg}");
-                }
-            }
-        }
-    }
-
-    /// Send a chat request with retry logic for transient failures
+    /// Send a chat request with retry logic for transient failures.
     async fn chat_with_retry(&self, request: &ChatRequest) -> Result<ChatResponse, CoreError> {
         let mut last_error = None;
-
         let config = self.client.config();
 
         for attempt in 0..=config.retry_config.max_retries {
@@ -271,309 +176,321 @@ impl<C: LLMClient> Core<C> {
         ))
     }
 
-    /// Send a streaming chat request and accumulate the response
-    async fn chat_stream_accumulated(
-        &self,
-        request: &ChatRequest,
-    ) -> Result<ChatResponse, CoreError> {
-        let mut stream = self.client.chat_stream(request).await?;
-
-        // Pre-allocate capacity for typical streaming responses
-        // Average LLM response is ~200-500 chars, allocate for 1KB to reduce reallocations
-        let mut accumulated_content = String::with_capacity(1024);
-        let mut response_metadata = None;
-        let mut role = None;
-        // Most responses have 0-3 tool calls, pre-allocate for 4 to avoid most reallocations
-        let mut tool_calls: Vec<ToolCall> = Vec::with_capacity(4);
-        let mut finish_reason = None;
-        // Accumulate usage across chunks (Anthropic splits input/output
-        // tokens across message_start and message_delta events)
-        let mut accumulated_usage: Option<neuromance_common::Usage> = None;
-
-        while let Some(chunk_result) = stream.next().await {
-            let chunk = chunk_result?;
-
-            // Accumulate content and emit event if callback present
-            if let Some(ref content) = chunk.delta_content {
-                accumulated_content.push_str(content);
-                self.emit_event(CoreEvent::Streaming(content.clone())).await;
-            }
-
-            // Capture role from first chunk
-            if role.is_none() {
-                role = chunk.delta_role;
-            }
-
-            // Merge tool call deltas
-            if let Some(ref delta_tool_calls) = chunk.delta_tool_calls {
-                debug!("Received {} tool call delta(s)", delta_tool_calls.len());
-                tool_calls = ToolCall::merge_deltas(tool_calls, delta_tool_calls);
-            }
-
-            // Capture finish reason
-            if chunk.finish_reason.is_some() {
-                finish_reason = chunk.finish_reason;
-            }
-
-            // Merge usage: take the max of each field across chunks so
-            // input tokens (from message_start) and output tokens (from
-            // message_delta) are both preserved.
-            if let Some(ref chunk_usage) = chunk.usage {
-                accumulated_usage = Some(match accumulated_usage {
-                    None => chunk_usage.clone(),
-                    Some(mut acc) => {
-                        acc.prompt_tokens = acc.prompt_tokens.max(chunk_usage.prompt_tokens);
-                        acc.completion_tokens =
-                            acc.completion_tokens.max(chunk_usage.completion_tokens);
-                        acc.total_tokens = acc.prompt_tokens + acc.completion_tokens;
-                        if acc.input_tokens_details.is_none() {
-                            acc.input_tokens_details
-                                .clone_from(&chunk_usage.input_tokens_details);
-                        }
-                        if acc.output_tokens_details.is_none() {
-                            acc.output_tokens_details
-                                .clone_from(&chunk_usage.output_tokens_details);
-                        }
-                        acc
-                    }
-                });
-            }
-
-            // Store metadata from last chunk
-            response_metadata = Some(chunk);
-        }
-
-        // Get the conversation_id from the first message in the request
-        let conversation_id = request
-            .messages
-            .first()
-            .ok_or_else(|| {
-                CoreError::NoResponse("Request must contain at least one message".to_string())
-            })?
-            .conversation_id;
-
-        // Construct the final response
-        let last_chunk = response_metadata
-            .ok_or_else(|| CoreError::NoResponse("Stream ended without any chunks".to_string()))?;
-
-        let message = Message {
-            id: uuid::Uuid::new_v4(),
-            conversation_id,
-            role: role.unwrap_or(MessageRole::Assistant),
-            content: accumulated_content,
-            tool_calls: tool_calls.into_iter().collect(),
-            tool_call_id: None,
-            name: None,
-            timestamp: Utc::now(),
-            metadata: last_chunk.metadata,
-            reasoning: None,
-        };
-
-        Ok(ChatResponse {
-            message,
-            model: last_chunk.model,
-            usage: accumulated_usage,
-            finish_reason,
-            created_at: last_chunk.created_at,
-            response_id: last_chunk.response_id,
-            metadata: std::collections::HashMap::new(),
-        })
-    }
-
-    /// Internal method to handle the chat loop with tool execution
+    /// Run the conversation loop as a stream of [`CoreEvent`]s.
     ///
-    /// # Errors
-    /// Returns an error if the chat request fails or tool execution fails.
+    /// The stream borrows `&mut self` and ends with [`CoreEvent::Completed`]
+    /// carrying the final message history. Errors surface inline as `Err`
+    /// items and terminate the stream.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use neuromance::{Core, CoreEvent, Message};
+    /// # use neuromance_client::chat_completions::ChatCompletionsClient;
+    /// # use futures::StreamExt;
+    /// # async fn example(mut core: Core<ChatCompletionsClient>, messages: Vec<Message>)
+    /// #     -> Result<Vec<Message>, neuromance::CoreError> {
+    /// let mut stream = Box::pin(core.run(messages));
+    /// while let Some(event) = stream.next().await {
+    ///     match event? {
+    ///         CoreEvent::Delta(chunk)      => print!("{chunk}"),
+    ///         CoreEvent::Completed(msgs)   => return Ok(msgs),
+    ///         _ => {}
+    ///     }
+    /// }
+    /// # unreachable!()
+    /// # }
+    /// ```
     #[allow(clippy::too_many_lines)]
-    pub async fn chat_with_tool_loop(
+    pub fn run(
         &mut self,
-        mut messages: Vec<Message>,
-    ) -> Result<Vec<Message>, CoreError> {
-        let mut turn_count = 0;
-        let start_time = Instant::now();
-        let mut messages_arc: Arc<[Message]> = messages.clone().into();
+        messages: Vec<Message>,
+    ) -> impl Stream<Item = Result<CoreEvent, CoreError>> + Send + '_ {
+        try_stream! {
+            let mut messages = messages;
+            let mut turn_count: u32 = 0;
+            let start_time = Instant::now();
+            let mut messages_arc: Arc<[Message]> = messages.clone().into();
 
-        loop {
-            // Create chat request
-            let mut request = ChatRequest::from((self.client.config(), messages_arc.clone()))
-                .with_tools(self.tool_executor.get_all_tools())
-                .with_tool_choice(self.tool_choice.clone());
+            loop {
+                let mut request = ChatRequest::from((self.client.config(), messages_arc.clone()))
+                    .with_tools(self.tool_executor.get_all_tools())
+                    .with_tool_choice(self.tool_choice.clone());
+                request = request.with_thinking_mode(self.thinking);
 
-            // Apply thinking configuration if set
-            request = request.with_thinking_mode(self.thinking);
-
-            info!(
-                "Executing chat turn ({}/{})",
-                turn_count + 1,
-                self.max_turns
-                    .map_or_else(|| "unlimited".to_string(), |max| max.to_string()),
-            );
-            debug!(
-                "Chat request:\n {}",
-                serde_json::to_string_pretty(&request)?
-            );
-
-            // Send to LLM with retry logic or streaming
-            let response = if self.streaming {
-                self.chat_stream_accumulated(&request).await?
-            } else {
-                self.chat_with_retry(&request).await?
-            };
-
-            debug!("Received response from LLM");
-            debug!(
-                "Assistant Response:\n {}",
-                serde_json::to_string_pretty(&response)?
-            );
-
-            // Emit usage event and record cache metrics
-            if let Some(ref usage) = response.usage {
-                self.emit_event(CoreEvent::Usage(usage.clone())).await;
-                self.cache_metrics.record(usage);
-            }
-
-            // Extract data we need before consuming the message
-            let conversation_id = response.message.conversation_id;
-            let tool_calls = response.message.tool_calls.clone();
-            let tool_calls_count = tool_calls.len();
-
-            // Add assistant message to history
-            messages.push(response.message);
-
-            // NOTE: this is an exit condition
-            // Check if tools were called,
-            if tool_calls.is_empty() {
-                let duration = start_time.elapsed();
-                debug!(
-                    "No tool calls in response, chat completed in {} turns ({:.2?})",
+                info!(
+                    "Executing chat turn ({}/{})",
                     turn_count + 1,
-                    duration
+                    self.max_turns
+                        .map_or_else(|| "unlimited".to_string(), |max| max.to_string()),
                 );
-                // Exit condition: No tools called, return all messages
-                return Ok(messages);
-            }
+                if log::log_enabled!(log::Level::Debug) {
+                    let pretty = serde_json::to_string_pretty(&request)?;
+                    debug!("Chat request:\n {pretty}");
+                }
 
-            // Execute tool calls
-            for tool_call in &tool_calls {
-                let tool_name = &tool_call.function.name;
-                let call_id = &tool_call.id;
+                let response = if self.streaming {
+                    let mut inner = self.client.chat_stream(&request).await?;
+                    let mut accumulated_content = String::with_capacity(1024);
+                    let mut response_metadata = None;
+                    let mut role = None;
+                    let mut tool_calls: Vec<ToolCall> = Vec::with_capacity(4);
+                    let mut finish_reason = None;
+                    let mut accumulated_usage: Option<neuromance_common::Usage> = None;
 
-                debug!("Tool Name: {tool_name} (id: {call_id})");
-                debug!("Tool Arguments: {:?}", tool_call.function.arguments);
+                    while let Some(chunk_result) = inner.next().await {
+                        let chunk = chunk_result?;
 
-                // Check if tool is auto-approved
-                let is_auto_approved =
-                    self.auto_approve_tools || self.tool_executor.is_tool_auto_approved(tool_name);
-                debug!("Tool auto-approved: {is_auto_approved}");
+                        if let Some(ref content) = chunk.delta_content {
+                            accumulated_content.push_str(content);
+                            yield CoreEvent::Delta(content.clone());
+                        }
 
-                let approval = if is_auto_approved {
-                    ToolApproval::Approved
-                } else if let Some(ref callback) = self.tool_approval_callback {
-                    callback(tool_call).await
+                        if role.is_none() {
+                            role = chunk.delta_role;
+                        }
+
+                        if let Some(ref delta_tool_calls) = chunk.delta_tool_calls {
+                            debug!("Received {} tool call delta(s)", delta_tool_calls.len());
+                            tool_calls = ToolCall::merge_deltas(tool_calls, delta_tool_calls);
+                        }
+
+                        if chunk.finish_reason.is_some() {
+                            finish_reason = chunk.finish_reason;
+                        }
+
+                        if let Some(ref chunk_usage) = chunk.usage {
+                            accumulated_usage = Some(match accumulated_usage {
+                                None => chunk_usage.clone(),
+                                Some(mut acc) => {
+                                    acc.prompt_tokens =
+                                        acc.prompt_tokens.max(chunk_usage.prompt_tokens);
+                                    acc.completion_tokens =
+                                        acc.completion_tokens.max(chunk_usage.completion_tokens);
+                                    acc.total_tokens = acc.prompt_tokens + acc.completion_tokens;
+                                    if acc.input_tokens_details.is_none() {
+                                        acc.input_tokens_details
+                                            .clone_from(&chunk_usage.input_tokens_details);
+                                    }
+                                    if acc.output_tokens_details.is_none() {
+                                        acc.output_tokens_details
+                                            .clone_from(&chunk_usage.output_tokens_details);
+                                    }
+                                    acc
+                                }
+                            });
+                        }
+
+                        response_metadata = Some(chunk);
+                    }
+
+                    let conversation_id = request
+                        .messages
+                        .first()
+                        .ok_or_else(|| {
+                            CoreError::NoResponse(
+                                "Request must contain at least one message".to_string(),
+                            )
+                        })?
+                        .conversation_id;
+
+                    let last_chunk = response_metadata.ok_or_else(|| {
+                        CoreError::NoResponse("Stream ended without any chunks".to_string())
+                    })?;
+
+                    let message = Message {
+                        id: uuid::Uuid::new_v4(),
+                        conversation_id,
+                        role: role.unwrap_or(MessageRole::Assistant),
+                        content: accumulated_content,
+                        tool_calls: tool_calls.into_iter().collect(),
+                        tool_call_id: None,
+                        name: None,
+                        timestamp: Utc::now(),
+                        metadata: last_chunk.metadata,
+                        reasoning: None,
+                    };
+
+                    ChatResponse {
+                        message,
+                        model: last_chunk.model,
+                        usage: accumulated_usage,
+                        finish_reason,
+                        created_at: last_chunk.created_at,
+                        response_id: last_chunk.response_id,
+                        metadata: std::collections::HashMap::new(),
+                    }
                 } else {
-                    // No callback provided and not auto-approved, deny by default
-                    ToolApproval::Denied("No approval mechanism configured".to_string())
+                    self.chat_with_retry(&request).await?
                 };
 
-                debug!("Tool Approval Status: {approval:?}");
+                debug!("Received response from LLM");
+                if log::log_enabled!(log::Level::Debug) {
+                    let pretty = serde_json::to_string_pretty(&response)?;
+                    debug!("Assistant Response:\n {pretty}");
+                }
 
-                match approval {
-                    ToolApproval::Approved => {
-                        debug!("Executing tool: {tool_name}");
-                        // Execute the tool
-                        match self.tool_executor.execute_tool(tool_call).await {
-                            Ok(result) => {
-                                debug!("Tool {tool_name} executed successfully");
-                                debug!("Tool result: {result}");
-                                self.successful_tool_calls += 1;
+                if let Some(ref usage) = response.usage {
+                    yield CoreEvent::Usage(usage.clone());
+                    self.cache_metrics.record(usage);
+                }
 
-                                // Emit tool result event
-                                self.emit_event(CoreEvent::ToolResult {
-                                    name: tool_name.clone(),
-                                    result: result.clone(),
-                                    success: true,
-                                })
-                                .await;
+                let conversation_id = response.message.conversation_id;
+                let tool_calls = response.message.tool_calls.clone();
+                let tool_calls_count = tool_calls.len();
+                messages.push(response.message);
 
-                                // Add tool result as a message
-                                let tool_message = Message::tool(
-                                    conversation_id,
-                                    result,
-                                    tool_call.id.clone(),
-                                    tool_call.function.name.clone(),
-                                )
-                                .map_err(|e| CoreError::ToolError(e.to_string()))?;
-                                messages.push(tool_message);
-                            }
-                            Err(e) => {
-                                debug!("Tool {tool_name} execution failed: {e}");
-                                self.failed_tool_calls += 1;
-                                let error_msg = format!("Tool execution failed: {e}");
+                if tool_calls.is_empty() {
+                    let duration = start_time.elapsed();
+                    debug!(
+                        "No tool calls in response, chat completed in {} turns ({:.2?})",
+                        turn_count + 1,
+                        duration
+                    );
+                    yield CoreEvent::Completed(messages);
+                    return;
+                }
 
-                                // Emit tool result event
-                                self.emit_event(CoreEvent::ToolResult {
-                                    name: tool_name.clone(),
-                                    result: error_msg.clone(),
-                                    success: false,
-                                })
-                                .await;
+                for tool_call in &tool_calls {
+                    let tool_name = &tool_call.function.name;
+                    let call_id = &tool_call.id;
+                    debug!("Tool Name: {tool_name} (id: {call_id})");
+                    debug!("Tool Arguments: {:?}", tool_call.function.arguments);
 
-                                // Add error as tool message
-                                let error_message = Message::tool(
-                                    conversation_id,
-                                    error_msg,
-                                    tool_call.id.clone(),
-                                    tool_call.function.name.clone(),
-                                )
-                                .map_err(|e| CoreError::ToolError(e.to_string()))?;
-                                messages.push(error_message);
+                    let is_auto_approved = self.auto_approve_tools
+                        || self.tool_executor.is_tool_auto_approved(tool_name);
+                    debug!("Tool auto-approved: {is_auto_approved}");
+
+                    let approval = if is_auto_approved {
+                        ToolApproval::Approved
+                    } else if let Some(ref callback) = self.tool_approval_callback {
+                        callback(tool_call).await
+                    } else {
+                        let (tx, rx) = oneshot::channel();
+                        yield CoreEvent::ApprovalRequest {
+                            tool_call: tool_call.clone(),
+                            responder: tx,
+                        };
+                        rx.await.unwrap_or_else(|_| {
+                            ToolApproval::Denied("Approval responder dropped".to_string())
+                        })
+                    };
+
+                    debug!("Tool Approval Status: {approval:?}");
+
+                    match approval {
+                        ToolApproval::Approved => {
+                            debug!("Executing tool: {tool_name}");
+                            match self.tool_executor.execute_tool(tool_call).await {
+                                Ok(result) => {
+                                    debug!("Tool {tool_name} executed successfully");
+                                    self.successful_tool_calls += 1;
+                                    yield CoreEvent::ToolResult {
+                                        name: tool_name.clone(),
+                                        result: result.clone(),
+                                        success: true,
+                                    };
+                                    let tool_message = Message::tool(
+                                        conversation_id,
+                                        result,
+                                        tool_call.id.clone(),
+                                        tool_call.function.name.clone(),
+                                    )
+                                    .map_err(|e| CoreError::ToolError(e.to_string()))?;
+                                    messages.push(tool_message);
+                                }
+                                Err(e) => {
+                                    debug!("Tool {tool_name} execution failed: {e}");
+                                    self.failed_tool_calls += 1;
+                                    let error_msg = format!("Tool execution failed: {e}");
+                                    yield CoreEvent::ToolResult {
+                                        name: tool_name.clone(),
+                                        result: error_msg.clone(),
+                                        success: false,
+                                    };
+                                    let error_message = Message::tool(
+                                        conversation_id,
+                                        error_msg,
+                                        tool_call.id.clone(),
+                                        tool_call.function.name.clone(),
+                                    )
+                                    .map_err(|e| CoreError::ToolError(e.to_string()))?;
+                                    messages.push(error_message);
+                                }
                             }
                         }
-                    }
-                    ToolApproval::Denied(reason) => {
-                        debug!("Tool {tool_name} denied: {reason}");
-                        let denial_message = Message::tool(
-                            conversation_id,
-                            format!("Tool execution denied: {reason}"),
-                            tool_call.id.clone(),
-                            tool_call.function.name.clone(),
-                        )
-                        .map_err(|e| CoreError::ToolError(e.to_string()))?;
-                        messages.push(denial_message);
-                    }
-                    ToolApproval::Quit => {
-                        debug!("User quit during tool approval");
-                        return Err(CoreError::UserQuit(
-                            "User quit during tool approval".to_string(),
-                        ));
+                        ToolApproval::Denied(reason) => {
+                            debug!("Tool {tool_name} denied: {reason}");
+                            let denial_message = Message::tool(
+                                conversation_id,
+                                format!("Tool execution denied: {reason}"),
+                                tool_call.id.clone(),
+                                tool_call.function.name.clone(),
+                            )
+                            .map_err(|e| CoreError::ToolError(e.to_string()))?;
+                            messages.push(denial_message);
+                        }
+                        ToolApproval::Quit => {
+                            debug!("User quit during tool approval");
+                            Err(CoreError::UserQuit(
+                                "User quit during tool approval".to_string(),
+                            ))?;
+                        }
                     }
                 }
-            }
 
-            debug!("Completed processing {tool_calls_count} tool calls, continuing conversation");
+                debug!("Completed processing {tool_calls_count} tool calls, continuing");
 
-            // Invoke turn callback (e.g., for context compaction)
-            if let Some(ref callback) = self.turn_callback {
-                messages = callback(messages)
-                    .await
-                    .map_err(|e| CoreError::TurnCallback(e.into()))?;
-            }
+                if let Some(ref callback) = self.turn_callback {
+                    messages = callback(messages)
+                        .await
+                        .map_err(|e| CoreError::TurnCallback(e.into()))?;
+                }
 
-            // Update Arc with new messages after tool execution
-            messages_arc = messages.clone().into();
+                messages_arc = messages.clone().into();
+                turn_count += 1;
 
-            // Increment turn count after processing tool calls
-            turn_count += 1;
-
-            // Check if we've exceeded max turns
-            if let Some(max) = self.max_turns
-                && turn_count >= max
-            {
-                return Err(CoreError::MaxTurnsExceeded(format!(
-                    "Exceeded maximum turns: {turn_count} (configured max: {max})"
-                )));
+                if let Some(max) = self.max_turns
+                    && turn_count >= max
+                {
+                    Err(CoreError::MaxTurnsExceeded(format!(
+                        "Exceeded maximum turns: {turn_count} (configured max: {max})"
+                    )))?;
+                }
             }
         }
+    }
+
+    /// Convenience wrapper around [`Core::run`] that drains the stream and
+    /// returns the final message history.
+    ///
+    /// When no [`Core::with_tool_approval_callback`] is set and a non-auto-approved
+    /// tool is requested, the yielded [`CoreEvent::ApprovalRequest`] is answered
+    /// with `Denied("No approval mechanism configured")`.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error produced by [`Core::run`]; also returns
+    /// [`CoreError::NoResponse`] if the stream ends without [`CoreEvent::Completed`].
+    pub async fn chat_with_tool_loop(
+        &mut self,
+        messages: Vec<Message>,
+    ) -> Result<Vec<Message>, CoreError> {
+        let mut stream = Box::pin(self.run(messages));
+        while let Some(event) = stream.next().await {
+            match event? {
+                CoreEvent::Completed(msgs) => return Ok(msgs),
+                CoreEvent::ApprovalRequest { responder, .. } => {
+                    let _ = responder.send(ToolApproval::Denied(
+                        "No approval mechanism configured".into(),
+                    ));
+                }
+                CoreEvent::Delta(_) | CoreEvent::ToolResult { .. } | CoreEvent::Usage(_) => {}
+            }
+        }
+        Err(CoreError::NoResponse(
+            "Stream ended without Completed event".to_string(),
+        ))
     }
 }
 
@@ -586,38 +503,7 @@ mod tests {
     use neuromance_client::chat_completions::ChatCompletionsClient;
     use neuromance_common::client::Config;
 
-    /// Test that event callbacks handle panics gracefully
-    #[tokio::test]
-    async fn test_event_callback_panic_handling() {
-        let config = Config::new("test", "test-model").with_api_key("test-key");
-        let client = ChatCompletionsClient::new(config).expect("Failed to create client");
-
-        let counter = Arc::new(tokio::sync::Mutex::new(0));
-        let counter_clone = Arc::clone(&counter);
-
-        let core = Core::new(client).with_event_callback(move |event| {
-            let counter = Arc::clone(&counter_clone);
-            async move {
-                let mut count = counter.lock().await;
-                *count += 1;
-                assert!(*count != 2, "Intentional panic in event callback");
-                drop(count);
-                drop(event);
-            }
-        });
-
-        core.emit_event(CoreEvent::Streaming("test1".to_string()))
-            .await;
-        core.emit_event(CoreEvent::Streaming("test2".to_string()))
-            .await;
-        core.emit_event(CoreEvent::Streaming("test3".to_string()))
-            .await;
-
-        let final_count = *counter.lock().await;
-        assert_eq!(final_count, 3);
-    }
-
-    /// Test that tool approval callback is registered and can deny tools
+    /// `with_tool_approval_callback` stores the callback.
     #[tokio::test]
     async fn test_tool_approval_callback() {
         let config = Config::new("test", "test-model").with_api_key("test-key");
@@ -637,60 +523,18 @@ mod tests {
         assert!(core.tool_approval_callback.is_some());
     }
 
-    /// Test Core without callbacks
+    /// Core without any callbacks builds cleanly.
     #[tokio::test]
     async fn test_core_without_callbacks() {
         let config = Config::new("test", "test-model").with_api_key("test-key");
         let client = ChatCompletionsClient::new(config).expect("Failed to create client");
         let core = Core::new(client);
 
-        assert!(core.event_callback.is_none());
         assert!(core.tool_approval_callback.is_none());
         assert!(core.turn_callback.is_none());
-
-        // Should not panic
-        core.emit_event(CoreEvent::Streaming("test".to_string()))
-            .await;
     }
 
-    /// Test multiple event types
-    #[tokio::test]
-    async fn test_multiple_event_types() {
-        let config = Config::new("test", "test-model").with_api_key("test-key");
-        let client = ChatCompletionsClient::new(config).expect("Failed to create client");
-
-        let events = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-        let events_clone = Arc::clone(&events);
-
-        let core = Core::new(client).with_event_callback(move |event| {
-            let events = Arc::clone(&events_clone);
-            async move {
-                let event_type = match event {
-                    CoreEvent::Streaming(_) => "streaming",
-                    CoreEvent::ToolResult { .. } => "tool",
-                    CoreEvent::Usage(_) => "usage",
-                };
-                events.lock().await.push(event_type);
-            }
-        });
-
-        core.emit_event(CoreEvent::Streaming("chunk".to_string()))
-            .await;
-        core.emit_event(CoreEvent::ToolResult {
-            name: "test".to_string(),
-            result: "ok".to_string(),
-            success: true,
-        })
-        .await;
-
-        let captured = events.lock().await;
-        assert_eq!(captured.len(), 2);
-        assert_eq!(captured[0], "streaming");
-        assert_eq!(captured[1], "tool");
-        drop(captured);
-    }
-
-    /// Test that turn callback builder sets the callback
+    /// `with_turn_callback` stores the callback.
     #[tokio::test]
     async fn test_core_with_turn_callback() {
         let config = Config::new("test", "test-model").with_api_key("test-key");
@@ -701,14 +545,13 @@ mod tests {
         assert!(core.turn_callback.is_some());
     }
 
-    /// Test that turn callback can transform messages
+    /// Turn callback can transform messages.
     #[tokio::test]
     async fn test_turn_callback_transforms_messages() {
         let config = Config::new("test", "test-model").with_api_key("test-key");
         let client = ChatCompletionsClient::new(config).expect("Failed to create client");
 
         let core = Core::new(client).with_turn_callback(|mut messages| async move {
-            // Append a marker message to prove the callback ran
             let conv_id = messages
                 .first()
                 .map_or_else(uuid::Uuid::new_v4, |m| m.conversation_id);
@@ -716,7 +559,6 @@ mod tests {
             Ok(messages)
         });
 
-        // Invoke the callback directly to verify transformation
         let conv_id = uuid::Uuid::new_v4();
         let input = vec![Message::user(conv_id, "hello")];
         let output = (core.turn_callback.unwrap())(input).await.unwrap();
@@ -725,7 +567,7 @@ mod tests {
         assert_eq!(output[1].content, "[compacted]");
     }
 
-    /// Test that errors from turn callback propagate correctly
+    /// Errors from turn callback propagate as `anyhow::Error`.
     #[tokio::test]
     async fn test_turn_callback_error_propagation() {
         let config = Config::new("test", "test-model").with_api_key("test-key");

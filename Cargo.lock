@@ -1454,6 +1454,7 @@ name = "neuromance"
 version = "0.0.6"
 dependencies = [
  "anyhow",
+ "async-stream",
  "chrono",
  "clap",
  "colored",

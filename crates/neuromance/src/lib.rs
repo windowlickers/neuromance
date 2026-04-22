@@ -5,19 +5,23 @@
 //! ## Quick Start
 //!
 //! ```rust,no_run
-//! use neuromance::{ChatCompletionsClient, Config, Core, CoreEvent};
+//! use futures::StreamExt;
+//! use neuromance::{ChatCompletionsClient, Config, Core, CoreEvent, Message};
 //!
 //! # async fn example() -> anyhow::Result<()> {
 //! let config = Config::new("openai", "gpt-4").with_api_key("sk-...");
 //! let client = ChatCompletionsClient::new(config)?;
+//! let mut core = Core::new(client).with_streaming();
 //!
-//! let core = Core::new(client)
-//!     .with_streaming()
-//!     .with_event_callback(|event| async move {
-//!         if let CoreEvent::Streaming(chunk) = event {
-//!             print!("{chunk}");
-//!         }
-//!     });
+//! let messages: Vec<Message> = vec![/* ... */];
+//! let mut stream = Box::pin(core.run(messages));
+//! while let Some(event) = stream.next().await {
+//!     match event? {
+//!         CoreEvent::Delta(chunk)    => print!("{chunk}"),
+//!         CoreEvent::Completed(_)    => break,
+//!         _ => {}
+//!     }
+//! }
 //! # Ok(())
 //! # }
 //! ```
