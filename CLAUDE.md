@@ -47,7 +47,7 @@ Neuromance is a Rust library for LLM orchestration, organized as a Cargo workspa
 
 - **neuromance-common**: Foundational types shared across all crates. Defines `Conversation`, `Message`, `ChatRequest`, `ChatResponse`, `Tool`, `ToolCall`, `Config`, and cross-provider abstractions like `ThinkingMode` and `ReasoningLevel`.
 
-- **neuromance-client**: LLM provider clients implementing the `LLMClient` trait. Includes `OpenAIClient` and `AnthropicClient` with streaming, tool calling, and retry support.
+- **neuromance-client**: LLM provider clients implementing the `LLMClient` trait. Includes `ChatCompletionsClient` (for `OpenAI` and any compatible provider), `ResponsesClient` (`OpenAI` Responses API), and `AnthropicClient`, all with streaming, tool calling, and retry support.
 
 - **neuromance-tools**: Tool execution framework. Defines `ToolImplementation` trait for custom tools, `ToolRegistry` for registration, and `ToolExecutor` for execution. Includes MCP (Model Context Protocol) client for connecting to external tool servers.
 

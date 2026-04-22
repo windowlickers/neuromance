@@ -28,14 +28,14 @@
 //! ```rust,ignore
 //! use neuromance_agent::{BaseAgent, Agent};
 //! use neuromance::Core;
-//! use neuromance_client::OpenAIClient;
+//! use neuromance_client::ChatCompletionsClient;
 //! use neuromance_common::{Config, Message};
 //!
 //! # async fn example() -> anyhow::Result<()> {
 //! // Create an LLM client
 //! let config = Config::new("openai", "gpt-4")
 //!     .with_api_key("sk-...");
-//! let client = OpenAIClient::new(config)?;
+//! let client = ChatCompletionsClient::new(config)?;
 //!
 //! // Build an agent
 //! let mut agent = BaseAgent::builder("research-agent", client)
@@ -56,12 +56,12 @@
 //!
 //! ```rust,ignore
 //! use neuromance_agent::BaseAgent;
-//! use neuromance_client::OpenAIClient;
+//! use neuromance_client::ChatCompletionsClient;
 //! use neuromance_common::Config;
 //!
 //! # async fn example() -> anyhow::Result<()> {
 //! let config = Config::new("openai", "gpt-4o-mini");
-//! let client = OpenAIClient::new(config)?;
+//! let client = ChatCompletionsClient::new(config)?;
 //!
 //! let agent = BaseAgent::builder("task-agent", client)
 //!     .system_prompt("You are a task completion agent.")

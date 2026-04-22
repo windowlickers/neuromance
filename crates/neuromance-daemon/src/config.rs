@@ -15,7 +15,7 @@
 //!
 //! [[models]]
 //! nickname = "gpt4"
-//! provider = "openai"
+//! provider = "chat_completions"
 //! model = "gpt-4o"
 //! api_key_env = "OPENAI_API_KEY"
 //!
@@ -272,7 +272,7 @@ api_key_env = "ANTHROPIC_API_KEY"
 
 [[models]]
 nickname = "gpt4"
-provider = "openai"
+provider = "chat_completions"
 model = "gpt-4o"
 api_key_env = "OPENAI_API_KEY"
 
@@ -312,7 +312,7 @@ active_model = "nonexistent"
 
 [[models]]
 nickname = "gpt4"
-provider = "openai"
+provider = "chat_completions"
 model = "gpt-4o"
 api_key_env = "OPENAI_API_KEY"
         "#;
@@ -328,7 +328,7 @@ active_model = "gpt4"
 
 [[models]]
 nickname = "gpt4"
-provider = "openai"
+provider = "chat_completions"
 model = "gpt-4o"
 api_key_env = "OPENAI_API_KEY"
 
@@ -350,7 +350,7 @@ active_model = "gpt4"
 
 [[models]]
 nickname = "gpt4"
-provider = "openai"
+provider = "chat_completions"
 model = "gpt-4o"
 api_key_env = "OPENAI_API_KEY"
         "#;

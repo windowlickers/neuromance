@@ -6,7 +6,7 @@ use log::info;
 use uuid::Uuid;
 
 use neuromance_agent::{Agent, BaseAgent};
-use neuromance_client::openai::client::OpenAIClient;
+use neuromance_client::chat_completions::client::ChatCompletionsClient;
 use neuromance_common::chat::Message;
 use neuromance_common::client::Config;
 use neuromance_tools::generic::CurrentTimeTool;
@@ -47,7 +47,7 @@ async fn main() -> Result<()> {
 
     // Agent 1: Pirate (using builder)
     info!(" --- Agent 1: Pirate ---");
-    let client1 = OpenAIClient::new(config.clone())?;
+    let client1 = ChatCompletionsClient::new(config.clone())?;
 
     let mut pirate_agent = BaseAgent::builder("pirate", client1)
         .add_tool(CurrentTimeTool)
@@ -65,7 +65,7 @@ async fn main() -> Result<()> {
 
     // Agent 2: Vampire (using builder)
     info!(" --- Agent 2: Vampire ---");
-    let client2 = OpenAIClient::new(config.clone())?;
+    let client2 = ChatCompletionsClient::new(config.clone())?;
 
     let mut vampire_agent = BaseAgent::builder("vampire", client2)
         .add_tool(CurrentTimeTool)
@@ -86,7 +86,7 @@ async fn main() -> Result<()> {
 
     // Agent 3: Summarizer (using builder)
     info!(" --- Agent 3: Summarizer ---");
-    let client3 = OpenAIClient::new(config.clone())?;
+    let client3 = ChatCompletionsClient::new(config.clone())?;
 
     let mut summarizer_agent = BaseAgent::builder("summarizer", client3)
         .max_turns(3)

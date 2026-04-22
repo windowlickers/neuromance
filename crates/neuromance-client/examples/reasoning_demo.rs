@@ -15,8 +15,8 @@ use clap::Parser;
 use futures::StreamExt;
 use uuid::Uuid;
 
+use neuromance_client::ChatCompletionsClient;
 use neuromance_client::LLMClient;
-use neuromance_client::OpenAIClient;
 use neuromance_common::{ChatRequest, Config, Message, ReasoningLevel};
 
 #[derive(Parser, Debug)]
@@ -82,8 +82,7 @@ async fn main() -> Result<()> {
         .with_base_url(&args.base_url)
         .with_api_key(&args.api_key);
 
-    // Create OpenAI client
-    let client = OpenAIClient::new(config.clone())?;
+    let client = ChatCompletionsClient::new(config.clone())?;
 
     // Create the chat request with reasoning parameters
     let conversation_id = Uuid::new_v4();

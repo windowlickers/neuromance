@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Different providers implement thinking differently:
 /// - **Anthropic**: Extended thinking with token budget, interleaved thinking between tool calls
-/// - **`OpenAI`**: Reasoning effort levels (o1, o3 models), `max_completion_tokens`
+/// - **Chat Completions**: Reasoning effort levels (o1, o3 models), `max_completion_tokens`
 /// - **Other providers**: May use temperature/sampling adjustments
 ///
 /// # Examples
@@ -36,7 +36,7 @@ pub enum ThinkingMode {
     /// Extended thinking with a token budget.
     ///
     /// - **Anthropic**: Maps to `thinking.budget_tokens`
-    /// - **`OpenAI`**: Maps to `max_completion_tokens` (for reasoning models)
+    /// - **Chat Completions**: Maps to `max_completion_tokens` (for reasoning models)
     Extended {
         /// Maximum tokens the model can use for thinking/reasoning.
         /// Anthropic minimum is 1024 tokens.
@@ -49,7 +49,7 @@ pub enum ThinkingMode {
     /// enabling more sophisticated multi-step reasoning.
     ///
     /// - **Anthropic**: Enables the interleaved-thinking beta feature
-    /// - **`OpenAI`**: Falls back to `Extended` behavior (not directly supported)
+    /// - **Chat Completions**: Falls back to `Extended` behavior (not directly supported)
     Interleaved {
         /// Maximum tokens the model can use for thinking/reasoning.
         budget_tokens: u32,
@@ -100,7 +100,7 @@ impl ThinkingMode {
 /// Reasoning effort level for models that support it.
 ///
 /// This is an abstraction over provider-specific reasoning controls:
-/// - **`OpenAI`**: Direct mapping to the `reasoning_effort` parameter (o1, o3 models)
+/// - **Chat Completions**: Direct mapping to the `reasoning_effort` parameter (o1, o3 models)
 /// - **Anthropic**: Can influence thinking budget selection heuristics
 ///
 /// # Examples

@@ -9,8 +9,8 @@
 //!
 //! ```rust,no_run
 //! use neuromance::{Conversation, Message, Core, CoreEvent, ToolApproval};
-//! # use neuromance::OpenAIClient;
-//! # let client: OpenAIClient = unimplemented!();
+//! # use neuromance::ChatCompletionsClient;
+//! # let client: ChatCompletionsClient = unimplemented!();
 //!
 //! // Create a conversation
 //! let mut conversation = Conversation::new().with_title("My Chat");

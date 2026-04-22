@@ -1,14 +1,14 @@
 //! Benchmarks for streaming response processing.
 //!
 //! These benchmarks measure the performance of deserializing and processing
-//! `OpenAI` streaming chunks, which is a hot path in real-time streaming.
+//! Chat Completions streaming chunks, which is a hot path in real-time streaming.
 
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use serde_json::json;
 
-use neuromance_client::openai::ChatCompletionChunk;
+use neuromance_client::chat_completions::ChatCompletionChunk;
 
 /// Create a typical streaming chunk with text content
 fn create_content_chunk_json() -> serde_json::Value {
@@ -166,7 +166,7 @@ fn bench_streaming_sequence(c: &mut Criterion) {
 /// Benchmark the chunk conversion function (hot path in streaming)
 #[allow(clippy::unwrap_used)]
 fn bench_convert_chunk(c: &mut Criterion) {
-    use neuromance_client::openai::convert_chunk_to_chat_chunk;
+    use neuromance_client::chat_completions::convert_chunk_to_chat_chunk;
 
     let content_chunk_json = create_content_chunk_json();
     let content_chunk: ChatCompletionChunk = serde_json::from_value(content_chunk_json).unwrap();

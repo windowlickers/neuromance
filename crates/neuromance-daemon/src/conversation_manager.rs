@@ -10,7 +10,7 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use neuromance::Core;
 use neuromance::error::CoreError;
-use neuromance_client::{AnthropicClient, LLMClient, OpenAIClient, ResponsesClient};
+use neuromance_client::{AnthropicClient, ChatCompletionsClient, LLMClient, ResponsesClient};
 use neuromance_common::events::{ConversationSummary, DaemonResponse};
 use neuromance_common::{Config, Conversation, Message, MessageRole, Provider, ToolApproval};
 use neuromance_tools::ToolImplementation;
@@ -29,7 +29,7 @@ use crate::storage::Storage;
 #[derive(Clone)]
 pub enum ClientType {
     Anthropic(AnthropicClient),
-    OpenAI(OpenAIClient),
+    ChatCompletions(ChatCompletionsClient),
     Responses(ResponsesClient),
 }
 
@@ -251,7 +251,9 @@ impl ConversationManager {
             ClientType::Anthropic(client) => {
                 Self::execute_chat_loop(client, messages, config).await
             }
-            ClientType::OpenAI(client) => Self::execute_chat_loop(client, messages, config).await,
+            ClientType::ChatCompletions(client) => {
+                Self::execute_chat_loop(client, messages, config).await
+            }
             ClientType::Responses(client) => {
                 Self::execute_chat_loop(client, messages, config).await
             }
@@ -487,9 +489,9 @@ impl ConversationManager {
                 let client = AnthropicClient::new(config)?;
                 ClientType::Anthropic(client)
             }
-            Provider::OpenAI => {
-                let client = OpenAIClient::new(config)?;
-                ClientType::OpenAI(client)
+            Provider::ChatCompletions => {
+                let client = ChatCompletionsClient::new(config)?;
+                ClientType::ChatCompletions(client)
             }
             Provider::Responses => {
                 let client = ResponsesClient::new(config)?;
@@ -889,7 +891,7 @@ api_key_env = "ANTHROPIC_API_KEY"
 
 [[models]]
 nickname = "other-model"
-provider = "openai"
+provider = "chat_completions"
 model = "gpt-4o"
 api_key_env = "OPENAI_API_KEY"
         "#;

@@ -1,6 +1,6 @@
-//! `OpenAI` Chat Completions API Demo
+//! Chat Completions API Demo
 //!
-//! This example demonstrates using the `OpenAI` client (Chat Completions API)
+//! This example demonstrates using the Chat Completions client
 //! with tool calling and a multi-turn conversation loop. Compatible with
 //! `OpenAI` and any provider exposing a `/chat/completions` endpoint.
 //!
@@ -8,16 +8,16 @@
 //!
 //! ```bash
 //! # With OpenAI
-//! cargo run --example openai_demo -- \
+//! cargo run --example chat_completions_demo -- \
 //!     --api-key sk-... --model gpt-5-mini-2025-08-07
 //!
 //! # With a local server
-//! cargo run --example openai_demo -- \
+//! cargo run --example chat_completions_demo -- \
 //!     --base-url http://localhost:8080/v1 \
 //!     --model my-model
 //!
 //! # With a custom prompt
-//! cargo run --example openai_demo -- \
+//! cargo run --example chat_completions_demo -- \
 //!     --message "Add a todo to water the plants"
 //! ```
 
@@ -28,13 +28,13 @@ use clap::Parser;
 use serde::Deserialize;
 use uuid::Uuid;
 
-use neuromance_client::{LLMClient, OpenAIClient};
+use neuromance_client::{ChatCompletionsClient, LLMClient};
 use neuromance_common::{
     ChatRequest, Config, Function, Message, Parameters, Property, Tool, ToolChoice,
 };
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "OpenAI Chat Completions API Demo")]
+#[command(author, version, about = "Chat Completions API Demo")]
 struct Args {
     /// Base URL for the API endpoint
     #[arg(long, default_value = "http://localhost:8080/v1")]
@@ -231,8 +231,8 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    println!("OpenAI Chat Completions Demo");
-    println!("============================");
+    println!("Chat Completions Demo");
+    println!("=====================");
     println!("Base URL: {}", args.base_url);
     println!("Model: {}", args.model);
     println!();
@@ -245,7 +245,7 @@ async fn main() -> Result<()> {
         config = config.with_temperature(temp);
     }
 
-    let client = OpenAIClient::new(config)?;
+    let client = ChatCompletionsClient::new(config)?;
 
     let conversation_id = Uuid::new_v4();
     let mut messages = vec![

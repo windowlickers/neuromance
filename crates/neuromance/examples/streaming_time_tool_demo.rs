@@ -8,7 +8,7 @@ use log::info;
 use uuid::Uuid;
 
 use neuromance::{Core, CoreEvent};
-use neuromance_client::openai::client::OpenAIClient;
+use neuromance_client::chat_completions::client::ChatCompletionsClient;
 use neuromance_common::chat::{Message, MessageRole};
 use neuromance_common::client::Config;
 use neuromance_tools::ToolImplementation;
@@ -62,8 +62,7 @@ async fn main() -> Result<()> {
         .with_base_url(&args.base_url)
         .with_api_key(&args.api_key);
 
-    // Create OpenAI client
-    let client = OpenAIClient::new(config.clone())?;
+    let client = ChatCompletionsClient::new(config.clone())?;
 
     // Create mutable Core instance
     let mut core = Core::new(client);

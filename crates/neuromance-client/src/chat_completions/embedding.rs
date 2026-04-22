@@ -9,7 +9,7 @@
 //!
 //! ```no_run
 //! use neuromance_client::embedding::{EmbeddingClient, EmbeddingConfig};
-//! use neuromance_client::openai::OpenAIEmbedding;
+//! use neuromance_client::chat_completions::OpenAIEmbedding;
 //!
 //! # async fn example() -> anyhow::Result<()> {
 //! let config = EmbeddingConfig::openai_small("sk-...");

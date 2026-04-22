@@ -3,7 +3,7 @@
 //! Client library for interacting with LLM inference providers.
 //!
 //! Provides a unified `LLMClient` trait for various LLM providers. Currently supports
-//! OpenAI-compatible APIs with tool/function calling and streaming.
+//! Chat Completions-compatible APIs with tool/function calling and streaming.
 
 // ClientError contains EventSourceError (~176 bytes), but this is acceptable
 // for network-bound code where HTTP latency dwarfs any stack size concerns.
@@ -24,18 +24,18 @@ use neuromance_common::{ChatRequest, ChatResponse, Config};
 use secrecy::SecretString;
 
 pub mod anthropic;
+pub mod chat_completions;
 pub mod embedding;
 mod error;
-pub mod openai;
 pub mod responses;
 pub(crate) mod transport;
 
 pub use anthropic::AnthropicClient;
+pub use chat_completions::{ChatCompletionsClient, OpenAIEmbedding};
 pub use embedding::{
     EmbeddingClient, EmbeddingConfig, EmbeddingInput, EmbeddingRequest, EmbeddingResponse,
 };
 pub use error::ClientError;
-pub use openai::{OpenAIClient, OpenAIEmbedding};
 pub use responses::ResponsesClient;
 
 /// Shared resources produced by client constructor logic.

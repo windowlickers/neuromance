@@ -91,7 +91,7 @@ impl ReasoningContent {
 
 /// Represents the role of a message sender in a conversation.
 ///
-/// Roles are serialized to lowercase strings matching the `OpenAI` API format.
+/// Roles are serialized to lowercase strings matching the Chat Completions API format.
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub enum MessageRole {

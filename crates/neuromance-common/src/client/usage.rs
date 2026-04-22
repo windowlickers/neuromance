@@ -44,7 +44,7 @@ pub struct InputTokensDetails {
     /// Number of tokens served from cache rather than processed fresh.
     ///
     /// Cached tokens are typically cheaper and faster to process.
-    /// For `OpenAI`: automatic prefix caching.
+    /// For Chat Completions: automatic prefix caching.
     /// For Anthropic: prompt caching (`cache_read_input_tokens`).
     #[serde(default)]
     pub cached_tokens: u32,

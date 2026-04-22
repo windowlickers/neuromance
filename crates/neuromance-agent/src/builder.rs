@@ -14,12 +14,12 @@ use crate::BaseAgent;
 /// # Example
 /// ```rust,no_run
 /// # use neuromance_agent::AgentBuilder;
-/// # use neuromance_client::openai::client::OpenAIClient;
+/// # use neuromance_client::chat_completions::client::ChatCompletionsClient;
 /// # use neuromance_common::client::Config;
 /// # use neuromance_tools::generic::CurrentTimeTool;
 /// # fn example() -> anyhow::Result<()> {
 /// let config = Config::new("openai", "gpt-4");
-/// let client = OpenAIClient::new(config)?;
+/// let client = ChatCompletionsClient::new(config)?;
 ///
 /// let agent = AgentBuilder::new("my-agent", client)
 ///     .system_prompt("You are a helpful assistant")

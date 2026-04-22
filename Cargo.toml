@@ -24,7 +24,7 @@ repository = "https://github.com/windowlickers/neuromance"
 homepage = "https://github.com/windowlickers/neuromance"
 documentation = "https://docs.rs/neuromance"
 readme = "README.md"
-keywords = ["llm", "openai", "orchestration"]
+keywords = ["llm", "orchestration"]
 categories = ["api-bindings", "asynchronous", "web-programming"]
 
 [workspace.dependencies]

@@ -1,10 +1,10 @@
-//! OpenAI-compatible client implementation.
+//! Chat Completions client implementation.
 //!
-//! This module provides a client for interacting with `OpenAI` and OpenAI-compatible APIs.
+//! This module provides a client for any API that implements the Chat Completions specification.
 //!
 //! # Features
 //!
-//! - **Chat Completions**: Implementation of the Chat completions API
+//! - **Chat Completions**: Implementation of the Chat Completions API
 //! - **Tool/Function Calling**: Support for function calling and tool use
 //! - **Automatic Retries**: Configurable exponential backoff with jitter for transient failures
 //! - **Secure API Keys**: Uses the `secrecy` crate to prevent accidental exposure
@@ -14,7 +14,7 @@
 //! ## Basic Chat Completion
 //!
 //! ```no_run
-//! use neuromance_client::{OpenAIClient, LLMClient};
+//! use neuromance_client::{ChatCompletionsClient, LLMClient};
 //! use neuromance_common::client::{Config, ChatRequest};
 //! use neuromance_common::chat::Conversation;
 //!
@@ -24,7 +24,7 @@
 //!     .with_api_key("sk-...")
 //!     .with_base_url("https://api.openai.com/v1");
 //!
-//! let client = OpenAIClient::new(config)?;
+//! let client = ChatCompletionsClient::new(config)?;
 //!
 //! // Create a conversation and add messages
 //! let mut conversation = Conversation::new()
@@ -50,7 +50,7 @@
 //! ## Using Custom Retry Configuration
 //!
 //! ```no_run
-//! use neuromance_client::OpenAIClient;
+//! use neuromance_client::ChatCompletionsClient;
 //! use neuromance_common::client::{Config, RetryConfig};
 //! use std::time::Duration;
 //!
@@ -67,22 +67,22 @@
 //!     .with_api_key("sk-...")
 //!     .with_retry_config(retry_config);
 //!
-//! let client = OpenAIClient::new(config)?;
+//! let client = ChatCompletionsClient::new(config)?;
 //! # Ok(())
 //! # }
 //! ```
 //!
 //! ## Message Builder Pattern
 //!
-//! The module provides a type-safe builder for constructing `OpenAI` messages:
+//! The module provides a type-safe builder for constructing Chat Completions messages:
 //!
 //! ```
-//! use neuromance_client::openai::OpenAIMessage;
+//! use neuromance_client::chat_completions::ChatCompletionsMessage;
 //! use neuromance_common::chat::MessageRole;
 //!
-//! let message = OpenAIMessage::builder()
+//! let message = ChatCompletionsMessage::builder()
 //!     .role(MessageRole::User)
-//!     .content(Some("Hello, GPT!".to_string()))
+//!     .content(Some("Hello!".to_string()))
 //!     .build();
 //! ```
 //!
@@ -120,10 +120,10 @@ use neuromance_common::chat::Message;
 use neuromance_common::client::{ChatChunk, ChatRequest, ChatResponse, Config, ProxyConfig, Usage};
 use neuromance_common::tools::{FunctionCall, ToolCall};
 
-use crate::error::{ClientError, ErrorResponse};
-use crate::openai::{
-    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, OpenAIMessage,
+use crate::chat_completions::{
+    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatCompletionsMessage,
 };
+use crate::error::{ClientError, ErrorResponse};
 use crate::transport::add_proxy_headers;
 use crate::{LLMClient, NoRetryPolicy, build_client_resources};
 
@@ -138,7 +138,7 @@ mod builder_states {
     pub struct HasRole;
 }
 
-/// Builder for constructing `OpenAI` messages with compile-time validation.
+/// Builder for constructing Chat Completions messages with compile-time validation.
 ///
 /// Uses the type-state pattern to ensure messages are built correctly:
 /// - Messages must have a role set before being built
@@ -147,25 +147,25 @@ mod builder_states {
 /// # Examples
 ///
 /// ```
-/// use neuromance_client::openai::OpenAIMessage;
+/// use neuromance_client::chat_completions::ChatCompletionsMessage;
 /// use neuromance_common::chat::MessageRole;
 ///
 /// // Valid: role is set
-/// let message = OpenAIMessage::builder()
+/// let message = ChatCompletionsMessage::builder()
 ///     .role(MessageRole::User)
 ///     .content(Some("Hello".to_string()))
 ///     .build();
 /// ```
-pub struct OpenAIMessageBuilder<State> {
+pub struct ChatCompletionsMessageBuilder<State> {
     _state: PhantomData<State>,
     role: Option<neuromance_common::chat::MessageRole>,
     content: Option<String>,
     name: Option<String>,
-    tool_calls: Option<SmallVec<[crate::openai::OpenAIToolCall; 2]>>,
+    tool_calls: Option<SmallVec<[crate::chat_completions::ChatCompletionsToolCall; 2]>>,
     tool_call_id: Option<String>,
 }
 
-impl OpenAIMessageBuilder<builder_states::NoRole> {
+impl ChatCompletionsMessageBuilder<builder_states::NoRole> {
     /// Creates a new message builder in the initial state.
     ///
     /// The builder starts in `NoRole` state and requires calling `role()`
@@ -194,8 +194,8 @@ impl OpenAIMessageBuilder<builder_states::NoRole> {
     pub fn role(
         self,
         role: neuromance_common::chat::MessageRole,
-    ) -> OpenAIMessageBuilder<builder_states::HasRole> {
-        OpenAIMessageBuilder {
+    ) -> ChatCompletionsMessageBuilder<builder_states::HasRole> {
+        ChatCompletionsMessageBuilder {
             _state: PhantomData,
             role: Some(role),
             content: self.content,
@@ -206,7 +206,7 @@ impl OpenAIMessageBuilder<builder_states::NoRole> {
     }
 }
 
-impl OpenAIMessageBuilder<builder_states::HasRole> {
+impl ChatCompletionsMessageBuilder<builder_states::HasRole> {
     /// Sets the message content.
     ///
     /// # Arguments
@@ -237,7 +237,10 @@ impl OpenAIMessageBuilder<builder_states::HasRole> {
     ///
     /// * `tool_calls` - Vector of tool calls to execute
     #[must_use]
-    pub fn tool_calls(mut self, tool_calls: SmallVec<[crate::openai::OpenAIToolCall; 2]>) -> Self {
+    pub fn tool_calls(
+        mut self,
+        tool_calls: SmallVec<[crate::chat_completions::ChatCompletionsToolCall; 2]>,
+    ) -> Self {
         self.tool_calls = Some(tool_calls);
         self
     }
@@ -255,7 +258,7 @@ impl OpenAIMessageBuilder<builder_states::HasRole> {
         self
     }
 
-    /// Builds the `OpenAI` message.
+    /// Builds the Chat Completions message.
     ///
     /// Only available in `HasRole` state, ensuring the role is always set.
     ///
@@ -263,8 +266,8 @@ impl OpenAIMessageBuilder<builder_states::HasRole> {
     ///
     /// Panics if the role is not set (should not happen in `HasRole` state).
     #[must_use]
-    pub fn build(self) -> OpenAIMessage {
-        OpenAIMessage {
+    pub fn build(self) -> ChatCompletionsMessage {
+        ChatCompletionsMessage {
             role: self
                 .role
                 .unwrap_or_else(|| unreachable!("Role must be set in HasRole state")),
@@ -278,16 +281,16 @@ impl OpenAIMessageBuilder<builder_states::HasRole> {
     }
 }
 
-impl Default for OpenAIMessageBuilder<builder_states::NoRole> {
+impl Default for ChatCompletionsMessageBuilder<builder_states::NoRole> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-/// Client for `OpenAI`-compatible APIs.
+/// Client for Chat Completions APIs.
 ///
 /// Supports chat completions with tool/function calling for any API
-/// that implements the `OpenAI` chat completions specification.
+/// that implements the Chat Completions specification.
 ///
 /// # Security
 ///
@@ -301,7 +304,7 @@ impl Default for OpenAIMessageBuilder<builder_states::NoRole> {
 /// through a tokenizer proxy. The proxy intercepts requests and injects real
 /// credentials, allowing agents to use sealed tokens instead of raw API keys.
 #[derive(Clone)]
-pub struct OpenAIClient {
+pub struct ChatCompletionsClient {
     client: ClientWithMiddleware,
     streaming_client: reqwest::Client,
     api_key: Arc<SecretString>,
@@ -313,9 +316,9 @@ pub struct OpenAIClient {
 }
 
 // Custom Debug implementation to avoid exposing API key
-impl std::fmt::Debug for OpenAIClient {
+impl std::fmt::Debug for ChatCompletionsClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OpenAIClient")
+        f.debug_struct("ChatCompletionsClient")
             .field("api_key", &"[REDACTED]")
             .field("base_url", &self.base_url)
             .field("config", &self.config)
@@ -325,7 +328,7 @@ impl std::fmt::Debug for OpenAIClient {
     }
 }
 
-/// Convert an `OpenAI` streaming chunk to our common `ChatChunk` format.
+/// Convert a Chat Completions streaming chunk to our common `ChatChunk` format.
 ///
 /// Handles delta updates for content, role, and tool calls.
 pub fn convert_chunk_to_chat_chunk(chunk: &ChatCompletionChunk) -> ChatChunk {
@@ -393,8 +396,8 @@ pub fn convert_chunk_to_chat_chunk(chunk: &ChatCompletionChunk) -> ChatChunk {
     }
 }
 
-impl OpenAIClient {
-    /// Create a new `OpenAI` client from a configuration.
+impl ChatCompletionsClient {
+    /// Create a new Chat Completions client from a configuration.
     ///
     /// # Arguments
     ///
@@ -403,7 +406,7 @@ impl OpenAIClient {
     /// # Examples
     ///
     /// ```no_run
-    /// use neuromance_client::OpenAIClient;
+    /// use neuromance_client::ChatCompletionsClient;
     /// use neuromance_client::ClientError;
     /// use neuromance_common::client::Config;
     ///
@@ -411,7 +414,7 @@ impl OpenAIClient {
     ///     .with_api_key("sk-...")
     ///     .with_base_url("https://api.openai.com/v1");
     ///
-    /// let client = OpenAIClient::new(config)?;
+    /// let client = ChatCompletionsClient::new(config)?;
     /// # Ok::<(), ClientError>(())
     /// ```
     ///
@@ -421,7 +424,7 @@ impl OpenAIClient {
     /// The `api_key` should contain a sealed token instead of the real API key.
     ///
     /// ```no_run
-    /// use neuromance_client::OpenAIClient;
+    /// use neuromance_client::ChatCompletionsClient;
     /// use neuromance_client::ClientError;
     /// use neuromance_common::client::{Config, ProxyConfig};
     ///
@@ -433,7 +436,7 @@ impl OpenAIClient {
     ///         target_host_header: Some("X-Target-Host".to_string()),
     ///     });
     ///
-    /// let client = OpenAIClient::new(config)?;
+    /// let client = ChatCompletionsClient::new(config)?;
     /// # Ok::<(), ClientError>(())
     /// ```
     ///
@@ -456,7 +459,7 @@ impl OpenAIClient {
 
     /// Set a custom base URL for the API endpoint.
     ///
-    /// Useful for connecting to `OpenAI`-compatible services like Azure `OpenAI`,
+    /// Useful for connecting to Chat Completions-compatible services like Azure `OpenAI`,
     /// local models, or proxy servers.
     ///
     /// # Arguments
@@ -559,7 +562,7 @@ impl OpenAIClient {
         Ok(parsed_response)
     }
 
-    /// Convert an `OpenAI` message to our internal message format.
+    /// Convert a Chat Completions message to our internal message format.
     ///
     /// # Note on Tool Arguments
     ///
@@ -581,13 +584,10 @@ impl OpenAIClient {
     ///         .context("Failed to parse tool arguments")
     /// }
     /// ```
-    fn convert_openai_message_to_message(
-        openai_msg: &OpenAIMessage,
-        conversation_id: uuid::Uuid,
-    ) -> Message {
-        let role = openai_msg.role;
+    fn convert_message(msg: &ChatCompletionsMessage, conversation_id: uuid::Uuid) -> Message {
+        let role = msg.role;
 
-        let tool_calls = openai_msg
+        let tool_calls = msg
             .tool_calls
             .as_ref()
             .map(|tcs| {
@@ -611,13 +611,13 @@ impl OpenAIClient {
             id: uuid::Uuid::new_v4(),
             conversation_id,
             role,
-            content: openai_msg.content.clone().unwrap_or_default(),
+            content: msg.content.clone().unwrap_or_default(),
             tool_calls,
-            tool_call_id: openai_msg.tool_call_id.clone(),
-            name: openai_msg.name.clone(),
+            tool_call_id: msg.tool_call_id.clone(),
+            name: msg.name.clone(),
             timestamp: Utc::now(),
             metadata: HashMap::new(),
-            reasoning: openai_msg
+            reasoning: msg
                 .reasoning_content
                 .clone()
                 .map(neuromance_common::ReasoningContent::new),
@@ -626,7 +626,7 @@ impl OpenAIClient {
 }
 
 #[async_trait]
-impl LLMClient for OpenAIClient {
+impl LLMClient for ChatCompletionsClient {
     fn config(&self) -> &Config {
         &self.config
     }
@@ -642,12 +642,11 @@ impl LLMClient for OpenAIClient {
     async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, ClientError> {
         self.validate_request(request)?;
 
-        let mut openai_request = ChatCompletionRequest::from((request, self.config.as_ref()));
-        openai_request.stream = Some(false);
+        let mut chat_request = ChatCompletionRequest::from((request, self.config.as_ref()));
+        chat_request.stream = Some(false);
 
-        let response: ChatCompletionResponse = self
-            .make_request("chat/completions", &openai_request)
-            .await?;
+        let response: ChatCompletionResponse =
+            self.make_request("chat/completions", &chat_request).await?;
 
         // Validate response has at least one choice
         let choice = response.choices.first().ok_or_else(|| {
@@ -668,7 +667,7 @@ impl LLMClient for OpenAIClient {
             })?
             .conversation_id;
 
-        let message = Self::convert_openai_message_to_message(&choice.message, conversation_id);
+        let message = Self::convert_message(&choice.message, conversation_id);
 
         let finish_reason = choice
             .finish_reason
@@ -703,9 +702,9 @@ impl LLMClient for OpenAIClient {
     {
         self.validate_request(request)?;
 
-        let mut openai_request = ChatCompletionRequest::from((request, self.config.as_ref()));
-        openai_request.stream = Some(true);
-        openai_request.stream_options = Some(serde_json::json!({
+        let mut chat_request = ChatCompletionRequest::from((request, self.config.as_ref()));
+        chat_request.stream = Some(true);
+        chat_request.stream_options = Some(serde_json::json!({
             "include_usage": true
         }));
 
@@ -734,7 +733,7 @@ impl LLMClient for OpenAIClient {
             &self.target_host,
         );
 
-        let request_builder = request_builder.json(&openai_request);
+        let request_builder = request_builder.json(&chat_request);
 
         // Create the EventSource
         // We handle retries at a higher level in Core
@@ -753,7 +752,7 @@ impl LLMClient for OpenAIClient {
                     None
                 }
                 Ok(Event::Message(message)) => {
-                    // OpenAI sends [DONE] to signal completion
+                    // Chat Completions API sends [DONE] to signal completion
                     if message.data == "[DONE]" {
                         debug!("Stream completed with [DONE] marker");
                         return None;
@@ -856,7 +855,7 @@ mod tests {
             .await;
 
         let config = create_test_config(&mock_server.uri());
-        let client = OpenAIClient::new(config).unwrap();
+        let client = ChatCompletionsClient::new(config).unwrap();
 
         let message = create_test_message();
         let request = ChatRequest::new(vec![message]);
@@ -906,7 +905,7 @@ mod tests {
                 .await;
 
             let config = create_test_config(&mock_server.uri());
-            let client = OpenAIClient::new(config).unwrap();
+            let client = ChatCompletionsClient::new(config).unwrap();
 
             let message = create_test_message();
             let request = ChatRequest::new(vec![message]);
@@ -940,7 +939,7 @@ mod tests {
             .await;
 
         let config = create_test_config(&mock_server.uri());
-        let client = OpenAIClient::new(config).unwrap();
+        let client = ChatCompletionsClient::new(config).unwrap();
 
         let message = create_test_message();
         let request = ChatRequest::new(vec![message]);
@@ -967,7 +966,7 @@ mod tests {
             .await;
 
         let config = create_test_config(&mock_server.uri());
-        let client = OpenAIClient::new(config).unwrap();
+        let client = ChatCompletionsClient::new(config).unwrap();
 
         let message = create_test_message();
         let request = ChatRequest::new(vec![message]);
@@ -995,7 +994,7 @@ mod tests {
             .await;
 
         let config = create_test_config(&mock_server.uri());
-        let client = OpenAIClient::new(config).unwrap();
+        let client = ChatCompletionsClient::new(config).unwrap();
 
         let message = create_test_message();
         let request = ChatRequest::new(vec![message]);
@@ -1023,7 +1022,7 @@ mod tests {
             .await;
 
         let config = create_test_config(&mock_server.uri());
-        let client = OpenAIClient::new(config).unwrap();
+        let client = ChatCompletionsClient::new(config).unwrap();
 
         let message = create_test_message();
         let request = ChatRequest::new(vec![message]);
@@ -1049,7 +1048,7 @@ mod tests {
             .await;
 
         let config = create_test_config(&mock_server.uri());
-        let client = OpenAIClient::new(config).unwrap();
+        let client = ChatCompletionsClient::new(config).unwrap();
 
         let message = create_test_message();
         let request = ChatRequest::new(vec![message]);
@@ -1098,7 +1097,7 @@ mod tests {
             .await;
 
         let config = create_test_config(&mock_server.uri());
-        let client = OpenAIClient::new(config).unwrap();
+        let client = ChatCompletionsClient::new(config).unwrap();
 
         let message = create_test_message();
         let request = ChatRequest::new(vec![message]);
@@ -1153,7 +1152,7 @@ mod tests {
             .await;
 
         let config = create_test_config(&mock_server.uri());
-        let client = OpenAIClient::new(config).unwrap();
+        let client = ChatCompletionsClient::new(config).unwrap();
 
         let message = create_test_message();
         let request = ChatRequest::new(vec![message]);
@@ -1218,7 +1217,7 @@ mod tests {
                 target_host_header: Some("X-Target-Host".to_string()),
             });
 
-        let client = OpenAIClient::new(config).unwrap();
+        let client = ChatCompletionsClient::new(config).unwrap();
 
         let message = create_test_message();
         let request = ChatRequest::new(vec![message]);
@@ -1249,7 +1248,7 @@ mod tests {
                 target_host_header: Some("X-Custom-Target".to_string()),
             });
 
-        let client = OpenAIClient::new(config).unwrap();
+        let client = ChatCompletionsClient::new(config).unwrap();
 
         let message = create_test_message();
         let request = ChatRequest::new(vec![message]);
@@ -1279,7 +1278,7 @@ mod tests {
                 target_host_header: None, // No target host header
             });
 
-        let client = OpenAIClient::new(config).unwrap();
+        let client = ChatCompletionsClient::new(config).unwrap();
 
         let message = create_test_message();
         let request = ChatRequest::new(vec![message]);
@@ -1292,7 +1291,7 @@ mod tests {
     async fn test_proxy_headers_sent_streaming() {
         let mock_server = MockServer::start().await;
 
-        // Minimal SSE event sequence for OpenAI streaming
+        // Minimal SSE event sequence for Chat Completions streaming
         let sse_body = [
             &format!(
                 "data: {}",
@@ -1347,7 +1346,7 @@ mod tests {
                 target_host_header: Some("X-Target-Host".to_string()),
             });
 
-        let client = OpenAIClient::new(config).unwrap();
+        let client = ChatCompletionsClient::new(config).unwrap();
 
         let message = create_test_message();
         let request = ChatRequest::new(vec![message]);
@@ -1390,7 +1389,7 @@ mod tests {
                 target_host_header: Some("X-Target-Host".to_string()),
             });
 
-        let client = OpenAIClient::new(config).unwrap();
+        let client = ChatCompletionsClient::new(config).unwrap();
 
         let message = create_test_message();
         let request = ChatRequest::new(vec![message]);
@@ -1405,25 +1404,25 @@ mod fuzz_tests {
     #![allow(clippy::unwrap_used)]
     #![allow(clippy::expect_used)]
 
-    use crate::openai::{ChatCompletionResponse, OpenAIMessage};
+    use crate::chat_completions::{ChatCompletionResponse, ChatCompletionsMessage};
     use neuromance_common::chat::MessageRole;
     use proptest::prelude::*;
 
     proptest! {
         #[test]
-        fn fuzz_openai_response_parsing(data in prop::collection::vec(any::<u8>(), 0..1000)) {
+        fn fuzz_chat_completions_response_parsing(data in prop::collection::vec(any::<u8>(), 0..1000)) {
             // Should not panic on malformed responses
             let _ = serde_json::from_slice::<ChatCompletionResponse>(&data);
         }
 
         #[test]
-        fn fuzz_openai_message_parsing(data in prop::collection::vec(any::<u8>(), 0..1000)) {
+        fn fuzz_chat_completions_message_parsing(data in prop::collection::vec(any::<u8>(), 0..1000)) {
             // Should not panic on malformed message data
-            let _ = serde_json::from_slice::<OpenAIMessage>(&data);
+            let _ = serde_json::from_slice::<ChatCompletionsMessage>(&data);
         }
 
         #[test]
-        fn fuzz_openai_response_with_invalid_fields(
+        fn fuzz_chat_completions_response_with_invalid_fields(
             id_str in ".*",
             model_str in ".*",
             created_val in any::<u64>(),
@@ -1443,7 +1442,7 @@ mod fuzz_tests {
         }
 
         #[test]
-        fn fuzz_openai_message_with_missing_fields(
+        fn fuzz_chat_completions_message_with_missing_fields(
             role_idx in 0usize..4,
             content in prop::option::of(".*"),
         ) {
@@ -1459,11 +1458,11 @@ mod fuzz_tests {
                 format!(r#"{{"role":"{role_str}","content":"{escaped}"}}"#)
             });
 
-            let _ = serde_json::from_str::<OpenAIMessage>(&json);
+            let _ = serde_json::from_str::<ChatCompletionsMessage>(&json);
         }
 
         #[test]
-        fn fuzz_openai_message_with_tool_calls(
+        fn fuzz_chat_completions_message_with_tool_calls(
             num_tool_calls in 0usize..5,
         ) {
             let mut tool_calls_json = Vec::new();
@@ -1482,7 +1481,7 @@ mod fuzz_tests {
                 r#"{"role":"assistant","content":"test"}"#.to_string()
             };
 
-            let result = serde_json::from_str::<OpenAIMessage>(&json);
+            let result = serde_json::from_str::<ChatCompletionsMessage>(&json);
             if result.is_ok() {
                 let msg = result.unwrap();
                 assert_eq!(msg.role, MessageRole::Assistant);
@@ -1515,7 +1514,7 @@ mod fuzz_tests {
         }
 
         #[test]
-        fn fuzz_openai_function_arguments(
+        fn fuzz_chat_completions_function_arguments(
             func_name in ".*",
             args_json in ".*",
         ) {
@@ -1525,7 +1524,7 @@ mod fuzz_tests {
                 args_json.replace('\\', "\\\\").replace('"', "\\\"")
             );
 
-            let _ = serde_json::from_str::<crate::openai::OpenAIFunction>(&json);
+            let _ = serde_json::from_str::<crate::chat_completions::ChatCompletionsFunction>(&json);
         }
 
         #[test]

@@ -6,7 +6,7 @@ use futures::StreamExt;
 use log::info;
 use uuid::Uuid;
 
-use neuromance_client::{LLMClient, OpenAIClient};
+use neuromance_client::{ChatCompletionsClient, LLMClient};
 use neuromance_common::{ChatRequest, Config, Message};
 
 #[derive(Parser, Debug)]
@@ -47,8 +47,7 @@ async fn main() -> Result<()> {
         .with_base_url(&args.base_url)
         .with_api_key(&args.api_key);
 
-    // Create OpenAI client
-    let client = OpenAIClient::new(config.clone())?;
+    let client = ChatCompletionsClient::new(config.clone())?;
 
     // Create the chat request
     let conversation_id = Uuid::new_v4();

@@ -1,7 +1,7 @@
-//! `OpenAI` API types and client implementation.
+//! Chat Completions API types and client implementation.
 //!
-//! This module provides types for the `OpenAI` chat completions API
-//! and a client implementation that works with any OpenAI-compatible endpoint.
+//! This module provides types for the Chat Completions API
+//! and a client implementation that works with any compatible endpoint.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -17,7 +17,7 @@ use neuromance_common::tools::{FunctionCall, Tool, ToolCall};
 
 pub use neuromance_common::client::ReasoningEffort;
 
-/// Convert from the abstract `ReasoningLevel` to `OpenAI`'s `ReasoningEffort`.
+/// Convert from the abstract `ReasoningLevel` to the Chat Completions API's `ReasoningEffort`.
 const fn reasoning_level_to_effort(level: ReasoningLevel) -> Option<ReasoningEffort> {
     match level {
         ReasoningLevel::Minimal => Some(ReasoningEffort::Minimal),
@@ -33,7 +33,7 @@ const fn reasoning_level_to_effort(level: ReasoningLevel) -> Option<ReasoningEff
 pub mod client;
 pub mod embedding;
 
-pub use client::{OpenAIClient, convert_chunk_to_chat_chunk};
+pub use client::{ChatCompletionsClient, convert_chunk_to_chat_chunk};
 pub use embedding::OpenAIEmbedding;
 
 /// A single choice from a chat completion response.
@@ -45,18 +45,18 @@ pub struct ChatChoice {
     /// The index of this choice in the response array.
     pub index: u32,
     /// The generated message for this choice.
-    pub message: OpenAIMessage,
+    pub message: ChatCompletionsMessage,
     /// Why generation stopped for this choice.
     ///
     /// Common values: "stop", "length", "`tool_calls`", "`content_filter`"
     pub finish_reason: Option<String>,
 }
 
-/// OpenAI-compatible message format.
+/// Chat Completions message format.
 ///
-/// Wrapper type for serializing/deserializing messages to the `OpenAI` API format.
+/// Wrapper type for serializing/deserializing messages to the Chat Completions API format.
 #[derive(Debug, Clone, Serialize, Deserialize, TypedBuilder)]
-pub struct OpenAIMessage {
+pub struct ChatCompletionsMessage {
     /// The role of the message author (user, assistant, system, or tool).
     pub role: MessageRole,
     /// The text content of the message (optional for tool calls).
@@ -70,7 +70,7 @@ pub struct OpenAIMessage {
     /// Tool calls requested by the assistant (optional).
     #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_calls: Option<SmallVec<[OpenAIToolCall; 2]>>,
+    pub tool_calls: Option<SmallVec<[ChatCompletionsToolCall; 2]>>,
     /// ID of the tool call this message is responding to (for tool messages).
     #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -85,7 +85,7 @@ pub struct OpenAIMessage {
     pub refusal: Option<String>,
 }
 
-impl From<&Message> for OpenAIMessage {
+impl From<&Message> for ChatCompletionsMessage {
     fn from(message: &Message) -> Self {
         let tool_calls = if message.tool_calls.is_empty() {
             None
@@ -94,7 +94,7 @@ impl From<&Message> for OpenAIMessage {
                 message
                     .tool_calls
                     .iter()
-                    .map(OpenAIToolCall::from)
+                    .map(ChatCompletionsToolCall::from)
                     .collect(),
             )
         };
@@ -117,29 +117,29 @@ impl From<&Message> for OpenAIMessage {
     }
 }
 
-/// OpenAI-compatible tool call format.
+/// Chat Completions tool call format.
 ///
 /// Represents a request from the model to call a function/tool.
 ///
 /// Uses `Cow<'static, str>` to avoid allocations for static strings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OpenAIToolCall {
+pub struct ChatCompletionsToolCall {
     /// Unique identifier for this tool call.
     pub id: Cow<'static, str>,
     /// Type of the tool call, typically "function".
     #[serde(rename = "type", default = "default_tool_call_type")]
     pub r#type: Cow<'static, str>,
     /// The function to call with its arguments.
-    pub function: OpenAIFunction,
+    pub function: ChatCompletionsFunction,
 }
 
-/// Conversion from a generic `ToolCall` to OpenAI-specific format.
-impl From<&ToolCall> for OpenAIToolCall {
+/// Conversion from a generic `ToolCall` to the Chat Completions format.
+impl From<&ToolCall> for ChatCompletionsToolCall {
     fn from(tool_call: &ToolCall) -> Self {
         Self {
             id: Cow::Owned(tool_call.id.clone()),
             r#type: Cow::Owned(tool_call.call_type.clone()),
-            function: OpenAIFunction::from(&tool_call.function),
+            function: ChatCompletionsFunction::from(&tool_call.function),
         }
     }
 }
@@ -148,20 +148,20 @@ const fn default_tool_call_type() -> Cow<'static, str> {
     Cow::Borrowed("function")
 }
 
-/// OpenAI-compatible function call format.
+/// Chat Completions function call format.
 ///
 /// Contains the function name and JSON-serialized arguments.
 ///
 /// Uses `Cow<'static, str>` to avoid allocations for static strings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OpenAIFunction {
+pub struct ChatCompletionsFunction {
     /// The name of the function to call.
     pub name: Cow<'static, str>,
     /// The arguments as a JSON-serialized string.
     pub arguments: Cow<'static, str>,
 }
 
-impl From<&FunctionCall> for OpenAIFunction {
+impl From<&FunctionCall> for ChatCompletionsFunction {
     fn from(function_call: &FunctionCall) -> Self {
         Self {
             name: Cow::Owned(function_call.name.clone()),
@@ -172,13 +172,13 @@ impl From<&FunctionCall> for OpenAIFunction {
 
 /// Request for a chat completion.
 ///
-/// Contains all parameters for the `OpenAI` chat completions API.
+/// Contains all parameters for the Chat Completions API.
 ///
 /// # Examples
 ///
 /// ```no_run
-/// use neuromance_client::openai::ChatCompletionRequest;
-/// # use neuromance_client::openai::OpenAIMessage;
+/// use neuromance_client::chat_completions::ChatCompletionRequest;
+/// # use neuromance_client::chat_completions::ChatCompletionsMessage;
 /// # use neuromance_common::MessageRole;
 ///
 /// let request = ChatCompletionRequest::builder()
@@ -192,8 +192,8 @@ impl From<&FunctionCall> for OpenAIFunction {
 pub struct ChatCompletionRequest {
     /// The model identifier to use (e.g., "gpt-4", "gpt-3.5-turbo").
     pub model: String,
-    /// The conversation messages in `OpenAI` format.
-    pub messages: Vec<OpenAIMessage>,
+    /// The conversation messages in Chat Completions format.
+    pub messages: Vec<ChatCompletionsMessage>,
     /// Maximum tokens to generate (optional, deprecated for reasoning models).
     #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -265,21 +265,24 @@ pub struct ChatCompletionRequest {
     pub stream_options: Option<serde_json::Value>,
 }
 
-/// Conversion from a generic `ChatRequest` to OpenAI-specific format.
+/// Conversion from a generic `ChatRequest` to the Chat Completions format.
 ///
-/// Maps common request parameters to the `OpenAI` API format, using the provided
+/// Maps common request parameters to the Chat Completions API format, using the provided
 /// configuration for defaults like the model name.
 impl From<(&ChatRequest, &Config)> for ChatCompletionRequest {
     fn from((request, config): (&ChatRequest, &Config)) -> Self {
-        let openai_messages: Vec<OpenAIMessage> =
-            request.messages.iter().map(OpenAIMessage::from).collect();
+        let messages: Vec<ChatCompletionsMessage> = request
+            .messages
+            .iter()
+            .map(ChatCompletionsMessage::from)
+            .collect();
 
         let tools: Option<Vec<Tool>> = request.tools.clone();
 
-        // Map ReasoningLevel to OpenAI's ReasoningEffort
+        // Map ReasoningLevel to ReasoningEffort
         let reasoning_effort = reasoning_level_to_effort(request.reasoning_level);
 
-        // Map ThinkingMode - for OpenAI, thinking budget maps to max_completion_tokens
+        // Map ThinkingMode - thinking budget maps to max_completion_tokens
         // and enable_thinking is set if any thinking mode is enabled
         let max_completion_tokens = request
             .max_completion_tokens
@@ -297,7 +300,7 @@ impl From<(&ChatRequest, &Config)> for ChatCompletionRequest {
                     .clone()
                     .unwrap_or_else(|| config.model.clone()),
             )
-            .messages(openai_messages)
+            .messages(messages)
             .max_tokens(request.max_tokens)
             .max_completion_tokens(max_completion_tokens)
             .reasoning_effort(reasoning_effort)
@@ -333,7 +336,7 @@ impl ChatCompletionRequest {
 /// # Examples
 ///
 /// ```no_run
-/// # use neuromance_client::openai::ChatCompletionResponse;
+/// # use neuromance_client::chat_completions::ChatCompletionResponse;
 /// # let response: ChatCompletionResponse = serde_json::from_str("{}").unwrap();
 /// // Access the first choice's message
 /// if let Some(choice) = response.choices.first() {
@@ -370,7 +373,7 @@ pub struct ChatStreamChoice {
     /// The index of this choice in the response array.
     pub index: u32,
     /// Incremental message delta for this chunk.
-    pub delta: OpenAIMessageDelta,
+    pub delta: ChatCompletionsMessageDelta,
     /// Why generation stopped (only present in final chunk).
     pub finish_reason: Option<String>,
 }
@@ -379,7 +382,7 @@ pub struct ChatStreamChoice {
 ///
 /// Used in streaming responses to communicate partial updates.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OpenAIMessageDelta {
+pub struct ChatCompletionsMessageDelta {
     /// The role (only present in first chunk).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<MessageRole>,
@@ -388,7 +391,7 @@ pub struct OpenAIMessageDelta {
     pub content: Option<String>,
     /// Incremental tool calls (for function calling).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_calls: Option<SmallVec<[OpenAIToolCallDelta; 2]>>,
+    pub tool_calls: Option<SmallVec<[ChatCompletionsToolCallDelta; 2]>>,
     /// Reasoning content delta (for streaming from thinking models).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
@@ -398,7 +401,7 @@ pub struct OpenAIMessageDelta {
 ///
 /// Tool calls may be built across multiple streaming chunks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OpenAIToolCallDelta {
+pub struct ChatCompletionsToolCallDelta {
     /// Index of this tool call in the array.
     pub index: u32,
     /// Unique identifier (only present in first chunk for this tool call).
@@ -409,12 +412,12 @@ pub struct OpenAIToolCallDelta {
     pub r#type: Option<String>,
     /// Incremental function call data.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub function: Option<OpenAIFunctionDelta>,
+    pub function: Option<ChatCompletionsFunctionDelta>,
 }
 
 /// Delta representing incremental changes to a function call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OpenAIFunctionDelta {
+pub struct ChatCompletionsFunctionDelta {
     /// Function name (only present in first chunk).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -430,7 +433,7 @@ pub struct OpenAIFunctionDelta {
 /// # Examples
 ///
 /// ```no_run
-/// # use neuromance_client::openai::ChatCompletionChunk;
+/// # use neuromance_client::chat_completions::ChatCompletionChunk;
 /// # let chunk: ChatCompletionChunk = serde_json::from_str("{}").unwrap();
 /// // Process streaming delta
 /// if let Some(choice) = chunk.choices.first() {

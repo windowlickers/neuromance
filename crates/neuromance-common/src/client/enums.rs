@@ -6,14 +6,14 @@ use serde::{Deserialize, Serialize};
 /// LLM provider identifier.
 ///
 /// Used in `ModelProfile` to select the correct client implementation.
-/// Deserializes from lowercase strings (e.g., `"anthropic"`, `"openai"`).
+/// Deserializes from `snake_case` strings (e.g., `"anthropic"`, `"chat_completions"`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum Provider {
     /// Anthropic (Claude models)
     Anthropic,
-    /// `OpenAI` Chat Completions API
-    OpenAI,
+    /// Chat Completions API (`OpenAI` and compatible providers)
+    ChatCompletions,
     /// `OpenAI` Responses API
     Responses,
 }
@@ -22,7 +22,7 @@ impl fmt::Display for Provider {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Anthropic => write!(f, "anthropic"),
-            Self::OpenAI => write!(f, "openai"),
+            Self::ChatCompletions => write!(f, "chat_completions"),
             Self::Responses => write!(f, "responses"),
         }
     }
@@ -34,7 +34,7 @@ impl FromStr for Provider {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "anthropic" => Ok(Self::Anthropic),
-            "openai" => Ok(Self::OpenAI),
+            "chat_completions" => Ok(Self::ChatCompletions),
             "responses" => Ok(Self::Responses),
             other => Err(format!("unknown provider: {other}")),
         }

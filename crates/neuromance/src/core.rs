@@ -81,8 +81,8 @@ impl<C: LLMClient> Core<C> {
     ///
     /// ```rust,no_run
     /// # use neuromance::{Core, ToolApproval};
-    /// # use neuromance_client::openai::OpenAIClient;
-    /// # let client: OpenAIClient = unimplemented!();
+    /// # use neuromance_client::chat_completions::ChatCompletionsClient;
+    /// # let client: ChatCompletionsClient = unimplemented!();
     /// let core = Core::new(client)
     ///     .with_tool_approval_callback(|tool_call| {
     ///         // Clone to move into async block (avoids lifetime issues)
@@ -118,8 +118,8 @@ impl<C: LLMClient> Core<C> {
     ///
     /// ```rust,no_run
     /// # use neuromance::{Core, CoreEvent};
-    /// # use neuromance_client::openai::OpenAIClient;
-    /// # let client: OpenAIClient = unimplemented!();
+    /// # use neuromance_client::chat_completions::ChatCompletionsClient;
+    /// # let client: ChatCompletionsClient = unimplemented!();
     /// let core = Core::new(client)
     ///     .with_event_callback(|event| async move {
     ///         match event {
@@ -152,8 +152,8 @@ impl<C: LLMClient> Core<C> {
     ///
     /// ```rust,no_run
     /// # use neuromance::Core;
-    /// # use neuromance_client::openai::OpenAIClient;
-    /// # let client: OpenAIClient = unimplemented!();
+    /// # use neuromance_client::chat_completions::ChatCompletionsClient;
+    /// # let client: ChatCompletionsClient = unimplemented!();
     /// let core = Core::new(client)
     ///     .with_turn_callback(|messages| async move {
     ///         // Could compact, filter, or transform messages here
@@ -583,14 +583,14 @@ mod tests {
     #![allow(clippy::expect_used)]
 
     use super::*;
-    use neuromance_client::openai::OpenAIClient;
+    use neuromance_client::chat_completions::ChatCompletionsClient;
     use neuromance_common::client::Config;
 
     /// Test that event callbacks handle panics gracefully
     #[tokio::test]
     async fn test_event_callback_panic_handling() {
         let config = Config::new("test", "test-model").with_api_key("test-key");
-        let client = OpenAIClient::new(config).expect("Failed to create client");
+        let client = ChatCompletionsClient::new(config).expect("Failed to create client");
 
         let counter = Arc::new(tokio::sync::Mutex::new(0));
         let counter_clone = Arc::clone(&counter);
@@ -621,7 +621,7 @@ mod tests {
     #[tokio::test]
     async fn test_tool_approval_callback() {
         let config = Config::new("test", "test-model").with_api_key("test-key");
-        let client = OpenAIClient::new(config).expect("Failed to create client");
+        let client = ChatCompletionsClient::new(config).expect("Failed to create client");
 
         let core = Core::new(client).with_tool_approval_callback(|tool_call| {
             let tool_name = tool_call.function.name.clone();
@@ -641,7 +641,7 @@ mod tests {
     #[tokio::test]
     async fn test_core_without_callbacks() {
         let config = Config::new("test", "test-model").with_api_key("test-key");
-        let client = OpenAIClient::new(config).expect("Failed to create client");
+        let client = ChatCompletionsClient::new(config).expect("Failed to create client");
         let core = Core::new(client);
 
         assert!(core.event_callback.is_none());
@@ -657,7 +657,7 @@ mod tests {
     #[tokio::test]
     async fn test_multiple_event_types() {
         let config = Config::new("test", "test-model").with_api_key("test-key");
-        let client = OpenAIClient::new(config).expect("Failed to create client");
+        let client = ChatCompletionsClient::new(config).expect("Failed to create client");
 
         let events = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let events_clone = Arc::clone(&events);
@@ -694,7 +694,7 @@ mod tests {
     #[tokio::test]
     async fn test_core_with_turn_callback() {
         let config = Config::new("test", "test-model").with_api_key("test-key");
-        let client = OpenAIClient::new(config).expect("Failed to create client");
+        let client = ChatCompletionsClient::new(config).expect("Failed to create client");
 
         let core = Core::new(client).with_turn_callback(|messages| async move { Ok(messages) });
 
@@ -705,7 +705,7 @@ mod tests {
     #[tokio::test]
     async fn test_turn_callback_transforms_messages() {
         let config = Config::new("test", "test-model").with_api_key("test-key");
-        let client = OpenAIClient::new(config).expect("Failed to create client");
+        let client = ChatCompletionsClient::new(config).expect("Failed to create client");
 
         let core = Core::new(client).with_turn_callback(|mut messages| async move {
             // Append a marker message to prove the callback ran
@@ -729,7 +729,7 @@ mod tests {
     #[tokio::test]
     async fn test_turn_callback_error_propagation() {
         let config = Config::new("test", "test-model").with_api_key("test-key");
-        let client = OpenAIClient::new(config).expect("Failed to create client");
+        let client = ChatCompletionsClient::new(config).expect("Failed to create client");
 
         let core = Core::new(client).with_turn_callback(|_messages| async move {
             Err(anyhow::anyhow!("compaction failed"))

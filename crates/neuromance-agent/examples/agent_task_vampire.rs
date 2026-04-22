@@ -8,7 +8,7 @@ use log::info;
 
 use neuromance_agent::AgentTask;
 use neuromance_client::LLMClient;
-use neuromance_client::openai::client::OpenAIClient;
+use neuromance_client::chat_completions::client::ChatCompletionsClient;
 use neuromance_common::client::Config;
 use neuromance_tools::generic::CurrentTimeTool;
 use neuromance_tools::mcp::{McpConfig, McpManager};
@@ -53,7 +53,7 @@ async fn main() -> Result<()> {
     let start_time = Instant::now();
 
     // Create the AgentTask with task description
-    let client = OpenAIClient::new(config)?;
+    let client = ChatCompletionsClient::new(config)?;
     info!("Client config model: {}", client.config().model);
     let mut task = AgentTask::new(
         "vampire-time-task",
