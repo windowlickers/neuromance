@@ -6,11 +6,11 @@
 //!
 //! ```rust,no_run
 //! use futures::StreamExt;
-//! use neuromance::{ChatCompletionsClient, Config, Core, CoreEvent, Message};
+//! use neuromance::{Config, Core, CoreEvent, Message, build_client};
 //!
 //! # async fn example() -> anyhow::Result<()> {
-//! let config = Config::new("openai", "gpt-4").with_api_key("sk-...");
-//! let client = ChatCompletionsClient::new(config)?;
+//! let config = Config::from_model("openai:gpt-4o")?.with_api_key("sk-...");
+//! let client = build_client(config)?;
 //! let mut core = Core::new(client).with_streaming();
 //!
 //! let messages: Vec<Message> = vec![/* ... */];
@@ -37,7 +37,7 @@ pub use crate::events::CoreEvent;
 
 // --- Clients ---
 pub use neuromance_client::{
-    AnthropicClient, ChatCompletionsClient, ClientError, LLMClient, ResponsesClient,
+    AnthropicClient, ChatCompletionsClient, ClientError, LLMClient, ResponsesClient, build_client,
 };
 
 // --- Config, request, response ---

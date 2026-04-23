@@ -1,9 +1,12 @@
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::time::Duration;
 
 use log::warn;
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
+
+use super::enums::resolve_model_prefix;
 
 /// Configuration for exponential backoff retry behavior.
 ///
@@ -356,6 +359,63 @@ impl Config {
         }
     }
 
+    /// Creates a configuration from a `"provider:model"` string.
+    ///
+    /// The prefix before the first colon is resolved via
+    /// [`resolve_model_prefix`](super::resolve_model_prefix) to pick the API family
+    /// and set a sensible default base URL. Everything after the first colon is the
+    /// model name (additional colons are preserved, so fine-tuned names like
+    /// `openai:ft:gpt-4o:org:abc123` round-trip correctly).
+    ///
+    /// Use [`with_base_url`](Self::with_base_url) afterward to override the default.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the string is missing a colon, the model name is empty,
+    /// or the prefix is not recognized.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use neuromance_common::Config;
+    ///
+    /// let config = Config::from_model("openai:gpt-4o")?.with_api_key("sk-...");
+    /// assert_eq!(config.model, "gpt-4o");
+    /// assert_eq!(config.base_url.as_deref(), Some("https://api.openai.com/v1"));
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    ///
+    /// Self-hosted providers set a local default that you can override:
+    ///
+    /// ```
+    /// use neuromance_common::Config;
+    ///
+    /// let config = Config::from_model("ollama:llama3.1")?;
+    /// assert_eq!(config.base_url.as_deref(), Some("http://localhost:11434/v1"));
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    pub fn from_model(model: impl AsRef<str>) -> anyhow::Result<Self> {
+        let raw = model.as_ref();
+        let (prefix, name) = raw.split_once(':').ok_or_else(|| {
+            anyhow::anyhow!(
+                "model string '{raw}' must be formatted as 'provider:model' \
+                 (e.g. 'openai:gpt-4o'). Use Config::new to pass them separately."
+            )
+        })?;
+        if name.is_empty() {
+            anyhow::bail!("model string '{raw}' is missing the model name after ':'");
+        }
+        let (_, base_url) = resolve_model_prefix(prefix).ok_or_else(|| {
+            anyhow::anyhow!("unknown provider prefix '{prefix}' in model string '{raw}'")
+        })?;
+        Ok(Self {
+            provider: prefix.to_string(),
+            model: name.to_string(),
+            base_url: base_url.map(String::from),
+            ..Default::default()
+        })
+    }
+
     /// Sets a custom base URL for API requests.
     ///
     /// # Arguments
@@ -566,6 +626,15 @@ impl Config {
     }
 }
 
+impl FromStr for Config {
+    type Err = anyhow::Error;
+
+    /// Parses a `"provider:model"` string. See [`Config::from_model`].
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::from_model(s)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -679,5 +748,88 @@ mod tests {
             assert_eq!(config.max_tokens, Some(max_tokens));
             assert!(config.validate().is_ok());
         }
+    }
+
+    #[test]
+    fn from_model_openai() {
+        let config = Config::from_model("openai:gpt-4o").unwrap();
+        assert_eq!(config.provider, "openai");
+        assert_eq!(config.model, "gpt-4o");
+        assert_eq!(
+            config.base_url.as_deref(),
+            Some("https://api.openai.com/v1")
+        );
+    }
+
+    #[test]
+    fn from_model_anthropic() {
+        let config = Config::from_model("anthropic:claude-sonnet-4-5-20250929").unwrap();
+        assert_eq!(config.provider, "anthropic");
+        assert_eq!(config.model, "claude-sonnet-4-5-20250929");
+        assert_eq!(
+            config.base_url.as_deref(),
+            Some("https://api.anthropic.com/v1")
+        );
+    }
+
+    #[test]
+    fn from_model_ollama_local_default() {
+        let config = Config::from_model("ollama:llama3.1").unwrap();
+        assert_eq!(config.provider, "ollama");
+        assert_eq!(
+            config.base_url.as_deref(),
+            Some("http://localhost:11434/v1")
+        );
+    }
+
+    #[test]
+    fn from_model_preserves_extra_colons() {
+        // OpenAI fine-tuned names include colons; only the first colon splits.
+        let config = Config::from_model("openai:ft:gpt-4o:org:abc123").unwrap();
+        assert_eq!(config.provider, "openai");
+        assert_eq!(config.model, "ft:gpt-4o:org:abc123");
+    }
+
+    #[test]
+    fn from_model_rejects_missing_colon() {
+        let err = Config::from_model("gpt-4o").unwrap_err();
+        assert!(err.to_string().contains("provider:model"));
+    }
+
+    #[test]
+    fn from_model_rejects_empty_model_name() {
+        let err = Config::from_model("openai:").unwrap_err();
+        assert!(err.to_string().contains("missing the model name"));
+    }
+
+    #[test]
+    fn from_model_rejects_unknown_prefix() {
+        let err = Config::from_model("not-a-provider:foo").unwrap_err();
+        assert!(err.to_string().contains("unknown provider prefix"));
+    }
+
+    #[test]
+    fn from_model_api_family_prefix_has_no_base_url() {
+        let config = Config::from_model("chat_completions:local-model").unwrap();
+        assert_eq!(config.provider, "chat_completions");
+        assert!(config.base_url.is_none());
+    }
+
+    #[test]
+    fn config_parses_via_fromstr() {
+        let config: Config = "groq:llama-3.1-70b".parse().unwrap();
+        assert_eq!(config.provider, "groq");
+        assert_eq!(
+            config.base_url.as_deref(),
+            Some("https://api.groq.com/openai/v1")
+        );
+    }
+
+    #[test]
+    fn from_model_override_base_url() {
+        let config = Config::from_model("openai:gpt-4o")
+            .unwrap()
+            .with_base_url("http://proxy.internal/v1");
+        assert_eq!(config.base_url.as_deref(), Some("http://proxy.internal/v1"));
     }
 }

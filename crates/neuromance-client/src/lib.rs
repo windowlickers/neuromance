@@ -19,7 +19,7 @@ use reqwest_middleware::ClientWithMiddleware;
 use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
 use reqwest_retry_after::RetryAfterMiddleware;
 
-use neuromance_common::client::{ChatChunk, ProxyConfig};
+use neuromance_common::client::{ChatChunk, Provider, ProxyConfig, resolve_model_prefix};
 use neuromance_common::{ChatRequest, ChatResponse, Config};
 use secrecy::SecretString;
 
@@ -153,6 +153,49 @@ impl reqwest_eventsource::retry::RetryPolicy for NoRetryPolicy {
     }
 }
 
+/// Builds a boxed [`LLMClient`] from a [`Config`], dispatching by provider prefix.
+///
+/// The `config.provider` string is resolved via
+/// [`resolve_model_prefix`](neuromance_common::client::resolve_model_prefix):
+/// friendly aliases like `"openai"`, `"anthropic"`, `"groq"`, or `"ollama"` pick
+/// the correct client implementation and base URL.
+///
+/// This is the ergonomic entry point when you don't want to hard-wire a specific
+/// client type — pair it with [`Config::from_model`] for a one-liner:
+///
+/// ```no_run
+/// use neuromance_client::build_client;
+/// use neuromance_common::Config;
+///
+/// # fn example() -> anyhow::Result<()> {
+/// let config = Config::from_model("openai:gpt-4o")?.with_api_key("sk-...");
+/// let client = build_client(config)?;
+/// # let _ = client;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// # Errors
+///
+/// Returns [`ClientError::ConfigurationError`] if the provider prefix is unknown,
+/// or propagates any error from the concrete client constructor.
+pub fn build_client(config: Config) -> Result<Box<dyn LLMClient>, ClientError> {
+    let (provider, _) = resolve_model_prefix(&config.provider).ok_or_else(|| {
+        ClientError::ConfigurationError(format!(
+            "unknown provider '{}'. Use Config::from_model(\"openai:gpt-4o\") \
+             or one of: openai, openai-responses, anthropic, ollama, groq, \
+             openrouter, together, mistral, deepseek, xai, chat_completions, responses",
+            config.provider
+        ))
+    })?;
+
+    match provider {
+        Provider::Anthropic => Ok(Box::new(AnthropicClient::new(config)?)),
+        Provider::ChatCompletions => Ok(Box::new(ChatCompletionsClient::new(config)?)),
+        Provider::Responses => Ok(Box::new(ResponsesClient::new(config)?)),
+    }
+}
+
 /// Trait for LLM client implementations.
 ///
 /// Provides a unified interface for interacting with different LLM providers.
@@ -230,6 +273,35 @@ pub trait LLMClient: Send + Sync {
         }
 
         Ok(())
+    }
+}
+
+/// Blanket impl so [`build_client`] output (`Box<dyn LLMClient>`) plugs into
+/// any API that is generic over `C: LLMClient`, such as `Core<C>`.
+#[async_trait]
+impl<T: LLMClient + ?Sized> LLMClient for Box<T> {
+    fn config(&self) -> &Config {
+        (**self).config()
+    }
+
+    async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, ClientError> {
+        (**self).chat(request).await
+    }
+
+    async fn chat_stream(
+        &self,
+        request: &ChatRequest,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatChunk, ClientError>> + Send>>, ClientError>
+    {
+        (**self).chat_stream(request).await
+    }
+
+    fn supports_tools(&self) -> bool {
+        (**self).supports_tools()
+    }
+
+    fn supports_streaming(&self) -> bool {
+        (**self).supports_streaming()
     }
 }
 
@@ -566,5 +638,46 @@ mod tests {
         let response = result.unwrap();
         assert_eq!(response.response_id, Some("test-response".to_string()));
         assert_eq!(response.model, "mock-model");
+    }
+
+    #[test]
+    fn build_client_dispatches_openai_to_chat_completions() {
+        let config = Config::from_model("openai:gpt-4o")
+            .unwrap()
+            .with_api_key("sk-test");
+        let client = build_client(config).unwrap();
+        assert!(client.supports_tools());
+        assert_eq!(client.config().model, "gpt-4o");
+    }
+
+    #[test]
+    fn build_client_dispatches_anthropic() {
+        let config = Config::from_model("anthropic:claude-sonnet-4-5-20250929")
+            .unwrap()
+            .with_api_key("sk-ant-test");
+        let client = build_client(config).unwrap();
+        assert_eq!(client.config().provider, "anthropic");
+    }
+
+    #[test]
+    fn build_client_rejects_unknown_provider() {
+        let config = Config::new("totally-fake", "some-model").with_api_key("k");
+        let result = build_client(config);
+        assert!(result.is_err(), "unknown provider should fail");
+        let err = result.err().unwrap();
+        assert!(matches!(err, ClientError::ConfigurationError(_)));
+        assert!(err.to_string().contains("totally-fake"));
+    }
+
+    #[test]
+    fn boxed_client_impls_llmclient() {
+        // Compile-time check: Box<dyn LLMClient> implements LLMClient via blanket impl
+        // so it plugs into any API that's generic over `C: LLMClient`.
+        fn assert_llm<C: LLMClient>(_: &C) {}
+        let config = Config::from_model("openai:gpt-4o")
+            .unwrap()
+            .with_api_key("k");
+        let boxed: Box<dyn LLMClient> = build_client(config).unwrap();
+        assert_llm(&boxed);
     }
 }

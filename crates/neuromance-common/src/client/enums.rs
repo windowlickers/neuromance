@@ -41,6 +41,61 @@ impl FromStr for Provider {
     }
 }
 
+/// Resolves a model-string prefix into a [`Provider`] and optional default base URL.
+///
+/// This is the single source of truth for friendly provider aliases like `"openai"`,
+/// `"anthropic"`, `"groq"`, or `"ollama"`. Both [`crate::Config::from_model`] and
+/// the client factory in `neuromance-client` consume this function.
+///
+/// Returns `None` if the prefix is unknown.
+///
+/// # Known prefixes
+///
+/// | Prefix              | Provider          | Default base URL                        |
+/// |---------------------|-------------------|-----------------------------------------|
+/// | `openai`            | `ChatCompletions` | `https://api.openai.com/v1`             |
+/// | `openai-responses`  | `Responses`       | `https://api.openai.com/v1`             |
+/// | `anthropic`         | `Anthropic`       | `https://api.anthropic.com/v1`          |
+/// | `ollama`            | `ChatCompletions` | `http://localhost:11434/v1`             |
+/// | `groq`              | `ChatCompletions` | `https://api.groq.com/openai/v1`        |
+/// | `openrouter`        | `ChatCompletions` | `https://openrouter.ai/api/v1`          |
+/// | `together`          | `ChatCompletions` | `https://api.together.xyz/v1`           |
+/// | `mistral`           | `ChatCompletions` | `https://api.mistral.ai/v1`             |
+/// | `deepseek`          | `ChatCompletions` | `https://api.deepseek.com/v1`           |
+/// | `xai`               | `ChatCompletions` | `https://api.x.ai/v1`                   |
+/// | `chat_completions`  | `ChatCompletions` | *(none — client uses its default)*      |
+/// | `responses`         | `Responses`       | *(none — client uses its default)*      |
+#[must_use]
+pub fn resolve_model_prefix(prefix: &str) -> Option<(Provider, Option<&'static str>)> {
+    match prefix {
+        "openai" => Some((Provider::ChatCompletions, Some("https://api.openai.com/v1"))),
+        "openai-responses" => Some((Provider::Responses, Some("https://api.openai.com/v1"))),
+        "anthropic" => Some((Provider::Anthropic, Some("https://api.anthropic.com/v1"))),
+        "ollama" => Some((Provider::ChatCompletions, Some("http://localhost:11434/v1"))),
+        "groq" => Some((
+            Provider::ChatCompletions,
+            Some("https://api.groq.com/openai/v1"),
+        )),
+        "openrouter" => Some((
+            Provider::ChatCompletions,
+            Some("https://openrouter.ai/api/v1"),
+        )),
+        "together" => Some((
+            Provider::ChatCompletions,
+            Some("https://api.together.xyz/v1"),
+        )),
+        "mistral" => Some((Provider::ChatCompletions, Some("https://api.mistral.ai/v1"))),
+        "deepseek" => Some((
+            Provider::ChatCompletions,
+            Some("https://api.deepseek.com/v1"),
+        )),
+        "xai" => Some((Provider::ChatCompletions, Some("https://api.x.ai/v1"))),
+        "chat_completions" => Some((Provider::ChatCompletions, None)),
+        "responses" => Some((Provider::Responses, None)),
+        _ => None,
+    }
+}
+
 /// Controls how the model selects which tool to call, if any.
 ///
 /// This enum provides fine-grained control over tool selection behavior,
