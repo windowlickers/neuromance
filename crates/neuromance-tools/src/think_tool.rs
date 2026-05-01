@@ -1,10 +1,12 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::ToolImplementation;
+use crate::factory::ToolFactory;
+use crate::{ToolImplementation, ToolRegistry};
 use neuromance_common::tools::{Function, Parameters, Property, Tool};
 
 /// A tool that allows the agent to record thoughts and reasoning
@@ -45,6 +47,21 @@ impl ToolImplementation for ThinkTool {
 
     fn is_auto_approved(&self) -> bool {
         true // Think tool is safe and can be auto-approved
+    }
+}
+
+/// Factory that registers [`ThinkTool`] under the name `think`.
+/// Takes no configuration.
+pub struct ThinkToolFactory;
+
+impl ToolFactory for ThinkToolFactory {
+    fn name(&self) -> &'static str {
+        "think"
+    }
+
+    fn build(&self, _config: &Value, registry: &ToolRegistry) -> Result<()> {
+        registry.register(Arc::new(ThinkTool));
+        Ok(())
     }
 }
 

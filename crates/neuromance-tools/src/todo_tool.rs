@@ -7,7 +7,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::ToolImplementation;
+use crate::factory::ToolFactory;
+use crate::{ToolImplementation, ToolRegistry};
 use neuromance_common::tools::{Function, ObjectSchema, Parameters, Property, Tool};
 
 /// Status of a todo item
@@ -192,6 +193,24 @@ pub fn create_todo_tools() -> (TodoReadTool, TodoWriteTool) {
         TodoReadTool::new(Arc::clone(&storage)),
         TodoWriteTool::new(storage),
     )
+}
+
+/// Factory that registers both [`TodoReadTool`] (`read_todos`) and
+/// [`TodoWriteTool`] (`write_todos`) sharing a single in-memory store.
+/// Takes no configuration.
+pub struct TodoToolsFactory;
+
+impl ToolFactory for TodoToolsFactory {
+    fn name(&self) -> &'static str {
+        "todos"
+    }
+
+    fn build(&self, _config: &Value, registry: &ToolRegistry) -> Result<()> {
+        let (read, write) = create_todo_tools();
+        registry.register(Arc::new(read));
+        registry.register(Arc::new(write));
+        Ok(())
+    }
 }
 
 #[cfg(test)]

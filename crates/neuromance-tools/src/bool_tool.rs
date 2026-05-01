@@ -1,10 +1,12 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::ToolImplementation;
+use crate::factory::ToolFactory;
+use crate::{ToolImplementation, ToolRegistry};
 use neuromance_common::tools::{Function, Parameters, Property, Tool};
 
 /// A tool that returns a boolean result based on the agent's analysis
@@ -58,6 +60,21 @@ impl ToolImplementation for BooleanTool {
 
     fn is_auto_approved(&self) -> bool {
         true // Bool tool is safe and can be auto-approved
+    }
+}
+
+/// Factory that registers [`BooleanTool`] under the name `return_bool`.
+/// Takes no configuration.
+pub struct BoolToolFactory;
+
+impl ToolFactory for BoolToolFactory {
+    fn name(&self) -> &'static str {
+        "return_bool"
+    }
+
+    fn build(&self, _config: &Value, registry: &ToolRegistry) -> Result<()> {
+        registry.register(Arc::new(BooleanTool));
+        Ok(())
     }
 }
 

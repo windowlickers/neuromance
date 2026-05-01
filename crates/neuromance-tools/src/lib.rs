@@ -123,14 +123,16 @@ use serde_json::Value;
 use neuromance_common::tools::{FunctionCall, Tool, ToolCall};
 
 mod bool_tool;
+pub mod factory;
 pub mod generic;
 pub mod mcp;
 pub mod proxy;
 mod think_tool;
 mod todo_tool;
-pub use bool_tool::BooleanTool;
-pub use think_tool::ThinkTool;
-pub use todo_tool::{TodoReadTool, TodoWriteTool, create_todo_tools};
+pub use bool_tool::{BoolToolFactory, BooleanTool};
+pub use factory::{ToolConfig, ToolFactory, ToolFactoryRegistry};
+pub use think_tool::{ThinkTool, ThinkToolFactory};
+pub use todo_tool::{TodoReadTool, TodoToolsFactory, TodoWriteTool, create_todo_tools};
 
 #[async_trait]
 pub trait ToolImplementation: Send + Sync {
