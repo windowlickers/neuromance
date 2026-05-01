@@ -70,12 +70,6 @@ pub mod features;
 /// Provides types for defining and executing functions/tools that LLMs can call.
 pub mod tools;
 
-/// Internal event and domain types for daemon communication.
-///
-/// Defines event types used by the daemon's conversation manager
-/// and the gRPC server bridge for streaming results through mpsc channels.
-pub mod events;
-
 pub mod agents;
 
 pub use agents::{AgentContext, AgentMemory, AgentMessage, AgentResponse, AgentState, AgentStats};
@@ -84,7 +78,6 @@ pub use client::{
     CacheMetrics, ChatRequest, ChatResponse, Config, FinishReason, InputTokensDetails,
     OutputTokensDetails, Provider, ProxyConfig, ReasoningEffort, RetryConfig, ToolChoice, Usage,
 };
-pub use events::{ConversationSummary, DaemonResponse, ErrorCode, ModelProfile};
 pub use features::{ReasoningLevel, ThinkingMode};
 pub use tools::{
     Function, FunctionCall, ObjectSchema, Parameters, Property, Tool, ToolApproval, ToolCall,

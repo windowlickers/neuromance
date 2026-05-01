@@ -16,9 +16,6 @@ cargo clippy --all-targets --all-features
 
 # Format code
 cargo fmt
-
-# Run the CLI
-cargo run --bin neuromance-cli -- --mcp-config mcp_config.toml
 ```
 
 ### Nix-based Development
@@ -34,9 +31,6 @@ nix develop
 
 # Build the library
 nix build
-
-# Build the CLI
-nix build .#neuromance-cli
 ```
 
 ## Architecture
@@ -54,8 +48,6 @@ Neuromance is a Rust library for LLM orchestration, organized as a Cargo workspa
 - **neuromance**: Main orchestration library. The `Core<C: LLMClient>` struct manages conversation loops with tool execution, using an event-driven architecture with callbacks for streaming content, tool approval, and usage tracking.
 
 - **neuromance-agent**: Agent framework for autonomous multi-turn task execution. The `Agent` trait and `BaseAgent` implementation provide state management, memory, and sequential execution with tool support.
-
-- **neuromance-cli**: Interactive command-line interface for LLM conversations with MCP tool support.
 
 ## Common Patterns
 
