@@ -49,6 +49,8 @@ Neuromance is a Rust library for LLM orchestration, organized as a Cargo workspa
 
 - **neuromance-agent**: Agent framework for autonomous multi-turn task execution. The `Agent` trait and `BaseAgent` implementation provide state management, memory, and sequential execution with tool support.
 
+- **neuromance-runtime**: Container runtime binary that boots a `BaseAgent` from TOML config and runs in `oneshot` mode (single task, write JSON, exit — for k8s `Job`s) or `serve` mode (HTTP intake at `POST /tasks` / `GET /tasks/{id}` until SIGTERM — for `Deployment`s). Tools are registered at startup via `ToolFactoryRegistry::with_builtin()`. Approval is `auto` or `async` (webhook). State is in-memory only; postgres persistence is future work.
+
 ## Common Patterns
 
 - **Builder pattern**: Structs use `typed-builder` for ergonomic construction (e.g., `Tool::builder()`, `Config::new().with_api_key()`)

@@ -1,0 +1,44 @@
+[package]
+name = "neuromance-runtime"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Container runtime that executes a Neuromance agent from config (oneshot or serve mode)"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "neuromance-runtime"
+path = "src/main.rs"
+
+[dependencies]
+neuromance = { workspace = true }
+neuromance-agent = { workspace = true }
+neuromance-client = { workspace = true }
+neuromance-common = { workspace = true }
+neuromance-tools = { workspace = true }
+
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+chrono = { workspace = true }
+dashmap = { workspace = true }
+reqwest = { workspace = true }
+secrecy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
