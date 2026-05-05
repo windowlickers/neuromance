@@ -47,24 +47,23 @@
 
 use async_trait::async_trait;
 use chrono::Utc;
-use futures::stream::{Stream, StreamExt};
+use futures::stream::Stream;
 use log::{debug, error, warn};
-use reqwest_eventsource::{Event, EventSource};
 use reqwest_middleware::ClientWithMiddleware;
 use secrecy::{ExposeSecret, SecretString};
 use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
 use neuromance_common::chat::{Message, MessageRole};
 use neuromance_common::client::{ChatChunk, ChatRequest, ChatResponse, Config, ProxyConfig, Usage};
 use neuromance_common::tools::{FunctionCall, ToolCall};
 
 use crate::error::ClientError;
+use crate::streaming::{StreamingProvider, run_sse_stream};
 use crate::transport::add_proxy_headers;
-use crate::{LLMClient, NoRetryPolicy, build_client_resources};
+use crate::{LLMClient, build_client_resources};
 
 use super::{
     ANTHROPIC_VERSION, ContentBlockStart, CreateMessageRequest, DEFAULT_BASE_URL, Delta,
@@ -589,12 +588,9 @@ impl LLMClient for AnthropicClient {
         anthropic_request.stream = Some(true);
 
         let url = format!("{}/messages", self.base_url);
-
-        // Validate URL construction
         reqwest::Url::parse(&url)
             .map_err(|e| ClientError::ConfigurationError(format!("Invalid URL '{url}': {e}")))?;
 
-        // Build the request with SSE headers
         let mut request_builder = self
             .streaming_client
             .post(&url)
@@ -602,12 +598,10 @@ impl LLMClient for AnthropicClient {
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("Content-Type", "application/json");
 
-        // Add beta header for interleaved thinking if enabled
         if request.thinking.is_interleaved() {
             request_builder = request_builder.header("anthropic-beta", INTERLEAVED_THINKING_BETA);
         }
 
-        // Add proxy headers if configured
         request_builder = add_proxy_headers(
             request_builder,
             self.proxy_config.as_ref(),
@@ -617,84 +611,44 @@ impl LLMClient for AnthropicClient {
 
         let request_builder = request_builder.json(&anthropic_request);
 
-        // Create the EventSource
-        let mut event_source = EventSource::new(request_builder).map_err(|e| {
-            ClientError::ConfigurationError(format!("Failed to create event source: {e}"))
-        })?;
+        run_sse_stream(self, request_builder)
+    }
+}
 
-        // Disable automatic retries
-        event_source.set_retry_policy(Box::new(NoRetryPolicy));
+/// Per-stream accumulator for the Anthropic streaming protocol.
+///
+/// `model` and `response_id` are seeded from config and overwritten by the
+/// `MessageStart` event; `streaming_tool_calls` accumulates partial tool-use
+/// JSON across `ContentBlockStart` / `ContentBlockDelta` / `ContentBlockStop`.
+pub struct AnthropicStreamState {
+    model: String,
+    response_id: String,
+    streaming_tool_calls: HashMap<u32, StreamingToolCall>,
+}
 
-        // State for tracking across events - using Arc<Mutex<Arc<str>>> for cheap clones
-        let model: Arc<str> = self.config.model.clone().into();
-        let current_model = Arc::new(Mutex::new(model));
-        let response_id: Arc<str> = "".into();
-        let response_id = Arc::new(Mutex::new(response_id));
-        let streaming_tool_calls: Arc<Mutex<HashMap<u32, StreamingToolCall>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+impl StreamingProvider for AnthropicClient {
+    type Event = StreamEvent;
+    type State = AnthropicStreamState;
 
-        // Convert the EventSource stream into our ChatChunk stream
-        let stream = event_source.filter_map(move |event| {
-            let current_model = Arc::clone(&current_model);
-            let response_id = Arc::clone(&response_id);
-            let streaming_tool_calls = Arc::clone(&streaming_tool_calls);
+    fn initial_state(&self) -> Self::State {
+        AnthropicStreamState {
+            model: self.config.model.clone(),
+            response_id: String::new(),
+            streaming_tool_calls: HashMap::new(),
+        }
+    }
 
-            async move {
-                match event {
-                    Ok(Event::Open) => {
-                        debug!("Stream connection opened");
-                        None
-                    }
-                    Ok(Event::Message(message)) => {
-                        // Parse the event
-                        match serde_json::from_str::<StreamEvent>(&message.data) {
-                            Ok(stream_event) => {
-                                // Update state from message_start
-                                if let StreamEvent::MessageStart { message: ref msg } = stream_event
-                                {
-                                    *current_model.lock().await = Arc::from(msg.model.as_str());
-                                    *response_id.lock().await = Arc::from(msg.id.as_str());
-                                }
-
-                                // Get current state for conversion (Arc<str> clone is cheap)
-                                let model_str = Arc::clone(&*current_model.lock().await);
-                                let response_id_str = Arc::clone(&*response_id.lock().await);
-
-                                // Convert to chat chunk
-                                let chunk = {
-                                    let mut guard = streaming_tool_calls.lock().await;
-                                    convert_event_to_chat_chunk(
-                                        &stream_event,
-                                        &model_str,
-                                        &response_id_str,
-                                        Some(&mut *guard),
-                                    )
-                                };
-
-                                chunk.map(Ok)
-                            }
-                            Err(e) => {
-                                warn!("Failed to parse streaming event: {e}");
-                                debug!("Problematic event data: {}", message.data);
-                                Some(Err(ClientError::SerializationError(e)))
-                            }
-                        }
-                    }
-                    Err(e) => match ClientError::from(e) {
-                        ClientError::EventSourceError(reqwest_eventsource::Error::StreamEnded) => {
-                            debug!("Stream ended normally");
-                            None
-                        }
-                        other_error => {
-                            error!("Stream error: {other_error}");
-                            Some(Err(other_error))
-                        }
-                    },
-                }
-            }
-        });
-
-        Ok(Box::pin(stream))
+    fn process_event(state: &mut Self::State, event: Self::Event) -> Option<ChatChunk> {
+        if let StreamEvent::MessageStart { message: ref msg } = event {
+            state.model.clone_from(&msg.model);
+            state.response_id.clone_from(&msg.id);
+        }
+        convert_event_to_chat_chunk(
+            &event,
+            &state.model,
+            &state.response_id,
+            Some(&mut state.streaming_tool_calls),
+        )
     }
 }
 
@@ -706,6 +660,7 @@ mod tests {
     #![allow(clippy::match_wildcard_for_single_variants)]
 
     use super::*;
+    use futures::StreamExt;
     use neuromance_common::chat::{Message, MessageRole};
     use neuromance_common::client::FinishReason;
     use wiremock::matchers::{header, method, path};

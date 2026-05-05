@@ -27,22 +27,28 @@ pub type ChatChunkStream = Pin<Box<dyn Stream<Item = Result<ChatChunk, ClientErr
 /// Implementors plug in:
 /// - the wire event type ([`Self::Event`])
 /// - per-stream accumulator state ([`Self::State`]; use `()` if none)
+/// - the seed for that state ([`Self::initial_state`]; can read provider config)
 /// - any stream-end sentinel ([`Self::is_stream_end`]; e.g. `OpenAI`'s `[DONE]`)
 /// - the event-to-chunk translation ([`Self::process_event`])
 ///
 /// The driver ([`run_sse_stream`]) handles connection setup, retry-policy
 /// disablement, parsing, stream termination, and HTTP-status error
 /// extraction — all the boilerplate that's identical across providers.
-pub trait StreamingProvider: Send + 'static {
+pub trait StreamingProvider {
     /// The provider's wire event type. Each SSE `data:` line is parsed
     /// into a value of this type.
-    type Event: DeserializeOwned + Send;
+    type Event: DeserializeOwned + Send + 'static;
 
     /// Per-stream accumulator state. Threaded mutably through every
     /// [`Self::process_event`] call so providers can track values like
     /// the active model id, response id, or in-flight tool calls without
     /// reaching for `Arc<Mutex<…>>`.
-    type State: Default + Send;
+    type State: Send + 'static;
+
+    /// Build the initial accumulator state for a stream. Reads provider
+    /// config (e.g. configured model id) so the state has something to
+    /// emit before the first server-supplied identifier event arrives.
+    fn initial_state(&self) -> Self::State;
 
     /// True if `data` is a sentinel that ends the stream cleanly.
     ///
@@ -63,9 +69,9 @@ pub trait StreamingProvider: Send + 'static {
 /// Drive an SSE event source through a [`StreamingProvider`], yielding a
 /// stream of [`ChatChunk`]s.
 ///
-/// The provider type is supplied via turbofish (`run_sse_stream::<MyProvider>(req)`)
-/// — providers are zero-sized type markers; only their associated types and
-/// associated functions are used.
+/// The provider is borrowed only to seed initial state via
+/// [`StreamingProvider::initial_state`] before the unfold loop starts; it
+/// does not need to outlive the returned stream.
 ///
 /// Behaviour:
 /// - `EventSource::Open` events are logged and skipped.
@@ -84,6 +90,7 @@ pub trait StreamingProvider: Send + 'static {
 /// Returns [`ClientError::ConfigurationError`] if the [`EventSource`] cannot
 /// be constructed from the supplied request builder.
 pub fn run_sse_stream<P: StreamingProvider>(
+    provider: &P,
     request: reqwest::RequestBuilder,
 ) -> Result<ChatChunkStream, ClientError> {
     let mut event_source = EventSource::new(request).map_err(|e| {
@@ -94,7 +101,7 @@ pub fn run_sse_stream<P: StreamingProvider>(
     let stream = futures::stream::unfold(
         StreamState::<P::State> {
             event_source,
-            provider_state: P::State::default(),
+            provider_state: provider.initial_state(),
             terminated: false,
         },
         |mut s| async move {
@@ -220,6 +227,10 @@ mod tests {
         type Event = TestEvent;
         type State = String;
 
+        fn initial_state(&self) -> Self::State {
+            String::new()
+        }
+
         fn is_stream_end(data: &str) -> bool {
             data == "[DONE]"
         }
@@ -285,7 +296,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let stream = run_sse_stream::<TestProvider>(post_request(&server)).unwrap();
+        let stream = run_sse_stream(&TestProvider, post_request(&server)).unwrap();
         let chunks: Vec<_> = stream.collect().await;
 
         assert_eq!(chunks.len(), 3);
@@ -318,7 +329,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let stream = run_sse_stream::<TestProvider>(post_request(&server)).unwrap();
+        let stream = run_sse_stream(&TestProvider, post_request(&server)).unwrap();
         let chunks: Vec<_> = stream.collect().await;
 
         assert_eq!(chunks.len(), 1);
@@ -344,7 +355,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let stream = run_sse_stream::<TestProvider>(post_request(&server)).unwrap();
+        let stream = run_sse_stream(&TestProvider, post_request(&server)).unwrap();
         let results: Vec<_> = stream.collect().await;
 
         assert_eq!(results.len(), 2);
@@ -369,7 +380,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let stream = run_sse_stream::<TestProvider>(post_request(&server)).unwrap();
+        let stream = run_sse_stream(&TestProvider, post_request(&server)).unwrap();
         let results: Vec<_> = stream.collect().await;
 
         assert_eq!(results.len(), 1);
@@ -388,7 +399,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let stream = run_sse_stream::<TestProvider>(post_request(&server)).unwrap();
+        let stream = run_sse_stream(&TestProvider, post_request(&server)).unwrap();
         let results: Vec<_> = stream.collect().await;
 
         assert_eq!(results.len(), 1);
@@ -409,7 +420,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let stream = run_sse_stream::<TestProvider>(post_request(&server)).unwrap();
+        let stream = run_sse_stream(&TestProvider, post_request(&server)).unwrap();
         let results: Vec<_> = stream.collect().await;
 
         assert_eq!(results.len(), 1);
@@ -428,7 +439,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let stream = run_sse_stream::<TestProvider>(post_request(&server)).unwrap();
+        let stream = run_sse_stream(&TestProvider, post_request(&server)).unwrap();
         let chunks: Vec<_> = stream.collect().await;
         assert!(chunks.is_empty());
     }

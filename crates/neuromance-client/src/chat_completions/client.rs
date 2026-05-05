@@ -730,13 +730,15 @@ impl LLMClient for ChatCompletionsClient {
 
         let request_builder = request_builder.json(&chat_request);
 
-        run_sse_stream::<Self>(request_builder)
+        run_sse_stream(self, request_builder)
     }
 }
 
 impl StreamingProvider for ChatCompletionsClient {
     type Event = ChatCompletionChunk;
     type State = ();
+
+    fn initial_state(&self) -> Self::State {}
 
     fn is_stream_end(data: &str) -> bool {
         data == "[DONE]"
