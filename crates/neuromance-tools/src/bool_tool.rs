@@ -4,7 +4,6 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
-use tokio_util::sync::CancellationToken;
 
 use crate::factory::ToolFactory;
 use crate::{ToolImplementation, ToolRegistry};
@@ -36,7 +35,7 @@ impl ToolImplementation for BooleanTool {
             .build()
     }
 
-    async fn execute(&self, args: &Value, _cancel: &CancellationToken) -> Result<String> {
+    async fn execute(&self, args: &Value) -> Result<String> {
         let obj = args
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("Expected object arguments"))?;
@@ -96,10 +95,7 @@ mod tests {
             "reason": "The goal was successfully achieved"
         });
 
-        let result = tool
-            .execute(&args, &CancellationToken::new())
-            .await
-            .unwrap();
+        let result = tool.execute(&args).await.unwrap();
         assert!(result.contains("RESULT: TRUE"));
         assert!(result.contains("REASON: The goal was successfully achieved"));
     }
@@ -113,10 +109,7 @@ mod tests {
             "reason": "The task failed due to missing dependencies"
         });
 
-        let result = tool
-            .execute(&args, &CancellationToken::new())
-            .await
-            .unwrap();
+        let result = tool.execute(&args).await.unwrap();
         assert!(result.contains("RESULT: FALSE"));
         assert!(result.contains("REASON: The task failed due to missing dependencies"));
     }
@@ -129,7 +122,7 @@ mod tests {
             "reason": "Some reason"
         });
 
-        let result = tool.execute(&args, &CancellationToken::new()).await;
+        let result = tool.execute(&args).await;
         assert!(result.is_err());
         assert!(
             result
@@ -147,7 +140,7 @@ mod tests {
             "result": true
         });
 
-        let result = tool.execute(&args, &CancellationToken::new()).await;
+        let result = tool.execute(&args).await;
         assert!(result.is_err());
         assert!(
             result

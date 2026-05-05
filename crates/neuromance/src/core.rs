@@ -413,7 +413,7 @@ impl<C: LLMClient> Core<C> {
                             let exec_outcome: Result<Result<String, anyhow::Error>, CoreError> = tokio::select! {
                                 biased;
                                 () = cancel.cancelled() => Err(CoreError::Cancelled("tool execution".to_string())),
-                                r = self.tool_executor.execute_tool(tool_call, &cancel) => Ok(r),
+                                r = self.tool_executor.execute_tool(tool_call) => Ok(r),
                             };
                             match exec_outcome? {
                                 Ok(result) => {
