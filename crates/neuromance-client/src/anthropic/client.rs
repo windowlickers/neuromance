@@ -638,7 +638,10 @@ impl StreamingProvider for AnthropicClient {
         }
     }
 
-    fn process_event(state: &mut Self::State, event: Self::Event) -> Option<ChatChunk> {
+    fn process_event(
+        state: &mut Self::State,
+        event: Self::Event,
+    ) -> Option<Result<ChatChunk, ClientError>> {
         if let StreamEvent::MessageStart { message: ref msg } = event {
             state.model.clone_from(&msg.model);
             state.response_id.clone_from(&msg.id);
@@ -649,6 +652,7 @@ impl StreamingProvider for AnthropicClient {
             &state.response_id,
             Some(&mut state.streaming_tool_calls),
         )
+        .map(Ok)
     }
 }
 

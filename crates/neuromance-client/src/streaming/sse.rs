@@ -58,12 +58,20 @@ pub trait StreamingProvider {
         false
     }
 
-    /// Translate one provider event into a [`ChatChunk`].
+    /// Translate one provider event into a stream item.
     ///
-    /// Returning `None` skips emission — useful for events that update
-    /// accumulator state without producing user-visible output (e.g.
-    /// Anthropic `Ping`, `MessageStart`).
-    fn process_event(state: &mut Self::State, event: Self::Event) -> Option<ChatChunk>;
+    /// - `None` skips emission — for events that update accumulator state
+    ///   without producing user-visible output (e.g. Anthropic `Ping`,
+    ///   `MessageStart`).
+    /// - `Some(Ok(chunk))` yields a [`ChatChunk`] to the consumer.
+    /// - `Some(Err(err))` surfaces a typed error from the wire data without
+    ///   terminating the stream — for application-level failures embedded
+    ///   in events (e.g. Responses `ResponseFailed`). Transport errors are
+    ///   handled by the driver, not here.
+    fn process_event(
+        state: &mut Self::State,
+        event: Self::Event,
+    ) -> Option<Result<ChatChunk, ClientError>>;
 }
 
 /// Drive an SSE event source through a [`StreamingProvider`], yielding a
@@ -120,12 +128,11 @@ pub fn run_sse_stream<P: StreamingProvider>(
                             return None;
                         }
                         match serde_json::from_str::<P::Event>(&message.data) {
-                            Ok(event) => {
-                                if let Some(chunk) = P::process_event(&mut s.provider_state, event)
-                                {
-                                    return Some((Ok(chunk), s));
-                                }
-                            }
+                            Ok(event) => match P::process_event(&mut s.provider_state, event) {
+                                Some(Ok(chunk)) => return Some((Ok(chunk), s)),
+                                Some(Err(err)) => return Some((Err(err), s)),
+                                None => {}
+                            },
                             Err(e) => {
                                 warn!("Failed to parse streaming event: {e}");
                                 debug!("Problematic event data: {}", message.data);
@@ -219,6 +226,7 @@ mod tests {
         Delta { text: String },
         Done,
         Ping,
+        Boom { message: String },
     }
 
     struct TestProvider;
@@ -235,15 +243,19 @@ mod tests {
             data == "[DONE]"
         }
 
-        fn process_event(state: &mut Self::State, event: Self::Event) -> Option<ChatChunk> {
+        fn process_event(
+            state: &mut Self::State,
+            event: Self::Event,
+        ) -> Option<Result<ChatChunk, ClientError>> {
             match event {
                 TestEvent::Hello { model } => {
                     *state = model;
                     None
                 }
                 TestEvent::Ping => None,
-                TestEvent::Delta { text } => Some(chunk(state, Some(text), None)),
-                TestEvent::Done => Some(chunk(state, None, Some(FinishReason::Stop))),
+                TestEvent::Delta { text } => Some(Ok(chunk(state, Some(text), None))),
+                TestEvent::Done => Some(Ok(chunk(state, None, Some(FinishReason::Stop)))),
+                TestEvent::Boom { message } => Some(Err(ClientError::RequestError(message))),
             }
         }
     }
@@ -336,6 +348,41 @@ mod tests {
         assert_eq!(
             chunks[0].as_ref().unwrap().delta_content.as_deref(),
             Some("after pings")
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_data_error_emits_error_but_stream_continues() {
+        let server = MockServer::start().await;
+        let body = sse_body(&[
+            r#"{"type":"hello","model":"m"}"#,
+            r#"{"type":"delta","text":"before"}"#,
+            r#"{"type":"boom","message":"upstream said no"}"#,
+            r#"{"type":"delta","text":"after"}"#,
+            "[DONE]",
+        ]);
+
+        Mock::given(method("POST"))
+            .and(path("/stream"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let stream = run_sse_stream(&TestProvider, post_request(&server)).unwrap();
+        let results: Vec<_> = stream.collect().await;
+
+        assert_eq!(results.len(), 3);
+        assert_eq!(
+            results[0].as_ref().unwrap().delta_content.as_deref(),
+            Some("before")
+        );
+        match &results[1] {
+            Err(ClientError::RequestError(msg)) => assert!(msg.contains("upstream said no")),
+            other => panic!("expected RequestError, got {other:?}"),
+        }
+        assert_eq!(
+            results[2].as_ref().unwrap().delta_content.as_deref(),
+            Some("after")
         );
     }
 

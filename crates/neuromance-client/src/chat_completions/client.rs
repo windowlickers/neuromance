@@ -744,8 +744,11 @@ impl StreamingProvider for ChatCompletionsClient {
         data == "[DONE]"
     }
 
-    fn process_event(_state: &mut Self::State, event: Self::Event) -> Option<ChatChunk> {
-        Some(convert_chunk_to_chat_chunk(&event))
+    fn process_event(
+        _state: &mut Self::State,
+        event: Self::Event,
+    ) -> Option<Result<ChatChunk, ClientError>> {
+        Some(Ok(convert_chunk_to_chat_chunk(&event)))
     }
 }
 

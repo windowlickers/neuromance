@@ -4,23 +4,22 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use futures::stream::{Stream, StreamExt};
+use futures::stream::Stream;
 use log::{debug, error, warn};
-use reqwest_eventsource::{Event, EventSource};
 use reqwest_middleware::ClientWithMiddleware;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
 use neuromance_common::chat::MessageRole;
 use neuromance_common::client::{ChatChunk, ChatRequest, ChatResponse, Config, Usage};
 use neuromance_common::tools::{FunctionCall, ToolCall};
 
 use crate::error::{ClientError, ErrorResponse};
-use crate::{LLMClient, NoRetryPolicy, build_client_resources};
+use crate::streaming::{StreamingProvider, run_sse_stream};
+use crate::{LLMClient, build_client_resources};
 
 use super::{
     OutputItem, ResponsesRequest, ResponsesResponse, StreamEvent, StreamingFunctionCall,
@@ -234,12 +233,9 @@ impl LLMClient for ResponsesClient {
         responses_request.stream = Some(true);
 
         let url = format!("{}/responses", self.base_url);
-
-        // Validate URL construction
         reqwest::Url::parse(&url)
             .map_err(|e| ClientError::ConfigurationError(format!("Invalid URL '{url}': {e}")))?;
 
-        // Build the request with SSE headers
         let request_builder = self
             .streaming_client
             .post(&url)
@@ -250,132 +246,54 @@ impl LLMClient for ResponsesClient {
             .header("Content-Type", "application/json")
             .json(&responses_request);
 
-        // Create the EventSource
-        let mut event_source = EventSource::new(request_builder).map_err(|e| {
-            ClientError::ConfigurationError(format!("Failed to create event source: {e}"))
-        })?;
-
-        // Disable automatic retries - we handle retries at the Core level
-        event_source.set_retry_policy(Box::new(NoRetryPolicy));
-
-        // Shared state for streaming using String for simplicity
-        let model: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
-        let response_id: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
-        let streaming_function_calls: Arc<Mutex<HashMap<u32, StreamingFunctionCall>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-
-        let model_clone = Arc::clone(&model);
-        let response_id_clone = Arc::clone(&response_id);
-        let streaming_function_calls_clone = Arc::clone(&streaming_function_calls);
-
-        // Convert the EventSource stream into our ChatChunk stream
-        let stream = event_source.filter_map(move |event| {
-            let model = Arc::clone(&model_clone);
-            let response_id = Arc::clone(&response_id_clone);
-            let streaming_function_calls = Arc::clone(&streaming_function_calls_clone);
-
-            async move {
-                match event {
-                    Ok(Event::Open) => {
-                        debug!("Stream connection opened");
-                        None
-                    }
-                    Ok(Event::Message(message)) => {
-                        // OpenAI sends [DONE] to signal stream completion
-                        if message.data == "[DONE]" {
-                            debug!("Stream completed with [DONE] marker");
-                            return None;
-                        }
-
-                        // Parse the event
-                        match serde_json::from_str::<StreamEvent>(&message.data) {
-                            Ok(stream_event) => {
-                                convert_stream_event_to_chunk(
-                                    stream_event,
-                                    &model,
-                                    &response_id,
-                                    &streaming_function_calls,
-                                )
-                                .await
-                            }
-                            Err(e) => {
-                                warn!("Failed to parse streaming event: {e}");
-                                debug!("Problematic event data: {}", message.data);
-                                Some(Err(ClientError::SerializationError(e)))
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        // Handle different error types
-                        match e {
-                            reqwest_eventsource::Error::StreamEnded => {
-                                debug!("Stream ended normally");
-                                None
-                            }
-                            reqwest_eventsource::Error::InvalidStatusCode(status, response) => {
-                                // Extract error details from response body
-                                let error = extract_error_from_response(status, response).await;
-                                error!("API error: {error}");
-                                Some(Err(error))
-                            }
-                            other => {
-                                let error = ClientError::EventSourceError(other);
-                                error!("Stream error: {error}");
-                                Some(Err(error))
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
-        Ok(Box::pin(stream))
+        run_sse_stream(self, request_builder)
     }
 }
 
-/// Extract error details from an HTTP error response.
+/// Per-stream accumulator for the Responses streaming protocol.
 ///
-/// Attempts to parse the response body as a structured error, falling back to raw text.
-async fn extract_error_from_response(
-    status: reqwest::StatusCode,
-    response: reqwest::Response,
-) -> ClientError {
-    let error_text = response.text().await.unwrap_or_default();
+/// `model` and `response_id` are populated by the first `ResponseCreated`
+/// event; `streaming_function_calls` accumulates partial tool-use arguments
+/// across `OutputItemAdded` / `FunctionCallArgumentsDelta` /
+/// `FunctionCallArgumentsDone` / `OutputItemDone`.
+#[derive(Default)]
+pub struct ResponsesStreamState {
+    model: String,
+    response_id: String,
+    streaming_function_calls: HashMap<u32, StreamingFunctionCall>,
+}
 
-    // Try to parse as structured error response
-    let error_message = match serde_json::from_str::<ErrorResponse>(&error_text) {
-        Ok(parsed) => parsed.error.message,
-        Err(_) => {
-            if error_text.is_empty() {
-                format!("HTTP {status}")
-            } else {
-                error_text
-            }
-        }
-    };
+impl StreamingProvider for ResponsesClient {
+    type Event = StreamEvent;
+    type State = ResponsesStreamState;
 
-    match status.as_u16() {
-        401 => ClientError::AuthenticationError(error_message),
-        429 => ClientError::RateLimitError { retry_after: None },
-        500..=599 => ClientError::ServiceUnavailable(error_message),
-        _ => ClientError::RequestError(error_message),
+    fn initial_state(&self) -> Self::State {
+        ResponsesStreamState::default()
+    }
+
+    fn is_stream_end(data: &str) -> bool {
+        data == "[DONE]"
+    }
+
+    fn process_event(
+        state: &mut Self::State,
+        event: Self::Event,
+    ) -> Option<Result<ChatChunk, ClientError>> {
+        convert_event_to_chunk(event, state)
     }
 }
 
-/// Convert a stream event to a `ChatChunk`.
+/// Translate one Responses stream event into a `ChatChunk` (or error).
 #[allow(clippy::too_many_lines)]
-async fn convert_stream_event_to_chunk(
+fn convert_event_to_chunk(
     event: StreamEvent,
-    model: &Arc<Mutex<String>>,
-    response_id: &Arc<Mutex<String>>,
-    streaming_function_calls: &Arc<Mutex<HashMap<u32, StreamingFunctionCall>>>,
+    state: &mut ResponsesStreamState,
 ) -> Option<Result<ChatChunk, ClientError>> {
     match event {
         StreamEvent::ResponseCreated { response }
         | StreamEvent::ResponseInProgress { response } => {
-            // Update shared state
-            model.lock().await.clone_from(&response.model);
-            response_id.lock().await.clone_from(&response.id);
+            state.model.clone_from(&response.model);
+            state.response_id.clone_from(&response.id);
 
             Some(Ok(ChatChunk {
                 model: response.model,
@@ -428,48 +346,36 @@ async fn convert_stream_event_to_chunk(
             Some(Err(ClientError::RequestError(error_msg)))
         }
 
-        StreamEvent::OutputTextDelta { delta, .. } => {
-            let current_model = model.lock().await.clone();
-            let current_response_id = response_id.lock().await.clone();
+        StreamEvent::OutputTextDelta { delta, .. } => Some(Ok(ChatChunk {
+            model: state.model.clone(),
+            delta_content: Some(delta),
+            delta_reasoning_content: None,
+            delta_role: None,
+            delta_tool_calls: None,
+            finish_reason: None,
+            usage: None,
+            response_id: Some(state.response_id.clone()),
+            created_at: Utc::now(),
+            metadata: HashMap::new(),
+        })),
 
-            Some(Ok(ChatChunk {
-                model: current_model,
-                delta_content: Some(delta),
-                delta_reasoning_content: None,
-                delta_role: None,
-                delta_tool_calls: None,
-                finish_reason: None,
-                usage: None,
-                response_id: Some(current_response_id),
-                created_at: Utc::now(),
-                metadata: HashMap::new(),
-            }))
-        }
-
-        StreamEvent::ReasoningSummaryTextDelta { delta, .. } => {
-            let current_model = model.lock().await.clone();
-            let current_response_id = response_id.lock().await.clone();
-
-            Some(Ok(ChatChunk {
-                model: current_model,
-                delta_content: None,
-                delta_reasoning_content: Some(delta),
-                delta_role: None,
-                delta_tool_calls: None,
-                finish_reason: None,
-                usage: None,
-                response_id: Some(current_response_id),
-                created_at: Utc::now(),
-                metadata: HashMap::new(),
-            }))
-        }
+        StreamEvent::ReasoningSummaryTextDelta { delta, .. } => Some(Ok(ChatChunk {
+            model: state.model.clone(),
+            delta_content: None,
+            delta_reasoning_content: Some(delta),
+            delta_role: None,
+            delta_tool_calls: None,
+            finish_reason: None,
+            usage: None,
+            response_id: Some(state.response_id.clone()),
+            created_at: Utc::now(),
+            metadata: HashMap::new(),
+        })),
 
         StreamEvent::OutputItemAdded { output_index, item } => {
-            // If this is a function call, start accumulating
             if let OutputItem::FunctionCall { call_id, name, .. } = item {
-                streaming_function_calls
-                    .lock()
-                    .await
+                state
+                    .streaming_function_calls
                     .insert(output_index, StreamingFunctionCall::new(call_id, name));
             }
             None
@@ -480,11 +386,9 @@ async fn convert_stream_event_to_chunk(
             delta,
             ..
         } => {
-            // Accumulate arguments as a fallback for OutputItemDone.
-            // The primary path (FunctionCallArgumentsDone) uses the complete arguments
-            // from that event directly, so these deltas only matter if the API sends
-            // OutputItemDone without a preceding FunctionCallArgumentsDone.
-            if let Some(fc) = streaming_function_calls.lock().await.get_mut(&output_index) {
+            // Fallback path for OutputItemDone — primary finalization uses
+            // FunctionCallArgumentsDone with full arguments.
+            if let Some(fc) = state.streaming_function_calls.get_mut(&output_index) {
                 fc.append_delta(&delta);
             }
             None
@@ -495,18 +399,13 @@ async fn convert_stream_event_to_chunk(
             arguments,
             ..
         } => {
-            // Get the call_id and function name from the accumulator and remove it.
-            // The call_id (not item_id) is the correct identifier for correlating
+            // call_id (not item_id) is the correct identifier for correlating
             // tool results back in multi-turn conversations.
-            let (call_id, function_name) = streaming_function_calls
-                .lock()
-                .await
+            let (call_id, function_name) = state
+                .streaming_function_calls
                 .remove(&output_index)
                 .map(|fc| (fc.call_id, fc.name))
                 .unwrap_or_default();
-
-            let current_model = model.lock().await.clone();
-            let current_response_id = response_id.lock().await.clone();
 
             let tool_call = ToolCall {
                 id: call_id,
@@ -518,39 +417,35 @@ async fn convert_stream_event_to_chunk(
             };
 
             Some(Ok(ChatChunk {
-                model: current_model,
+                model: state.model.clone(),
                 delta_content: None,
                 delta_reasoning_content: None,
                 delta_role: None,
                 delta_tool_calls: Some(vec![tool_call]),
                 finish_reason: None,
                 usage: None,
-                response_id: Some(current_response_id),
+                response_id: Some(state.response_id.clone()),
                 created_at: Utc::now(),
                 metadata: HashMap::new(),
             }))
         }
 
         StreamEvent::OutputItemDone { output_index, .. } => {
-            // If this was a function call that wasn't finalized via FunctionCallArgumentsDone,
-            // finalize it now
-            let maybe_fc = streaming_function_calls.lock().await.remove(&output_index);
+            // Finalize a function call that wasn't already closed via
+            // FunctionCallArgumentsDone.
+            let maybe_fc = state.streaming_function_calls.remove(&output_index);
 
             if let Some(fc) = maybe_fc {
-                let current_model = model.lock().await.clone();
-                let current_response_id = response_id.lock().await.clone();
-
                 let tool_call = fc.finalize();
-
                 return Some(Ok(ChatChunk {
-                    model: current_model,
+                    model: state.model.clone(),
                     delta_content: None,
                     delta_reasoning_content: None,
                     delta_role: None,
                     delta_tool_calls: Some(vec![tool_call]),
                     finish_reason: None,
                     usage: None,
-                    response_id: Some(current_response_id),
+                    response_id: Some(state.response_id.clone()),
                     created_at: Utc::now(),
                     metadata: HashMap::new(),
                 }));
@@ -566,7 +461,6 @@ async fn convert_stream_event_to_chunk(
             Some(Err(ClientError::RequestError(error.message)))
         }
 
-        // Events we don't need to emit chunks for
         StreamEvent::ContentPartAdded { .. }
         | StreamEvent::ContentPartDone { .. }
         | StreamEvent::OutputTextDone { .. }
@@ -582,6 +476,7 @@ mod tests {
     #![allow(clippy::panic)]
 
     use super::*;
+    use futures::StreamExt;
     use neuromance_common::chat::Message;
     use neuromance_common::client::FinishReason;
     use smallvec::SmallVec;
@@ -765,20 +660,11 @@ mod tests {
     }
 
     // ========================================================================
-    // Streaming unit tests for convert_stream_event_to_chunk
+    // Streaming unit tests for convert_event_to_chunk
     // ========================================================================
 
-    #[allow(clippy::type_complexity)]
-    fn create_shared_state() -> (
-        Arc<Mutex<String>>,
-        Arc<Mutex<String>>,
-        Arc<Mutex<HashMap<u32, StreamingFunctionCall>>>,
-    ) {
-        (
-            Arc::new(Mutex::new(String::new())),
-            Arc::new(Mutex::new(String::new())),
-            Arc::new(Mutex::new(HashMap::new())),
-        )
+    fn make_state() -> ResponsesStreamState {
+        ResponsesStreamState::default()
     }
 
     fn make_partial_response(id: &str, model: &str) -> super::super::PartialResponse {
@@ -797,13 +683,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_response_created_sets_model_and_role() {
-        let (model, response_id, fc) = create_shared_state();
+        let mut state = make_state();
 
         let event = StreamEvent::ResponseCreated {
             response: make_partial_response("resp_abc", "gpt-4o"),
         };
 
-        let result = convert_stream_event_to_chunk(event, &model, &response_id, &fc).await;
+        let result = convert_event_to_chunk(event, &mut state);
         let chunk = result.unwrap().unwrap();
 
         assert_eq!(chunk.model, "gpt-4o");
@@ -812,15 +698,15 @@ mod tests {
         assert!(chunk.delta_content.is_none());
 
         // Shared state should be updated
-        assert_eq!(*model.lock().await, "gpt-4o");
-        assert_eq!(*response_id.lock().await, "resp_abc");
+        assert_eq!(state.model, "gpt-4o");
+        assert_eq!(state.response_id, "resp_abc");
     }
 
     #[tokio::test]
     async fn test_stream_text_delta() {
-        let (model, response_id, fc) = create_shared_state();
-        *model.lock().await = "gpt-4o".to_string();
-        *response_id.lock().await = "resp_abc".to_string();
+        let mut state = make_state();
+        state.model = "gpt-4o".to_string();
+        state.response_id = "resp_abc".to_string();
 
         let event = StreamEvent::OutputTextDelta {
             output_index: 0,
@@ -828,7 +714,7 @@ mod tests {
             delta: "Hello ".to_string(),
         };
 
-        let result = convert_stream_event_to_chunk(event, &model, &response_id, &fc).await;
+        let result = convert_event_to_chunk(event, &mut state);
         let chunk = result.unwrap().unwrap();
 
         assert_eq!(chunk.delta_content.as_deref(), Some("Hello "));
@@ -839,9 +725,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_reasoning_delta() {
-        let (model, response_id, fc) = create_shared_state();
-        *model.lock().await = "o3".to_string();
-        *response_id.lock().await = "resp_r".to_string();
+        let mut state = make_state();
+        state.model = "o3".to_string();
+        state.response_id = "resp_r".to_string();
 
         let event = StreamEvent::ReasoningSummaryTextDelta {
             output_index: 0,
@@ -849,7 +735,7 @@ mod tests {
             delta: "Let me think...".to_string(),
         };
 
-        let result = convert_stream_event_to_chunk(event, &model, &response_id, &fc).await;
+        let result = convert_event_to_chunk(event, &mut state);
         let chunk = result.unwrap().unwrap();
 
         assert_eq!(
@@ -862,7 +748,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_response_completed_with_usage() {
-        let (model, response_id, fc) = create_shared_state();
+        let mut state = make_state();
 
         let response = super::super::ResponsesResponse {
             id: "resp_done".to_string(),
@@ -888,7 +774,7 @@ mod tests {
 
         let event = StreamEvent::ResponseCompleted { response };
 
-        let result = convert_stream_event_to_chunk(event, &model, &response_id, &fc).await;
+        let result = convert_event_to_chunk(event, &mut state);
         let chunk = result.unwrap().unwrap();
 
         assert_eq!(chunk.finish_reason, Some(FinishReason::Stop));
@@ -900,7 +786,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_response_incomplete_with_usage() {
-        let (model, response_id, fc) = create_shared_state();
+        let mut state = make_state();
 
         let response = super::super::ResponsesResponse {
             id: "resp_inc".to_string(),
@@ -928,7 +814,7 @@ mod tests {
 
         let event = StreamEvent::ResponseIncomplete { response };
 
-        let result = convert_stream_event_to_chunk(event, &model, &response_id, &fc).await;
+        let result = convert_event_to_chunk(event, &mut state);
         let chunk = result.unwrap().unwrap();
 
         assert_eq!(chunk.finish_reason, Some(FinishReason::Length));
@@ -940,7 +826,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_response_failed() {
-        let (model, response_id, fc) = create_shared_state();
+        let mut state = make_state();
 
         let mut partial = make_partial_response("resp_fail", "gpt-4o");
         partial.status = super::super::ResponseStatus::Failed;
@@ -951,16 +837,16 @@ mod tests {
 
         let event = StreamEvent::ResponseFailed { response: partial };
 
-        let result = convert_stream_event_to_chunk(event, &model, &response_id, &fc).await;
+        let result = convert_event_to_chunk(event, &mut state);
         let err = result.unwrap().unwrap_err();
         assert!(err.to_string().contains("Internal server error"));
     }
 
     #[tokio::test]
     async fn test_stream_function_call_flow() {
-        let (model, response_id, fc) = create_shared_state();
-        *model.lock().await = "gpt-4o".to_string();
-        *response_id.lock().await = "resp_fc".to_string();
+        let mut state = make_state();
+        state.model = "gpt-4o".to_string();
+        state.response_id = "resp_fc".to_string();
 
         // 1. OutputItemAdded with function call
         let added_event = StreamEvent::OutputItemAdded {
@@ -971,7 +857,7 @@ mod tests {
                 arguments: String::new(),
             },
         };
-        let result = convert_stream_event_to_chunk(added_event, &model, &response_id, &fc).await;
+        let result = convert_event_to_chunk(added_event, &mut state);
         assert!(result.is_none());
 
         // 2. First arguments delta
@@ -980,7 +866,7 @@ mod tests {
             call_id: String::new(),
             delta: r#"{"loc"#.to_string(),
         };
-        let result = convert_stream_event_to_chunk(delta1, &model, &response_id, &fc).await;
+        let result = convert_event_to_chunk(delta1, &mut state);
         assert!(result.is_none());
 
         // 3. Second arguments delta
@@ -989,7 +875,7 @@ mod tests {
             call_id: String::new(),
             delta: r#"ation":"SF"}"#.to_string(),
         };
-        let result = convert_stream_event_to_chunk(delta2, &model, &response_id, &fc).await;
+        let result = convert_event_to_chunk(delta2, &mut state);
         assert!(result.is_none());
 
         // 4. FunctionCallArgumentsDone
@@ -999,7 +885,7 @@ mod tests {
             arguments: r#"{"location":"SF"}"#.to_string(),
             sequence_number: 0,
         };
-        let result = convert_stream_event_to_chunk(done_event, &model, &response_id, &fc).await;
+        let result = convert_event_to_chunk(done_event, &mut state);
         let chunk = result.unwrap().unwrap();
 
         let tool_calls = chunk.delta_tool_calls.unwrap();
@@ -1011,9 +897,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_function_call_finalized_on_output_item_done() {
-        let (model, response_id, fc) = create_shared_state();
-        *model.lock().await = "gpt-4o".to_string();
-        *response_id.lock().await = "resp_fc2".to_string();
+        let mut state = make_state();
+        state.model = "gpt-4o".to_string();
+        state.response_id = "resp_fc2".to_string();
 
         // 1. OutputItemAdded
         let added = StreamEvent::OutputItemAdded {
@@ -1024,7 +910,7 @@ mod tests {
                 arguments: String::new(),
             },
         };
-        convert_stream_event_to_chunk(added, &model, &response_id, &fc).await;
+        convert_event_to_chunk(added, &mut state);
 
         // No deltas — empty args
 
@@ -1037,7 +923,7 @@ mod tests {
                 arguments: String::new(),
             },
         };
-        let result = convert_stream_event_to_chunk(done, &model, &response_id, &fc).await;
+        let result = convert_event_to_chunk(done, &mut state);
         let chunk = result.unwrap().unwrap();
 
         let tool_calls = chunk.delta_tool_calls.unwrap();
@@ -1050,7 +936,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_output_item_done_no_pending_function_call() {
-        let (model, response_id, fc) = create_shared_state();
+        let mut state = make_state();
 
         // OutputItemDone for a message item (no pending function call)
         let done = StreamEvent::OutputItemDone {
@@ -1060,13 +946,13 @@ mod tests {
                 content: vec![],
             },
         };
-        let result = convert_stream_event_to_chunk(done, &model, &response_id, &fc).await;
+        let result = convert_event_to_chunk(done, &mut state);
         assert!(result.is_none());
     }
 
     #[tokio::test]
     async fn test_stream_error_event() {
-        let (model, response_id, fc) = create_shared_state();
+        let mut state = make_state();
 
         let event = StreamEvent::Error {
             error: super::super::ApiError {
@@ -1076,14 +962,14 @@ mod tests {
             },
         };
 
-        let result = convert_stream_event_to_chunk(event, &model, &response_id, &fc).await;
+        let result = convert_event_to_chunk(event, &mut state);
         let err = result.unwrap().unwrap_err();
         assert!(err.to_string().contains("Invalid model specified"));
     }
 
     #[tokio::test]
     async fn test_stream_unknown_events_return_none() {
-        let (model, response_id, fc) = create_shared_state();
+        let mut state = make_state();
 
         // ContentPartAdded
         let event = StreamEvent::ContentPartAdded {
@@ -1093,11 +979,7 @@ mod tests {
                 text: String::new(),
             },
         };
-        assert!(
-            convert_stream_event_to_chunk(event, &model, &response_id, &fc)
-                .await
-                .is_none()
-        );
+        assert!(convert_event_to_chunk(event, &mut state).is_none());
 
         // ContentPartDone
         let event = StreamEvent::ContentPartDone {
@@ -1107,11 +989,7 @@ mod tests {
                 text: "done".to_string(),
             },
         };
-        assert!(
-            convert_stream_event_to_chunk(event, &model, &response_id, &fc)
-                .await
-                .is_none()
-        );
+        assert!(convert_event_to_chunk(event, &mut state).is_none());
 
         // OutputTextDone
         let event = StreamEvent::OutputTextDone {
@@ -1119,11 +997,7 @@ mod tests {
             content_index: 0,
             text: "done".to_string(),
         };
-        assert!(
-            convert_stream_event_to_chunk(event, &model, &response_id, &fc)
-                .await
-                .is_none()
-        );
+        assert!(convert_event_to_chunk(event, &mut state).is_none());
 
         // ReasoningSummaryTextDone
         let event = StreamEvent::ReasoningSummaryTextDone {
@@ -1131,18 +1005,10 @@ mod tests {
             summary_index: 0,
             text: "done".to_string(),
         };
-        assert!(
-            convert_stream_event_to_chunk(event, &model, &response_id, &fc)
-                .await
-                .is_none()
-        );
+        assert!(convert_event_to_chunk(event, &mut state).is_none());
 
         // Unknown
-        assert!(
-            convert_stream_event_to_chunk(StreamEvent::Unknown, &model, &response_id, &fc)
-                .await
-                .is_none()
-        );
+        assert!(convert_event_to_chunk(StreamEvent::Unknown, &mut state).is_none());
     }
 
     // ========================================================================
