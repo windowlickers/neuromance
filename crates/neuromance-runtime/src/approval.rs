@@ -98,9 +98,7 @@ impl WebhookApprover {
                     let status = resp.status();
                     if !status.is_success() {
                         warn!(%status, tool=%tool_name, "approval webhook returned non-success");
-                        return ToolApproval::Denied(format!(
-                            "approval webhook returned {status}"
-                        ));
+                        return ToolApproval::Denied(format!("approval webhook returned {status}"));
                     }
                     match resp.json::<WebhookResponse>().await {
                         Ok(parsed) if parsed.approved => ToolApproval::Approved,
@@ -111,9 +109,7 @@ impl WebhookApprover {
                         ),
                         Err(e) => {
                             warn!(error=%e, tool=%tool_name, "approval response parse failed");
-                            ToolApproval::Denied(format!(
-                                "approval response parse failed: {e}"
-                            ))
+                            ToolApproval::Denied(format!("approval response parse failed: {e}"))
                         }
                     }
                 }

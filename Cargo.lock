@@ -1343,6 +1343,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "uuid",
 ]
 
@@ -1364,6 +1365,7 @@ dependencies = [
  "neuromance-tools",
  "serde_json",
  "tokio",
+ "tokio-util",
  "uuid",
 ]
 
@@ -1427,6 +1429,7 @@ dependencies = [
  "axum",
  "chrono",
  "dashmap",
+ "futures",
  "neuromance",
  "neuromance-agent",
  "neuromance-client",
@@ -1462,6 +1465,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "tokio",
+ "tokio-util",
  "toml",
  "url",
 ]

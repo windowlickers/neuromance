@@ -10,6 +10,7 @@
 //! ```rust,no_run
 //! use neuromance::{ChatCompletionsClient, Config};
 //! use neuromance_agent::{Agent, AgentBuilder};
+//! use tokio_util::sync::CancellationToken;
 //!
 //! # async fn example() -> anyhow::Result<()> {
 //! let config = Config::new("openai", "gpt-4").with_api_key("sk-...");
@@ -22,7 +23,7 @@
 //!     .auto_approve_tools(true)
 //!     .build();
 //!
-//! let response = agent.execute(None).await?;
+//! let response = agent.execute(None, CancellationToken::new()).await?;
 //! println!("{}", response.content.content);
 //! # Ok(())
 //! # }
@@ -30,6 +31,7 @@
 
 use async_trait::async_trait;
 use log::info;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use neuromance::Core;
@@ -107,6 +109,7 @@ impl<C: LLMClient + Send + Sync> Agent for BaseAgent<C> {
     async fn execute(
         &mut self,
         messages: Option<Vec<Message>>,
+        cancel: CancellationToken,
     ) -> Result<AgentResponse, CoreError> {
         info!("Agent {} executing", self.id);
         self.core.tool_choice = self.tool_choice.clone();
@@ -145,7 +148,7 @@ impl<C: LLMClient + Send + Sync> Agent for BaseAgent<C> {
         let success_before = self.core.successful_tool_calls;
         let fail_before = self.core.failed_tool_calls;
 
-        let messages = self.core.chat_with_tool_loop(messages).await?;
+        let messages = self.core.chat_with_tool_loop(messages, cancel).await?;
 
         self.state.stats.total_messages += messages.len();
         let tokens_after = self.core.cache_metrics.total_input_tokens
@@ -209,6 +212,9 @@ pub trait Agent: Send + Sync {
     async fn reset(&mut self) -> Result<(), CoreError>;
 
     /// Execute core chat with tools loop
-    async fn execute(&mut self, messages: Option<Vec<Message>>)
-    -> Result<AgentResponse, CoreError>;
+    async fn execute(
+        &mut self,
+        messages: Option<Vec<Message>>,
+        cancel: CancellationToken,
+    ) -> Result<AgentResponse, CoreError>;
 }

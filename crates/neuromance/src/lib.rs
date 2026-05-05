@@ -7,6 +7,7 @@
 //! ```rust,no_run
 //! use futures::StreamExt;
 //! use neuromance::{Config, Core, CoreEvent, Message, build_client};
+//! use tokio_util::sync::CancellationToken;
 //!
 //! # async fn example() -> anyhow::Result<()> {
 //! let config = Config::from_model("openai:gpt-4o")?.with_api_key("sk-...");
@@ -14,7 +15,8 @@
 //! let mut core = Core::new(client).with_streaming();
 //!
 //! let messages: Vec<Message> = vec![/* ... */];
-//! let mut stream = Box::pin(core.run(messages));
+//! let cancel = CancellationToken::new();
+//! let mut stream = Box::pin(core.run(messages, cancel));
 //! while let Some(event) = stream.next().await {
 //!     match event? {
 //!         CoreEvent::Delta(chunk)    => print!("{chunk}"),

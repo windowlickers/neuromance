@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 use crate::ToolImplementation;
 use neuromance_common::tools::{Function, ObjectSchema, Parameters, Property, Tool};
@@ -132,7 +133,7 @@ impl ToolImplementation for McpToolAdapter {
             .build()
     }
 
-    async fn execute(&self, args: &Value) -> Result<String> {
+    async fn execute(&self, args: &Value, cancel: &CancellationToken) -> Result<String> {
         log::info!(
             "Executing MCP tool '{}' on server '{}' with args: {}",
             self.tool_name,
@@ -140,8 +141,13 @@ impl ToolImplementation for McpToolAdapter {
             serde_json::to_string_pretty(args)?
         );
 
-        // Call the tool through the MCP client
-        let result = self.client.call_tool(&self.tool_name, args.clone()).await?;
+        let result = tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                anyhow::bail!("mcp tool call cancelled");
+            }
+            res = self.client.call_tool(&self.tool_name, args.clone()) => res?,
+        };
 
         // Check if there was an error
         if result.is_error.unwrap_or(false) {

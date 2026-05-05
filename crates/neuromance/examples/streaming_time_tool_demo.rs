@@ -6,6 +6,7 @@ use anyhow::Result;
 use clap::Parser;
 use futures::StreamExt;
 use log::info;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use neuromance::{Core, CoreEvent};
@@ -106,7 +107,7 @@ async fn main() -> Result<()> {
 
     let original_message_count = messages.len();
     let mut final_messages: Vec<Message> = Vec::new();
-    let mut stream = Box::pin(core.run(messages.clone()));
+    let mut stream = Box::pin(core.run(messages.clone(), CancellationToken::new()));
     while let Some(event) = stream.next().await {
         match event? {
             CoreEvent::Delta(chunk) => {

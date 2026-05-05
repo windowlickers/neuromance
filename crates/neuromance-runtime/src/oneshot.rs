@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use serde::Serialize;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use uuid::Uuid;
 
@@ -30,6 +31,7 @@ pub struct OneshotOutput {
 pub async fn run<C: LLMClient + Send + Sync>(
     config: &RuntimeConfig,
     agent: &mut BaseAgent<C>,
+    cancel: CancellationToken,
 ) -> Result<()> {
     let oneshot = config
         .oneshot
@@ -43,7 +45,11 @@ pub async fn run<C: LLMClient + Send + Sync>(
     ];
 
     info!(agent=%agent.id, conversation_id=%conversation_id, "running oneshot");
-    let result = agent.execute(Some(messages)).await;
+    let result = tokio::select! {
+        biased;
+        () = cancel.cancelled() => Err(anyhow::anyhow!("oneshot cancelled")),
+        res = agent.execute(Some(messages), cancel.child_token()) => res.map_err(anyhow::Error::from),
+    };
 
     let output = match result {
         Ok(response) => OneshotOutput {
@@ -70,8 +76,7 @@ pub async fn run<C: LLMClient + Send + Sync>(
     let json = serde_json::to_string_pretty(&output)?;
 
     if let Some(path) = &oneshot.output_path {
-        std::fs::write(path, &json)
-            .with_context(|| format!("write {}", path.display()))?;
+        std::fs::write(path, &json).with_context(|| format!("write {}", path.display()))?;
         info!(path=%path.display(), "oneshot output written");
     } else {
         println!("{json}");

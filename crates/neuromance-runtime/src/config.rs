@@ -120,9 +120,8 @@ impl RuntimeConfig {
     /// Returns [`RuntimeError::Config`] if the file cannot be read or parsed.
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, RuntimeError> {
         let path = path.as_ref();
-        let contents = std::fs::read_to_string(path).map_err(|e| {
-            RuntimeError::Config(format!("read {}: {e}", path.display()))
-        })?;
+        let contents = std::fs::read_to_string(path)
+            .map_err(|e| RuntimeError::Config(format!("read {}: {e}", path.display())))?;
         let config: Self = toml::from_str(&contents)
             .map_err(|e| RuntimeError::Config(format!("parse {}: {e}", path.display())))?;
         config.validate()?;
@@ -141,8 +140,7 @@ impl RuntimeConfig {
                 "oneshot mode requires [oneshot] section".to_string(),
             ));
         }
-        if matches!(self.approval.mode, ApprovalMode::Async)
-            && self.approval.webhook_url.is_none()
+        if matches!(self.approval.mode, ApprovalMode::Async) && self.approval.webhook_url.is_none()
         {
             return Err(RuntimeError::Config(
                 "approval.mode = \"async\" requires approval.webhook_url".to_string(),

@@ -13,7 +13,7 @@ use neuromance_runtime::{
     ApprovalMode, Mode, RuntimeConfig, RuntimeError,
     approval::WebhookApprover,
     health::{ReadinessGate, router as health_router},
-    lifecycle::install_shutdown_handler,
+    lifecycle::shutdown_handler,
     oneshot, serve,
 };
 use neuromance_tools::ToolFactoryRegistry;
@@ -31,7 +31,7 @@ async fn main() -> Result<()> {
     );
 
     let cancel = CancellationToken::new();
-    install_shutdown_handler(cancel.clone()).context("install shutdown handler")?;
+    shutdown_handler(cancel.clone()).context("install shutdown handler")?;
 
     let readiness = Arc::new(ReadinessGate::new());
     let health_handle = spawn_health_server(&config, Arc::clone(&readiness), cancel.clone())
@@ -42,7 +42,7 @@ async fn main() -> Result<()> {
     readiness.set_ready(true);
 
     let result = match config.mode {
-        Mode::Oneshot => run_oneshot(&config, agent).await,
+        Mode::Oneshot => run_oneshot(&config, agent, cancel.clone()).await,
         Mode::Serve => run_serve(&config, agent, cancel.clone()).await,
     };
 
@@ -103,8 +103,8 @@ fn build_agent(config: &RuntimeConfig) -> Result<BaseAgent<Box<dyn LLMClient>>, 
     let llm_config = Config::from_model(&config.agent.model)
         .map_err(|e| RuntimeError::Config(format!("model '{}': {e}", config.agent.model)))?
         .with_api_key(api_key);
-    let client = build_client(llm_config)
-        .map_err(|e| RuntimeError::Config(format!("build client: {e}")))?;
+    let client =
+        build_client(llm_config).map_err(|e| RuntimeError::Config(format!("build client: {e}")))?;
 
     let mut core = Core::new(client);
     if config.agent.streaming {
@@ -149,8 +149,9 @@ fn build_agent(config: &RuntimeConfig) -> Result<BaseAgent<Box<dyn LLMClient>>, 
 async fn run_oneshot(
     config: &RuntimeConfig,
     mut agent: BaseAgent<Box<dyn LLMClient>>,
+    cancel: CancellationToken,
 ) -> Result<()> {
-    oneshot::run(config, &mut agent).await
+    oneshot::run(config, &mut agent, cancel).await
 }
 
 async fn run_serve(

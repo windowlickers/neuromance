@@ -9,7 +9,7 @@ use tracing::info;
 ///
 /// # Errors
 /// Returns the underlying `io::Error` if signal handlers cannot be installed.
-pub fn install_shutdown_handler(token: CancellationToken) -> std::io::Result<()> {
+pub fn shutdown_handler(token: CancellationToken) -> std::io::Result<()> {
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
     tokio::spawn(async move {

@@ -136,6 +136,7 @@ mod tests {
     use super::*;
     use crate::ToolImplementation;
     use neuromance_common::tools::{Function, Parameters, Tool};
+    use tokio_util::sync::CancellationToken;
 
     struct DummyTool {
         name: String,
@@ -153,7 +154,7 @@ mod tests {
                 .build()
         }
 
-        async fn execute(&self, _args: &Value) -> Result<String> {
+        async fn execute(&self, _args: &Value, _cancel: &CancellationToken) -> Result<String> {
             Ok("ok".to_string())
         }
     }

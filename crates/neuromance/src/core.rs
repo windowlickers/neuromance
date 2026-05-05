@@ -8,6 +8,7 @@ use chrono::Utc;
 use futures::{Stream, StreamExt};
 use log::{debug, info};
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 
 use neuromance_client::LLMClient;
 use neuromance_common::CacheMetrics;
@@ -188,9 +189,11 @@ impl<C: LLMClient> Core<C> {
     /// # use neuromance::{Core, CoreEvent, Message};
     /// # use neuromance_client::chat_completions::ChatCompletionsClient;
     /// # use futures::StreamExt;
+    /// # use tokio_util::sync::CancellationToken;
     /// # async fn example(mut core: Core<ChatCompletionsClient>, messages: Vec<Message>)
     /// #     -> Result<Vec<Message>, neuromance::CoreError> {
-    /// let mut stream = Box::pin(core.run(messages));
+    /// let cancel = CancellationToken::new();
+    /// let mut stream = Box::pin(core.run(messages, cancel));
     /// while let Some(event) = stream.next().await {
     ///     match event? {
     ///         CoreEvent::Delta(chunk)      => print!("{chunk}"),
@@ -205,6 +208,7 @@ impl<C: LLMClient> Core<C> {
     pub fn run(
         &mut self,
         messages: Vec<Message>,
+        cancel: CancellationToken,
     ) -> impl Stream<Item = Result<CoreEvent, CoreError>> + Send + '_ {
         try_stream! {
             let mut messages = messages;
@@ -213,6 +217,10 @@ impl<C: LLMClient> Core<C> {
             let mut messages_arc: Arc<[Message]> = messages.clone().into();
 
             loop {
+                if cancel.is_cancelled() {
+                    Err(CoreError::Cancelled("loop start".to_string()))?;
+                }
+
                 let mut request = ChatRequest::from((self.client.config(), messages_arc.clone()))
                     .with_tools(self.tool_executor.get_all_tools())
                     .with_tool_choice(self.tool_choice.clone());
@@ -238,7 +246,13 @@ impl<C: LLMClient> Core<C> {
                     let mut finish_reason = None;
                     let mut accumulated_usage: Option<neuromance_common::Usage> = None;
 
-                    while let Some(chunk_result) = inner.next().await {
+                    loop {
+                        let next_chunk: Result<_, CoreError> = tokio::select! {
+                            biased;
+                            () = cancel.cancelled() => Err(CoreError::Cancelled("stream chunk".to_string())),
+                            next = inner.next() => Ok(next),
+                        };
+                        let Some(chunk_result) = next_chunk? else { break };
                         let chunk = chunk_result?;
 
                         if let Some(ref content) = chunk.delta_content {
@@ -321,7 +335,12 @@ impl<C: LLMClient> Core<C> {
                         metadata: std::collections::HashMap::new(),
                     }
                 } else {
-                    self.chat_with_retry(&request).await?
+                    let outcome: Result<ChatResponse, CoreError> = tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => Err(CoreError::Cancelled("chat_with_retry".to_string())),
+                        res = self.chat_with_retry(&request) => res,
+                    };
+                    outcome?
                 };
 
                 debug!("Received response from LLM");
@@ -364,16 +383,26 @@ impl<C: LLMClient> Core<C> {
                     let approval = if is_auto_approved {
                         ToolApproval::Approved
                     } else if let Some(ref callback) = self.tool_approval_callback {
-                        callback(tool_call).await
+                        let outcome: Result<ToolApproval, CoreError> = tokio::select! {
+                            biased;
+                            () = cancel.cancelled() => Err(CoreError::Cancelled("approval callback".to_string())),
+                            a = callback(tool_call) => Ok(a),
+                        };
+                        outcome?
                     } else {
                         let (tx, rx) = oneshot::channel();
                         yield CoreEvent::ApprovalRequest {
                             tool_call: tool_call.clone(),
                             responder: tx,
                         };
-                        rx.await.unwrap_or_else(|_| {
-                            ToolApproval::Denied("Approval responder dropped".to_string())
-                        })
+                        let outcome: Result<ToolApproval, CoreError> = tokio::select! {
+                            biased;
+                            () = cancel.cancelled() => Err(CoreError::Cancelled("approval responder".to_string())),
+                            res = rx => Ok(res.unwrap_or_else(|_| {
+                                ToolApproval::Denied("Approval responder dropped".to_string())
+                            })),
+                        };
+                        outcome?
                     };
 
                     debug!("Tool Approval Status: {approval:?}");
@@ -381,7 +410,12 @@ impl<C: LLMClient> Core<C> {
                     match approval {
                         ToolApproval::Approved => {
                             debug!("Executing tool: {tool_name}");
-                            match self.tool_executor.execute_tool(tool_call).await {
+                            let exec_outcome: Result<Result<String, anyhow::Error>, CoreError> = tokio::select! {
+                                biased;
+                                () = cancel.cancelled() => Err(CoreError::Cancelled("tool execution".to_string())),
+                                r = self.tool_executor.execute_tool(tool_call, &cancel) => Ok(r),
+                            };
+                            match exec_outcome? {
                                 Ok(result) => {
                                     debug!("Tool {tool_name} executed successfully");
                                     self.successful_tool_calls += 1;
@@ -442,9 +476,12 @@ impl<C: LLMClient> Core<C> {
                 debug!("Completed processing {tool_calls_count} tool calls, continuing");
 
                 if let Some(ref callback) = self.turn_callback {
-                    messages = callback(messages)
-                        .await
-                        .map_err(|e| CoreError::TurnCallback(e.into()))?;
+                    let outcome: Result<Result<Vec<Message>, anyhow::Error>, CoreError> = tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => Err(CoreError::Cancelled("turn callback".to_string())),
+                        r = callback(messages) => Ok(r),
+                    };
+                    messages = outcome?.map_err(|e| CoreError::TurnCallback(e.into()))?;
                 }
 
                 messages_arc = messages.clone().into();
@@ -475,8 +512,9 @@ impl<C: LLMClient> Core<C> {
     pub async fn chat_with_tool_loop(
         &mut self,
         messages: Vec<Message>,
+        cancel: CancellationToken,
     ) -> Result<Vec<Message>, CoreError> {
-        let mut stream = Box::pin(self.run(messages));
+        let mut stream = Box::pin(self.run(messages, cancel));
         while let Some(event) = stream.next().await {
             match event? {
                 CoreEvent::Completed(msgs) => return Ok(msgs),
@@ -565,6 +603,45 @@ mod tests {
 
         assert_eq!(output.len(), 2);
         assert_eq!(output[1].content, "[compacted]");
+    }
+
+    /// Pre-cancelling the token surfaces `CoreError::Cancelled` immediately:
+    /// the loop-start check fires before any client request is built.
+    #[tokio::test]
+    async fn test_run_yields_cancelled_when_pre_cancelled() {
+        let config = Config::new("test", "test-model").with_api_key("test-key");
+        let client = ChatCompletionsClient::new(config).expect("Failed to create client");
+        let mut core = Core::new(client);
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let messages = vec![Message::user(uuid::Uuid::new_v4(), "hello")];
+        let mut stream = Box::pin(core.run(messages, cancel));
+
+        let event = stream.next().await.expect("stream should yield an event");
+        assert!(
+            matches!(event, Err(CoreError::Cancelled(_))),
+            "unexpected: {event:?}"
+        );
+    }
+
+    /// `chat_with_tool_loop` propagates `CoreError::Cancelled` from `run`.
+    #[tokio::test]
+    async fn test_chat_with_tool_loop_propagates_cancelled() {
+        let config = Config::new("test", "test-model").with_api_key("test-key");
+        let client = ChatCompletionsClient::new(config).expect("Failed to create client");
+        let mut core = Core::new(client);
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let messages = vec![Message::user(uuid::Uuid::new_v4(), "hello")];
+        let result = core.chat_with_tool_loop(messages, cancel).await;
+        assert!(
+            matches!(result, Err(CoreError::Cancelled(_))),
+            "unexpected: {result:?}"
+        );
     }
 
     /// Errors from turn callback propagate as `anyhow::Error`.

@@ -7,6 +7,7 @@ use std::pin::Pin;
 
 use async_trait::async_trait;
 use futures::Stream;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use neuromance::Core;
@@ -107,7 +108,7 @@ async fn execute_rejects_too_few_messages() {
     let client = MockLLMClient::new();
     let mut agent = BaseAgent::new("test".into(), Core::new(client));
 
-    let result = agent.execute(Some(vec![])).await;
+    let result = agent.execute(Some(vec![]), CancellationToken::new()).await;
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(
@@ -123,10 +124,13 @@ async fn execute_rejects_wrong_first_role() {
     let conv_id = Uuid::new_v4();
 
     let result = agent
-        .execute(Some(vec![
-            Message::user(conv_id, "not system"),
-            Message::user(conv_id, "hello"),
-        ]))
+        .execute(
+            Some(vec![
+                Message::user(conv_id, "not system"),
+                Message::user(conv_id, "hello"),
+            ]),
+            CancellationToken::new(),
+        )
         .await;
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
@@ -143,10 +147,13 @@ async fn execute_rejects_wrong_second_role() {
     let conv_id = Uuid::new_v4();
 
     let result = agent
-        .execute(Some(vec![
-            Message::system(conv_id, "system"),
-            Message::system(conv_id, "not user"),
-        ]))
+        .execute(
+            Some(vec![
+                Message::system(conv_id, "system"),
+                Message::system(conv_id, "not user"),
+            ]),
+            CancellationToken::new(),
+        )
         .await;
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
@@ -190,7 +197,9 @@ async fn execute_tracks_stats() {
     let mut agent = BaseAgent::new("test".into(), Core::new(client));
     let conv_id = agent.conversation_id;
 
-    let result = agent.execute(Some(make_messages(conv_id))).await;
+    let result = agent
+        .execute(Some(make_messages(conv_id)), CancellationToken::new())
+        .await;
     assert!(result.is_ok());
 
     let stats = &agent.state.stats;
@@ -208,11 +217,17 @@ async fn stats_accumulate_across_executions() {
     let mut agent = BaseAgent::new("test".into(), Core::new(client));
     let conv_id = agent.conversation_id;
 
-    agent.execute(Some(make_messages(conv_id))).await.unwrap();
+    agent
+        .execute(Some(make_messages(conv_id)), CancellationToken::new())
+        .await
+        .unwrap();
     let first_tokens = agent.state.stats.tokens_used;
     let first_messages = agent.state.stats.total_messages;
 
-    agent.execute(Some(make_messages(conv_id))).await.unwrap();
+    agent
+        .execute(Some(make_messages(conv_id)), CancellationToken::new())
+        .await
+        .unwrap();
     assert_eq!(agent.state.stats.tokens_used, first_tokens * 2);
     assert_eq!(agent.state.stats.total_messages, first_messages * 2);
 }
@@ -225,7 +240,10 @@ async fn execute_records_conversation_history() {
     let mut agent = BaseAgent::new("test".into(), Core::new(client));
     let conv_id = agent.conversation_id;
 
-    agent.execute(Some(make_messages(conv_id))).await.unwrap();
+    agent
+        .execute(Some(make_messages(conv_id)), CancellationToken::new())
+        .await
+        .unwrap();
 
     assert_eq!(agent.state.conversation_history.len(), 1);
     let (msg, resp) = &agent.state.conversation_history[0];
@@ -414,7 +432,9 @@ async fn context_injected_into_system_prompt() {
 
     agent.state.context.task = Some("Find cats".into());
 
-    let result = agent.execute(Some(make_messages(conv_id))).await;
+    let result = agent
+        .execute(Some(make_messages(conv_id)), CancellationToken::new())
+        .await;
     assert!(result.is_ok());
     // Stats should be populated (proves the execute path ran)
     assert!(agent.state.stats.total_messages > 0);

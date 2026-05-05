@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use neuromance::error::CoreError;
 use neuromance_tools::{ToolImplementation, ToolRegistry};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use neuromance_client::LLMClient;
@@ -110,7 +111,10 @@ impl<C: LLMClient + Send + Sync> AgentTask<C> {
     ///
     /// # Errors
     /// Returns an error if context analysis fails
-    pub async fn gather_context(&mut self) -> Result<AgentResponse, CoreError> {
+    pub async fn gather_context(
+        &mut self,
+        cancel: &CancellationToken,
+    ) -> Result<AgentResponse, CoreError> {
         // Get all available tools from the registry
         let available_tools = self.get_all_tools();
 
@@ -120,7 +124,7 @@ impl<C: LLMClient + Send + Sync> AgentTask<C> {
         // Pass tools information to context agent
         let response = self
             .context_agent
-            .analyze_with_tools(&self.task_description, &tools_description)
+            .analyze_with_tools(&self.task_description, &tools_description, cancel)
             .await?;
         self.state.context_response = Some(response.clone());
         Ok(response)
@@ -130,7 +134,10 @@ impl<C: LLMClient + Send + Sync> AgentTask<C> {
     ///
     /// # Errors
     /// Returns an error if context was not gathered first or action execution fails
-    pub async fn take_action(&mut self) -> Result<AgentResponse, CoreError> {
+    pub async fn take_action(
+        &mut self,
+        cancel: &CancellationToken,
+    ) -> Result<AgentResponse, CoreError> {
         if self.state.context_response.is_none() {
             return Err(CoreError::InvalidInput(
                 "Cannot take action before gathering context".to_string(),
@@ -159,7 +166,7 @@ impl<C: LLMClient + Send + Sync> AgentTask<C> {
 
         let response = self
             .action_agent
-            .execute_task(&self.task_description, &context)
+            .execute_task(&self.task_description, &context, cancel)
             .await?;
         self.state.action_response = Some(response.clone());
         Ok(response)
@@ -169,7 +176,7 @@ impl<C: LLMClient + Send + Sync> AgentTask<C> {
     ///
     /// # Errors
     /// Returns an error if action was not taken first or verification fails
-    pub async fn verify(&mut self) -> Result<AgentResponse, CoreError> {
+    pub async fn verify(&mut self, cancel: &CancellationToken) -> Result<AgentResponse, CoreError> {
         if self.state.action_response.is_none() {
             return Err(CoreError::InvalidInput(
                 "Cannot verify before action is taken".to_string(),
@@ -185,7 +192,7 @@ impl<C: LLMClient + Send + Sync> AgentTask<C> {
 
         let (verified, response) = self
             .verifier_agent
-            .verify(&self.task_description, &action_result)
+            .verify(&self.task_description, &action_result, cancel)
             .await?;
 
         self.state.verified = verified;
@@ -197,15 +204,18 @@ impl<C: LLMClient + Send + Sync> AgentTask<C> {
     ///
     /// # Errors
     /// Returns an error if any phase of the task pipeline fails
-    pub async fn execute_full(&mut self) -> Result<TaskResponse, CoreError> {
+    pub async fn execute_full(
+        &mut self,
+        cancel: CancellationToken,
+    ) -> Result<TaskResponse, CoreError> {
         // Phase 1: Gather context
-        let context_response = self.gather_context().await?;
+        let context_response = self.gather_context(&cancel).await?;
 
         // Phase 2: Take action based on context
-        let action_response = self.take_action().await?;
+        let action_response = self.take_action(&cancel).await?;
 
         // Phase 3: Verify the action results
-        let verification_response = self.verify().await?;
+        let verification_response = self.verify(&cancel).await?;
 
         Ok(TaskResponse {
             context_response,

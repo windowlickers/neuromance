@@ -3,6 +3,7 @@ use std::time::Instant;
 use anyhow::Result;
 use clap::Parser;
 use log::info;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use neuromance_agent::{Agent, BaseAgent};
@@ -60,7 +61,9 @@ async fn main() -> Result<()> {
         Message::user(conversation_id, "What time is it?"),
     ];
 
-    let pirate_response = pirate_agent.execute(Some(pirate_messages)).await?;
+    let pirate_response = pirate_agent
+        .execute(Some(pirate_messages), CancellationToken::new())
+        .await?;
     info!("Pirate says: {}", pirate_response.content.content);
 
     // Agent 2: Vampire (using builder)
@@ -81,7 +84,9 @@ async fn main() -> Result<()> {
         Message::user(conversation_id, "What time is it?"),
     ];
 
-    let vampire_response = vampire_agent.execute(Some(vampire_messages)).await?;
+    let vampire_response = vampire_agent
+        .execute(Some(vampire_messages), CancellationToken::new())
+        .await?;
     info!("Vampire says: {}", vampire_response.content.content);
 
     // Agent 3: Summarizer (using builder)
@@ -106,7 +111,9 @@ async fn main() -> Result<()> {
         Message::user(conversation_id, &summary_prompt),
     ];
 
-    let summary_response = summarizer_agent.execute(Some(summarizer_messages)).await?;
+    let summary_response = summarizer_agent
+        .execute(Some(summarizer_messages), CancellationToken::new())
+        .await?;
     info!("Summary:\n\n {}", summary_response.content.content);
 
     let total_duration = start_time.elapsed();

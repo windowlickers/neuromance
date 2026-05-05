@@ -27,6 +27,7 @@
 //! use serde_json::{json, Value};
 //! use async_trait::async_trait;
 //! use anyhow::Result;
+//! use tokio_util::sync::CancellationToken;
 //!
 //! // Define a custom tool
 //! struct GreetingTool;
@@ -53,7 +54,7 @@
 //!         }
 //!     }
 //!
-//!     async fn execute(&self, args: &Value) -> Result<String> {
+//!     async fn execute(&self, args: &Value, _cancel: &CancellationToken) -> Result<String> {
 //!         let name = args["name"].as_str().unwrap_or("stranger");
 //!         Ok(format!("Hello, {}!", name))
 //!     }
@@ -119,6 +120,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 use neuromance_common::tools::{FunctionCall, Tool, ToolCall};
 
@@ -138,7 +140,7 @@ pub use todo_tool::{TodoReadTool, TodoToolsFactory, TodoWriteTool, create_todo_t
 pub trait ToolImplementation: Send + Sync {
     fn get_definition(&self) -> Tool;
 
-    async fn execute(&self, args: &Value) -> Result<String>;
+    async fn execute(&self, args: &Value, cancel: &CancellationToken) -> Result<String>;
 
     fn is_auto_approved(&self) -> bool {
         false
@@ -251,7 +253,11 @@ impl ToolExecutor {
     ///
     /// # Errors
     /// Returns an error if the tool is not found or if execution fails.
-    pub async fn execute_tool(&self, tool_call: &ToolCall) -> Result<String> {
+    pub async fn execute_tool(
+        &self,
+        tool_call: &ToolCall,
+        cancel: &CancellationToken,
+    ) -> Result<String> {
         let function = &tool_call.function;
 
         let tool = self
@@ -261,8 +267,7 @@ impl ToolExecutor {
 
         let args = Self::parse_arguments(function)?;
 
-        // Execute the tool
-        tool.execute(&args).await
+        tool.execute(&args, cancel).await
     }
 
     fn parse_arguments(arguments: &FunctionCall) -> Result<Value> {

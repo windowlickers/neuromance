@@ -5,6 +5,7 @@ use anyhow::Result;
 use clap::Parser;
 use colored::Colorize;
 use log::info;
+use tokio_util::sync::CancellationToken;
 
 use neuromance_agent::AgentTask;
 use neuromance_client::LLMClient;
@@ -101,16 +102,18 @@ async fn main() -> Result<()> {
         .client
         .with_model("gpt-oss:120b".to_string());
 
+    let cancel = CancellationToken::new();
+
     info!("\n=== Phase 1: Context Agent ===");
-    let context_response = task.gather_context().await?;
+    let context_response = task.gather_context(&cancel).await?;
     info!("Context Analysis:\n{}", context_response.content.content);
 
     info!("\n=== Phase 2: Action Agent ===");
-    let action_response = task.take_action().await?;
+    let action_response = task.take_action(&cancel).await?;
     info!("Vampire says:\n{}", action_response.content.content);
 
     info!("\n=== Phase 3: Verifier Agent ===");
-    let verify_response = task.verify().await?;
+    let verify_response = task.verify(&cancel).await?;
 
     info!("Task Result:\n\n {}", action_response.content.content);
 

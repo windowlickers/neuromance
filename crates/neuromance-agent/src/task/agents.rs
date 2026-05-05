@@ -1,4 +1,5 @@
 use log::debug;
+use tokio_util::sync::CancellationToken;
 
 use neuromance::error::CoreError;
 use neuromance_client::LLMClient;
@@ -40,6 +41,7 @@ impl<C: LLMClient + Send + Sync> ContextAgent<C> {
         &mut self,
         task_description: &str,
         tools_description: &str,
+        cancel: &CancellationToken,
     ) -> Result<AgentResponse, CoreError> {
         let system_prompt = self.agent.system_prompt.as_deref().unwrap_or_default();
         let enhanced_system_prompt = format!("{system_prompt}\n\n{tools_description}");
@@ -63,7 +65,7 @@ impl<C: LLMClient + Send + Sync> ContextAgent<C> {
             ),
         ];
 
-        self.agent.execute(Some(messages)).await
+        self.agent.execute(Some(messages), cancel.clone()).await
     }
 }
 
@@ -95,6 +97,7 @@ impl<C: LLMClient + Send + Sync> ActionAgent<C> {
         &mut self,
         task_description: &str,
         context: &str,
+        cancel: &CancellationToken,
     ) -> Result<AgentResponse, CoreError> {
         let id = self.agent.conversation_id;
         let messages = vec![
@@ -109,7 +112,7 @@ impl<C: LLMClient + Send + Sync> ActionAgent<C> {
             ),
         ];
 
-        self.agent.execute(Some(messages)).await
+        self.agent.execute(Some(messages), cancel.clone()).await
     }
 }
 
@@ -139,6 +142,7 @@ impl<C: LLMClient + Send + Sync> VerifierAgent<C> {
         &self,
         task_description: &str,
         action_result: &str,
+        cancel: &CancellationToken,
     ) -> Result<(bool, AgentResponse), CoreError> {
         let id = self.agent.conversation_id;
         let messages = vec![
@@ -168,7 +172,12 @@ impl<C: LLMClient + Send + Sync> VerifierAgent<C> {
             serde_json::to_string_pretty(&request)?
         );
 
-        let response = self.agent.core.client.chat(&request).await?;
+        let chat_outcome: Result<_, CoreError> = tokio::select! {
+            biased;
+            () = cancel.cancelled() => Err(CoreError::Cancelled("verifier chat".to_string())),
+            res = self.agent.core.client.chat(&request) => res.map_err(CoreError::from),
+        };
+        let response = chat_outcome?;
 
         debug!("Received response from LLM");
         debug!(

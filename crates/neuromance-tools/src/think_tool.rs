@@ -4,6 +4,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 use crate::factory::ToolFactory;
 use crate::{ToolImplementation, ToolRegistry};
@@ -31,7 +32,7 @@ impl ToolImplementation for ThinkTool {
             .build()
     }
 
-    async fn execute(&self, args: &Value) -> Result<String> {
+    async fn execute(&self, args: &Value, _cancel: &CancellationToken) -> Result<String> {
         let obj = args
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("Expected object arguments"))?;
@@ -81,7 +82,10 @@ mod tests {
             "thought": "I need to analyze the dependencies before proceeding with the refactoring"
         });
 
-        let result = tool.execute(&args).await.unwrap();
+        let result = tool
+            .execute(&args, &CancellationToken::new())
+            .await
+            .unwrap();
         assert!(result.contains("THOUGHT RECORDED:"));
         assert!(
             result.contains(
@@ -96,7 +100,7 @@ mod tests {
 
         let args = json!({});
 
-        let result = tool.execute(&args).await;
+        let result = tool.execute(&args, &CancellationToken::new()).await;
         assert!(result.is_err());
         assert!(
             result

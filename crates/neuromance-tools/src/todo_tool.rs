@@ -6,6 +6,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 use crate::factory::ToolFactory;
 use crate::{ToolImplementation, ToolRegistry};
@@ -74,7 +75,7 @@ impl ToolImplementation for TodoReadTool {
             .build()
     }
 
-    async fn execute(&self, _args: &Value) -> Result<String> {
+    async fn execute(&self, _args: &Value, _cancel: &CancellationToken) -> Result<String> {
         let todos = self
             .storage
             .read()
@@ -147,7 +148,7 @@ impl ToolImplementation for TodoWriteTool {
             .build()
     }
 
-    async fn execute(&self, args: &Value) -> Result<String> {
+    async fn execute(&self, args: &Value, _cancel: &CancellationToken) -> Result<String> {
         let obj = args
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("Expected object arguments"))?;
@@ -225,7 +226,10 @@ mod tests {
     async fn test_todo_read_empty() {
         let (read_tool, _) = create_todo_tools();
 
-        let result = read_tool.execute(&json!({})).await.unwrap();
+        let result = read_tool
+            .execute(&json!({}), &CancellationToken::new())
+            .await
+            .unwrap();
         assert!(result.contains("(empty)"));
     }
 
@@ -248,11 +252,17 @@ mod tests {
             ]
         });
 
-        let write_result = write_tool.execute(&args).await.unwrap();
+        let write_result = write_tool
+            .execute(&args, &CancellationToken::new())
+            .await
+            .unwrap();
         assert!(write_result.contains("TODO LIST UPDATED:"));
         assert!(write_result.contains("[→] Create contact form component"));
 
-        let read_result = read_tool.execute(&json!({})).await.unwrap();
+        let read_result = read_tool
+            .execute(&json!({}), &CancellationToken::new())
+            .await
+            .unwrap();
         assert!(read_result.contains("[→] Create contact form component"));
         assert!(read_result.contains("[ ] Add form validation"));
     }
@@ -271,7 +281,7 @@ mod tests {
             ]
         });
 
-        let result = write_tool.execute(&args).await;
+        let result = write_tool.execute(&args, &CancellationToken::new()).await;
         assert!(result.is_err());
         assert!(
             result
@@ -300,7 +310,10 @@ mod tests {
                 }
             ]
         });
-        write_tool.execute(&args).await.unwrap();
+        write_tool
+            .execute(&args, &CancellationToken::new())
+            .await
+            .unwrap();
 
         // Update: Task 1 completed, Task 2 in progress
         let args = json!({
@@ -317,9 +330,15 @@ mod tests {
                 }
             ]
         });
-        write_tool.execute(&args).await.unwrap();
+        write_tool
+            .execute(&args, &CancellationToken::new())
+            .await
+            .unwrap();
 
-        let read_result = read_tool.execute(&json!({})).await.unwrap();
+        let read_result = read_tool
+            .execute(&json!({}), &CancellationToken::new())
+            .await
+            .unwrap();
         assert!(read_result.contains("[✓] Task 1"));
         assert!(read_result.contains("[→] Task 2"));
     }

@@ -25,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+use neuromance::error::CoreError;
 use neuromance_agent::{Agent, BaseAgent};
 use neuromance_client::LLMClient;
 use neuromance_common::chat::Message;
@@ -38,6 +39,13 @@ pub enum TaskStatus {
     Running,
     Succeeded,
     Failed,
+    Cancelled,
+}
+
+enum JobOutcome {
+    Succeeded,
+    Failed,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -157,18 +165,20 @@ async fn worker_loop<C: LLMClient + Send + Sync + 'static>(
                     info!("worker channel closed");
                     return;
                 };
-                process_job(&tasks, &agent, &system_prompt, job).await;
+                let _ = process_job(&tasks, &agent, &system_prompt, job, cancel.clone()).await;
             }
         }
     }
 }
 
+#[allow(clippy::significant_drop_tightening)]
 async fn process_job<C: LLMClient + Send + Sync>(
     tasks: &Arc<DashMap<Uuid, TaskRecord>>,
     agent: &Arc<Mutex<BaseAgent<C>>>,
     system_prompt: &str,
     job: WorkerJob,
-) {
+    cancel: CancellationToken,
+) -> JobOutcome {
     if let Some(mut entry) = tasks.get_mut(&job.task_id) {
         entry.status = TaskStatus::Running;
         entry.updated_at = Utc::now();
@@ -181,7 +191,13 @@ async fn process_job<C: LLMClient + Send + Sync>(
         Message::user(conversation_id, &job.user),
     ];
 
-    match agent.execute(Some(messages)).await {
+    let exec_result = tokio::select! {
+        biased;
+        () = cancel.cancelled() => Err(CoreError::Cancelled("worker shutdown".to_string())),
+        res = agent.execute(Some(messages), cancel.child_token()) => res,
+    };
+
+    match exec_result {
         Ok(response) => {
             info!(task_id=%job.task_id, "task succeeded");
             if let Some(mut entry) = tasks.get_mut(&job.task_id) {
@@ -189,6 +205,16 @@ async fn process_job<C: LLMClient + Send + Sync>(
                 entry.output = Some(response.content.content);
                 entry.updated_at = Utc::now();
             }
+            JobOutcome::Succeeded
+        }
+        Err(CoreError::Cancelled(_)) => {
+            warn!(task_id=%job.task_id, "task cancelled");
+            if let Some(mut entry) = tasks.get_mut(&job.task_id) {
+                entry.status = TaskStatus::Cancelled;
+                entry.error = Some("cancelled".to_string());
+                entry.updated_at = Utc::now();
+            }
+            JobOutcome::Cancelled
         }
         Err(e) => {
             error!(task_id=%job.task_id, error=%e, "task failed");
@@ -197,6 +223,7 @@ async fn process_job<C: LLMClient + Send + Sync>(
                 entry.error = Some(e.to_string());
                 entry.updated_at = Utc::now();
             }
+            JobOutcome::Failed
         }
     }
 }
@@ -249,4 +276,122 @@ pub async fn run<C: LLMClient + Send + Sync + 'static>(
 
     info!("serve mode shutdown complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::expect_used)]
+
+    use std::pin::Pin;
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+    use futures::Stream;
+    use tokio::time::{sleep, timeout};
+
+    use neuromance::Core;
+    use neuromance_client::ClientError;
+    use neuromance_common::client::{ChatChunk, ChatRequest, ChatResponse, Config};
+
+    use super::*;
+
+    /// `LLMClient` stub whose `chat_stream` sleeps long enough to outlast the test.
+    /// The cancel-aware select inside `Core::run` should drop the future when
+    /// the worker's cancellation token fires.
+    struct SleepingClient {
+        config: Config,
+    }
+
+    impl SleepingClient {
+        fn new() -> Self {
+            Self {
+                config: Config::new("mock", "mock-model"),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LLMClient for SleepingClient {
+        fn config(&self) -> &Config {
+            &self.config
+        }
+
+        async fn chat(&self, _request: &ChatRequest) -> Result<ChatResponse, ClientError> {
+            std::future::pending().await
+        }
+
+        async fn chat_stream(
+            &self,
+            _request: &ChatRequest,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatChunk, ClientError>> + Send>>, ClientError>
+        {
+            // Never yields a chunk — the cancel race in `Core::run`'s SSE
+            // consumer fires when the worker's token is cancelled.
+            Ok(Box::pin(futures::stream::pending()))
+        }
+
+        fn supports_tools(&self) -> bool {
+            true
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_cancels_in_flight_task() {
+        let task_id = Uuid::new_v4();
+        let now = Utc::now();
+        let tasks: Arc<DashMap<Uuid, TaskRecord>> = Arc::new(DashMap::new());
+        tasks.insert(
+            task_id,
+            TaskRecord {
+                id: task_id,
+                status: TaskStatus::Pending,
+                created_at: now,
+                updated_at: now,
+                output: None,
+                error: None,
+            },
+        );
+
+        let core = Core::new(SleepingClient::new()).with_streaming();
+        let agent = Arc::new(Mutex::new(BaseAgent::new("test".into(), core)));
+        let (work_tx, work_rx) = mpsc::channel::<WorkerJob>(1);
+        let cancel = CancellationToken::new();
+
+        let worker = tokio::spawn(worker_loop(
+            work_rx,
+            Arc::clone(&tasks),
+            Arc::clone(&agent),
+            "system".to_string(),
+            cancel.clone(),
+        ));
+
+        work_tx
+            .send(WorkerJob {
+                task_id,
+                user: "hello".to_string(),
+            })
+            .await
+            .unwrap();
+
+        // Give the worker a moment to pick up the job and start the agent.
+        sleep(Duration::from_millis(100)).await;
+        cancel.cancel();
+
+        timeout(Duration::from_secs(2), worker)
+            .await
+            .expect("worker did not exit within timeout")
+            .unwrap();
+
+        let (status, error) = {
+            let entry = tasks.get(&task_id).expect("task record should exist");
+            (entry.status, entry.error.clone())
+        };
+        assert_eq!(status, TaskStatus::Cancelled);
+        assert_eq!(error.as_deref(), Some("cancelled"));
+    }
 }

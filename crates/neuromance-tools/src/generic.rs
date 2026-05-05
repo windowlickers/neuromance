@@ -4,6 +4,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 use crate::ToolImplementation;
 use neuromance_common::tools::{Function, Parameters, Tool};
@@ -22,7 +23,7 @@ impl ToolImplementation for CurrentTimeTool {
             .build()
     }
 
-    async fn execute(&self, _args: &Value) -> Result<String> {
+    async fn execute(&self, _args: &Value, _cancel: &CancellationToken) -> Result<String> {
         let now: DateTime<Utc> = Utc::now();
         Ok(format!(
             "Current time: {}",

@@ -16,6 +16,9 @@ pub enum CoreError {
     #[error("User quit: {0}")]
     UserQuit(String),
 
+    #[error("Cancelled: {0}")]
+    Cancelled(String),
+
     #[error("No response: {0}")]
     NoResponse(String),
 
