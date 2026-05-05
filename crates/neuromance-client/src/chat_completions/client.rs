@@ -104,9 +104,8 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use futures::stream::{Stream, StreamExt};
+use futures::stream::Stream;
 use log::{debug, error, warn};
-use reqwest_eventsource::{Event, EventSource};
 use reqwest_middleware::ClientWithMiddleware;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -124,8 +123,9 @@ use crate::chat_completions::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatCompletionsMessage,
 };
 use crate::error::{ClientError, ErrorResponse};
+use crate::streaming::{StreamingProvider, run_sse_stream};
 use crate::transport::add_proxy_headers;
-use crate::{LLMClient, NoRetryPolicy, build_client_resources};
+use crate::{LLMClient, build_client_resources};
 
 /// Type-state marker types for compile-time validation.
 ///
@@ -709,13 +709,9 @@ impl LLMClient for ChatCompletionsClient {
         }));
 
         let url = format!("{}/{}", self.base_url, "chat/completions");
-
-        // Validate URL construction
         reqwest::Url::parse(&url)
             .map_err(|e| ClientError::ConfigurationError(format!("Invalid URL '{url}': {e}")))?;
 
-        // Build the request with SSE headers
-        // Use the reusable streaming_client (without retry middleware to avoid interfering with SSE)
         let mut request_builder = self
             .streaming_client
             .post(&url)
@@ -725,7 +721,6 @@ impl LLMClient for ChatCompletionsClient {
             )
             .header("Content-Type", "application/json");
 
-        // Add proxy headers if configured
         request_builder = add_proxy_headers(
             request_builder,
             self.proxy_config.as_ref(),
@@ -735,60 +730,20 @@ impl LLMClient for ChatCompletionsClient {
 
         let request_builder = request_builder.json(&chat_request);
 
-        // Create the EventSource
-        // We handle retries at a higher level in Core
-        let mut event_source = EventSource::new(request_builder).map_err(|e| {
-            ClientError::ConfigurationError(format!("Failed to create event source: {e}"))
-        })?;
+        run_sse_stream::<Self>(request_builder)
+    }
+}
 
-        // Disable automatic retries - we handle retries at the Core level
-        event_source.set_retry_policy(Box::new(NoRetryPolicy));
+impl StreamingProvider for ChatCompletionsClient {
+    type Event = ChatCompletionChunk;
+    type State = ();
 
-        // Convert the EventSource stream into our ChatChunk stream
-        let stream = event_source.filter_map(move |event| async move {
-            match event {
-                Ok(Event::Open) => {
-                    debug!("Stream connection opened");
-                    None
-                }
-                Ok(Event::Message(message)) => {
-                    // Chat Completions API sends [DONE] to signal completion
-                    if message.data == "[DONE]" {
-                        debug!("Stream completed with [DONE] marker");
-                        return None;
-                    }
+    fn is_stream_end(data: &str) -> bool {
+        data == "[DONE]"
+    }
 
-                    // Parse the chunk
-                    match serde_json::from_str::<ChatCompletionChunk>(&message.data) {
-                        Ok(chunk) => {
-                            // Convert to our common ChatChunk type
-                            let chat_chunk = convert_chunk_to_chat_chunk(&chunk);
-                            Some(Ok(chat_chunk))
-                        }
-                        Err(e) => {
-                            warn!("Failed to parse streaming chunk: {e}");
-                            debug!("Problematic chunk data: {}", message.data);
-                            Some(Err(ClientError::SerializationError(e)))
-                        }
-                    }
-                }
-                Err(e) => {
-                    // Check if this is a normal stream end
-                    match ClientError::from(e) {
-                        ClientError::EventSourceError(reqwest_eventsource::Error::StreamEnded) => {
-                            debug!("Stream ended normally");
-                            None
-                        }
-                        other_error => {
-                            error!("Stream error: {other_error}");
-                            Some(Err(other_error))
-                        }
-                    }
-                }
-            }
-        });
-
-        Ok(Box::pin(stream))
+    fn process_event(_state: &mut Self::State, event: Self::Event) -> Option<ChatChunk> {
+        Some(convert_chunk_to_chat_chunk(&event))
     }
 }
 
@@ -798,6 +753,7 @@ mod tests {
     #![allow(clippy::expect_used)]
 
     use super::*;
+    use futures::StreamExt;
     use neuromance_common::chat::{Message, MessageRole};
     use neuromance_common::client::FinishReason;
     use wiremock::matchers::{header, method, path};
