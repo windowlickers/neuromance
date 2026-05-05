@@ -123,6 +123,7 @@ use crate::chat_completions::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatCompletionsMessage,
 };
 use crate::error::{ClientError, ErrorResponse};
+use crate::message::MessageBuilder;
 use crate::streaming::{StreamingProvider, run_sse_stream};
 use crate::transport::add_proxy_headers;
 use crate::{LLMClient, build_client_resources};
@@ -585,43 +586,32 @@ impl ChatCompletionsClient {
     /// }
     /// ```
     fn convert_message(msg: &ChatCompletionsMessage, conversation_id: uuid::Uuid) -> Message {
-        let role = msg.role;
-
-        let tool_calls = msg
-            .tool_calls
-            .as_ref()
-            .map(|tcs| {
-                // Pre-allocate capacity to avoid reallocations during collection
-                let mut result = SmallVec::with_capacity(tcs.len());
-                for tc in tcs {
-                    result.push(ToolCall {
-                        id: tc.id.to_string(),
-                        call_type: tc.r#type.to_string(),
-                        function: FunctionCall {
-                            name: tc.function.name.to_string(),
-                            arguments: tc.function.arguments.to_string(),
-                        },
-                    });
-                }
-                result
-            })
-            .unwrap_or_default();
-
-        Message {
-            id: uuid::Uuid::new_v4(),
-            conversation_id,
-            role,
-            content: msg.content.clone().unwrap_or_default(),
-            tool_calls,
-            tool_call_id: msg.tool_call_id.clone(),
-            name: msg.name.clone(),
-            timestamp: Utc::now(),
-            metadata: HashMap::new(),
-            reasoning: msg
-                .reasoning_content
-                .clone()
-                .map(neuromance_common::ReasoningContent::new),
+        let mut builder = MessageBuilder::new(conversation_id, msg.role);
+        if let Some(content) = msg.content.as_deref() {
+            builder.set_content(content.to_string());
         }
+        if let Some(tcs) = msg.tool_calls.as_ref() {
+            for tc in tcs {
+                builder.push_tool_call(ToolCall {
+                    id: tc.id.to_string(),
+                    call_type: tc.r#type.to_string(),
+                    function: FunctionCall {
+                        name: tc.function.name.to_string(),
+                        arguments: tc.function.arguments.to_string(),
+                    },
+                });
+            }
+        }
+        if let Some(id) = msg.tool_call_id.as_ref() {
+            builder.set_tool_call_id(id.clone());
+        }
+        if let Some(name) = msg.name.as_ref() {
+            builder.set_name(name.clone());
+        }
+        if let Some(reasoning) = msg.reasoning_content.as_ref() {
+            builder.append_reasoning(reasoning, "\n");
+        }
+        builder.build()
     }
 }
 

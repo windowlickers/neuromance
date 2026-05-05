@@ -7,13 +7,14 @@ use std::collections::HashMap;
 
 use log::warn;
 use serde::{Deserialize, Serialize};
-use smallvec::SmallVec;
 use typed_builder::TypedBuilder;
 
 use neuromance_common::chat::{Message, MessageRole};
 use neuromance_common::client::{ChatRequest, Config, Usage};
 use neuromance_common::features::ReasoningLevel;
 use neuromance_common::tools::{FunctionCall, Tool, ToolCall};
+
+use crate::message::MessageBuilder;
 
 pub mod client;
 pub use client::ResponsesClient;
@@ -945,13 +946,12 @@ impl StreamingFunctionCall {
 // ============================================================================
 
 /// Convert a Responses API response to our internal Message format.
+#[must_use]
 pub fn convert_response_to_message(
     response: &ResponsesResponse,
     conversation_id: uuid::Uuid,
 ) -> Message {
-    let mut content = String::new();
-    let mut tool_calls: SmallVec<[ToolCall; 2]> = SmallVec::new();
-    let mut reasoning_content: Option<String> = None;
+    let mut builder = MessageBuilder::new(conversation_id, MessageRole::Assistant);
 
     for item in &response.output {
         match item {
@@ -960,18 +960,8 @@ pub fn convert_response_to_message(
             } => {
                 for block in blocks {
                     match block {
-                        OutputContentBlock::OutputText { text } => {
-                            if !content.is_empty() {
-                                content.push('\n');
-                            }
-                            content.push_str(text);
-                        }
-                        OutputContentBlock::Refusal { refusal } => {
-                            if !content.is_empty() {
-                                content.push('\n');
-                            }
-                            content.push_str(refusal);
-                        }
+                        OutputContentBlock::OutputText { text } => builder.append_content(text),
+                        OutputContentBlock::Refusal { refusal } => builder.append_content(refusal),
                     }
                 }
             }
@@ -980,7 +970,7 @@ pub fn convert_response_to_message(
                 name,
                 arguments,
             } => {
-                tool_calls.push(ToolCall {
+                builder.push_tool_call(ToolCall {
                     id: call_id.clone(),
                     call_type: "function".to_string(),
                     function: FunctionCall {
@@ -995,12 +985,7 @@ pub fn convert_response_to_message(
                 for block in reasoning_blocks {
                     match block {
                         ReasoningOutputBlock::SummaryText { text } => {
-                            if let Some(ref mut rc) = reasoning_content {
-                                rc.push('\n');
-                                rc.push_str(text);
-                            } else {
-                                reasoning_content = Some(text.clone());
-                            }
+                            builder.append_reasoning(text, "\n");
                         }
                     }
                 }
@@ -1008,16 +993,5 @@ pub fn convert_response_to_message(
         }
     }
 
-    Message {
-        id: uuid::Uuid::new_v4(),
-        conversation_id,
-        role: MessageRole::Assistant,
-        content,
-        tool_calls,
-        tool_call_id: None,
-        name: None,
-        timestamp: chrono::Utc::now(),
-        metadata: HashMap::new(),
-        reasoning: reasoning_content.map(neuromance_common::ReasoningContent::new),
-    }
+    builder.build()
 }

@@ -27,6 +27,7 @@ pub mod anthropic;
 pub mod chat_completions;
 pub mod embedding;
 mod error;
+pub(crate) mod message;
 pub mod responses;
 pub(crate) mod streaming;
 pub(crate) mod transport;

@@ -51,7 +51,6 @@ use futures::stream::Stream;
 use log::{debug, error, warn};
 use reqwest_middleware::ClientWithMiddleware;
 use secrecy::{ExposeSecret, SecretString};
-use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -61,6 +60,7 @@ use neuromance_common::client::{ChatChunk, ChatRequest, ChatResponse, Config, Pr
 use neuromance_common::tools::{FunctionCall, ToolCall};
 
 use crate::error::ClientError;
+use crate::message::MessageBuilder;
 use crate::streaming::{StreamingProvider, run_sse_stream};
 use crate::transport::add_proxy_headers;
 use crate::{LLMClient, build_client_resources};
@@ -278,21 +278,12 @@ impl AnthropicClient {
         response: &MessageResponse,
         conversation_id: uuid::Uuid,
     ) -> Message {
-        let mut content = String::new();
-        let mut tool_calls: SmallVec<[ToolCall; 2]> = SmallVec::new();
-        let mut reasoning_content: Option<String> = None;
-        let mut reasoning_signature: Option<String> = None;
-
+        let mut builder = MessageBuilder::new(conversation_id, MessageRole::Assistant);
         for block in &response.content {
             match block {
-                ResponseContentBlock::Text { text, .. } => {
-                    if !content.is_empty() {
-                        content.push('\n');
-                    }
-                    content.push_str(text);
-                }
+                ResponseContentBlock::Text { text, .. } => builder.append_content(text),
                 ResponseContentBlock::ToolUse { id, name, input } => {
-                    tool_calls.push(ToolCall {
+                    builder.push_tool_call(ToolCall {
                         id: id.clone(),
                         call_type: "function".to_string(),
                         function: FunctionCall {
@@ -305,40 +296,13 @@ impl AnthropicClient {
                     thinking,
                     signature,
                 } => {
-                    match &mut reasoning_content {
-                        Some(existing) => {
-                            existing.push_str("\n\n");
-                            existing.push_str(thinking);
-                        }
-                        None => reasoning_content = Some(thinking.clone()),
-                    }
-                    // Keep the last signature (typically there's only one thinking block)
-                    reasoning_signature = Some(signature.clone());
+                    builder.append_reasoning(thinking, "\n\n");
+                    builder.set_reasoning_signature(signature.clone());
                 }
-                ResponseContentBlock::RedactedThinking { .. } => {
-                    // Redacted thinking blocks are not exposed to the user
-                }
+                ResponseContentBlock::RedactedThinking { .. } => {}
             }
         }
-
-        // Build reasoning content if we have thinking
-        let reasoning = reasoning_content.map(|content| neuromance_common::ReasoningContent {
-            content,
-            signature: reasoning_signature,
-        });
-
-        Message {
-            id: uuid::Uuid::new_v4(),
-            conversation_id,
-            role: MessageRole::Assistant,
-            content,
-            tool_calls,
-            tool_call_id: None,
-            name: None,
-            timestamp: Utc::now(),
-            metadata: HashMap::new(),
-            reasoning,
-        }
+        builder.build()
     }
 }
 
@@ -667,6 +631,7 @@ mod tests {
     use futures::StreamExt;
     use neuromance_common::chat::{Message, MessageRole};
     use neuromance_common::client::FinishReason;
+    use smallvec::SmallVec;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
