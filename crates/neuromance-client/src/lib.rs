@@ -28,6 +28,7 @@ pub mod chat_completions;
 pub mod embedding;
 mod error;
 pub mod responses;
+pub(crate) mod streaming;
 pub(crate) mod transport;
 
 pub use anthropic::AnthropicClient;
