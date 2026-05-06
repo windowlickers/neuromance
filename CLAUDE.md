@@ -11,6 +11,12 @@ cargo build
 # Run tests
 cargo test
 
+# Run tests for a specific crate
+cargo test -p neuromance-runtime
+
+# Run a single test by name (with output)
+cargo test -p neuromance-runtime test_name -- --nocapture
+
 # Lint with clippy (strict settings enforced)
 cargo clippy --all-targets --all-features
 
@@ -33,6 +39,26 @@ nix develop
 nix build
 ```
 
+`nix flake check` runs clippy with `-D warnings`, so any warning fails CI even if `cargo clippy` is clean locally.
+
+### Container Images
+
+The flake produces two runtime image variants:
+
+```bash
+# Build images
+nix build .#neuromance-image          # minimal runtime image
+nix build .#neuromance-image-toolkit  # adds busybox, git, curl, jq, node, python3, shell
+
+# Load into local docker
+nix run .#load-minimal
+nix run .#load-toolkit
+
+# Push to a registry (defaults to ghcr.io/windowlickers)
+nix run .#push-minimal -- <registry>
+nix run .#push-toolkit -- <registry>
+```
+
 ## Architecture
 
 Neuromance is a Rust library for LLM orchestration, organized as a Cargo workspace.
@@ -47,9 +73,9 @@ Neuromance is a Rust library for LLM orchestration, organized as a Cargo workspa
 
 - **neuromance**: Main orchestration library. The `Core<C: LLMClient>` struct manages conversation loops with tool execution, using an event-driven architecture with callbacks for streaming content, tool approval, and usage tracking.
 
-- **neuromance-agent**: Agent framework for autonomous multi-turn task execution. The `Agent` trait and `BaseAgent` implementation provide state management, memory, and sequential execution with tool support.
+- **neuromance-agent**: Agent framework for autonomous multi-turn task execution. `Agent<C: LLMClient>` wraps `Core` with state, memory, and a sequential tool-using execution loop; constructed via `AgentBuilder` (`Agent::builder(id, client)`).
 
-- **neuromance-runtime**: Container runtime binary that boots a `BaseAgent` from TOML config and runs in `oneshot` mode (single task, write JSON, exit — for k8s `Job`s) or `serve` mode (HTTP intake at `POST /tasks` / `GET /tasks/{id}` until SIGTERM — for `Deployment`s). Tools are registered at startup via `ToolFactoryRegistry::with_builtin()`. Approval is `auto` or `async` (webhook). State is in-memory only; postgres persistence is future work.
+- **neuromance-runtime**: Container runtime binary that boots an `Agent` from TOML config and runs in `oneshot` mode (single task, write JSON, exit — for k8s `Job`s) or `serve` mode (HTTP intake at `POST /tasks` / `GET /tasks/{id}` until SIGTERM — for `Deployment`s). Tools are registered at startup via `ToolFactoryRegistry::with_builtin()`. Approval is `auto` or `async` (webhook). State is in-memory only; postgres persistence is future work. Set `RUST_LOG_FORMAT=json` for structured logs (k8s ingestion); default is human-readable.
 
 ## Common Patterns
 
@@ -117,7 +143,11 @@ The workspace enforces strict lints (see `Cargo.toml`):
 
 ### Commit Messages
 
-Commits must follow [Conventional Commits](https://www.conventionalcommits.org/) format (enforced by commitlint in CI).
+Commits follow [Conventional Commits](https://www.conventionalcommits.org/) format.
+
+## CI
+
+CI runs on Forgejo (`.forgejo/workflows/nix-ci.yaml`), not GitHub Actions.
 
 ## Rust Version
 
