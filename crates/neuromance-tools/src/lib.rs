@@ -130,11 +130,13 @@ pub mod proxy;
 mod read_tool;
 mod think_tool;
 mod todo_tool;
+mod write_tool;
 pub use bool_tool::{BoolToolFactory, BooleanTool};
 pub use factory::{ToolConfig, ToolFactory, ToolFactoryRegistry};
 pub use read_tool::{ReadTool, ReadToolFactory};
 pub use think_tool::{ThinkTool, ThinkToolFactory};
 pub use todo_tool::{TodoReadTool, TodoToolsFactory, TodoWriteTool, create_todo_tools};
+pub use write_tool::{WriteTool, WriteToolFactory};
 
 #[async_trait]
 pub trait ToolImplementation: Send + Sync {

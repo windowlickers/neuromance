@@ -19,6 +19,7 @@ use crate::bool_tool::BoolToolFactory;
 use crate::read_tool::ReadToolFactory;
 use crate::think_tool::ThinkToolFactory;
 use crate::todo_tool::TodoToolsFactory;
+use crate::write_tool::WriteToolFactory;
 
 /// Per-tool configuration entry.
 ///
@@ -67,7 +68,7 @@ impl ToolFactoryRegistry {
     }
 
     /// Returns a registry pre-populated with the built-in factories:
-    /// `return_bool`, `think`, `todos`, `read`.
+    /// `return_bool`, `think`, `todos`, `read`, `write`.
     #[must_use]
     pub fn with_builtin() -> Self {
         let mut r = Self::new();
@@ -75,6 +76,7 @@ impl ToolFactoryRegistry {
         r.register(ThinkToolFactory);
         r.register(TodoToolsFactory);
         r.register(ReadToolFactory);
+        r.register(WriteToolFactory);
         r
     }
 
