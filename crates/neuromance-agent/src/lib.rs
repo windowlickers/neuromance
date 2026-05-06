@@ -29,7 +29,6 @@
 //! # }
 //! ```
 
-use async_trait::async_trait;
 use log::info;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -53,8 +52,8 @@ pub use neuromance_common::agents::{
     AgentContext, AgentMemory, AgentMessage, AgentResponse, AgentState, AgentStats, ContextUpdate,
 };
 
-/// Base agent implementation with common functionality
-pub struct BaseAgent<C: LLMClient> {
+/// Concrete agent: wraps [`Core`] with state, memory, and a tool-using execution loop.
+pub struct Agent<C: LLMClient> {
     pub id: String,
     pub conversation_id: Uuid,
     pub core: Core<C>,
@@ -64,7 +63,7 @@ pub struct BaseAgent<C: LLMClient> {
     pub tool_choice: ToolChoice,
 }
 
-impl<C: LLMClient> BaseAgent<C> {
+impl<C: LLMClient> Agent<C> {
     pub fn new(id: String, core: Core<C>) -> Self {
         Self {
             id,
@@ -82,21 +81,26 @@ impl<C: LLMClient> BaseAgent<C> {
     }
 }
 
-#[async_trait]
-impl<C: LLMClient + Send + Sync> Agent for BaseAgent<C> {
-    fn id(&self) -> &str {
+impl<C: LLMClient + Send + Sync> Agent<C> {
+    pub fn id(&self) -> &str {
         &self.id
     }
 
-    fn state(&self) -> &AgentState {
+    pub const fn state(&self) -> &AgentState {
         &self.state
     }
 
-    fn state_mut(&mut self) -> &mut AgentState {
+    pub const fn state_mut(&mut self) -> &mut AgentState {
         &mut self.state
     }
 
-    async fn reset(&mut self) -> Result<(), CoreError> {
+    /// Reset conversation history, memory, context, stats, and message buffer.
+    ///
+    /// # Errors
+    /// Returns [`CoreError`] for forward-compatibility with future
+    /// implementations that may perform fallible I/O during reset.
+    #[allow(clippy::unused_async)]
+    pub async fn reset(&mut self) -> Result<(), CoreError> {
         self.state.conversation_history.clear();
         self.state.memory = AgentMemory::default();
         self.state.context = AgentContext::default();
@@ -106,7 +110,15 @@ impl<C: LLMClient + Send + Sync> Agent for BaseAgent<C> {
         Ok(())
     }
 
-    async fn execute(
+    /// Run the chat-with-tools loop and return the assistant's final response.
+    ///
+    /// # Errors
+    /// Returns [`CoreError::InvalidInput`] if the message slice does not start
+    /// with a system message followed by a user message; propagates any error
+    /// from the underlying [`Core::chat_with_tool_loop`] (network, cancellation,
+    /// tool failure); returns [`CoreError::NoResponse`] if the model produced
+    /// no assistant message.
+    pub async fn execute(
         &mut self,
         messages: Option<Vec<Message>>,
         cancel: CancellationToken,
@@ -190,25 +202,3 @@ impl<C: LLMClient + Send + Sync> Agent for BaseAgent<C> {
 
 #[cfg(test)]
 mod tests;
-
-#[async_trait]
-pub trait Agent: Send + Sync {
-    /// Returns the unique identifier of the agent.
-    fn id(&self) -> &str;
-
-    /// Returns immutable reference to the agent's current state.
-    fn state(&self) -> &AgentState;
-
-    /// Returns mutable reference to the agent's current state.
-    fn state_mut(&mut self) -> &mut AgentState;
-
-    /// Resets the agent to its initial state.
-    async fn reset(&mut self) -> Result<(), CoreError>;
-
-    /// Execute core chat with tools loop
-    async fn execute(
-        &mut self,
-        messages: Option<Vec<Message>>,
-        cancel: CancellationToken,
-    ) -> Result<AgentResponse, CoreError>;
-}

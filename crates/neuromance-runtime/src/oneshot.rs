@@ -6,7 +6,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use uuid::Uuid;
 
-use neuromance_agent::{Agent, BaseAgent};
+use neuromance_agent::Agent;
 use neuromance_client::LLMClient;
 use neuromance_common::chat::Message;
 
@@ -30,7 +30,7 @@ pub struct OneshotOutput {
 /// execution fails, or writing the output fails.
 pub async fn run<C: LLMClient + Send + Sync>(
     config: &RuntimeConfig,
-    agent: &mut BaseAgent<C>,
+    agent: &mut Agent<C>,
     cancel: CancellationToken,
 ) -> Result<()> {
     let oneshot = config

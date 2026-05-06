@@ -10,7 +10,7 @@ use neuromance_common::client::ToolChoice;
 use neuromance_common::tools::{ToolApproval, ToolCall};
 use neuromance_tools::ToolImplementation;
 
-use crate::BaseAgent;
+use crate::Agent;
 
 /// Simple builder for creating agents with common configuration
 ///
@@ -139,8 +139,8 @@ impl<C: LLMClient> AgentBuilder<C> {
     /// Build the agent
     ///
     /// # Returns
-    /// A fully configured `BaseAgent` instance
-    pub fn build(self) -> BaseAgent<C> {
+    /// A fully configured `Agent` instance
+    pub fn build(self) -> Agent<C> {
         let conversation_id = Uuid::new_v4();
 
         // Build messages from system and user prompts
@@ -154,7 +154,7 @@ impl<C: LLMClient> AgentBuilder<C> {
             messages.push(Message::user(conversation_id, prompt));
         }
 
-        BaseAgent {
+        Agent {
             id: self.id,
             conversation_id,
             core: self.core,

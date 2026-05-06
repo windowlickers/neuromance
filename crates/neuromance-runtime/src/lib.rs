@@ -1,6 +1,6 @@
 //! # neuromance-runtime
 //!
-//! Container runtime that boots a [`neuromance_agent::BaseAgent`] from a TOML
+//! Container runtime that boots a [`neuromance_agent::Agent`] from a TOML
 //! config and runs it in one of two modes:
 //!
 //! - **`oneshot`** — execute a single configured input, write the result, exit.

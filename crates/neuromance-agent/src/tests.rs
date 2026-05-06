@@ -16,7 +16,7 @@ use neuromance_common::agents::{AgentMessage, AgentState, ContextUpdate};
 use neuromance_common::chat::{Message, MessageRole};
 use neuromance_common::client::{ChatChunk, ChatRequest, ChatResponse, Config, ToolChoice, Usage};
 
-use crate::{Agent, BaseAgent};
+use crate::Agent;
 
 struct MockLLMClient {
     config: Config,
@@ -106,7 +106,7 @@ fn make_messages(conv_id: Uuid) -> Vec<Message> {
 #[tokio::test]
 async fn execute_rejects_too_few_messages() {
     let client = MockLLMClient::new();
-    let mut agent = BaseAgent::new("test".into(), Core::new(client));
+    let mut agent = Agent::new("test".into(), Core::new(client));
 
     let result = agent.execute(Some(vec![]), CancellationToken::new()).await;
     assert!(result.is_err());
@@ -120,7 +120,7 @@ async fn execute_rejects_too_few_messages() {
 #[tokio::test]
 async fn execute_rejects_wrong_first_role() {
     let client = MockLLMClient::new();
-    let mut agent = BaseAgent::new("test".into(), Core::new(client));
+    let mut agent = Agent::new("test".into(), Core::new(client));
     let conv_id = Uuid::new_v4();
 
     let result = agent
@@ -143,7 +143,7 @@ async fn execute_rejects_wrong_first_role() {
 #[tokio::test]
 async fn execute_rejects_wrong_second_role() {
     let client = MockLLMClient::new();
-    let mut agent = BaseAgent::new("test".into(), Core::new(client));
+    let mut agent = Agent::new("test".into(), Core::new(client));
     let conv_id = Uuid::new_v4();
 
     let result = agent
@@ -168,7 +168,7 @@ async fn execute_rejects_wrong_second_role() {
 #[tokio::test]
 async fn reset_clears_all_state() {
     let client = MockLLMClient::new();
-    let mut agent = BaseAgent::new("test".into(), Core::new(client));
+    let mut agent = Agent::new("test".into(), Core::new(client));
     let conv_id = agent.conversation_id;
 
     // Populate some state
@@ -194,7 +194,7 @@ async fn reset_clears_all_state() {
 #[tokio::test]
 async fn execute_tracks_stats() {
     let client = MockLLMClient::new();
-    let mut agent = BaseAgent::new("test".into(), Core::new(client));
+    let mut agent = Agent::new("test".into(), Core::new(client));
     let conv_id = agent.conversation_id;
 
     let result = agent
@@ -214,7 +214,7 @@ async fn execute_tracks_stats() {
 #[tokio::test]
 async fn stats_accumulate_across_executions() {
     let client = MockLLMClient::new();
-    let mut agent = BaseAgent::new("test".into(), Core::new(client));
+    let mut agent = Agent::new("test".into(), Core::new(client));
     let conv_id = agent.conversation_id;
 
     agent
@@ -237,7 +237,7 @@ async fn stats_accumulate_across_executions() {
 #[tokio::test]
 async fn execute_records_conversation_history() {
     let client = MockLLMClient::new();
-    let mut agent = BaseAgent::new("test".into(), Core::new(client));
+    let mut agent = Agent::new("test".into(), Core::new(client));
     let conv_id = agent.conversation_id;
 
     agent
@@ -381,7 +381,7 @@ fn apply_clear_memory() {
 #[test]
 fn builder_sets_id_and_prompts() {
     let client = MockLLMClient::new();
-    let agent = BaseAgent::builder("my-agent", client)
+    let agent = Agent::builder("my-agent", client)
         .system_prompt("You are helpful.")
         .user_prompt("Hi there")
         .build();
@@ -397,7 +397,7 @@ fn builder_sets_id_and_prompts() {
 #[test]
 fn builder_sets_max_turns() {
     let client = MockLLMClient::new();
-    let agent = BaseAgent::builder("agent", client).max_turns(5).build();
+    let agent = Agent::builder("agent", client).max_turns(5).build();
 
     assert_eq!(agent.core.max_turns, Some(5));
 }
@@ -405,7 +405,7 @@ fn builder_sets_max_turns() {
 #[test]
 fn builder_sets_auto_approve() {
     let client = MockLLMClient::new();
-    let agent = BaseAgent::builder("agent", client)
+    let agent = Agent::builder("agent", client)
         .auto_approve_tools(true)
         .build();
 
@@ -417,7 +417,7 @@ fn builder_sets_tool_approval_callback() {
     use neuromance_common::tools::ToolApproval;
 
     let client = MockLLMClient::new();
-    let agent = BaseAgent::builder("agent", client)
+    let agent = Agent::builder("agent", client)
         .with_tool_approval_callback(|_tc| async { ToolApproval::Approved })
         .build();
 
@@ -427,7 +427,7 @@ fn builder_sets_tool_approval_callback() {
 #[test]
 fn builder_sets_tool_choice() {
     let client = MockLLMClient::new();
-    let agent = BaseAgent::builder("agent", client)
+    let agent = Agent::builder("agent", client)
         .tool_choice(ToolChoice::None)
         .build();
 
@@ -439,7 +439,7 @@ fn builder_sets_tool_choice() {
 #[tokio::test]
 async fn context_injected_into_system_prompt() {
     let client = MockLLMClient::new();
-    let mut agent = BaseAgent::new("test".into(), Core::new(client));
+    let mut agent = Agent::new("test".into(), Core::new(client));
     let conv_id = agent.conversation_id;
 
     agent.state.context.task = Some("Find cats".into());
@@ -474,14 +474,14 @@ fn agent_state_default_is_empty() {
 #[test]
 fn agent_id_returns_correct_value() {
     let client = MockLLMClient::new();
-    let agent = BaseAgent::new("my-id".into(), Core::new(client));
+    let agent = Agent::new("my-id".into(), Core::new(client));
     assert_eq!(agent.id(), "my-id");
 }
 
 #[test]
 fn agent_state_accessors() {
     let client = MockLLMClient::new();
-    let mut agent = BaseAgent::new("test".into(), Core::new(client));
+    let mut agent = Agent::new("test".into(), Core::new(client));
     agent.state_mut().stats.total_messages = 42;
     assert_eq!(agent.state().stats.total_messages, 42);
 }

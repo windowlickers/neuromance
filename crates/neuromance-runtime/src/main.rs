@@ -7,7 +7,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
 
 use neuromance::{Config, Core, build_client};
-use neuromance_agent::BaseAgent;
+use neuromance_agent::Agent;
 use neuromance_client::LLMClient;
 use neuromance_runtime::{
     ApprovalMode, Mode, RuntimeConfig, RuntimeError,
@@ -96,7 +96,7 @@ async fn spawn_health_server(
     Ok(handle)
 }
 
-fn build_agent(config: &RuntimeConfig) -> Result<BaseAgent<Box<dyn LLMClient>>, RuntimeError> {
+fn build_agent(config: &RuntimeConfig) -> Result<Agent<Box<dyn LLMClient>>, RuntimeError> {
     let api_key = std::env::var(&config.agent.api_key_env)
         .map_err(|_| RuntimeError::MissingEnv(config.agent.api_key_env.clone()))?;
 
@@ -143,12 +143,12 @@ fn build_agent(config: &RuntimeConfig) -> Result<BaseAgent<Box<dyn LLMClient>>, 
         }
     }
 
-    Ok(BaseAgent::new(config.agent.id.clone(), core))
+    Ok(Agent::new(config.agent.id.clone(), core))
 }
 
 async fn run_oneshot(
     config: &RuntimeConfig,
-    mut agent: BaseAgent<Box<dyn LLMClient>>,
+    mut agent: Agent<Box<dyn LLMClient>>,
     cancel: CancellationToken,
 ) -> Result<()> {
     oneshot::run(config, &mut agent, cancel).await
@@ -156,7 +156,7 @@ async fn run_oneshot(
 
 async fn run_serve(
     config: &RuntimeConfig,
-    agent: BaseAgent<Box<dyn LLMClient>>,
+    agent: Agent<Box<dyn LLMClient>>,
     cancel: CancellationToken,
 ) -> Result<()> {
     serve::run(config, agent, cancel).await

@@ -10,8 +10,6 @@ use neuromance_client::LLMClient;
 use neuromance_common::agents::AgentResponse;
 use neuromance_common::tools::Tool;
 
-use crate::Agent;
-
 mod agents;
 use agents::{ActionAgent, ContextAgent, VerifierAgent};
 

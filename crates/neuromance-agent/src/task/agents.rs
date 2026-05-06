@@ -8,17 +8,17 @@ use neuromance_common::chat::Message;
 use neuromance_common::client::ChatRequest;
 use neuromance_tools::{BooleanTool, ThinkTool, ToolImplementation, create_todo_tools};
 
-use crate::{Agent, BaseAgent};
+use crate::Agent;
 
 /// Context analysis agent that determines what's needed to complete a task
 pub struct ContextAgent<C: LLMClient> {
-    pub agent: BaseAgent<C>,
+    pub agent: Agent<C>,
 }
 
 impl<C: LLMClient + Send + Sync> ContextAgent<C> {
     pub fn new(id: &str, client: C) -> Self {
         Self {
-            agent: BaseAgent::builder(format!("{id}-context"), client)
+            agent: Agent::builder(format!("{id}-context"), client)
                 .system_prompt(
                     "You are the assistant. Your job is to analyze what tools, \
                     information, and approach would be needed to complete a task. \
@@ -71,14 +71,14 @@ impl<C: LLMClient + Send + Sync> ContextAgent<C> {
 
 /// Action agent that executes tasks based on context
 pub struct ActionAgent<C: LLMClient> {
-    pub agent: BaseAgent<C>,
+    pub agent: Agent<C>,
 }
 
 impl<C: LLMClient + Send + Sync> ActionAgent<C> {
     pub fn new(id: &str, client: C) -> Self {
         let (todo_read, todo_write) = create_todo_tools();
         Self {
-            agent: BaseAgent::builder(format!("{id}-action"), client)
+            agent: Agent::builder(format!("{id}-action"), client)
                 .system_prompt(
                     "You are the assistant. Based on task analysis, you \
                     execute the required actions to complete tasks. Be precise \
@@ -118,13 +118,13 @@ impl<C: LLMClient + Send + Sync> ActionAgent<C> {
 
 /// Verifier agent that validates task completion
 pub struct VerifierAgent<C: LLMClient> {
-    pub agent: BaseAgent<C>,
+    pub agent: Agent<C>,
 }
 
 impl<C: LLMClient + Send + Sync> VerifierAgent<C> {
     pub fn new(id: &str, client: C) -> Self {
         Self {
-            agent: BaseAgent::builder(format!("{id}-verifier"), client)
+            agent: Agent::builder(format!("{id}-verifier"), client)
                 .system_prompt(
                     "You are a verification agent. You check if tasks were \
                     completed successfully and correctly. Use the return_bool \

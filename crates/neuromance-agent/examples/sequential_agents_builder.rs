@@ -6,7 +6,7 @@ use log::info;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use neuromance_agent::{Agent, BaseAgent};
+use neuromance_agent::Agent;
 use neuromance_client::chat_completions::client::ChatCompletionsClient;
 use neuromance_common::chat::Message;
 use neuromance_common::client::Config;
@@ -50,7 +50,7 @@ async fn main() -> Result<()> {
     info!(" --- Agent 1: Pirate ---");
     let client1 = ChatCompletionsClient::new(config.clone())?;
 
-    let mut pirate_agent = BaseAgent::builder("pirate", client1)
+    let mut pirate_agent = Agent::builder("pirate", client1)
         .add_tool(CurrentTimeTool)
         .max_turns(3)
         .auto_approve_tools(true)
@@ -70,7 +70,7 @@ async fn main() -> Result<()> {
     info!(" --- Agent 2: Vampire ---");
     let client2 = ChatCompletionsClient::new(config.clone())?;
 
-    let mut vampire_agent = BaseAgent::builder("vampire", client2)
+    let mut vampire_agent = Agent::builder("vampire", client2)
         .add_tool(CurrentTimeTool)
         .max_turns(3)
         .auto_approve_tools(true)
@@ -93,7 +93,7 @@ async fn main() -> Result<()> {
     info!(" --- Agent 3: Summarizer ---");
     let client3 = ChatCompletionsClient::new(config.clone())?;
 
-    let mut summarizer_agent = BaseAgent::builder("summarizer", client3)
+    let mut summarizer_agent = Agent::builder("summarizer", client3)
         .max_turns(3)
         .auto_approve_tools(true)
         .build();

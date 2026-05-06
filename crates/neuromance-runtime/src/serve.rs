@@ -26,7 +26,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use neuromance::error::CoreError;
-use neuromance_agent::{Agent, BaseAgent};
+use neuromance_agent::Agent;
 use neuromance_client::LLMClient;
 use neuromance_common::chat::Message;
 
@@ -150,7 +150,7 @@ async fn get_task(State(state): State<ServeState>, Path(id): Path<Uuid>) -> impl
 async fn worker_loop<C: LLMClient + Send + Sync + 'static>(
     mut rx: mpsc::Receiver<WorkerJob>,
     tasks: Arc<DashMap<Uuid, TaskRecord>>,
-    agent: Arc<Mutex<BaseAgent<C>>>,
+    agent: Arc<Mutex<Agent<C>>>,
     system_prompt: String,
     cancel: CancellationToken,
 ) {
@@ -174,7 +174,7 @@ async fn worker_loop<C: LLMClient + Send + Sync + 'static>(
 #[allow(clippy::significant_drop_tightening)]
 async fn process_job<C: LLMClient + Send + Sync>(
     tasks: &Arc<DashMap<Uuid, TaskRecord>>,
-    agent: &Arc<Mutex<BaseAgent<C>>>,
+    agent: &Arc<Mutex<Agent<C>>>,
     system_prompt: &str,
     job: WorkerJob,
     cancel: CancellationToken,
@@ -235,7 +235,7 @@ async fn process_job<C: LLMClient + Send + Sync>(
 /// or the HTTP server returns an error during operation.
 pub async fn run<C: LLMClient + Send + Sync + 'static>(
     config: &RuntimeConfig,
-    agent: BaseAgent<C>,
+    agent: Agent<C>,
     cancel: CancellationToken,
 ) -> Result<()> {
     let tasks: Arc<DashMap<Uuid, TaskRecord>> = Arc::new(DashMap::new());
@@ -358,7 +358,7 @@ mod tests {
         );
 
         let core = Core::new(SleepingClient::new()).with_streaming();
-        let agent = Arc::new(Mutex::new(BaseAgent::new("test".into(), core)));
+        let agent = Arc::new(Mutex::new(Agent::new("test".into(), core)));
         let (work_tx, work_rx) = mpsc::channel::<WorkerJob>(1);
         let cancel = CancellationToken::new();
 

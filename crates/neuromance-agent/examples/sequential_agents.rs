@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use neuromance::Core;
-use neuromance_agent::{Agent, BaseAgent};
+use neuromance_agent::Agent;
 use neuromance_client::chat_completions::client::ChatCompletionsClient;
 use neuromance_common::chat::Message;
 use neuromance_common::client::Config;
@@ -51,7 +51,7 @@ async fn main() -> Result<()> {
     let client1 = ChatCompletionsClient::new(config.clone())?;
     let mut core1 = Core::new(client1);
     core1.tool_executor.add_tool(CurrentTimeTool);
-    let mut pirate_agent = BaseAgent::new("pirate".to_string(), core1);
+    let mut pirate_agent = Agent::new("pirate".to_string(), core1);
 
     let conversation_id = Uuid::new_v4();
     let pirate_messages = vec![
@@ -69,7 +69,7 @@ async fn main() -> Result<()> {
     let client2 = ChatCompletionsClient::new(config.clone())?;
     let mut core2 = Core::new(client2);
     core2.tool_executor.add_tool(CurrentTimeTool);
-    let mut vampire_agent = BaseAgent::new("vampire".to_string(), core2);
+    let mut vampire_agent = Agent::new("vampire".to_string(), core2);
 
     let vampire_messages = vec![
         Message::system(
@@ -88,7 +88,7 @@ async fn main() -> Result<()> {
     info!(" --- Agent 3: Summarizer ---");
     let client3 = ChatCompletionsClient::new(config.clone())?;
     let core3 = Core::new(client3);
-    let mut summarizer_agent = BaseAgent::new("summarizer".to_string(), core3);
+    let mut summarizer_agent = Agent::new("summarizer".to_string(), core3);
 
     let summary_prompt = format!(
         "Summarize what these two characters said about the time:\n\nPirate: {}\n\nVampire: {}",
