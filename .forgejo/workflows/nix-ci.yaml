@@ -1,0 +1,106 @@
+name: Nix CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+env:
+  ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
+  ATTIC_URL: ${{ vars.ATTIC_URL }}
+
+jobs:
+  fmt:
+    runs-on: nix-latest
+    container:
+      options: --user root
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup attic
+        run: |
+          attic login ci "$ATTIC_URL" "$ATTIC_TOKEN"
+          attic use ci
+      - name: cargo fmt
+        run: nix build .#checks.x86_64-linux.fmt --print-build-logs
+      - name: Push to attic
+        run: attic push ci ./result
+
+  clippy:
+    runs-on: nix-latest
+    container:
+      options: --user root
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup attic
+        run: |
+          attic login ci "$ATTIC_URL" "$ATTIC_TOKEN"
+          attic use ci
+      - name: cargo clippy
+        run: nix build .#checks.x86_64-linux.clippy --print-build-logs
+      - name: Push to attic
+        run: attic push ci ./result
+
+  tests:
+    runs-on: nix-latest
+    container:
+      options: --user root
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup attic
+        run: |
+          attic login ci "$ATTIC_URL" "$ATTIC_TOKEN"
+          attic use ci
+      - name: cargo test
+        run: nix build .#checks.x86_64-linux.tests --print-build-logs
+      - name: Push to attic
+        run: attic push ci ./result
+
+  build:
+    runs-on: nix-latest
+    container:
+      options: --user root
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup attic
+        run: |
+          attic login ci "$ATTIC_URL" "$ATTIC_TOKEN"
+          attic use ci
+      - name: Build neuromance
+        run: nix build .#neuromance --print-build-logs
+      - name: Push neuromance to attic
+        run: attic push ci ./result
+      - name: Build neuromance-runtime
+        run: nix build .#neuromance-runtime --print-build-logs
+      - name: Push neuromance-runtime to attic
+        run: attic push ci ./result
+      - name: Verify runtime binary
+        run: test -x result/bin/neuromance-runtime
+
+  image:
+    runs-on: nix-latest
+    container:
+      options: --user root
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup attic
+        run: |
+          attic login ci "$ATTIC_URL" "$ATTIC_TOKEN"
+          attic use ci
+      - name: Build minimal image
+        run: nix build .#neuromance-image --print-build-logs
+      - name: Push minimal image to attic
+        run: attic push ci ./result
+      - name: Verify minimal image archive
+        run: test -f result
+      - name: Build toolkit image
+        run: nix build .#neuromance-image-toolkit --print-build-logs
+      - name: Push toolkit image to attic
+        run: attic push ci ./result
+      - name: Verify toolkit image archive
+        run: test -f result
