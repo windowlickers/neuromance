@@ -95,29 +95,52 @@
 
         neuromanceImage = import ./image.nix {
           inherit pkgs neuromance-runtime version;
+          variant = "minimal";
         };
 
-        loadImage = pkgs.writeShellScriptBin "load" ''
+        toolkitTools = with pkgs; [
+          busybox
+          coreutils
+          git
+          curl
+          jq
+          nodejs
+          python3
+        ];
+
+        neuromanceImageToolkit = import ./image.nix {
+          inherit pkgs neuromance-runtime version;
+          variant = "toolkit";
+          extraTools = toolkitTools;
+          includeShell = true;
+        };
+
+        mkLoad = image: variant: pkgs.writeShellScriptBin "load-${variant}" ''
           set -euo pipefail
-          echo "Loading neuromance-runtime:${version} into Docker..."
-          ${pkgs.docker}/bin/docker load < ${neuromanceImage}
-          echo "Loaded neuromance-runtime:${version}"
+          echo "Loading neuromance-runtime:${version}-${variant} into Docker..."
+          ${pkgs.docker}/bin/docker load < ${image}
+          echo "Loaded neuromance-runtime:${version}-${variant}"
         '';
 
         defaultRegistry = "ghcr.io/windowlickers";
-        pushImage = pkgs.writeShellScriptBin "push" ''
+        mkPush = image: variant: pkgs.writeShellScriptBin "push-${variant}" ''
           set -euo pipefail
           registry="''${1:-''${REGISTRY:-${defaultRegistry}}}"
-          echo "Pushing to $registry/neuromance-runtime:${version}..."
+          echo "Pushing to $registry/neuromance-runtime:${version}-${variant}..."
           ${pkgs.skopeo}/bin/skopeo --insecure-policy copy \
-            docker-archive:${neuromanceImage} \
-            "docker://$registry/neuromance-runtime:${version}"
-          echo "Pushing to $registry/neuromance-runtime:latest..."
+            docker-archive:${image} \
+            "docker://$registry/neuromance-runtime:${version}-${variant}"
+          echo "Pushing to $registry/neuromance-runtime:${variant}..."
           ${pkgs.skopeo}/bin/skopeo --insecure-policy copy \
-            docker-archive:${neuromanceImage} \
-            "docker://$registry/neuromance-runtime:latest"
-          echo "Pushed ${version}"
+            docker-archive:${image} \
+            "docker://$registry/neuromance-runtime:${variant}"
+          echo "Pushed ${version}-${variant}"
         '';
+
+        loadMinimal = mkLoad neuromanceImage "minimal";
+        loadToolkit = mkLoad neuromanceImageToolkit "toolkit";
+        pushMinimal = mkPush neuromanceImage "minimal";
+        pushToolkit = mkPush neuromanceImageToolkit "toolkit";
 
       in
       {
@@ -146,17 +169,26 @@
         packages = {
           inherit neuromance neuromance-runtime;
           neuromance-image = neuromanceImage;
+          neuromance-image-toolkit = neuromanceImageToolkit;
           default = neuromance;
         };
 
         apps = {
-          load = {
+          load-minimal = {
             type = "app";
-            program = "${loadImage}/bin/load";
+            program = "${loadMinimal}/bin/load-minimal";
           };
-          push = {
+          load-toolkit = {
             type = "app";
-            program = "${pushImage}/bin/push";
+            program = "${loadToolkit}/bin/load-toolkit";
+          };
+          push-minimal = {
+            type = "app";
+            program = "${pushMinimal}/bin/push-minimal";
+          };
+          push-toolkit = {
+            type = "app";
+            program = "${pushToolkit}/bin/push-toolkit";
           };
         };
 
