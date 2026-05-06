@@ -1,3 +1,5 @@
+use std::future::Future;
+
 use uuid::Uuid;
 
 use neuromance::Core;
@@ -5,6 +7,7 @@ use neuromance_client::LLMClient;
 use neuromance_common::agents::AgentState;
 use neuromance_common::chat::Message;
 use neuromance_common::client::ToolChoice;
+use neuromance_common::tools::{ToolApproval, ToolCall};
 use neuromance_tools::ToolImplementation;
 
 use crate::BaseAgent;
@@ -101,6 +104,25 @@ impl<C: LLMClient> AgentBuilder<C> {
     #[must_use]
     pub const fn auto_approve_tools(mut self, auto_approve: bool) -> Self {
         self.core.auto_approve_tools = auto_approve;
+        self
+    }
+
+    /// Set a stored callback that decides tool approval per call.
+    ///
+    /// Mirrors [`Core::with_tool_approval_callback`]. When set, the underlying
+    /// `Core` answers approvals via the callback instead of yielding
+    /// `CoreEvent::ApprovalRequest`. `auto_approve_tools` still short-circuits
+    /// the callback when enabled.
+    ///
+    /// # Arguments
+    /// * `callback` - Async function called for each non-auto-approved tool call
+    #[must_use]
+    pub fn with_tool_approval_callback<F, Fut>(mut self, callback: F) -> Self
+    where
+        F: Fn(&ToolCall) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ToolApproval> + Send + 'static,
+    {
+        self.core = self.core.with_tool_approval_callback(callback);
         self
     }
 

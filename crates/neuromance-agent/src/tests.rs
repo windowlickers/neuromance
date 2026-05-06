@@ -413,6 +413,18 @@ fn builder_sets_auto_approve() {
 }
 
 #[test]
+fn builder_sets_tool_approval_callback() {
+    use neuromance_common::tools::ToolApproval;
+
+    let client = MockLLMClient::new();
+    let agent = BaseAgent::builder("agent", client)
+        .with_tool_approval_callback(|_tc| async { ToolApproval::Approved })
+        .build();
+
+    assert!(agent.core.tool_approval_callback.is_some());
+}
+
+#[test]
 fn builder_sets_tool_choice() {
     let client = MockLLMClient::new();
     let agent = BaseAgent::builder("agent", client)
