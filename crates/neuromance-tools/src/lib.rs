@@ -123,6 +123,7 @@ use serde_json::Value;
 use neuromance_common::tools::{FunctionCall, Tool, ToolCall};
 
 mod bool_tool;
+mod edit_tool;
 pub mod factory;
 pub mod generic;
 pub mod mcp;
@@ -132,6 +133,7 @@ mod think_tool;
 mod todo_tool;
 mod write_tool;
 pub use bool_tool::{BoolToolFactory, BooleanTool};
+pub use edit_tool::{EditTool, EditToolFactory};
 pub use factory::{ToolConfig, ToolFactory, ToolFactoryRegistry};
 pub use read_tool::{ReadTool, ReadToolFactory};
 pub use think_tool::{ThinkTool, ThinkToolFactory};
