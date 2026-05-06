@@ -243,15 +243,15 @@ mod tests {
             system_prompt = "x"
 
             [[tools]]
-            name = "think"
+            name = "read"
 
             [[tools]]
-            name = "todos"
+            name = "bash"
         "#;
         let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
         config.validate().unwrap();
         assert_eq!(config.tools.len(), 2);
-        assert_eq!(config.tools[0].name, "think");
-        assert_eq!(config.tools[1].name, "todos");
+        assert_eq!(config.tools[0].name, "read");
+        assert_eq!(config.tools[1].name, "bash");
     }
 }

@@ -15,9 +15,10 @@
 //!
 //! ## Built-in Tools
 //!
-//! - [`BooleanTool`]: Returns boolean values based on conditions
-//! - [`ThinkTool`]: Enables chain-of-thought reasoning for LLMs
-//! - [`TodoWriteTool`] / [`TodoReadTool`]: Task management tools for agents
+//! - [`ReadTool`]: Read UTF-8 files with optional line offset/limit
+//! - [`WriteTool`]: Create or overwrite a file at an absolute path
+//! - [`EditTool`]: Exact-string replacement on a file
+//! - [`BashTool`]: Execute a shell command via `sh -c` with a timeout
 //!
 //! ## Example: Creating and Executing a Custom Tool
 //!
@@ -123,23 +124,17 @@ use serde_json::Value;
 use neuromance_common::tools::{FunctionCall, Tool, ToolCall};
 
 mod bash_tool;
-mod bool_tool;
 mod edit_tool;
 pub mod factory;
 pub mod generic;
 pub mod mcp;
 pub mod proxy;
 mod read_tool;
-mod think_tool;
-mod todo_tool;
 mod write_tool;
 pub use bash_tool::{BashTool, BashToolFactory};
-pub use bool_tool::{BoolToolFactory, BooleanTool};
 pub use edit_tool::{EditTool, EditToolFactory};
 pub use factory::{ToolConfig, ToolFactory, ToolFactoryRegistry};
 pub use read_tool::{ReadTool, ReadToolFactory};
-pub use think_tool::{ThinkTool, ThinkToolFactory};
-pub use todo_tool::{TodoReadTool, TodoToolsFactory, TodoWriteTool, create_todo_tools};
 pub use write_tool::{WriteTool, WriteToolFactory};
 
 #[async_trait]

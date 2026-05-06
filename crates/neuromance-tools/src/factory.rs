@@ -5,8 +5,7 @@
 //! [`ToolConfig`] entries from its config file and dispatches each to the
 //! matching factory in [`ToolFactoryRegistry`].
 //!
-//! A single factory entry may register multiple tools — `todos` registers
-//! both `read_todos` and `write_todos` so they share storage.
+//! A single factory entry may register multiple tools.
 
 use std::collections::HashMap;
 
@@ -16,11 +15,8 @@ use serde_json::Value;
 
 use crate::ToolRegistry;
 use crate::bash_tool::BashToolFactory;
-use crate::bool_tool::BoolToolFactory;
 use crate::edit_tool::EditToolFactory;
 use crate::read_tool::ReadToolFactory;
-use crate::think_tool::ThinkToolFactory;
-use crate::todo_tool::TodoToolsFactory;
 use crate::write_tool::WriteToolFactory;
 
 /// Per-tool configuration entry.
@@ -29,10 +25,10 @@ use crate::write_tool::WriteToolFactory;
 ///
 /// ```toml
 /// [[tools]]
-/// name = "think"
+/// name = "read"
 ///
 /// [[tools]]
-/// name = "todos"
+/// name = "bash"
 /// [tools.config]   # optional, factory-specific
 /// ```
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -70,13 +66,10 @@ impl ToolFactoryRegistry {
     }
 
     /// Returns a registry pre-populated with the built-in factories:
-    /// `return_bool`, `think`, `todos`, `read`, `write`, `edit`, `bash`.
+    /// `read`, `write`, `edit`, `bash`.
     #[must_use]
     pub fn with_builtin() -> Self {
         let mut r = Self::new();
-        r.register(BoolToolFactory);
-        r.register(ThinkToolFactory);
-        r.register(TodoToolsFactory);
         r.register(ReadToolFactory);
         r.register(WriteToolFactory);
         r.register(EditToolFactory);
@@ -183,9 +176,10 @@ mod tests {
     fn test_with_builtin_registers_known_factories() {
         let r = ToolFactoryRegistry::with_builtin();
         let names = r.factory_names();
-        assert!(names.contains(&"return_bool".to_string()));
-        assert!(names.contains(&"think".to_string()));
-        assert!(names.contains(&"todos".to_string()));
+        assert!(names.contains(&"read".to_string()));
+        assert!(names.contains(&"write".to_string()));
+        assert!(names.contains(&"edit".to_string()));
+        assert!(names.contains(&"bash".to_string()));
     }
 
     #[test]
@@ -193,11 +187,19 @@ mod tests {
         let factory_registry = ToolFactoryRegistry::with_builtin();
         let configs = vec![
             ToolConfig {
-                name: "think".to_string(),
+                name: "read".to_string(),
                 config: Value::Null,
             },
             ToolConfig {
-                name: "todos".to_string(),
+                name: "write".to_string(),
+                config: Value::Null,
+            },
+            ToolConfig {
+                name: "edit".to_string(),
+                config: Value::Null,
+            },
+            ToolConfig {
+                name: "bash".to_string(),
                 config: Value::Null,
             },
         ];
@@ -205,11 +207,11 @@ mod tests {
         let tools = factory_registry.build_all(&configs).unwrap();
         let tool_names = tools.tool_names();
 
-        // think + todos (which expands to read_todos and write_todos) = 3 tools
-        assert!(tool_names.contains(&"think".to_string()));
-        assert!(tool_names.contains(&"read_todos".to_string()));
-        assert!(tool_names.contains(&"write_todos".to_string()));
-        assert_eq!(tool_names.len(), 3);
+        assert!(tool_names.contains(&"read".to_string()));
+        assert!(tool_names.contains(&"write".to_string()));
+        assert!(tool_names.contains(&"edit".to_string()));
+        assert!(tool_names.contains(&"bash".to_string()));
+        assert_eq!(tool_names.len(), 4);
     }
 
     #[test]
@@ -225,9 +227,10 @@ mod tests {
         let err = result.err().unwrap();
         let msg = format!("{err:#}");
         assert!(msg.contains("nonexistent"));
-        assert!(msg.contains("return_bool"));
-        assert!(msg.contains("think"));
-        assert!(msg.contains("todos"));
+        assert!(msg.contains("read"));
+        assert!(msg.contains("write"));
+        assert!(msg.contains("edit"));
+        assert!(msg.contains("bash"));
     }
 
     #[test]
@@ -249,10 +252,10 @@ mod tests {
     #[test]
     fn test_tool_config_deserializes_with_default_config() {
         let toml_str = r#"
-            name = "think"
+            name = "read"
         "#;
         let cfg: ToolConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(cfg.name, "think");
+        assert_eq!(cfg.name, "read");
         assert!(cfg.config.is_null());
     }
 }
