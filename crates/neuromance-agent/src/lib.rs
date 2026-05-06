@@ -143,23 +143,17 @@ impl<C: LLMClient + Send + Sync> Agent for BaseAgent<C> {
             messages[0].content.push_str(&ctx);
         }
 
-        let tokens_before = self.core.cache_metrics.total_input_tokens
-            + self.core.cache_metrics.total_output_tokens;
-        let success_before = self.core.successful_tool_calls;
-        let fail_before = self.core.failed_tool_calls;
-
-        let messages = self.core.chat_with_tool_loop(messages, cancel).await?;
+        let (messages, run_stats) = self.core.chat_with_tool_loop(messages, cancel).await?;
 
         self.state.stats.total_messages += messages.len();
-        let tokens_after = self.core.cache_metrics.total_input_tokens
-            + self.core.cache_metrics.total_output_tokens;
         #[allow(clippy::cast_possible_truncation)]
         {
-            self.state.stats.tokens_used += (tokens_after - tokens_before) as usize;
+            let tokens = run_stats.cache_metrics.total_input_tokens
+                + run_stats.cache_metrics.total_output_tokens;
+            self.state.stats.tokens_used += tokens as usize;
+            self.state.stats.successful_tool_calls += run_stats.successful_tool_calls as usize;
+            self.state.stats.failed_tool_calls += run_stats.failed_tool_calls as usize;
         }
-        self.state.stats.successful_tool_calls +=
-            (self.core.successful_tool_calls - success_before) as usize;
-        self.state.stats.failed_tool_calls += (self.core.failed_tool_calls - fail_before) as usize;
 
         let content = messages
             .iter()

@@ -96,8 +96,6 @@ impl Usage {
 ///
 /// Tracks cumulative token counts and cache hit rates to monitor
 /// prompt caching effectiveness over a session or agent run.
-///
-/// Access via `core.cache_metrics` after running tool loops.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CacheMetrics {
     /// Sum of `prompt_tokens` across all recorded requests.

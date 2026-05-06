@@ -11,7 +11,6 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use neuromance_client::LLMClient;
-use neuromance_common::CacheMetrics;
 use neuromance_common::chat::{Message, MessageRole};
 use neuromance_common::client::{ChatRequest, ChatResponse, ToolChoice};
 use neuromance_common::features::ThinkingMode;
@@ -20,6 +19,7 @@ use neuromance_tools::ToolExecutor;
 
 use crate::error::CoreError;
 use crate::events::{CoreEvent, ToolApprovalCallback, TurnCallback};
+use crate::stats::RunStats;
 
 /// Core orchestration layer for LLM conversations with tool execution.
 ///
@@ -44,12 +44,6 @@ pub struct Core<C: LLMClient> {
     pub turn_callback: Option<TurnCallback>,
     /// Thinking/reasoning mode configuration.
     pub thinking: ThinkingMode,
-    /// Aggregate cache statistics across all requests made through this Core.
-    pub cache_metrics: CacheMetrics,
-    /// Number of tool calls that executed successfully.
-    pub successful_tool_calls: u32,
-    /// Number of tool calls that failed during execution.
-    pub failed_tool_calls: u32,
 }
 
 impl<C: LLMClient> Core<C> {
@@ -64,9 +58,6 @@ impl<C: LLMClient> Core<C> {
             tool_approval_callback: None,
             turn_callback: None,
             thinking: ThinkingMode::Default,
-            cache_metrics: CacheMetrics::default(),
-            successful_tool_calls: 0,
-            failed_tool_calls: 0,
         }
     }
 
@@ -351,7 +342,6 @@ impl<C: LLMClient> Core<C> {
 
                 if let Some(ref usage) = response.usage {
                     yield CoreEvent::Usage(usage.clone());
-                    self.cache_metrics.record(usage);
                 }
 
                 let conversation_id = response.message.conversation_id;
@@ -418,7 +408,6 @@ impl<C: LLMClient> Core<C> {
                             match exec_outcome? {
                                 Ok(result) => {
                                     debug!("Tool {tool_name} executed successfully");
-                                    self.successful_tool_calls += 1;
                                     yield CoreEvent::ToolResult {
                                         name: tool_name.clone(),
                                         result: result.clone(),
@@ -435,7 +424,6 @@ impl<C: LLMClient> Core<C> {
                                 }
                                 Err(e) => {
                                     debug!("Tool {tool_name} execution failed: {e}");
-                                    self.failed_tool_calls += 1;
                                     let error_msg = format!("Tool execution failed: {e}");
                                     yield CoreEvent::ToolResult {
                                         name: tool_name.clone(),
@@ -499,7 +487,8 @@ impl<C: LLMClient> Core<C> {
     }
 
     /// Convenience wrapper around [`Core::run`] that drains the stream and
-    /// returns the final message history.
+    /// returns the final message history along with [`RunStats`] aggregated
+    /// over the run.
     ///
     /// When no [`Core::with_tool_approval_callback`] is set and a non-auto-approved
     /// tool is requested, the yielded [`CoreEvent::ApprovalRequest`] is answered
@@ -513,11 +502,14 @@ impl<C: LLMClient> Core<C> {
         &mut self,
         messages: Vec<Message>,
         cancel: CancellationToken,
-    ) -> Result<Vec<Message>, CoreError> {
+    ) -> Result<(Vec<Message>, RunStats), CoreError> {
+        let mut stats = RunStats::default();
         let mut stream = Box::pin(self.run(messages, cancel));
         while let Some(event) = stream.next().await {
-            match event? {
-                CoreEvent::Completed(msgs) => return Ok(msgs),
+            let event = event?;
+            stats.observe(&event);
+            match event {
+                CoreEvent::Completed(msgs) => return Ok((msgs, stats)),
                 CoreEvent::ApprovalRequest { responder, .. } => {
                     let _ = responder.send(ToolApproval::Denied(
                         "No approval mechanism configured".into(),

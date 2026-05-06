@@ -31,11 +31,13 @@
 pub mod core;
 pub mod error;
 pub mod events;
+pub mod stats;
 
 // --- Orchestration ---
 pub use crate::core::Core;
 pub use crate::error::CoreError;
 pub use crate::events::CoreEvent;
+pub use crate::stats::RunStats;
 
 // --- Clients ---
 pub use neuromance_client::{
