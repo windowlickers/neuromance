@@ -66,6 +66,7 @@ env_logger = "0.11"
 typed-builder = "0.22"
 secrecy = { version = "0.10", features = ["serde"] }
 smallvec = { version = "1.13", features = ["serde"] }
+tempfile = "3"
 toml = "0.9.7"
 rmcp = { version = "0.14.0", features = [
     "client",

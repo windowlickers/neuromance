@@ -32,3 +32,6 @@ rmcp.workspace = true
 url.workspace = true
 
 neuromance-common = { workspace = true }
+
+[dev-dependencies]
+tempfile.workspace = true
