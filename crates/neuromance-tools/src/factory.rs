@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::ToolRegistry;
+use crate::bash_tool::BashToolFactory;
 use crate::bool_tool::BoolToolFactory;
 use crate::edit_tool::EditToolFactory;
 use crate::read_tool::ReadToolFactory;
@@ -69,7 +70,7 @@ impl ToolFactoryRegistry {
     }
 
     /// Returns a registry pre-populated with the built-in factories:
-    /// `return_bool`, `think`, `todos`, `read`, `write`, `edit`.
+    /// `return_bool`, `think`, `todos`, `read`, `write`, `edit`, `bash`.
     #[must_use]
     pub fn with_builtin() -> Self {
         let mut r = Self::new();
@@ -79,6 +80,7 @@ impl ToolFactoryRegistry {
         r.register(ReadToolFactory);
         r.register(WriteToolFactory);
         r.register(EditToolFactory);
+        r.register(BashToolFactory);
         r
     }
 

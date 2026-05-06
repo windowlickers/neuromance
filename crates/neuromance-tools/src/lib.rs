@@ -122,6 +122,7 @@ use serde_json::Value;
 
 use neuromance_common::tools::{FunctionCall, Tool, ToolCall};
 
+mod bash_tool;
 mod bool_tool;
 mod edit_tool;
 pub mod factory;
@@ -132,6 +133,7 @@ mod read_tool;
 mod think_tool;
 mod todo_tool;
 mod write_tool;
+pub use bash_tool::{BashTool, BashToolFactory};
 pub use bool_tool::{BoolToolFactory, BooleanTool};
 pub use edit_tool::{EditTool, EditToolFactory};
 pub use factory::{ToolConfig, ToolFactory, ToolFactoryRegistry};
