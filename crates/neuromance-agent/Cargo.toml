@@ -39,10 +39,6 @@ futures = { workspace = true }
 tokio = { workspace = true }
 
 [[example]]
-name = "agent_task_vampire"
-path = "examples/agent_task_vampire.rs"
-
-[[example]]
 name = "sequential_agents"
 path = "examples/sequential_agents.rs"
 

@@ -1,4 +1,4 @@
-//! Serve mode: long-lived HTTP intake for `AgentTask`-style work.
+//! Serve mode: long-lived HTTP intake for agent task work.
 //!
 //! `POST /tasks` enqueues a task and returns immediately with a UUID;
 //! `GET /tasks/{id}` returns the current state. Tasks are processed

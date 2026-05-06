@@ -40,11 +40,9 @@ use neuromance_common::chat::{Message, MessageRole};
 use neuromance_common::client::ToolChoice;
 
 pub mod builder;
-pub mod task;
 
 // --- Agent core ---
 pub use builder::AgentBuilder;
-pub use task::{AgentTask, TaskResponse, TaskState};
 
 // --- Agent state types (live in neuromance-common so they can be shared,
 //     surfaced here so agent consumers only need this crate) ---

@@ -4,7 +4,7 @@
 //! config and runs it in one of two modes:
 //!
 //! - **`oneshot`** — execute a single configured input, write the result, exit.
-//!   Designed for Kubernetes Jobs (`AgentTask`).
+//!   Designed for Kubernetes Jobs.
 //! - **`serve`** — bind an HTTP intake (`POST /tasks`, `GET /tasks/{id}`) and
 //!   process tasks sequentially until SIGTERM. Designed for Deployments.
 //!
