@@ -66,7 +66,11 @@ async fn main() -> Result<()> {
 
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    fmt().with_env_filter(filter).with_target(true).init();
+    let builder = fmt().with_env_filter(filter).with_target(true);
+    match std::env::var("RUST_LOG_FORMAT").as_deref() {
+        Ok("json") => builder.json().flatten_event(true).init(),
+        _ => builder.init(),
+    }
 }
 
 async fn spawn_health_server(
