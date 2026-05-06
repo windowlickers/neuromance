@@ -76,7 +76,9 @@ pub async fn run<C: LLMClient + Send + Sync>(
     let json = serde_json::to_string_pretty(&output)?;
 
     if let Some(path) = &oneshot.output_path {
-        std::fs::write(path, &json).with_context(|| format!("write {}", path.display()))?;
+        tokio::fs::write(path, &json)
+            .await
+            .with_context(|| format!("write {}", path.display()))?;
         info!(path=%path.display(), "oneshot output written");
     } else {
         println!("{json}");
