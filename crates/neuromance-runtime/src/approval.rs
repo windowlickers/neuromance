@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use neuromance_common::tools::{ToolApproval, ToolCall};
 
@@ -109,14 +109,24 @@ impl WebhookApprover {
                                 .unwrap_or_else(|| "denied by webhook".to_string()),
                         ),
                         Err(e) => {
-                            warn!(error=%e, tool=%tool_name, "approval response parse failed");
-                            ToolApproval::Denied(format!("approval response parse failed: {e}"))
+                            // Don't surface `e` to the caller: reqwest's parse
+                            // errors include the URL, which may carry an auth
+                            // token in its query string.
+                            debug!(error=%e, tool=%tool_name, "approval response parse failed");
+                            warn!(tool=%tool_name, "approval response parse failed");
+                            ToolApproval::Denied("approval response parse failed".to_string())
                         }
                     }
                 }
                 Err(e) => {
-                    warn!(error=%e, tool=%tool_name, "approval webhook call failed");
-                    ToolApproval::Denied(format!("approval webhook unreachable: {e}"))
+                    // Same reasoning: `e.to_string()` from reqwest typically
+                    // contains the full request URL.
+                    debug!(error=%e, tool=%tool_name, "approval webhook call failed");
+                    let status_hint = e
+                        .status()
+                        .map_or_else(|| "unreachable".to_string(), |s| format!("status={s}"));
+                    warn!(status=%status_hint, tool=%tool_name, "approval webhook call failed");
+                    ToolApproval::Denied(format!("approval webhook call failed: {status_hint}"))
                 }
             }
         })
