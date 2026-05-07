@@ -64,6 +64,7 @@ impl WebhookApprover {
     ) -> Result<Self, RuntimeError> {
         let client = reqwest::Client::builder()
             .timeout(timeout)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| RuntimeError::Approval(format!("build webhook client: {e}")))?;
         Ok(Self {

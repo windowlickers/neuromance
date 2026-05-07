@@ -134,6 +134,8 @@ impl RuntimeConfig {
     /// Returns [`RuntimeError::Config`] when:
     /// - `mode = "oneshot"` but no `[oneshot]` section is present
     /// - `approval.mode = "async"` but `approval.webhook_url` is unset
+    /// - `approval.webhook_url` is set to a URL whose scheme is not
+    ///   `http` or `https`
     pub fn validate(&self) -> Result<(), RuntimeError> {
         if matches!(self.mode, Mode::Oneshot) && self.oneshot.is_none() {
             return Err(RuntimeError::Config(
@@ -145,6 +147,17 @@ impl RuntimeConfig {
             return Err(RuntimeError::Config(
                 "approval.mode = \"async\" requires approval.webhook_url".to_string(),
             ));
+        }
+        if let Some(url) = &self.approval.webhook_url {
+            let parsed = url::Url::parse(url).map_err(|e| {
+                RuntimeError::Config(format!("approval.webhook_url is not a valid URL: {e}"))
+            })?;
+            if !matches!(parsed.scheme(), "http" | "https") {
+                return Err(RuntimeError::Config(format!(
+                    "approval.webhook_url must use http or https, got scheme '{}'",
+                    parsed.scheme()
+                )));
+            }
         }
         Ok(())
     }
@@ -215,6 +228,45 @@ mod tests {
         let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
         let err = config.validate().err().unwrap();
         assert!(format!("{err}").contains("webhook_url"));
+    }
+
+    #[test]
+    fn test_webhook_url_must_be_http_or_https() {
+        let toml_str = r#"
+            mode = "serve"
+            [agent]
+            id = "x"
+            model = "openai:gpt-4o"
+            api_key_env = "K"
+            system_prompt = "be helpful"
+            [approval]
+            mode = "async"
+            webhook_url = "file:///etc/passwd"
+        "#;
+        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        let err = config.validate().err().unwrap();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("http or https"),
+            "expected scheme rejection, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_webhook_url_https_validates() {
+        let toml_str = r#"
+            mode = "serve"
+            [agent]
+            id = "x"
+            model = "openai:gpt-4o"
+            api_key_env = "K"
+            system_prompt = "be helpful"
+            [approval]
+            mode = "async"
+            webhook_url = "https://approve.example.com/decide"
+        "#;
+        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        config.validate().unwrap();
     }
 
     #[test]
