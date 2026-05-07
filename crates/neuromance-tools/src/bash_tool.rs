@@ -20,6 +20,12 @@ const MAX_TIMEOUT_MS: u64 = 600_000;
 /// Maximum bytes captured from each of stdout / stderr.
 const MAX_STREAM_BYTES: usize = 64 * 1024;
 
+/// Environment variables forwarded into the shell subprocess. Anything else —
+/// including secrets injected by k8s as env vars (`OPENAI_API_KEY`,
+/// `KUBERNETES_*`, projected service-account paths, etc.) — is stripped via
+/// `env_clear` so it cannot leak into tool output.
+const ENV_ALLOWLIST: &[&str] = &["PATH", "HOME", "LANG", "LC_ALL", "TERM"];
+
 /// Executes a shell command via `sh -c` and returns its exit code, stdout,
 /// and stderr.
 ///
@@ -80,6 +86,12 @@ impl ToolImplementation for BashTool {
         cmd.arg("-c").arg(command);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         cmd.kill_on_drop(true);
+        cmd.env_clear();
+        for key in ENV_ALLOWLIST {
+            if let Ok(value) = std::env::var(key) {
+                cmd.env(key, value);
+            }
+        }
 
         if let Some(cwd) = obj.get("cwd").and_then(Value::as_str) {
             let cwd = PathBuf::from(cwd);
@@ -252,5 +264,38 @@ mod tests {
     #[test]
     fn test_is_not_auto_approved() {
         assert!(!BashTool.is_auto_approved());
+    }
+
+    #[tokio::test]
+    async fn test_bash_forwards_path_env() {
+        // PATH is in ENV_ALLOWLIST and is set in any sane test environment.
+        let tool = BashTool;
+        let result = tool
+            .execute(&json!({ "command": "test -n \"$PATH\" && echo PATH_OK" }))
+            .await
+            .unwrap();
+        assert!(
+            result.contains("PATH_OK"),
+            "PATH should be forwarded into the shell:\n{result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bash_strips_non_allowlisted_env() {
+        // `cargo test` always sets `CARGO`; it is not in ENV_ALLOWLIST, so
+        // `env_clear` followed by the allowlist forwarding should drop it.
+        // If $CARGO is empty inside the shell, env_clear is working.
+        let tool = BashTool;
+        let result = tool
+            .execute(&json!({
+                "command": "if [ -z \"$CARGO\" ]; then echo CLEAN; else echo LEAKED; fi"
+            }))
+            .await
+            .unwrap();
+        assert!(
+            result.contains("CLEAN"),
+            "non-allowlisted env (CARGO) leaked into shell:\n{result}"
+        );
+        assert!(!result.contains("LEAKED"));
     }
 }
