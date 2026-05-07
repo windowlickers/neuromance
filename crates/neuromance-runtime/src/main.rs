@@ -122,6 +122,24 @@ fn build_agent(config: &RuntimeConfig) -> Result<Agent<Box<dyn LLMClient>>, Runt
     let staged = factories
         .build_all(&config.tools)
         .map_err(RuntimeError::Other)?;
+
+    if matches!(config.approval.mode, ApprovalMode::Auto) {
+        let mut needs_approval: Vec<String> = staged
+            .tool_names()
+            .into_iter()
+            .filter(|name| !staged.is_tool_auto_approved(name))
+            .collect();
+        if !needs_approval.is_empty() {
+            needs_approval.sort();
+            return Err(RuntimeError::Config(format!(
+                "approval.mode = \"auto\" but the following tools require explicit approval: \
+                 [{}]. Either remove them from [[tools]] or set approval.mode = \"async\" \
+                 with an approval.webhook_url.",
+                needs_approval.join(", ")
+            )));
+        }
+    }
+
     for name in staged.tool_names() {
         if let Some(tool) = staged.get(&name) {
             core.tool_executor.add_tool_arc(tool);
