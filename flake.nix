@@ -142,6 +142,12 @@
         pushMinimal = mkPush neuromanceImage "minimal";
         pushToolkit = mkPush neuromanceImageToolkit "toolkit";
 
+        mkAppMeta = description: with pkgs.lib; {
+          inherit description;
+          license = licenses.asl20;
+          platforms = platforms.linux;
+        };
+
       in
       {
         checks = {
@@ -177,18 +183,22 @@
           load-minimal = {
             type = "app";
             program = "${loadMinimal}/bin/load-minimal";
+            meta = mkAppMeta "Load the minimal neuromance-runtime image into Docker";
           };
           load-toolkit = {
             type = "app";
             program = "${loadToolkit}/bin/load-toolkit";
+            meta = mkAppMeta "Load the toolkit neuromance-runtime image into Docker";
           };
           push-minimal = {
             type = "app";
             program = "${pushMinimal}/bin/push-minimal";
+            meta = mkAppMeta "Push the minimal neuromance-runtime image to a registry";
           };
           push-toolkit = {
             type = "app";
             program = "${pushToolkit}/bin/push-toolkit";
+            meta = mkAppMeta "Push the toolkit neuromance-runtime image to a registry";
           };
         };
 
