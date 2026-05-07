@@ -12,7 +12,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -80,10 +80,15 @@ pub struct ServeState {
     work_tx: mpsc::Sender<WorkerJob>,
 }
 
+/// Cap on `POST /tasks` request bodies. Task input is a single user prompt;
+/// 64 KiB is generous and prevents memory amplification from oversized intake.
+const MAX_TASK_BODY_BYTES: usize = 64 * 1024;
+
 pub fn router(state: ServeState) -> Router {
     Router::new()
         .route("/tasks", post(create_task))
         .route("/tasks/{id}", get(get_task))
+        .layer(DefaultBodyLimit::max(MAX_TASK_BODY_BYTES))
         .with_state(state)
 }
 

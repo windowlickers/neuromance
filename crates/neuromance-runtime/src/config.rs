@@ -74,10 +74,10 @@ impl Default for RuntimeSettings {
 }
 
 fn default_listen_addr() -> String {
-    "0.0.0.0:8080".to_string()
+    "127.0.0.1:8080".to_string()
 }
 fn default_health_addr() -> String {
-    "0.0.0.0:8081".to_string()
+    "127.0.0.1:8081".to_string()
 }
 const fn default_shutdown_grace() -> u64 {
     30
@@ -178,7 +178,7 @@ mod tests {
         config.validate().unwrap();
         assert_eq!(config.mode, Mode::Oneshot);
         assert_eq!(config.agent.id, "research");
-        assert_eq!(config.runtime.listen_addr, "0.0.0.0:8080");
+        assert_eq!(config.runtime.listen_addr, "127.0.0.1:8080");
         assert_eq!(config.runtime.shutdown_grace_seconds, 30);
         assert_eq!(config.approval.mode, ApprovalMode::Auto);
         assert!(config.tools.is_empty());
