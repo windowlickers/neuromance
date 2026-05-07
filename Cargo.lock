@@ -1524,6 +1524,7 @@ dependencies = [
  "neuromance-agent",
  "neuromance-client",
  "neuromance-common",
+ "neuromance-repl",
  "neuromance-tools",
  "reqwest",
  "secrecy",

@@ -53,7 +53,7 @@ pub(crate) use state::WithShared;
 
 // Re-export tool implementation
 #[cfg(feature = "tools")]
-pub use tool::PythonReplTool;
+pub use tool::{PythonReplTool, PythonReplToolFactory};
 
 /// Register a callback, marking it for re-injection if it replaces
 /// an existing one with the same name.

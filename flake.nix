@@ -73,25 +73,37 @@
           }
         );
 
+        runtimeMeta = with pkgs.lib; {
+          description = "Runtime that executes a Neuromance agent from config (oneshot or serve mode)";
+          homepage = "https://github.com/windowlickers/neuromance";
+          license = licenses.asl20;
+          maintainers = [
+            {
+              name = "Evan Dobry";
+              email = "ecdobry@windowlicke.rs";
+              github = "ecdobry";
+              githubId = 16653165;
+            }
+          ];
+        };
+
         neuromance-runtime = craneLib.buildPackage (
           commonArgs
           // {
             inherit cargoArtifacts;
             pname = "neuromance-runtime";
             cargoExtraArgs = "--package neuromance-runtime";
-            meta = with pkgs.lib; {
-              description = "Runtime that executes a Neuromance agent from config (oneshot or serve mode)";
-              homepage = "https://github.com/windowlickers/neuromance";
-              license = licenses.asl20;
-              maintainers = [
-                {
-                  name = "Evan Dobry";
-                  email = "ecdobry@windowlicke.rs";
-                  github = "ecdobry";
-                  githubId = 16653165;
-                }
-              ];
-            };
+            meta = runtimeMeta;
+          }
+        );
+
+        neuromance-runtime-toolkit = craneLib.buildPackage (
+          commonArgs
+          // {
+            inherit cargoArtifacts;
+            pname = "neuromance-runtime-toolkit";
+            cargoExtraArgs = "--package neuromance-runtime --features python-repl";
+            meta = runtimeMeta;
           }
         );
 
@@ -111,7 +123,8 @@
         ];
 
         neuromanceImageToolkit = import ./image.nix {
-          inherit pkgs neuromance-runtime version;
+          inherit pkgs version;
+          neuromance-runtime = neuromance-runtime-toolkit;
           variant = "toolkit";
           extraTools = toolkitTools;
           includeShell = true;
@@ -153,7 +166,7 @@
       in
       {
         checks = {
-          inherit neuromance neuromance-runtime;
+          inherit neuromance neuromance-runtime neuromance-runtime-toolkit;
 
           fmt = craneLib.cargoFmt { inherit src; };
 
@@ -175,7 +188,7 @@
         };
 
         packages = {
-          inherit neuromance neuromance-runtime;
+          inherit neuromance neuromance-runtime neuromance-runtime-toolkit;
           neuromance-image = neuromanceImage;
           neuromance-image-toolkit = neuromanceImageToolkit;
           default = neuromance;

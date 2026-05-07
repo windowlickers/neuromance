@@ -6,11 +6,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use neuromance_common::tools::{Function, Parameters, Property, Tool};
-use neuromance_tools::{ToolError, ToolImplementation};
+use neuromance_tools::{ToolError, ToolFactory, ToolImplementation, ToolRegistry};
 
 use super::PythonRepl;
 
@@ -140,5 +141,23 @@ impl ToolImplementation for PythonReplTool {
 
     fn is_auto_approved(&self) -> bool {
         false
+    }
+}
+
+/// Factory that registers [`PythonReplTool`] under the name `execute_python`.
+///
+/// Constructs a default [`PythonRepl`] (state persists across tool calls within
+/// a runtime instance). Takes no configuration.
+pub struct PythonReplToolFactory;
+
+impl ToolFactory for PythonReplToolFactory {
+    fn name(&self) -> &'static str {
+        "execute_python"
+    }
+
+    fn build(&self, _config: &Value, registry: &ToolRegistry) -> Result<()> {
+        let repl = PythonRepl::new().context("init PythonRepl")?;
+        registry.register(Arc::new(PythonReplTool::new(Arc::new(repl))));
+        Ok(())
     }
 }

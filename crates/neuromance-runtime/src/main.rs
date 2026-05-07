@@ -118,7 +118,10 @@ fn build_agent(config: &RuntimeConfig) -> Result<Agent<Box<dyn LLMClient>>, Runt
         core.max_turns = Some(max);
     }
 
-    let factories = ToolFactoryRegistry::with_builtin();
+    #[cfg_attr(not(feature = "python-repl"), allow(unused_mut))]
+    let mut factories = ToolFactoryRegistry::with_builtin();
+    #[cfg(feature = "python-repl")]
+    factories.register(neuromance_repl::python::PythonReplToolFactory);
     let staged = factories
         .build_all(&config.tools)
         .map_err(RuntimeError::Other)?;
