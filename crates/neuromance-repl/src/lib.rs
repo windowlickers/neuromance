@@ -32,8 +32,9 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
-use thiserror::Error;
+
+pub mod error;
+pub use error::ReplError;
 
 #[cfg(feature = "python")]
 pub mod python;
@@ -44,31 +45,6 @@ pub use python::{InteractivePythonRepl, PythonCallback, PythonRepl, PythonReplCo
 
 #[cfg(all(feature = "python", feature = "tools"))]
 pub use python::PythonReplTool;
-
-/// Errors that can occur during REPL operations.
-#[derive(Error, Debug)]
-pub enum ReplError {
-    /// Code execution failed
-    #[error("Execution error: {0}")]
-    ExecutionError(String),
-
-    /// Timeout during execution
-    #[error("Execution timeout after {0:?}")]
-    Timeout(Duration),
-
-    /// Python runtime error
-    #[cfg(feature = "python")]
-    #[error("Python error: {0}")]
-    Python(#[from] pyo3::PyErr),
-
-    /// Tokio task join failure
-    #[error("Task join error: {0}")]
-    TaskJoin(#[from] tokio::task::JoinError),
-
-    /// REPL state mutex was poisoned by a prior panic
-    #[error("REPL state poisoned by a prior panic")]
-    StatePoisoned,
-}
 
 /// Result of executing code in a REPL environment.
 #[derive(Debug, Clone, Serialize, Deserialize)]

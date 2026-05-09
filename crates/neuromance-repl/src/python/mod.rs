@@ -36,6 +36,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::ReplError;
 
+pub mod builtins;
+pub use builtins::SAFE_PYTHON_BUILTINS;
 pub mod callback;
 mod capture;
 pub mod direct;
