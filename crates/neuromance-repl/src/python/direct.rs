@@ -411,7 +411,7 @@ mod tests {
         let repl = PythonRepl::new().unwrap();
         let result = repl.execute("1 / 0").await.unwrap();
         assert!(!result.success);
-        assert!(result.stderr.contains("ZeroDivisionError") || !result.success);
+        assert!(result.stderr.contains("ZeroDivisionError"));
     }
 
     #[tokio::test]
