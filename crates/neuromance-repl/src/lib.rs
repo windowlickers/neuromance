@@ -17,8 +17,7 @@
 //!     use neuromance_repl::python::{PythonRepl, PythonReplConfig};
 //!
 //!     // Configure available modules
-//!     let mut config = PythonReplConfig::default();
-//!     config.python_modules.push("numpy".into());
+//!     let config = PythonReplConfig::default().with_modules(["numpy"]);
 //!
 //!     let repl = PythonRepl::with_config(config)?;
 //!

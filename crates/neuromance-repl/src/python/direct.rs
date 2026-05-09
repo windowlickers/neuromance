@@ -755,8 +755,7 @@ for i in range(1, 11):
     #[tokio::test]
     #[serial]
     async fn test_python_repl_execution_time_accuracy() {
-        let mut config = PythonReplConfig::default();
-        config.python_modules.push("time".into());
+        let config = PythonReplConfig::default().with_modules(["time"]);
         let repl = PythonRepl::with_config(config).unwrap();
 
         // Execute code with a known sleep duration

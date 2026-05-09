@@ -46,7 +46,9 @@ fn create_filtered_import(
         move |args: &Bound<PyTuple>, kwargs: Option<&Bound<PyDict>>| -> PyResult<Py<PyAny>> {
             let py = args.py();
             let name: String = args.get_item(0)?.extract()?;
-            let top = name.split_once('.').map_or(name.as_str(), |(prefix, _)| prefix);
+            let top = name
+                .split_once('.')
+                .map_or(name.as_str(), |(prefix, _)| prefix);
             if !allowed.contains(top) {
                 return Err(pyo3::exceptions::PyImportError::new_err(format!(
                     "Import of '{name}' is not allowed"

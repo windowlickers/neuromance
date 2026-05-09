@@ -10,8 +10,7 @@
 //! use std::collections::HashMap;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! let mut config = PythonReplConfig::default();
-//! config.python_modules.push("numpy".into());
+//! let config = PythonReplConfig::default().with_modules(["numpy"]);
 //!
 //! let repl = PythonRepl::with_config(config)?;
 //!
@@ -154,5 +153,22 @@ impl Default for PythonReplConfig {
                 Cow::Borrowed("functools"),
             ],
         }
+    }
+}
+
+impl PythonReplConfig {
+    /// Append modules to [`Self::python_modules`], returning the updated config.
+    ///
+    /// Extends rather than replaces so chaining onto
+    /// [`PythonReplConfig::default`] keeps the standard-library modules.
+    #[must_use]
+    pub fn with_modules<I, S>(mut self, modules: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<Cow<'static, str>>,
+    {
+        self.python_modules
+            .extend(modules.into_iter().map(Into::into));
+        self
     }
 }
