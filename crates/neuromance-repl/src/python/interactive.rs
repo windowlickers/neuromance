@@ -136,7 +136,9 @@ impl InteractivePythonRepl {
         let line = line.to_string();
 
         tokio::task::spawn_blocking(move || {
-            let guard = state.lock().map_err(|_| ReplError::StatePoisoned)?;
+            let guard = state
+                .lock()
+                .map_err(|e| ReplError::StatePoisoned(e.to_string()))?;
             Python::attach(|py| {
                 let console_ref = guard.console.bind(py);
 
@@ -167,7 +169,9 @@ impl InteractivePythonRepl {
                 let start = Instant::now();
 
                 Python::attach(|py| {
-                    let s = &mut *state.lock().map_err(|_| ReplError::StatePoisoned)?;
+                    let s = &mut *state
+                        .lock()
+                        .map_err(|e| ReplError::StatePoisoned(e.to_string()))?;
 
                     let locals_ref = s.shared.locals.bind(py);
 
@@ -234,7 +238,9 @@ impl InteractivePythonRepl {
 
         tokio::task::spawn_blocking(move || {
             Python::attach(|py| {
-                let mut guard = state.lock().map_err(|_| ReplError::StatePoisoned)?;
+                let mut guard = state
+                    .lock()
+                    .map_err(|e| ReplError::StatePoisoned(e.to_string()))?;
 
                 let locals = PyDict::new(py);
                 let console = make_tracking_console(py, &locals)?;

@@ -30,6 +30,6 @@ pub enum ReplError {
     TaskJoin(#[from] tokio::task::JoinError),
 
     /// REPL state mutex was poisoned by a prior panic
-    #[error("REPL state poisoned by a prior panic")]
-    StatePoisoned,
+    #[error("REPL state poisoned by a prior panic: {0}")]
+    StatePoisoned(String),
 }

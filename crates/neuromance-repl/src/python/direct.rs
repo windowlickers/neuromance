@@ -136,7 +136,9 @@ impl PythonRepl {
                 let start = Instant::now();
 
                 Python::attach(|py| {
-                    let s = &mut *state.lock().map_err(|_| ReplError::StatePoisoned)?;
+                    let s = &mut *state
+                        .lock()
+                        .map_err(|e| ReplError::StatePoisoned(e.to_string()))?;
 
                     let globals_ref = s.globals.bind(py);
                     let locals_ref = s.shared.locals.bind(py);
@@ -203,7 +205,9 @@ impl PythonRepl {
 
         tokio::task::spawn_blocking(move || {
             Python::attach(|py| {
-                let mut guard = state.lock().map_err(|_| ReplError::StatePoisoned)?;
+                let mut guard = state
+                    .lock()
+                    .map_err(|e| ReplError::StatePoisoned(e.to_string()))?;
                 guard.shared.locals = PyDict::new(py).unbind();
                 guard.shared.injected_callbacks.clear();
                 drop(guard);

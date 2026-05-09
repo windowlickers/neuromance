@@ -65,7 +65,9 @@ pub(crate) fn inject_function<S: WithShared>(
     name: &str,
     callback: PythonCallback,
 ) -> Result<(), ReplError> {
-    let mut guard = state.lock().map_err(|_| ReplError::StatePoisoned)?;
+    let mut guard = state
+        .lock()
+        .map_err(|e| ReplError::StatePoisoned(e.to_string()))?;
     let shared = guard.shared_mut();
     shared.injected_callbacks.remove(name);
     shared
@@ -83,7 +85,9 @@ pub(crate) async fn get_variable<S: WithShared + Send + 'static>(
     let name = name.to_string();
 
     tokio::task::spawn_blocking(move || {
-        let guard = state.lock().map_err(|_| ReplError::StatePoisoned)?;
+        let guard = state
+            .lock()
+            .map_err(|e| ReplError::StatePoisoned(e.to_string()))?;
         Python::attach(|py| {
             let locals_dict = guard.shared().locals.bind(py);
             match locals_dict.get_item(&name)? {
@@ -109,7 +113,9 @@ pub(crate) async fn set_variable<S: WithShared + Send + 'static>(
     let value = value.to_string();
 
     tokio::task::spawn_blocking(move || {
-        let guard = state.lock().map_err(|_| ReplError::StatePoisoned)?;
+        let guard = state
+            .lock()
+            .map_err(|e| ReplError::StatePoisoned(e.to_string()))?;
         Python::attach(|py| {
             let locals_dict = guard.shared().locals.bind(py);
             let py_value = pyo3::IntoPyObject::into_pyobject(value, py)
