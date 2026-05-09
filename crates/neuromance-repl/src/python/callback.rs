@@ -10,8 +10,17 @@ use std::sync::Arc;
 /// Callback function type for injected functions.
 ///
 /// Receives:
-/// - `args`: Positional arguments as strings
-/// - `kwargs`: Keyword arguments as a string-to-string map
+/// - `args`: Positional arguments, each coerced via Python's `str()` before
+///   being handed to the callback. A Python `int`, `list`, or arbitrary
+///   object reaches the callback as its `str()` form (e.g. `"42"`,
+///   `"[1, 2, 3]"`).
+/// - `kwargs`: Keyword arguments as a string-to-string map. Keys must be
+///   strings (Python guarantees this for `**kwargs`); values are coerced
+///   via Python's `str()` like positional args.
+///
+/// If `str()` fails or the resulting object cannot be extracted as a
+/// `String`, the failure is propagated to Python as an exception rather
+/// than silently substituted.
 ///
 /// Returns a `BoxFuture` to allow async operations within the callback.
 /// Use `Box::pin(async move { ... })` when creating callbacks.
@@ -36,26 +45,22 @@ pub fn create_py_callback<'py>(
         None,
         None,
         move |args: &Bound<PyTuple>, kwargs: Option<&Bound<PyDict>>| {
-            #[allow(clippy::unnecessary_debug_formatting)]
             let args_vec: Vec<String> = args
                 .iter()
-                .map(|arg| {
-                    arg.extract::<String>()
-                        .unwrap_or_else(|_| format!("{arg:?}"))
-                })
-                .collect();
+                .map(|arg| arg.str()?.extract::<String>())
+                .collect::<PyResult<_>>()?;
 
-            #[allow(clippy::unnecessary_debug_formatting)]
             let kwargs_map: HashMap<String, String> = kwargs
                 .map(|kw| {
                     kw.iter()
-                        .filter_map(|(k, v)| {
-                            let key = k.extract::<String>().ok()?;
-                            let value = v.extract::<String>().unwrap_or_else(|_| format!("{v:?}"));
-                            Some((key, value))
+                        .map(|(k, v)| {
+                            let key = k.extract::<String>()?;
+                            let value = v.str()?.extract::<String>()?;
+                            Ok((key, value))
                         })
-                        .collect()
+                        .collect::<PyResult<_>>()
                 })
+                .transpose()?
                 .unwrap_or_default();
 
             // Release the GIL before calling the callback, as it may do

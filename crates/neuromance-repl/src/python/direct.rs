@@ -686,6 +686,60 @@ for i in range(1, 11):
 
     #[tokio::test]
     #[serial]
+    async fn test_python_repl_callback_str_coerces_non_string_args() {
+        let repl = PythonRepl::new().unwrap();
+
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = Arc::clone(&captured);
+
+        repl.inject_function(
+            "echo",
+            Box::new(move |args: Vec<String>, kwargs: HashMap<String, String>| {
+                let captured = Arc::clone(&captured_clone);
+                Box::pin(async move {
+                    let mut all = args.clone();
+                    let mut keys: Vec<_> = kwargs.keys().collect();
+                    keys.sort();
+                    for k in keys {
+                        all.push(format!("{k}={}", kwargs[k]));
+                    }
+                    captured.lock().unwrap().extend(all.iter().cloned());
+                    Ok(all.join("|"))
+                })
+            }),
+        )
+        .unwrap();
+
+        let result = repl.execute("r1 = echo(42)").await.unwrap();
+        assert!(result.success, "stderr: {}", result.stderr);
+        assert_eq!(repl.get_variable("r1").await.unwrap(), Some("42".into()));
+
+        let result = repl.execute("r2 = echo([1, 2, 3])").await.unwrap();
+        assert!(result.success, "stderr: {}", result.stderr);
+        assert_eq!(
+            repl.get_variable("r2").await.unwrap(),
+            Some("[1, 2, 3]".into())
+        );
+
+        let result = repl.execute("r3 = echo(payload={'k': 1})").await.unwrap();
+        assert!(result.success, "stderr: {}", result.stderr);
+        assert_eq!(
+            repl.get_variable("r3").await.unwrap(),
+            Some("payload={'k': 1}".into())
+        );
+
+        let snapshot = captured.lock().unwrap().clone();
+        assert_eq!(
+            snapshot,
+            vec!["42", "[1, 2, 3]", "payload={'k': 1}"]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn test_python_repl_config() {
         let config = PythonReplConfig {
             timeout: Duration::from_secs(10),
