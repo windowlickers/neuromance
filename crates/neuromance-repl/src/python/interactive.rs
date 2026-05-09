@@ -187,19 +187,13 @@ impl InteractivePythonRepl {
                     let console_ref = s.console.bind(py);
                     console_ref.setattr("error_occurred", false)?;
 
-                    let mut exec_error = None;
-                    for line in code.lines() {
-                        if let Err(e) = console_ref.call_method1("push", (line,)) {
-                            exec_error = Some(e);
-                            break;
-                        }
-                    }
-
-                    if exec_error.is_none()
-                        && let Err(e) = console_ref.call_method1("push", ("",))
-                    {
-                        exec_error = Some(e);
-                    }
+                    // Stash the first push error (if any) so streams.restore()
+                    // still runs before we propagate it.
+                    let exec_error = code
+                        .lines()
+                        .chain(std::iter::once(""))
+                        .try_for_each(|line| console_ref.call_method1("push", (line,)).map(drop))
+                        .err();
 
                     let success = !console_ref.getattr("error_occurred")?.extract::<bool>()?;
 
