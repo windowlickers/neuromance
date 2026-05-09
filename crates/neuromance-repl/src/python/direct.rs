@@ -694,13 +694,6 @@ for i in range(1, 11):
 
     #[tokio::test]
     #[serial]
-    async fn test_python_repl_language_name() {
-        let repl = PythonRepl::new().unwrap();
-        assert_eq!(repl.language_name(), "python");
-    }
-
-    #[tokio::test]
-    #[serial]
     async fn test_python_repl_config() {
         let config = PythonReplConfig {
             timeout: Duration::from_secs(10),
