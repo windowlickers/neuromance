@@ -289,6 +289,7 @@ impl InteractivePythonRepl {
 mod tests {
     use super::*;
     use serial_test::serial;
+    use std::collections::HashMap;
     use std::time::Duration;
 
     #[tokio::test]
@@ -371,6 +372,70 @@ result = factorial(5)
         let result = repl.execute("1 / 0").await.unwrap();
         assert!(!result.success);
         assert!(result.stderr.contains("ZeroDivisionError"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_interactive_syntax_error() {
+        let repl = InteractivePythonRepl::new().unwrap();
+        let result = repl.execute("x = ").await.unwrap();
+        assert!(!result.success);
+        assert!(
+            result.stderr.contains("SyntaxError"),
+            "expected SyntaxError, got: {}",
+            result.stderr,
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_interactive_name_error() {
+        let repl = InteractivePythonRepl::new().unwrap();
+        let result = repl.execute("undefined_variable").await.unwrap();
+        assert!(!result.success);
+        assert!(
+            result.stderr.contains("NameError"),
+            "expected NameError, got: {}",
+            result.stderr,
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_interactive_callback_injection() {
+        let repl = InteractivePythonRepl::new().unwrap();
+        repl.inject_function(
+            "double",
+            Box::new(|args: Vec<String>, _kwargs: HashMap<String, String>| {
+                Box::pin(async move {
+                    if let Some(arg) = args.first()
+                        && let Ok(num) = arg.parse::<i32>()
+                    {
+                        return Ok((num * 2).to_string());
+                    }
+                    Err("Invalid argument".to_string())
+                })
+            }),
+        )
+        .unwrap();
+
+        let result = repl.execute("result = double('21')").await.unwrap();
+        assert!(result.success, "stderr: {}", result.stderr);
+        assert_eq!(
+            repl.get_variable("result").await.unwrap(),
+            Some("42".to_string()),
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_interactive_set_and_get_variable() {
+        let repl = InteractivePythonRepl::new().unwrap();
+        repl.set_variable("greeting", "hello").await.unwrap();
+        assert_eq!(
+            repl.get_variable("greeting").await.unwrap(),
+            Some("hello".to_string()),
+        );
     }
 
     #[tokio::test]

@@ -331,6 +331,55 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn test_python_repl_callback_err_propagates_as_runtime_error() {
+        let repl = PythonRepl::new().unwrap();
+        repl.inject_function(
+            "boom",
+            Box::new(|_args: Vec<String>, _kwargs: HashMap<String, String>| {
+                Box::pin(async move { Err("boom: callback rejected input".to_string()) })
+            }),
+        )
+        .unwrap();
+
+        let result = repl.execute("boom()").await.unwrap();
+        assert!(!result.success);
+        assert!(
+            result.stderr.contains("RuntimeError"),
+            "expected RuntimeError, got: {}",
+            result.stderr,
+        );
+        assert!(
+            result.stderr.contains("boom: callback rejected input"),
+            "expected propagated message, got: {}",
+            result.stderr,
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_python_repl_stdout_capture() {
+        let repl = PythonRepl::new().unwrap();
+        let result = repl.execute("print('hi')").await.unwrap();
+        assert!(result.success);
+        assert_eq!(result.stdout.trim(), "hi");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_python_repl_multiple_prints() {
+        let repl = PythonRepl::new().unwrap();
+        let result = repl
+            .execute("print('line1')\nprint('line2')\nprint('line3')")
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.stdout.contains("line1"));
+        assert!(result.stdout.contains("line2"));
+        assert!(result.stdout.contains("line3"));
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn test_python_repl_restricted_builtins() {
         let repl = PythonRepl::new().unwrap();
 
