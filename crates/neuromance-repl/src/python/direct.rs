@@ -7,6 +7,7 @@
 //! - Output capture (stdout/stderr)
 //! - Configurable module imports
 
+use crate::error::PyResultExt;
 use crate::{ReplError, ReplResult};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -82,7 +83,9 @@ impl PythonRepl {
 
             // Setup restricted builtins
             let builtins = create_restricted_builtins(py, &config.python_modules)?;
-            globals.set_item("__builtins__", builtins)?;
+            globals
+                .set_item("__builtins__", builtins)
+                .at("set_item __builtins__ in globals")?;
 
             // Add configured modules
             Self::add_modules(py, &globals, &config.python_modules)?;
@@ -106,7 +109,9 @@ impl PythonRepl {
         for module_name in modules {
             match py.import(module_name.as_ref()) {
                 Ok(module) => {
-                    globals.set_item(module_name.as_ref(), module)?;
+                    globals
+                        .set_item(module_name.as_ref(), module)
+                        .at("set_item user-configured module in globals")?;
                 }
                 Err(e) => {
                     log::warn!("Failed to import Python module '{module_name}': {e}");
@@ -161,7 +166,7 @@ impl PythonRepl {
                         })
                         .and_then(|c_code| {
                             py.run(c_code.as_c_str(), Some(globals_ref), Some(locals_ref))
-                                .map_err(ReplError::from)
+                                .map_err(ReplError::PythonExec)
                         });
 
                     let (stdout, stderr) = streams.restore(py)?;

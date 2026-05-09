@@ -1,6 +1,7 @@
 //! Shared callback creation and injection for Python REPLs.
 
 use crate::ReplError;
+use crate::error::PyResultExt;
 use futures::future::BoxFuture;
 use pyo3::prelude::*;
 use pyo3::types::{PyCFunction, PyDict, PyTuple};
@@ -40,7 +41,7 @@ pub fn create_py_callback<'py>(
     callback: &Arc<PythonCallback>,
 ) -> Result<Bound<'py, PyCFunction>, ReplError> {
     let cb = Arc::clone(callback);
-    Ok(PyCFunction::new_closure(
+    PyCFunction::new_closure(
         py,
         None,
         None,
@@ -75,7 +76,8 @@ pub fn create_py_callback<'py>(
                 Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e)),
             }
         },
-    )?)
+    )
+    .at("create PyCFunction closure")
 }
 
 /// Inject callbacks into a Python dict if not already injected.
@@ -105,7 +107,9 @@ pub fn inject_callbacks_if_needed(
 
         let py_func = create_py_callback(py, callback)?;
 
-        target.set_item(name.as_str(), py_func)?;
+        target
+            .set_item(name.as_str(), py_func)
+            .at("set_item callback in target dict")?;
 
         injected.insert(name.clone());
     }

@@ -16,6 +16,7 @@ use std::time::Instant;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyModule};
 
+use crate::error::PyResultExt;
 use crate::{ReplError, ReplResult};
 
 use super::PythonReplConfig;
@@ -69,7 +70,7 @@ impl std::fmt::Debug for InteractivePythonRepl {
 fn make_tracking_console<'py>(
     py: Python<'py>,
     locals: &Bound<'py, PyDict>,
-) -> PyResult<Bound<'py, PyAny>> {
+) -> Result<Bound<'py, PyAny>, ReplError> {
     let module = PyModule::from_code(
         py,
         c"
@@ -90,8 +91,13 @@ class TrackingConsole(code.InteractiveConsole):
 ",
         c"neuromance_tracking_console.py",
         c"neuromance_tracking_console",
-    )?;
-    module.getattr("TrackingConsole")?.call1((locals,))
+    )
+    .at("compile TrackingConsole module")?;
+    module
+        .getattr("TrackingConsole")
+        .at("getattr TrackingConsole")?
+        .call1((locals,))
+        .at("call TrackingConsole(locals)")
 }
 
 impl InteractivePythonRepl {
@@ -142,9 +148,11 @@ impl InteractivePythonRepl {
             Python::attach(|py| {
                 let console_ref = guard.console.bind(py);
 
-                Ok(console_ref
-                    .call_method1("push", (line,))?
-                    .extract::<bool>()?)
+                console_ref
+                    .call_method1("push", (line,))
+                    .at("call console.push")?
+                    .extract::<bool>()
+                    .at("extract console.push -> bool")
             })
         })
         .await?
@@ -185,22 +193,33 @@ impl InteractivePythonRepl {
                     let streams = redirect_streams(py)?;
 
                     let console_ref = s.console.bind(py);
-                    console_ref.setattr("error_occurred", false)?;
+                    console_ref
+                        .setattr("error_occurred", false)
+                        .at("setattr console.error_occurred")?;
 
                     // Stash the first push error (if any) so streams.restore()
                     // still runs before we propagate it.
                     let exec_error = code
                         .lines()
                         .chain(std::iter::once(""))
-                        .try_for_each(|line| console_ref.call_method1("push", (line,)).map(drop))
+                        .try_for_each(|line| {
+                            console_ref
+                                .call_method1("push", (line,))
+                                .map(drop)
+                                .at("call console.push")
+                        })
                         .err();
 
-                    let success = !console_ref.getattr("error_occurred")?.extract::<bool>()?;
+                    let success = !console_ref
+                        .getattr("error_occurred")
+                        .at("getattr console.error_occurred")?
+                        .extract::<bool>()
+                        .at("extract console.error_occurred -> bool")?;
 
                     let (stdout, stderr) = streams.restore(py)?;
 
                     if let Some(e) = exec_error {
-                        return Err(e.into());
+                        return Err(e);
                     }
 
                     Ok(ReplResult {

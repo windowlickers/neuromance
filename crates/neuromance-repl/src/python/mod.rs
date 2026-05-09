@@ -34,6 +34,7 @@ use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::ReplError;
+use crate::error::PyResultExt;
 
 pub mod builtins;
 pub use builtins::SAFE_PYTHON_BUILTINS;
@@ -89,10 +90,14 @@ pub(crate) async fn get_variable<S: WithShared + Send + 'static>(
             .map_err(|e| ReplError::StatePoisoned(e.to_string()))?;
         Python::attach(|py| {
             let locals_dict = guard.shared().locals.bind(py);
-            match locals_dict.get_item(&name)? {
+            match locals_dict.get_item(&name).at("get_item from locals")? {
                 Some(value) => {
-                    let str_repr = value.str()?;
-                    Ok(Some(str_repr.extract::<String>()?))
+                    let str_repr = value.str().at("str() locals value")?;
+                    Ok(Some(
+                        str_repr
+                            .extract::<String>()
+                            .at("extract locals value -> String")?,
+                    ))
                 }
                 None => Ok(None),
             }
@@ -119,7 +124,9 @@ pub(crate) async fn set_variable<S: WithShared + Send + 'static>(
             let locals_dict = guard.shared().locals.bind(py);
             let py_value = pyo3::IntoPyObject::into_pyobject(value, py)
                 .map_err(|e| ReplError::Conversion(e.to_string()))?;
-            locals_dict.set_item(&name, py_value)?;
+            locals_dict
+                .set_item(&name, py_value)
+                .at("set_item into locals")?;
             Ok(())
         })
     })

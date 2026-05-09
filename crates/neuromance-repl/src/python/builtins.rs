@@ -4,6 +4,7 @@ use std::borrow::Cow;
 use std::collections::HashSet;
 
 use crate::ReplError;
+use crate::error::PyResultExt;
 
 /// Create restricted builtins with a filtered `__import__`
 /// that only allows modules from the configured allowlist.
@@ -12,16 +13,20 @@ pub(super) fn create_restricted_builtins(
     allowed_modules: &[Cow<'static, str>],
 ) -> Result<Py<PyDict>, ReplError> {
     let builtins = PyDict::new(py);
-    let main_builtins = py.import("builtins")?;
+    let main_builtins = py.import("builtins").at("import builtins")?;
 
     for name in SAFE_PYTHON_BUILTINS {
         if let Ok(obj) = main_builtins.getattr(*name) {
-            builtins.set_item(*name, obj)?;
+            builtins
+                .set_item(*name, obj)
+                .at("set_item safe builtin into restricted dict")?;
         }
     }
 
     let restricted_import = create_filtered_import(py, allowed_modules)?;
-    builtins.set_item("__import__", restricted_import)?;
+    builtins
+        .set_item("__import__", restricted_import)
+        .at("set_item __import__ into restricted builtins")?;
 
     Ok(builtins.unbind())
 }
@@ -37,7 +42,12 @@ fn create_filtered_import(
 ) -> Result<Py<PyAny>, ReplError> {
     let allowed: HashSet<Cow<'static, str>> = allowed_modules.iter().cloned().collect();
 
-    let real_import = py.import("builtins")?.getattr("__import__")?.unbind();
+    let real_import = py
+        .import("builtins")
+        .at("import builtins (filtered_import)")?
+        .getattr("__import__")
+        .at("getattr builtins.__import__")?
+        .unbind();
 
     let func = PyCFunction::new_closure(
         py,
@@ -56,7 +66,8 @@ fn create_filtered_import(
             }
             Ok(real_import.bind(py).call(args, kwargs)?.unbind())
         },
-    )?;
+    )
+    .at("create _restricted_import PyCFunction")?;
 
     Ok(func.unbind().into())
 }
