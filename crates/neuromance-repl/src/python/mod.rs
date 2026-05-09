@@ -127,7 +127,7 @@ pub(crate) async fn set_variable<S: WithShared + Send + 'static>(
 }
 
 /// Python REPL configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PythonReplConfig {
     /// Maximum execution time per code block
     pub timeout: Duration,

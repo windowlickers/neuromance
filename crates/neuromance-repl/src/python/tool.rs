@@ -40,6 +40,7 @@ use super::PythonRepl;
 /// # Ok(())
 /// # }
 /// ```
+#[derive(Debug)]
 pub struct PythonReplTool {
     repl: Arc<PythonRepl>,
 }
@@ -150,6 +151,7 @@ impl ToolImplementation for PythonReplTool {
 ///
 /// Constructs a default [`PythonRepl`] (state persists across tool calls within
 /// a runtime instance). Takes no configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PythonReplToolFactory;
 
 impl ToolFactory for PythonReplToolFactory {
