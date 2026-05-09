@@ -18,6 +18,7 @@ use std::time::Instant;
 use super::PythonReplConfig;
 use super::builtins::create_restricted_builtins;
 use super::callback::{self, PythonCallback};
+use super::capture::redirect_streams;
 use super::state::{SharedState, WithShared};
 
 /// Mutable state consolidated behind a single `Mutex`.
@@ -115,30 +116,6 @@ impl PythonRepl {
 
         Ok(())
     }
-
-    /// Execute code with output capture.
-    fn execute_with_capture(
-        py: Python,
-        code: &str,
-        globals: &Bound<PyDict>,
-        locals: &Bound<PyDict>,
-    ) -> Result<(String, String), ReplError> {
-        let streams = super::capture::redirect_streams(py)?;
-
-        let c_code = CString::new(code).map_err(|e| {
-            ReplError::ExecutionError(format!(
-                "code contains an interior NUL byte at position {}",
-                e.nul_position()
-            ))
-        })?;
-        let exec_result = py.run(c_code.as_c_str(), Some(globals), Some(locals));
-
-        let (stdout, stderr) = streams.restore(py)?;
-
-        exec_result?;
-
-        Ok((stdout, stderr))
-    }
 }
 
 impl PythonRepl {
@@ -171,20 +148,37 @@ impl PythonRepl {
                         &mut s.shared.injected_callbacks,
                     )?;
 
-                    match Self::execute_with_capture(py, &code, globals_ref, locals_ref) {
-                        Ok((stdout, stderr)) => Ok(ReplResult {
+                    let streams = redirect_streams(py)?;
+
+                    let exec_result = CString::new(code.as_str())
+                        .map_err(|e| {
+                            ReplError::ExecutionError(format!(
+                                "code contains an interior NUL byte at position {}",
+                                e.nul_position()
+                            ))
+                        })
+                        .and_then(|c_code| {
+                            py.run(c_code.as_c_str(), Some(globals_ref), Some(locals_ref))
+                                .map_err(ReplError::from)
+                        });
+
+                    let (stdout, stderr) = streams.restore(py)?;
+                    let elapsed_ms = start.elapsed().as_millis() as u64;
+
+                    match exec_result {
+                        Ok(()) => Ok(ReplResult {
                             stdout,
                             stderr,
                             success: true,
                             return_value: None,
-                            execution_time_ms: start.elapsed().as_millis() as u64,
+                            execution_time_ms: elapsed_ms,
                         }),
                         Err(e) => Ok(ReplResult {
                             stdout: String::new(),
                             stderr: e.to_string(),
                             success: false,
                             return_value: None,
-                            execution_time_ms: start.elapsed().as_millis() as u64,
+                            execution_time_ms: elapsed_ms,
                         }),
                     }
                 })
