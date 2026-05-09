@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyModule};
 
 use crate::{ReplError, ReplResult};
 
@@ -62,6 +62,38 @@ impl std::fmt::Debug for InteractivePythonRepl {
     }
 }
 
+/// Build a `code.InteractiveConsole` subclass instance that records whether
+/// `showtraceback` or `showsyntaxerror` fired. Reading `error_occurred` on the
+/// returned object is the canonical "did execution raise" signal — relying on
+/// stderr content would also flip on benign output like `DeprecationWarning`.
+fn make_tracking_console<'py>(
+    py: Python<'py>,
+    locals: &Bound<'py, PyDict>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let module = PyModule::from_code(
+        py,
+        c"
+import code
+
+class TrackingConsole(code.InteractiveConsole):
+    def __init__(self, locals=None):
+        super().__init__(locals)
+        self.error_occurred = False
+
+    def showtraceback(self):
+        self.error_occurred = True
+        super().showtraceback()
+
+    def showsyntaxerror(self, filename=None, **kwargs):
+        self.error_occurred = True
+        super().showsyntaxerror(filename, **kwargs)
+",
+        c"neuromance_tracking_console.py",
+        c"neuromance_tracking_console",
+    )?;
+    module.getattr("TrackingConsole")?.call1((locals,))
+}
+
 impl InteractivePythonRepl {
     /// Create a new interactive Python REPL with default configuration.
     ///
@@ -79,16 +111,8 @@ impl InteractivePythonRepl {
     /// Returns `ReplError` if Python initialization fails.
     pub fn with_config(config: PythonReplConfig) -> Result<Self, ReplError> {
         Python::attach(|py| {
-            // Import code module
-            let code_module = py.import("code")?;
-
-            // Create local namespace
             let locals = PyDict::new(py);
-
-            // Create InteractiveConsole instance
-            let interactive_console = code_module.getattr("InteractiveConsole")?;
-
-            let console = interactive_console.call1((locals.clone(),))?;
+            let console = make_tracking_console(py, &locals)?;
 
             Ok(Self {
                 config,
@@ -157,6 +181,7 @@ impl InteractivePythonRepl {
                     let streams = redirect_streams(py)?;
 
                     let console_ref = s.console.bind(py);
+                    console_ref.setattr("error_occurred", false)?;
 
                     let mut exec_error = None;
                     for line in code.lines() {
@@ -172,13 +197,14 @@ impl InteractivePythonRepl {
                         exec_error = Some(e);
                     }
 
+                    let success = !console_ref.getattr("error_occurred")?.extract::<bool>()?;
+
                     let (stdout, stderr) = streams.restore(py)?;
 
                     if let Some(e) = exec_error {
                         return Err(e.into());
                     }
 
-                    let success = stderr.is_empty();
                     Ok(ReplResult {
                         stdout,
                         stderr,
@@ -210,10 +236,8 @@ impl InteractivePythonRepl {
             Python::attach(|py| {
                 let mut guard = state.lock().map_err(|_| ReplError::StatePoisoned)?;
 
-                let code_module = py.import("code")?;
                 let locals = PyDict::new(py);
-                let interactive_console = code_module.getattr("InteractiveConsole")?;
-                let console = interactive_console.call1((locals.clone(),))?;
+                let console = make_tracking_console(py, &locals)?;
 
                 guard.console = console.unbind();
                 guard.shared.locals = locals.unbind();
@@ -346,6 +370,23 @@ result = factorial(5)
         let result = repl.execute("1 / 0").await.unwrap();
         assert!(!result.success);
         assert!(result.stderr.contains("ZeroDivisionError"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_interactive_warning_does_not_fail() {
+        let repl = InteractivePythonRepl::new().unwrap();
+        let result = repl
+            .execute(
+                "import warnings\nwarnings.simplefilter('always')\nwarnings.warn('x', DeprecationWarning)",
+            )
+            .await
+            .unwrap();
+        assert!(
+            result.success,
+            "warning should not flip success; stderr was: {}",
+            result.stderr
+        );
     }
 
     #[tokio::test]
