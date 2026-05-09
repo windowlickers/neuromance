@@ -90,8 +90,8 @@ impl ReplResult {
     }
 
     /// Set the return value.
-    pub fn with_return_value(mut self, value: String) -> Self {
-        self.return_value = Some(value);
+    pub fn with_return_value(mut self, value: impl Into<String>) -> Self {
+        self.return_value = Some(value.into());
         self
     }
 
