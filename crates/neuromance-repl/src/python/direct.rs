@@ -152,7 +152,7 @@ impl PythonRepl {
 
                     let exec_result = CString::new(code.as_str())
                         .map_err(|e| {
-                            ReplError::ExecutionError(format!(
+                            ReplError::InvalidInput(format!(
                                 "code contains an interior NUL byte at position {}",
                                 e.nul_position()
                             ))

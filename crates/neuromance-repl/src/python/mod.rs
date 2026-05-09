@@ -113,7 +113,7 @@ pub(crate) async fn set_variable<S: WithShared + Send + 'static>(
         Python::attach(|py| {
             let locals_dict = guard.shared().locals.bind(py);
             let py_value = pyo3::IntoPyObject::into_pyobject(value, py)
-                .map_err(|e| ReplError::ExecutionError(e.to_string()))?;
+                .map_err(|e| ReplError::Conversion(e.to_string()))?;
             locals_dict.set_item(&name, py_value)?;
             Ok(())
         })

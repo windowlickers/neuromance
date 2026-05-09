@@ -8,6 +8,14 @@ pub enum ReplError {
     #[error("Execution error: {0}")]
     ExecutionError(String),
 
+    /// Input rejected before execution (e.g. interior NUL byte)
+    #[error("Invalid input: {0}")]
+    InvalidInput(String),
+
+    /// Failed to convert a Rust value into a Python object
+    #[error("Conversion error: {0}")]
+    Conversion(String),
+
     /// Timeout during execution
     #[error("Execution timeout after {0:?}")]
     Timeout(Duration),
