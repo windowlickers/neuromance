@@ -289,6 +289,7 @@ impl InteractivePythonRepl {
 mod tests {
     use super::*;
     use serial_test::serial;
+    use std::time::Duration;
 
     #[tokio::test]
     #[serial]
@@ -416,5 +417,20 @@ result = factorial(5)
 
         repl.reset().await.unwrap();
         assert_eq!(repl.get_variable("x").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_interactive_execute_timeout_returns_timeout_error() {
+        let config = PythonReplConfig {
+            timeout: Duration::from_millis(100),
+            python_modules: vec!["time".into()],
+        };
+        let repl = InteractivePythonRepl::with_config(config).unwrap();
+        let err = repl
+            .execute("import time; time.sleep(5)")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ReplError::Timeout(d) if d == Duration::from_millis(100)));
     }
 }

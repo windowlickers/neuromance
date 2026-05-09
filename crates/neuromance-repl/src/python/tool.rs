@@ -164,3 +164,70 @@ impl ToolFactory for PythonReplToolFactory {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use serial_test::serial;
+
+    fn make_tool() -> PythonReplTool {
+        PythonReplTool::new(Arc::new(PythonRepl::new().unwrap()))
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_execute_rejects_non_object_args() {
+        let tool = make_tool();
+        let err = tool.execute(&json!("not an object")).await.unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments(msg) if msg.contains("object")));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_execute_rejects_missing_code_arg() {
+        let tool = make_tool();
+        let err = tool.execute(&json!({})).await.unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments(msg) if msg.contains("code")));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_execute_rejects_non_string_code_arg() {
+        let tool = make_tool();
+        let err = tool.execute(&json!({ "code": 42 })).await.unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments(msg) if msg.contains("code")));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_execute_returns_success_json_shape() {
+        let tool = make_tool();
+        let response = tool
+            .execute(&json!({ "code": "print('hello')" }))
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(parsed["status"], "success");
+        assert!(parsed["stdout"].as_str().unwrap().contains("hello"));
+        assert!(parsed["execution_time_ms"].is_number());
+        assert!(parsed.get("return_value").is_some());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_execute_returns_error_json_shape() {
+        let tool = make_tool();
+        let response = tool.execute(&json!({ "code": "1 / 0" })).await.unwrap();
+        let parsed: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(parsed["status"], "error");
+        assert!(
+            parsed["stderr"]
+                .as_str()
+                .unwrap()
+                .contains("ZeroDivisionError")
+        );
+        assert!(parsed["execution_time_ms"].is_number());
+    }
+}

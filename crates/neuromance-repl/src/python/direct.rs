@@ -867,4 +867,28 @@ x = 42
         let y = repl.get_variable("y").await.unwrap();
         assert_eq!(y, Some("2".to_string()));
     }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_execute_timeout_returns_timeout_error() {
+        let config = PythonReplConfig {
+            timeout: Duration::from_millis(100),
+            python_modules: vec!["time".into()],
+        };
+        let repl = PythonRepl::with_config(config).unwrap();
+        let err = repl
+            .execute("import time; time.sleep(5)")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ReplError::Timeout(d) if d == Duration::from_millis(100)));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_execute_rejects_nul_byte_in_code() {
+        let repl = PythonRepl::new().unwrap();
+        let result = repl.execute("x = 1\0y = 2").await.unwrap();
+        assert!(!result.success);
+        assert!(result.stderr.contains("NUL"));
+    }
 }
