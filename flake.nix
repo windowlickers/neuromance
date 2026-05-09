@@ -52,6 +52,24 @@
 
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
+        fmtCheck = craneLib.cargoFmt { inherit src; };
+
+        clippyCheck = craneLib.cargoClippy (
+          commonArgs
+          // {
+            inherit cargoArtifacts;
+            cargoClippyExtraArgs = "--all-targets --all-features -- -D warnings";
+          }
+        );
+
+        testCheck = craneLib.cargoTest (
+          commonArgs
+          // {
+            inherit cargoArtifacts;
+            cargoTestExtraArgs = "--all-features";
+          }
+        );
+
         neuromance = craneLib.buildPackage (
           commonArgs
           // {
@@ -163,28 +181,17 @@
           platforms = platforms.linux;
         };
 
+        mkCraneApp = name: drv: pkgs.writeShellScriptBin name ''
+          echo "${name} ok: ${drv}"
+        '';
+
       in
       {
         checks = {
           inherit neuromance neuromance-runtime neuromance-runtime-toolkit;
-
-          fmt = craneLib.cargoFmt { inherit src; };
-
-          clippy = craneLib.cargoClippy (
-            commonArgs
-            // {
-              inherit cargoArtifacts;
-              cargoClippyExtraArgs = "--all-targets --all-features -- -D warnings";
-            }
-          );
-
-          tests = craneLib.cargoTest (
-            commonArgs
-            // {
-              inherit cargoArtifacts;
-              cargoTestExtraArgs = "--all-features";
-            }
-          );
+          fmt = fmtCheck;
+          clippy = clippyCheck;
+          tests = testCheck;
         };
 
         packages = {
@@ -195,6 +202,26 @@
         };
 
         apps = {
+          fmt = {
+            type = "app";
+            program = "${mkCraneApp "fmt" fmtCheck}/bin/fmt";
+            meta = mkAppMeta "Run cargo fmt via crane (cached)";
+          };
+          clippy = {
+            type = "app";
+            program = "${mkCraneApp "clippy" clippyCheck}/bin/clippy";
+            meta = mkAppMeta "Run cargo clippy via crane (cached)";
+          };
+          test = {
+            type = "app";
+            program = "${mkCraneApp "test" testCheck}/bin/test";
+            meta = mkAppMeta "Run cargo test via crane (cached)";
+          };
+          build = {
+            type = "app";
+            program = "${mkCraneApp "build" neuromance}/bin/build";
+            meta = mkAppMeta "Build neuromance via crane (cached)";
+          };
           load-minimal = {
             type = "app";
             program = "${loadMinimal}/bin/load-minimal";
