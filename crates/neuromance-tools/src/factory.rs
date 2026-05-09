@@ -9,13 +9,13 @@
 
 use std::collections::HashMap;
 
-use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::ToolRegistry;
 use crate::bash_tool::BashToolFactory;
 use crate::edit_tool::EditToolFactory;
+use crate::error::ToolError;
 use crate::read_tool::ReadToolFactory;
 use crate::write_tool::WriteToolFactory;
 
@@ -48,8 +48,9 @@ pub trait ToolFactory: Send + Sync {
     /// A single factory may register multiple tools.
     ///
     /// # Errors
-    /// Returns an error if the config is invalid or construction fails.
-    fn build(&self, config: &Value, registry: &ToolRegistry) -> Result<()>;
+    /// Returns a [`ToolError`] if the config is invalid or construction fails.
+    /// Wrap source errors in [`ToolError::Execution`] so callers can downcast.
+    fn build(&self, config: &Value, registry: &ToolRegistry) -> Result<(), ToolError>;
 }
 
 /// Registry of [`ToolFactory`] instances keyed by name.
@@ -85,26 +86,24 @@ impl ToolFactoryRegistry {
     /// Build a tool from a single config entry and register it into `registry`.
     ///
     /// # Errors
-    /// Returns an error if no factory is registered for `config.name` or if
-    /// the factory's `build` fails.
-    pub fn build_one(&self, config: &ToolConfig, registry: &ToolRegistry) -> Result<()> {
-        let factory = self.factories.get(&config.name).with_context(|| {
-            format!(
+    /// Returns a [`ToolError`] if no factory is registered for `config.name`
+    /// or if the factory's `build` fails.
+    pub fn build_one(&self, config: &ToolConfig, registry: &ToolRegistry) -> Result<(), ToolError> {
+        let factory = self.factories.get(&config.name).ok_or_else(|| {
+            ToolError::execution(format!(
                 "no tool factory registered for '{}'; known factories: [{}]",
                 config.name,
                 self.factory_names().join(", ")
-            )
+            ))
         })?;
-        factory
-            .build(&config.config, registry)
-            .with_context(|| format!("failed to build tool '{}'", config.name))
+        factory.build(&config.config, registry)
     }
 
     /// Build a fresh [`ToolRegistry`] populated from a slice of configs.
     ///
     /// # Errors
-    /// Returns an error on the first failed config.
-    pub fn build_all(&self, configs: &[ToolConfig]) -> Result<ToolRegistry> {
+    /// Returns a [`ToolError`] on the first failed config.
+    pub fn build_all(&self, configs: &[ToolConfig]) -> Result<ToolRegistry, ToolError> {
         let registry = ToolRegistry::new();
         for cfg in configs {
             self.build_one(cfg, &registry)?;
@@ -164,7 +163,7 @@ mod tests {
         fn name(&self) -> &'static str {
             "dummy"
         }
-        fn build(&self, _config: &Value, registry: &ToolRegistry) -> Result<()> {
+        fn build(&self, _config: &Value, registry: &ToolRegistry) -> Result<(), ToolError> {
             registry.register(Arc::new(DummyTool {
                 name: "dummy_tool".to_string(),
             }));

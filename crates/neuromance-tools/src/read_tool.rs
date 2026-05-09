@@ -3,7 +3,6 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio::fs;
@@ -166,7 +165,7 @@ impl ToolFactory for ReadToolFactory {
         "read"
     }
 
-    fn build(&self, _config: &Value, registry: &ToolRegistry) -> Result<()> {
+    fn build(&self, _config: &Value, registry: &ToolRegistry) -> Result<(), ToolError> {
         registry.register(Arc::new(ReadTool));
         Ok(())
     }

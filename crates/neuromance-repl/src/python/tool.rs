@@ -6,7 +6,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
@@ -159,8 +158,8 @@ impl ToolFactory for PythonReplToolFactory {
         "execute_python"
     }
 
-    fn build(&self, _config: &Value, registry: &ToolRegistry) -> Result<()> {
-        let repl = PythonRepl::new().context("init PythonRepl")?;
+    fn build(&self, _config: &Value, registry: &ToolRegistry) -> Result<(), ToolError> {
+        let repl = PythonRepl::new()?;
         registry.register(Arc::new(PythonReplTool::new(Arc::new(repl))));
         Ok(())
     }

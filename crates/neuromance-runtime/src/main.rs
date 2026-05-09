@@ -122,9 +122,7 @@ fn build_agent(config: &RuntimeConfig) -> Result<Agent<Box<dyn LLMClient>>, Runt
     let mut factories = ToolFactoryRegistry::with_builtin();
     #[cfg(feature = "python-repl")]
     factories.register(neuromance_repl::python::PythonReplToolFactory);
-    let staged = factories
-        .build_all(&config.tools)
-        .map_err(RuntimeError::Other)?;
+    let staged = factories.build_all(&config.tools)?;
 
     if matches!(config.approval.mode, ApprovalMode::Auto) {
         let mut needs_approval: Vec<String> = staged

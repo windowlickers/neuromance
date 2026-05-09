@@ -15,5 +15,8 @@ pub enum RuntimeError {
     Io(#[from] std::io::Error),
 
     #[error(transparent)]
+    ToolBuild(#[from] neuromance_tools::ToolError),
+
+    #[error(transparent)]
     Other(#[from] anyhow::Error),
 }

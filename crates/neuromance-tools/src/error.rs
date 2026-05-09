@@ -3,14 +3,14 @@ use std::fmt;
 
 use thiserror::Error;
 
-/// Errors from [`ToolImplementation::execute()`].
+/// Errors from [`ToolImplementation::execute()`] and [`ToolFactory::build()`].
 #[derive(Error, Debug)]
 pub enum ToolError {
     /// Missing or malformed arguments.
     #[error("{0}")]
     InvalidArguments(String),
 
-    /// Runtime failure during tool execution.
+    /// Runtime failure during tool construction or execution.
     ///
     /// Wraps the source error for downcasting (e.g., to `ReplError`).
     #[error(transparent)]

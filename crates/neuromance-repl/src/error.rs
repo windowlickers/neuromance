@@ -33,3 +33,10 @@ pub enum ReplError {
     #[error("REPL state poisoned by a prior panic: {0}")]
     StatePoisoned(String),
 }
+
+#[cfg(feature = "tools")]
+impl From<ReplError> for neuromance_tools::ToolError {
+    fn from(err: ReplError) -> Self {
+        Self::Execution(Box::new(err))
+    }
+}

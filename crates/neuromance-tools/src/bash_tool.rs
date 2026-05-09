@@ -5,7 +5,6 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio::process::Command;
@@ -169,7 +168,7 @@ impl ToolFactory for BashToolFactory {
         "bash"
     }
 
-    fn build(&self, _config: &Value, registry: &ToolRegistry) -> Result<()> {
+    fn build(&self, _config: &Value, registry: &ToolRegistry) -> Result<(), ToolError> {
         registry.register(Arc::new(BashTool));
         Ok(())
     }
