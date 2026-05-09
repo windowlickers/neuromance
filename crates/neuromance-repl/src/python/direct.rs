@@ -225,12 +225,6 @@ impl PythonRepl {
         &self.config
     }
 
-    /// Get the language name.
-    #[must_use]
-    pub const fn language_name(&self) -> &'static str {
-        "python"
-    }
-
     /// Inject a callable function into the REPL environment.
     ///
     /// # Errors
