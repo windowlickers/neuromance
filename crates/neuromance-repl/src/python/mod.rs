@@ -10,7 +10,7 @@
 //! use std::collections::HashMap;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! let config = PythonReplConfig::default().with_modules(["numpy"]);
+//! let config = PythonReplConfig::default().with_modules(["statistics"]);
 //!
 //! let repl = PythonRepl::with_config(config)?;
 //!

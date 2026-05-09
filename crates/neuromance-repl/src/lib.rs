@@ -17,7 +17,7 @@
 //!     use neuromance_repl::python::{PythonRepl, PythonReplConfig};
 //!
 //!     // Configure available modules
-//!     let config = PythonReplConfig::default().with_modules(["numpy"]);
+//!     let config = PythonReplConfig::default().with_modules(["statistics"]);
 //!
 //!     let repl = PythonRepl::with_config(config)?;
 //!
