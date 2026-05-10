@@ -28,17 +28,9 @@ use neuromance_repl::PythonRepl;
 use std::collections::HashMap;
 use std::time::Instant;
 
-#[cfg(target_os = "linux")]
-fn count_file_descriptors() -> usize {
-    std::fs::read_dir("/proc/self/fd")
-        .map(|entries| entries.count())
-        .unwrap_or(0)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn count_file_descriptors() -> usize {
-    0
-}
+#[path = "../dev_utils.rs"]
+mod dev_utils;
+use dev_utils::count_file_descriptors;
 
 fn get_memory_kb() -> u64 {
     #[cfg(target_os = "linux")]

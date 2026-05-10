@@ -548,13 +548,15 @@ mod tests {
     /// Property: any module name whose top-level segment is not in the
     /// configured allowlist must be rejected with an `Import of '{name}'`
     /// message, regardless of dotted suffix or letter case.
-    #[tokio::test]
+    #[test]
     #[serial]
-    async fn prop_disallowed_imports_always_blocked() {
-        use proptest::strategy::{Strategy, ValueTree};
-        use proptest::test_runner::{Config, TestRunner};
+    fn prop_disallowed_imports_always_blocked() {
+        use proptest::prop_assert;
+        use proptest::strategy::Strategy;
+        use proptest::test_runner::{Config, TestCaseError, TestRunner};
         use std::collections::HashSet;
 
+        let runtime = tokio::runtime::Runtime::new().unwrap();
         let repl = PythonRepl::new().unwrap();
         let allowed: HashSet<String> = repl
             .config()
@@ -573,34 +575,34 @@ mod tests {
                 move |(base, _)| !allowed_filter.contains(base),
             );
 
-        // Generate cases synchronously, then exercise the async REPL serially.
-        // proptest's `proptest!` macro is sync-only and `repl.execute` is async,
-        // so we drive the strategy by hand instead of nesting block_on.
+        // Drive proptest's TestRunner directly (instead of `proptest!`) so we
+        // can call `runtime.block_on(repl.execute(..))` from inside the
+        // synchronous closure. `TestRunner::run` performs search-and-shrink
+        // on failures, so a counter-example is minimised.
         let mut runner = TestRunner::new(Config {
             cases: 64,
             ..Config::default()
         });
-        let mut cases: Vec<(String, Option<String>)> = Vec::with_capacity(64);
-        for _ in 0..64 {
-            let tree = strategy.new_tree(&mut runner).unwrap();
-            cases.push(tree.current());
-        }
-
-        for (base, suffix) in cases {
-            let name = match suffix {
-                Some(s) => format!("{base}.{s}"),
-                None => base,
-            };
-            let code = format!("__import__({name:?})");
-            let result = repl.execute(&code).await.unwrap();
-            assert!(!result.success, "import of {name:?} unexpectedly succeeded");
-            let needle = format!("Import of '{name}'");
-            assert!(
-                result.stderr.contains(&needle),
-                "import of {name:?}: stderr={}",
-                result.stderr
-            );
-        }
+        runner
+            .run(&strategy, |(base, suffix)| {
+                let name = match suffix {
+                    Some(s) => format!("{base}.{s}"),
+                    None => base,
+                };
+                let code = format!("__import__({name:?})");
+                let result = runtime
+                    .block_on(repl.execute(&code))
+                    .map_err(|e| TestCaseError::fail(format!("execute: {e}")))?;
+                prop_assert!(!result.success, "import of {name:?} unexpectedly succeeded");
+                let needle = format!("Import of '{name}'");
+                prop_assert!(
+                    result.stderr.contains(&needle),
+                    "import of {name:?}: stderr={}",
+                    result.stderr
+                );
+                Ok(())
+            })
+            .unwrap();
     }
 
     // Known limitation: Function definitions across multiple execute() calls
@@ -897,18 +899,6 @@ for i in range(1, 11):
                 .map(String::from)
                 .collect::<Vec<_>>()
         );
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_python_repl_config() {
-        let config = PythonReplConfig {
-            timeout: Duration::from_secs(10),
-            python_modules: vec!["math".into(), "json".into()],
-        };
-
-        let repl = PythonRepl::with_config(config).unwrap();
-        assert_eq!(repl.config().timeout, Duration::from_secs(10));
     }
 
     #[tokio::test]

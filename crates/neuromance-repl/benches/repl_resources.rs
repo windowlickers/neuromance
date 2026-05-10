@@ -54,6 +54,10 @@ use neuromance_repl::PythonRepl;
 use std::collections::HashMap;
 use sysinfo::{Pid, System};
 
+#[path = "../dev_utils.rs"]
+mod dev_utils;
+use dev_utils::count_file_descriptors;
+
 /// Get current process memory usage in bytes
 fn get_memory_usage() -> u64 {
     let mut sys = System::new();
@@ -61,19 +65,6 @@ fn get_memory_usage() -> u64 {
     sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
 
     sys.process(pid).map_or(0, |p| p.memory())
-}
-
-/// Count open file descriptors (Linux only)
-#[cfg(target_os = "linux")]
-fn count_file_descriptors() -> usize {
-    std::fs::read_dir("/proc/self/fd")
-        .map(|entries| entries.count())
-        .unwrap_or(0)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn count_file_descriptors() -> usize {
-    0 // Not supported on non-Linux
 }
 
 /// Benchmark single REPL creation

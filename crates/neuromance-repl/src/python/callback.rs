@@ -90,7 +90,6 @@ pub(crate) fn create_py_callback<'py>(
 ///
 /// Only injects callbacks that are new or have been updated,
 /// avoiding redundant Python object creation on every `execute()`.
-/// Stale entries in `injected` are removed automatically.
 ///
 /// # Errors
 ///
@@ -103,9 +102,6 @@ pub(crate) fn inject_callbacks_if_needed(
     callbacks: &HashMap<String, Arc<PythonCallback>>,
     injected: &mut HashSet<String>,
 ) -> Result<(), ReplError> {
-    // Remove stale entries (callbacks that were removed since last injection)
-    injected.retain(|name| callbacks.contains_key(name));
-
     for (name, callback) in callbacks {
         if injected.contains(name) {
             continue;
