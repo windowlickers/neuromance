@@ -122,8 +122,7 @@ pub(crate) async fn set_variable<S: WithShared + Send + 'static>(
             .map_err(|e| ReplError::StatePoisoned(e.to_string()))?;
         Python::attach(|py| {
             let locals_dict = guard.shared().locals.bind(py);
-            let py_value = pyo3::IntoPyObject::into_pyobject(value, py)
-                .map_err(|e| ReplError::Conversion(e.to_string()))?;
+            let py_value = pyo3::types::PyString::new(py, &value);
             locals_dict
                 .set_item(&name, py_value)
                 .at("set_item into locals")?;

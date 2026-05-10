@@ -12,10 +12,6 @@ pub enum ReplError {
     #[error("Invalid input: {0}")]
     InvalidInput(String),
 
-    /// Failed to convert a Rust value into a Python object
-    #[error("Conversion error: {0}")]
-    Conversion(String),
-
     /// Timeout during execution
     #[error("Execution timeout after {0:?}")]
     Timeout(Duration),

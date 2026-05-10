@@ -155,19 +155,18 @@ impl PythonRepl {
                         &mut s.shared.injected_callbacks,
                     )?;
 
+                    let c_code = CString::new(code.as_str()).map_err(|e| {
+                        ReplError::InvalidInput(format!(
+                            "code contains an interior NUL byte at position {}",
+                            e.nul_position()
+                        ))
+                    })?;
+
                     let streams = redirect_streams(py)?;
 
-                    let exec_result = CString::new(code.as_str())
-                        .map_err(|e| {
-                            ReplError::InvalidInput(format!(
-                                "code contains an interior NUL byte at position {}",
-                                e.nul_position()
-                            ))
-                        })
-                        .and_then(|c_code| {
-                            py.run(c_code.as_c_str(), Some(globals_ref), Some(locals_ref))
-                                .map_err(ReplError::PythonExec)
-                        });
+                    let exec_result = py
+                        .run(c_code.as_c_str(), Some(globals_ref), Some(locals_ref))
+                        .map_err(ReplError::PythonExec);
 
                     let (stdout, stderr) = streams.restore(py)?;
                     let elapsed_ms = start.elapsed().as_millis() as u64;
@@ -1035,8 +1034,7 @@ x = 42
     #[serial]
     async fn test_execute_rejects_nul_byte_in_code() {
         let repl = PythonRepl::new().unwrap();
-        let result = repl.execute("x = 1\0y = 2").await.unwrap();
-        assert!(!result.success);
-        assert!(result.stderr.contains("NUL"));
+        let err = repl.execute("x = 1\0y = 2").await.unwrap_err();
+        assert!(matches!(err, ReplError::InvalidInput(ref msg) if msg.contains("NUL")));
     }
 }
