@@ -15,6 +15,8 @@ Neuromance provides high-level abstractions for building LLM-powered application
 - **`neuromance-client`** - Client implementations for various LLM providers
 - **`neuromance-agent`** - Agent framework for autonomous task execution with LLMs
 - **`neuromance-tools`** - Tool execution framework with MCP support
+- **`neuromance-repl`** - Embedded Python REPL (PyO3) with stateful sessions and Rust-backed callbacks
+- **`neuromance-runtime`** - Container runtime binary; runs an agent in `oneshot` or `serve` mode
 
 ## Development
 
@@ -56,7 +58,9 @@ neuromance/
 │   ├── neuromance-common/   # Common types and data structures
 │   ├── neuromance-client/   # Client implementations
 │   ├── neuromance-agent/    # Agent framework
-│   └── neuromance-tools/    # Tool execution framework
+│   ├── neuromance-tools/    # Tool execution framework
+│   ├── neuromance-repl/     # Embedded Python REPL
+│   └── neuromance-runtime/  # Container runtime binary
 ├── Cargo.toml               # Workspace configuration
 └── README.md
 ```

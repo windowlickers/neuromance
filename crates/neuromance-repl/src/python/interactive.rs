@@ -10,6 +10,7 @@
 //! - Less control over execution environment
 //! - No restricted builtins
 
+use std::ffi::CString;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -190,42 +191,38 @@ impl InteractivePythonRepl {
                         &mut s.shared.injected_callbacks,
                     )?;
 
+                    let c_code = CString::new(code.as_str()).map_err(|e| {
+                        ReplError::InvalidInput(format!(
+                            "code contains an interior NUL byte at position {}",
+                            e.nul_position()
+                        ))
+                    })?;
+
                     let streams = redirect_streams(py)?;
 
-                    let console_ref = s.console.bind(py);
-                    console_ref
-                        .setattr("error_occurred", false)
-                        .at("setattr console.error_occurred")?;
+                    // Compile and exec the full code block as a single unit so
+                    // multi-line input like `for x in ...:\n    body\nprint(x)`
+                    // works without an intervening blank line. The earlier
+                    // line-by-line `InteractiveConsole.push` approach raised
+                    // SyntaxError on that shape because `compile_command`
+                    // requires a blank line to terminate top-level compound
+                    // statements. The line-at-a-time API is still available
+                    // via `push()` for callers that need it.
+                    let exec_result = py.run(c_code.as_c_str(), Some(locals_ref), Some(locals_ref));
 
-                    // Stash the first push error (if any) so streams.restore()
-                    // still runs before we propagate it.
-                    let exec_error = code
-                        .lines()
-                        .chain(std::iter::once(""))
-                        .try_for_each(|line| {
-                            console_ref
-                                .call_method1("push", (line,))
-                                .map(drop)
-                                .at("call console.push")
-                        })
-                        .err();
-
-                    let success = !console_ref
-                        .getattr("error_occurred")
-                        .at("getattr console.error_occurred")?
-                        .extract::<bool>()
-                        .at("extract console.error_occurred -> bool")?;
+                    if let Err(ref err) = exec_result {
+                        // Render a proper Python traceback into the redirected
+                        // stderr — matches what `InteractiveConsole.showtraceback`
+                        // used to print.
+                        err.print(py);
+                    }
 
                     let (stdout, stderr) = streams.restore(py)?;
-
-                    if let Some(e) = exec_error {
-                        return Err(e);
-                    }
 
                     Ok(ReplResult {
                         stdout,
                         stderr,
-                        success,
+                        success: exec_result.is_ok(),
                         return_value: None,
                         execution_time_ms: start.elapsed().as_millis() as u64,
                     })
@@ -501,6 +498,37 @@ result = factorial(5)
 
         repl.reset().await.unwrap();
         assert_eq!(repl.get_variable("x").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_interactive_compound_then_simple_statement_no_blank_line() {
+        // Regression: a top-level compound statement (for-loop) followed
+        // directly by a non-indented simple statement, with no blank line
+        // between them, used to raise SyntaxError because each line was fed
+        // into `code.InteractiveConsole.push()` and `compile_command` couldn't
+        // tell whether the for-loop was complete.
+        let repl = InteractivePythonRepl::new().unwrap();
+        let code = "\
+total = 0
+for i in range(5):
+    total += i
+print(total)";
+        let result = repl.execute(code).await.unwrap();
+        assert!(
+            result.success,
+            "expected success, stderr was: {}",
+            result.stderr
+        );
+        assert_eq!(result.stdout.trim(), "10");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_interactive_rejects_nul_byte_in_code() {
+        let repl = InteractivePythonRepl::new().unwrap();
+        let err = repl.execute("x = 1\0").await.unwrap_err();
+        assert!(matches!(err, ReplError::InvalidInput(msg) if msg.contains("NUL byte")));
     }
 
     #[tokio::test]

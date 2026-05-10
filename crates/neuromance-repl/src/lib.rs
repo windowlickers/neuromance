@@ -3,9 +3,31 @@
 //! Provides Python execution with persistent state, configurable modules, and stdout/stderr
 //! capture.
 //!
+//! # Why an embedded REPL?
+//!
+//! An agent could shell out to `python3` via a generic bash tool, but the embedded REPL
+//! offers three things a subprocess can't:
+//!
+//! - **Stateful sessions.** Variables, imports, and loaded data persist across executions,
+//!   so an agent can load a large dataset once and query it across many turns instead of
+//!   re-parsing on every call.
+//! - **In-process Rust callbacks.** With the `tools` feature, Rust-backed callables can be
+//!   injected into the Python namespace as native functions — no IPC, no serialization
+//!   round-trip.
+//! - **No `python3` on PATH.** The interpreter is linked into the binary via `PyO3`, so it
+//!   works in minimal images without a shell or a system Python install.
+//!
+//! Tradeoff: the interpreter shares the host process. A segfault in a C extension takes
+//! the whole agent down, which a subprocess would isolate.
+//!
 //! **Sandboxing:** [`PythonRepl`] enforces a restricted-builtins allowlist;
 //! [`InteractivePythonRepl`] does **not** — it wraps Python's `code.InteractiveConsole` and
 //! exposes the full builtin set. Pick `PythonRepl` for untrusted code.
+//!
+//! When the `tools` feature is enabled, the `execute_python` tool factory selects between
+//! the two via a `restricted` flag in its TOML config (default `true`). Set
+//! `restricted = false` only when the surrounding container is the security boundary —
+//! file I/O, networking, and arbitrary imports are permitted in that mode.
 //!
 //! # Features
 //!

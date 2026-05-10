@@ -110,7 +110,7 @@
           // {
             inherit cargoArtifacts;
             pname = "neuromance-runtime";
-            cargoExtraArgs = "--package neuromance-runtime";
+            cargoExtraArgs = "--package neuromance-runtime --features python-repl";
             meta = runtimeMeta;
           }
         );

@@ -7,12 +7,34 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use neuromance_common::tools::{Function, Parameters, Property, Tool};
 use neuromance_tools::{ToolError, ToolFactory, ToolImplementation, ToolRegistry};
 
-use super::PythonRepl;
+use crate::{ReplError, ReplResult};
+
+use super::{InteractivePythonRepl, PythonRepl};
+
+/// Backing REPL for [`PythonReplTool`].
+#[derive(Debug)]
+enum Backend {
+    /// Restricted-builtins REPL with a Rust-backed import allowlist.
+    Restricted(Arc<PythonRepl>),
+    /// Unrestricted REPL — full builtins, unfiltered imports. Suitable when the
+    /// surrounding container is the security boundary.
+    Unrestricted(Arc<InteractivePythonRepl>),
+}
+
+impl Backend {
+    async fn execute(&self, code: &str) -> Result<ReplResult, ReplError> {
+        match self {
+            Self::Restricted(repl) => repl.execute(code).await,
+            Self::Unrestricted(repl) => repl.execute(code).await,
+        }
+    }
+}
 
 /// Tool implementation for executing Python code in a REPL environment.
 ///
@@ -41,15 +63,31 @@ use super::PythonRepl;
 /// ```
 #[derive(Debug)]
 pub struct PythonReplTool {
-    repl: Arc<PythonRepl>,
+    backend: Backend,
 }
 
 impl PythonReplTool {
-    /// Create a new Python REPL tool with the given REPL instance.
+    /// Create a new Python REPL tool backed by a restricted [`PythonRepl`].
     #[must_use]
     #[allow(clippy::missing_const_for_fn)] // Arc is not const-constructible
     pub fn new(repl: Arc<PythonRepl>) -> Self {
-        Self { repl }
+        Self {
+            backend: Backend::Restricted(repl),
+        }
+    }
+
+    /// Create a new Python REPL tool backed by an unrestricted
+    /// [`InteractivePythonRepl`].
+    ///
+    /// Pick this only when the surrounding container provides the security
+    /// boundary — the in-process builtin allowlist and import filter are
+    /// disabled in this mode.
+    #[must_use]
+    #[allow(clippy::missing_const_for_fn)] // Arc is not const-constructible
+    pub fn with_interactive(repl: Arc<InteractivePythonRepl>) -> Self {
+        Self {
+            backend: Backend::Unrestricted(repl),
+        }
     }
 }
 
@@ -93,9 +131,8 @@ impl ToolImplementation for PythonReplTool {
 
         log::debug!("Executing Python code:\n```python\n{code}\n```");
 
-        // Execute in REPL
         let result = self
-            .repl
+            .backend
             .execute(code)
             .await
             .map_err(|e| ToolError::Execution(e.into()))?;
@@ -140,16 +177,45 @@ impl ToolImplementation for PythonReplTool {
     }
 
     fn is_auto_approved(&self) -> bool {
-        // The REPL sandboxes execution in-process via restricted builtins and a
-        // Rust-backed import allowlist, so per-call approval is unnecessary.
+        // Restricted mode sandboxes via the builtin allowlist and import filter.
+        // Unrestricted mode relies on the surrounding container as the security
+        // boundary; either way per-call approval is unnecessary in this runtime.
         true
+    }
+}
+
+/// Tool config for [`PythonReplToolFactory`].
+///
+/// Deserialized from the `[tools.config]` block of a `[[tools]]` entry whose
+/// `name = "execute_python"`. Defaults to restricted mode.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct PythonReplToolConfig {
+    /// When `true` (default), use the sandboxed [`PythonRepl`] with restricted
+    /// builtins and a Rust-backed import allowlist. When `false`, use the full
+    /// [`InteractivePythonRepl`] — file I/O, networking, and arbitrary imports
+    /// are permitted.
+    restricted: bool,
+}
+
+impl Default for PythonReplToolConfig {
+    fn default() -> Self {
+        Self { restricted: true }
     }
 }
 
 /// Factory that registers [`PythonReplTool`] under the name `execute_python`.
 ///
-/// Constructs a default [`PythonRepl`] (state persists across tool calls within
-/// a runtime instance). Takes no configuration.
+/// Reads an optional `restricted` boolean from the tool's config block:
+///
+/// ```toml
+/// [[tools]]
+/// name = "execute_python"
+/// [tools.config]
+/// restricted = false  # default: true
+/// ```
+///
+/// State persists across tool calls within a runtime instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PythonReplToolFactory;
 
@@ -158,9 +224,23 @@ impl ToolFactory for PythonReplToolFactory {
         "execute_python"
     }
 
-    fn build(&self, _config: &Value, registry: &ToolRegistry) -> Result<(), ToolError> {
-        let repl = PythonRepl::new()?;
-        registry.register(Arc::new(PythonReplTool::new(Arc::new(repl))));
+    fn build(&self, config: &Value, registry: &ToolRegistry) -> Result<(), ToolError> {
+        let cfg: PythonReplToolConfig = if config.is_null() {
+            PythonReplToolConfig::default()
+        } else {
+            serde_json::from_value(config.clone())
+                .map_err(|e| ToolError::execution(format!("invalid execute_python config: {e}")))?
+        };
+
+        let tool = if cfg.restricted {
+            PythonReplTool::new(Arc::new(PythonRepl::new()?))
+        } else {
+            log::warn!(
+                "execute_python registered in unrestricted mode: full builtins and unfiltered imports"
+            );
+            PythonReplTool::with_interactive(Arc::new(InteractivePythonRepl::new()?))
+        };
+        registry.register(Arc::new(tool));
         Ok(())
     }
 }
@@ -249,5 +329,48 @@ mod tests {
                 .contains("ZeroDivisionError")
         );
         assert!(parsed["execution_time_ms"].is_number());
+    }
+
+    #[test]
+    fn test_factory_default_config_is_restricted() {
+        let cfg = PythonReplToolConfig::default();
+        assert!(cfg.restricted);
+    }
+
+    #[test]
+    fn test_factory_config_rejects_unknown_fields() {
+        let err = serde_json::from_value::<PythonReplToolConfig>(json!({
+            "restricted": false,
+            "bogus": 1,
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("bogus"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_unrestricted_tool_allows_open_builtin() {
+        let repl = Arc::new(InteractivePythonRepl::new().unwrap());
+        let tool = PythonReplTool::with_interactive(repl);
+        let response = tool
+            .execute(&json!({ "code": "print(callable(open))" }))
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(parsed["status"], "success");
+        assert!(parsed["stdout"].as_str().unwrap().contains("True"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_restricted_tool_blocks_open_builtin() {
+        let tool = make_tool();
+        let response = tool
+            .execute(&json!({ "code": "open('/etc/passwd')" }))
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(parsed["status"], "error");
+        assert!(parsed["stderr"].as_str().unwrap().contains("NameError"));
     }
 }
