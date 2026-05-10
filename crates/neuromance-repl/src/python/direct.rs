@@ -435,12 +435,12 @@ mod tests {
         // __import__('os') is blocked (direct sandbox escape)
         let result = repl.execute("__import__('os')").await.unwrap();
         assert!(!result.success);
-        assert!(result.stderr.contains("not allowed"));
+        assert!(result.stderr.contains("Import of 'os'"));
 
         // import os statement is blocked
         let result = repl.execute("import os").await.unwrap();
         assert!(!result.success);
-        assert!(result.stderr.contains("not allowed"));
+        assert!(result.stderr.contains("Import of 'os'"));
 
         // Configured module via import statement works
         let result = repl.execute("import math\ny = math.pi").await.unwrap();
@@ -533,8 +533,8 @@ mod tests {
     }
 
     /// Property: any module name whose top-level segment is not in the
-    /// configured allowlist must be rejected with "not allowed",
-    /// regardless of dotted suffix or letter case.
+    /// configured allowlist must be rejected with an `Import of '{name}'`
+    /// message, regardless of dotted suffix or letter case.
     #[tokio::test]
     #[serial]
     async fn prop_disallowed_imports_always_blocked() {
@@ -581,8 +581,9 @@ mod tests {
             let code = format!("__import__({name:?})");
             let result = repl.execute(&code).await.unwrap();
             assert!(!result.success, "import of {name:?} unexpectedly succeeded");
+            let needle = format!("Import of '{name}'");
             assert!(
-                result.stderr.contains("not allowed"),
+                result.stderr.contains(&needle),
                 "import of {name:?}: stderr={}",
                 result.stderr
             );

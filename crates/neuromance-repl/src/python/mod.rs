@@ -90,13 +90,13 @@ pub(crate) async fn get_variable<S: WithShared + Send + 'static>(
             .map_err(|e| ReplError::StatePoisoned(e.to_string()))?;
         Python::attach(|py| {
             let locals_dict = guard.shared().locals.bind(py);
-            match locals_dict.get_item(&name).at("get_item from locals")? {
+            match locals_dict.get_item(&name).at_var("get_item", &name)? {
                 Some(value) => {
-                    let str_repr = value.str().at("str() locals value")?;
+                    let str_repr = value.str().at_var("str() value", &name)?;
                     Ok(Some(
                         str_repr
                             .extract::<String>()
-                            .at("extract locals value -> String")?,
+                            .at_var("extract -> String", &name)?,
                     ))
                 }
                 None => Ok(None),
@@ -125,7 +125,7 @@ pub(crate) async fn set_variable<S: WithShared + Send + 'static>(
             let py_value = pyo3::types::PyString::new(py, &value);
             locals_dict
                 .set_item(&name, py_value)
-                .at("set_item into locals")?;
+                .at_var("set_item", &name)?;
             Ok(())
         })
     })

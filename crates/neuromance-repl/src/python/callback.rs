@@ -35,7 +35,7 @@ pub type PythonCallback = Box<
 ///
 /// # Errors
 ///
-/// Returns `ReplError::Python` if the `PyCFunction` closure cannot be created.
+/// Returns `ReplError::PythonInfra` if the `PyCFunction` closure cannot be created.
 pub fn create_py_callback<'py>(
     py: Python<'py>,
     callback: &Arc<PythonCallback>,
@@ -88,7 +88,7 @@ pub fn create_py_callback<'py>(
 ///
 /// # Errors
 ///
-/// Returns `ReplError::Python` if a callback cannot be
+/// Returns `ReplError::PythonInfra` if a callback cannot be
 /// created or injected into the target dict.
 #[allow(clippy::implicit_hasher)]
 pub fn inject_callbacks_if_needed(

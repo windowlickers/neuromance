@@ -42,6 +42,15 @@ fn create_filtered_import(
 ) -> Result<Py<PyAny>, ReplError> {
     let allowed: HashSet<Cow<'static, str>> = allowed_modules.iter().cloned().collect();
 
+    // Pre-format the sorted allowlist once so blocked-import errors can name
+    // the actual permitted modules without paying the formatting cost on
+    // every rejection.
+    let allowed_list = {
+        let mut sorted: Vec<&str> = allowed.iter().map(AsRef::as_ref).collect();
+        sorted.sort_unstable();
+        sorted.join(", ")
+    };
+
     let real_import = py
         .import("builtins")
         .at("import builtins (filtered_import)")?
@@ -61,7 +70,7 @@ fn create_filtered_import(
                 .map_or(name.as_str(), |(prefix, _)| prefix);
             if !allowed.contains(top) {
                 return Err(pyo3::exceptions::PyImportError::new_err(format!(
-                    "Import of '{name}' is not allowed"
+                    "Import of '{name}' is not allowed; allowed top-level modules: {allowed_list}"
                 )));
             }
             Ok(real_import.bind(py).call(args, kwargs)?.unbind())
