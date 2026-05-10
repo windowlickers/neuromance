@@ -1,7 +1,11 @@
 //! REPL (Read-Eval-Print-Loop) environments for LLM tool execution.
 //!
-//! Provides Python execution with restricted builtins, persistent state, configurable modules,
-//! and stdout/stderr capture.
+//! Provides Python execution with persistent state, configurable modules, and stdout/stderr
+//! capture.
+//!
+//! **Sandboxing:** [`PythonRepl`] enforces a restricted-builtins allowlist;
+//! [`InteractivePythonRepl`] does **not** — it wraps Python's `code.InteractiveConsole` and
+//! exposes the full builtin set. Pick `PythonRepl` for untrusted code.
 //!
 //! # Features
 //!
