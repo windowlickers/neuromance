@@ -15,13 +15,16 @@ pub(super) fn create_restricted_builtins(
     let builtins = PyDict::new(py);
     let main_builtins = py.import("builtins").at("import builtins")?;
 
-    for name in SAFE_PYTHON_BUILTINS {
-        if let Ok(obj) = main_builtins.getattr(*name) {
-            builtins
-                .set_item(*name, obj)
-                .at("set_item safe builtin into restricted dict")?;
-        }
-    }
+    SAFE_PYTHON_BUILTINS
+        .iter()
+        .try_for_each(|name| -> Result<(), ReplError> {
+            if let Ok(obj) = main_builtins.getattr(*name) {
+                builtins
+                    .set_item(*name, obj)
+                    .at("set_item safe builtin into restricted dict")?;
+            }
+            Ok(())
+        })?;
 
     let restricted_import = create_filtered_import(py, allowed_modules)?;
     builtins

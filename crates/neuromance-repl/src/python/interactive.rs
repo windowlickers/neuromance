@@ -10,10 +10,12 @@
 //! - Less control over execution environment
 //! - No restricted builtins
 
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use futures::future::BoxFuture;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyModule};
 
@@ -21,7 +23,7 @@ use crate::error::PyResultExt;
 use crate::{ReplError, ReplResult};
 
 use super::PythonReplConfig;
-use super::callback::{self, PythonCallback};
+use super::callback;
 use super::capture::redirect_streams;
 use super::state::{SharedState, WithShared};
 
@@ -107,6 +109,7 @@ impl InteractivePythonRepl {
     /// # Errors
     ///
     /// Returns `ReplError` if Python initialization fails.
+    #[must_use = "InteractivePythonRepl::new returns a Result that must be handled"]
     pub fn new() -> Result<Self, ReplError> {
         Self::with_config(PythonReplConfig::default())
     }
@@ -116,6 +119,7 @@ impl InteractivePythonRepl {
     /// # Errors
     ///
     /// Returns `ReplError` if Python initialization fails.
+    #[must_use = "InteractivePythonRepl::with_config returns a Result that must be handled"]
     pub fn with_config(config: PythonReplConfig) -> Result<Self, ReplError> {
         Python::attach(|py| {
             let locals = PyDict::new(py);
@@ -274,11 +278,20 @@ impl InteractivePythonRepl {
 
     /// Inject a callable function into the REPL environment.
     ///
+    /// Pass a closure that returns a `BoxFuture`; the callback is boxed
+    /// internally so callers don't need to wrap it themselves.
+    ///
     /// # Errors
     ///
     /// Returns `ReplError` if the state mutex is poisoned.
-    pub fn inject_function(&self, name: &str, callback: PythonCallback) -> Result<(), ReplError> {
-        super::inject_function(&self.state, name, callback)
+    pub fn inject_function<F>(&self, name: &str, callback: F) -> Result<(), ReplError>
+    where
+        F: Fn(Vec<String>, HashMap<String, String>) -> BoxFuture<'static, Result<String, String>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        super::inject_function(&self.state, name, Box::new(callback))
     }
 
     /// Get a variable's string representation from the REPL.
@@ -422,7 +435,7 @@ result = factorial(5)
         let repl = InteractivePythonRepl::new().unwrap();
         repl.inject_function(
             "double",
-            Box::new(|args: Vec<String>, _kwargs: HashMap<String, String>| {
+            |args: Vec<String>, _kwargs: HashMap<String, String>| {
                 Box::pin(async move {
                     if let Some(arg) = args.first()
                         && let Ok(num) = arg.parse::<i32>()
@@ -431,7 +444,7 @@ result = factorial(5)
                     }
                     Err("Invalid argument".to_string())
                 })
-            }),
+            },
         )
         .unwrap();
 

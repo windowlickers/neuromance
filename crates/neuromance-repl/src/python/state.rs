@@ -13,6 +13,11 @@ use pyo3::types::PyDict;
 use super::callback::PythonCallback;
 
 /// State shared by all Python REPL variants.
+///
+/// Visibility note: kept `pub` because the surrounding `state` module is
+/// already declared `pub(crate)`, which limits reach to this crate.
+/// Writing `pub(crate)` here would be redundant
+/// (`clippy::redundant_pub_crate`).
 pub struct SharedState {
     pub locals: Py<PyDict>,
     pub callbacks: HashMap<String, Arc<PythonCallback>>,
@@ -40,6 +45,9 @@ impl SharedState {
 /// both state structs without duplicating the helper bodies.
 ///
 /// Static dispatch only — there are no `dyn WithShared` users.
+///
+/// Visibility note: kept `pub` for the same reason as
+/// [`SharedState`] — the `state` module is already `pub(crate)`.
 pub trait WithShared {
     fn shared(&self) -> &SharedState;
     fn shared_mut(&mut self) -> &mut SharedState;

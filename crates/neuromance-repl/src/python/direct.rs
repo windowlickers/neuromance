@@ -9,16 +9,18 @@
 
 use crate::error::PyResultExt;
 use crate::{ReplError, ReplResult};
+use futures::future::BoxFuture;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use super::PythonReplConfig;
 use super::builtins::create_restricted_builtins;
-use super::callback::{self, PythonCallback};
+use super::callback;
 use super::capture::redirect_streams;
 use super::state::{SharedState, WithShared};
 
@@ -67,6 +69,7 @@ impl PythonRepl {
     /// # Errors
     ///
     /// Returns `ReplError` if Python initialization fails.
+    #[must_use = "PythonRepl::new returns a Result that must be handled"]
     pub fn new() -> Result<Self, ReplError> {
         Self::with_config(PythonReplConfig::default())
     }
@@ -76,6 +79,7 @@ impl PythonRepl {
     /// # Errors
     ///
     /// Returns `ReplError` if Python initialization fails.
+    #[must_use = "PythonRepl::with_config returns a Result that must be handled"]
     pub fn with_config(config: PythonReplConfig) -> Result<Self, ReplError> {
         Python::attach(|py| {
             let globals = PyDict::new(py);
@@ -229,11 +233,20 @@ impl PythonRepl {
 
     /// Inject a callable function into the REPL environment.
     ///
+    /// Pass a closure that returns a `BoxFuture`; the callback is boxed
+    /// internally so callers don't need to wrap it themselves.
+    ///
     /// # Errors
     ///
     /// Returns `ReplError` if the state mutex is poisoned.
-    pub fn inject_function(&self, name: &str, callback: PythonCallback) -> Result<(), ReplError> {
-        super::inject_function(&self.state, name, callback)
+    pub fn inject_function<F>(&self, name: &str, callback: F) -> Result<(), ReplError>
+    where
+        F: Fn(Vec<String>, HashMap<String, String>) -> BoxFuture<'static, Result<String, String>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        super::inject_function(&self.state, name, Box::new(callback))
     }
 
     /// Get a variable's string representation from the REPL.
@@ -315,7 +328,7 @@ mod tests {
         // Inject a callback that doubles the input number
         repl.inject_function(
             "double",
-            Box::new(|args: Vec<String>, _kwargs: HashMap<String, String>| {
+            |args: Vec<String>, _kwargs: HashMap<String, String>| {
                 Box::pin(async move {
                     if let Some(arg) = args.first()
                         && let Ok(num) = arg.parse::<i32>()
@@ -324,7 +337,7 @@ mod tests {
                     }
                     Err("Invalid argument".to_string())
                 })
-            }),
+            },
         )
         .unwrap();
 
@@ -339,9 +352,9 @@ mod tests {
         let repl = PythonRepl::new().unwrap();
         repl.inject_function(
             "boom",
-            Box::new(|_args: Vec<String>, _kwargs: HashMap<String, String>| {
+            |_args: Vec<String>, _kwargs: HashMap<String, String>| {
                 Box::pin(async move { Err("boom: callback rejected input".to_string()) })
-            }),
+            },
         )
         .unwrap();
 
@@ -366,9 +379,9 @@ mod tests {
 
         repl.inject_function(
             "f",
-            Box::new(|_args: Vec<String>, _kwargs: HashMap<String, String>| {
+            |_args: Vec<String>, _kwargs: HashMap<String, String>| {
                 Box::pin(async move { Ok("A".to_string()) })
-            }),
+            },
         )
         .unwrap();
 
@@ -381,9 +394,9 @@ mod tests {
         // will rebind on the next execute().
         repl.inject_function(
             "f",
-            Box::new(|_args: Vec<String>, _kwargs: HashMap<String, String>| {
+            |_args: Vec<String>, _kwargs: HashMap<String, String>| {
                 Box::pin(async move { Ok("B".to_string()) })
-            }),
+            },
         )
         .unwrap();
 
@@ -742,7 +755,7 @@ for i in range(1, 11):
         // Inject multiple callbacks
         repl.inject_function(
             "add",
-            Box::new(|args: Vec<String>, _kwargs: HashMap<String, String>| {
+            |args: Vec<String>, _kwargs: HashMap<String, String>| {
                 Box::pin(async move {
                     if args.len() < 2 {
                         return Err("Need 2 arguments".to_string());
@@ -751,13 +764,13 @@ for i in range(1, 11):
                     let b: i32 = args[1].parse().map_err(|_| "Invalid number".to_string())?;
                     Ok((a + b).to_string())
                 })
-            }),
+            },
         )
         .unwrap();
 
         repl.inject_function(
             "multiply",
-            Box::new(|args: Vec<String>, _kwargs: HashMap<String, String>| {
+            |args: Vec<String>, _kwargs: HashMap<String, String>| {
                 Box::pin(async move {
                     if args.len() < 2 {
                         return Err("Need 2 arguments".to_string());
@@ -766,7 +779,7 @@ for i in range(1, 11):
                     let b: i32 = args[1].parse().map_err(|_| "Invalid number".to_string())?;
                     Ok((a * b).to_string())
                 })
-            }),
+            },
         )
         .unwrap();
 
@@ -791,7 +804,7 @@ for i in range(1, 11):
         // Inject a callback that uses keyword arguments
         repl.inject_function(
             "greet",
-            Box::new(|args: Vec<String>, kwargs: HashMap<String, String>| {
+            |args: Vec<String>, kwargs: HashMap<String, String>| {
                 Box::pin(async move {
                     let name = args.first().cloned().unwrap_or_else(|| "World".to_string());
                     let greeting = kwargs
@@ -800,7 +813,7 @@ for i in range(1, 11):
                         .unwrap_or_else(|| "Hello".to_string());
                     Ok(format!("{greeting}, {name}!"))
                 })
-            }),
+            },
         )
         .unwrap();
 
@@ -842,7 +855,7 @@ for i in range(1, 11):
 
         repl.inject_function(
             "echo",
-            Box::new(move |args: Vec<String>, kwargs: HashMap<String, String>| {
+            move |args: Vec<String>, kwargs: HashMap<String, String>| {
                 let captured = Arc::clone(&captured_clone);
                 Box::pin(async move {
                     let mut all = args.clone();
@@ -854,7 +867,7 @@ for i in range(1, 11):
                     captured.lock().unwrap().extend(all.iter().cloned());
                     Ok(all.join("|"))
                 })
-            }),
+            },
         )
         .unwrap();
 
@@ -910,13 +923,13 @@ for i in range(1, 11):
 
         repl.inject_function(
             "track_calls",
-            Box::new(move |args: Vec<String>, _kwargs: HashMap<String, String>| {
+            move |args: Vec<String>, _kwargs: HashMap<String, String>| {
                 let call_count = Arc::clone(&call_count_clone);
                 Box::pin(async move {
                     call_count.fetch_add(1, Ordering::SeqCst);
                     Ok(format!("Called with: {args:?}"))
                 })
-            }),
+            },
         )
         .unwrap();
 

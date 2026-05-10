@@ -15,11 +15,11 @@
 //! let repl = PythonRepl::with_config(config)?;
 //!
 //! // Inject async callback for LLM integration (receives args and kwargs)
-//! repl.inject_function("llm_query", Box::new(|args, _kwargs: HashMap<String, String>| {
+//! repl.inject_function("llm_query", |args, _kwargs: HashMap<String, String>| {
 //!     Box::pin(async move {
 //!         Ok(format!("Response to: {}", args[0]))
 //!     })
-//! }))?;
+//! })?;
 //!
 //! repl.execute("result = llm_query('summarize')").await?;
 //! # Ok(())
@@ -141,7 +141,11 @@ pub struct PythonReplConfig {
     /// Python modules to import and make available globally.
     /// Standard library modules are imported if available.
     /// Third-party packages must be installed in the Python environment.
-    pub python_modules: Vec<Cow<'static, str>>,
+    ///
+    /// Use [`PythonReplConfig::with_modules`] to extend the list. The
+    /// `Cow<'static, str>` storage is an internal detail and not part of
+    /// the public API.
+    pub(crate) python_modules: Vec<Cow<'static, str>>,
 }
 
 impl Default for PythonReplConfig {

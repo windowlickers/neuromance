@@ -25,6 +25,12 @@ use std::sync::Arc;
 ///
 /// Returns a `BoxFuture` to allow async operations within the callback.
 /// Use `Box::pin(async move { ... })` when creating callbacks.
+///
+/// Most callers should pass an unboxed closure to
+/// [`PythonRepl::inject_function`](super::PythonRepl::inject_function) or
+/// [`InteractivePythonRepl::inject_function`](super::InteractivePythonRepl::inject_function)
+/// — those entry points box internally. This alias is the storage form
+/// held inside [`SharedState`](super::state::SharedState).
 pub type PythonCallback = Box<
     dyn Fn(Vec<String>, HashMap<String, String>) -> BoxFuture<'static, Result<String, String>>
         + Send
@@ -36,7 +42,7 @@ pub type PythonCallback = Box<
 /// # Errors
 ///
 /// Returns `ReplError::PythonInfra` if the `PyCFunction` closure cannot be created.
-pub fn create_py_callback<'py>(
+pub(crate) fn create_py_callback<'py>(
     py: Python<'py>,
     callback: &Arc<PythonCallback>,
 ) -> Result<Bound<'py, PyCFunction>, ReplError> {
@@ -91,7 +97,7 @@ pub fn create_py_callback<'py>(
 /// Returns `ReplError::PythonInfra` if a callback cannot be
 /// created or injected into the target dict.
 #[allow(clippy::implicit_hasher)]
-pub fn inject_callbacks_if_needed(
+pub(crate) fn inject_callbacks_if_needed(
     py: Python,
     target: &Bound<PyDict>,
     callbacks: &HashMap<String, Arc<PythonCallback>>,

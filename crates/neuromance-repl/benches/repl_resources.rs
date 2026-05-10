@@ -164,9 +164,9 @@ fn bench_resource_usage_by_depth(c: &mut Criterion) {
                             for (i, repl) in repls.iter().enumerate() {
                                 repl.inject_function(
                                     "callback",
-                                    Box::new(move |_args, _kwargs| {
+                                    move |_args, _kwargs: HashMap<String, String>| {
                                         Box::pin(async move { Ok(format!("depth_{i}")) })
-                                    }),
+                                    },
                                 )
                                 .expect("Inject failed");
 
@@ -218,12 +218,9 @@ fn bench_callback_injection(c: &mut Criterion) {
     group.bench_function("single_callback", |b| {
         let repl = PythonRepl::new().expect("Failed to create REPL");
         b.iter(|| {
-            repl.inject_function(
-                "test_fn",
-                Box::new(|_args, _kwargs: HashMap<String, String>| {
-                    Box::pin(async move { Ok("result".to_string()) })
-                }),
-            )
+            repl.inject_function("test_fn", |_args, _kwargs: HashMap<String, String>| {
+                Box::pin(async move { Ok("result".to_string()) })
+            })
             .expect("Inject failed");
         })
     });
@@ -235,9 +232,9 @@ fn bench_callback_injection(c: &mut Criterion) {
             for i in 0..10 {
                 repl.inject_function(
                     &format!("fn_{i}"),
-                    Box::new(move |_args, _kwargs: HashMap<String, String>| {
+                    move |_args, _kwargs: HashMap<String, String>| {
                         Box::pin(async move { Ok(format!("result_{i}")) })
-                    }),
+                    },
                 )
                 .expect("Inject failed");
             }
@@ -268,12 +265,9 @@ fn bench_execution_throughput(c: &mut Criterion) {
     // With callback invocation
     group.bench_function("with_callback_call", |b| {
         let repl = PythonRepl::new().expect("Failed to create REPL");
-        repl.inject_function(
-            "get_value",
-            Box::new(|_args, _kwargs: HashMap<String, String>| {
-                Box::pin(async move { Ok("42".to_string()) })
-            }),
-        )
+        repl.inject_function("get_value", |_args, _kwargs: HashMap<String, String>| {
+            Box::pin(async move { Ok("42".to_string()) })
+        })
         .expect("Inject failed");
 
         b.iter(|| {

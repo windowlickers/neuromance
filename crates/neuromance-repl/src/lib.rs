@@ -72,7 +72,7 @@ pub use python::{InteractivePythonRepl, PythonCallback, PythonRepl, PythonReplCo
 pub use python::PythonReplTool;
 
 /// Result of executing code in a REPL environment.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[must_use]
 pub struct ReplResult {
     /// Standard output captured during execution
