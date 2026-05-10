@@ -1501,6 +1501,7 @@ dependencies = [
  "neuromance-client",
  "neuromance-common",
  "neuromance-tools",
+ "proptest",
  "pyo3",
  "serde",
  "serde_json",

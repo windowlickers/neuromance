@@ -362,6 +362,43 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn test_python_repl_reinject_callback_replaces_previous() {
+        let repl = PythonRepl::new().unwrap();
+
+        repl.inject_function(
+            "f",
+            Box::new(|_args: Vec<String>, _kwargs: HashMap<String, String>| {
+                Box::pin(async move { Ok("A".to_string()) })
+            }),
+        )
+        .unwrap();
+
+        let r1 = repl.execute("x = f()").await.unwrap();
+        assert!(r1.success, "stderr: {}", r1.stderr);
+        assert_eq!(repl.get_variable("x").await.unwrap(), Some("A".into()));
+
+        // Re-inject under the same name. mod.rs::inject_function removes "f"
+        // from injected_callbacks so callback::inject_callbacks_if_needed
+        // will rebind on the next execute().
+        repl.inject_function(
+            "f",
+            Box::new(|_args: Vec<String>, _kwargs: HashMap<String, String>| {
+                Box::pin(async move { Ok("B".to_string()) })
+            }),
+        )
+        .unwrap();
+
+        let r2 = repl.execute("y = f()").await.unwrap();
+        assert!(r2.success, "stderr: {}", r2.stderr);
+        assert_eq!(
+            repl.get_variable("y").await.unwrap(),
+            Some("B".into()),
+            "second injection did not replace the first PyCFunction"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn test_python_repl_stdout_capture() {
         let repl = PythonRepl::new().unwrap();
         let result = repl.execute("print('hi')").await.unwrap();
@@ -493,6 +530,63 @@ mod tests {
         for (code, label) in &blocked {
             let result = repl.execute(code).await.unwrap();
             assert!(!result.success, "ESCAPE: {label} succeeded — code: {code}");
+        }
+    }
+
+    /// Property: any module name whose top-level segment is not in the
+    /// configured allowlist must be rejected with "not allowed",
+    /// regardless of dotted suffix or letter case.
+    #[tokio::test]
+    #[serial]
+    async fn prop_disallowed_imports_always_blocked() {
+        use proptest::strategy::{Strategy, ValueTree};
+        use proptest::test_runner::{Config, TestRunner};
+        use std::collections::HashSet;
+
+        let repl = PythonRepl::new().unwrap();
+        let allowed: HashSet<String> = repl
+            .config()
+            .python_modules
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+
+        let allowed_filter = allowed.clone();
+        let strategy = (
+            "[A-Za-z][A-Za-z0-9_]{0,15}",
+            proptest::option::of("[A-Za-z][A-Za-z0-9_]{0,15}(\\.[A-Za-z][A-Za-z0-9_]{0,15}){0,3}"),
+        )
+            .prop_filter(
+                "top-level segment must not be in allowlist",
+                move |(base, _)| !allowed_filter.contains(base),
+            );
+
+        // Generate cases synchronously, then exercise the async REPL serially.
+        // proptest's `proptest!` macro is sync-only and `repl.execute` is async,
+        // so we drive the strategy by hand instead of nesting block_on.
+        let mut runner = TestRunner::new(Config {
+            cases: 64,
+            ..Config::default()
+        });
+        let mut cases: Vec<(String, Option<String>)> = Vec::with_capacity(64);
+        for _ in 0..64 {
+            let tree = strategy.new_tree(&mut runner).unwrap();
+            cases.push(tree.current());
+        }
+
+        for (base, suffix) in cases {
+            let name = match suffix {
+                Some(s) => format!("{base}.{s}"),
+                None => base,
+            };
+            let code = format!("__import__({name:?})");
+            let result = repl.execute(&code).await.unwrap();
+            assert!(!result.success, "import of {name:?} unexpectedly succeeded");
+            assert!(
+                result.stderr.contains("not allowed"),
+                "import of {name:?}: stderr={}",
+                result.stderr
+            );
         }
     }
 

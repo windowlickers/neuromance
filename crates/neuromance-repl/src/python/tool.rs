@@ -176,6 +176,26 @@ mod tests {
         PythonReplTool::new(Arc::new(PythonRepl::new().unwrap()))
     }
 
+    #[test]
+    fn test_get_definition_function_name_and_required() {
+        let tool = make_tool();
+        let def = tool.get_definition();
+
+        assert_eq!(def.function.name, "execute_python");
+
+        let required = def
+            .function
+            .parameters
+            .get("required")
+            .and_then(|v| v.as_array())
+            .expect("parameters.required must be an array");
+        let required_strs: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
+        assert!(
+            required_strs.contains(&"code"),
+            "required missing 'code': {required_strs:?}"
+        );
+    }
+
     #[tokio::test]
     #[serial]
     async fn test_execute_rejects_non_object_args() {

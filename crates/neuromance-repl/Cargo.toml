@@ -38,6 +38,7 @@ clap = { version = "4.5", features = ["derive"] }
 env_logger = "0.11"
 log = "0.4"
 serial_test = "3"
+proptest = "1.4"
 neuromance = { workspace = true }
 neuromance-client = { workspace = true }
 neuromance-common = { workspace = true }
