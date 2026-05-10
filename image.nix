@@ -1,6 +1,7 @@
 {
   pkgs,
   neuromance-runtime,
+  pythonEnv,
   version,
   variant ? "minimal",
   extraTools ? [ ],
@@ -13,6 +14,11 @@ let
   shellExtraCommands = pkgs.lib.optionalString includeShell ''
     ln -sf bash bin/sh
   '';
+
+  # PyO3 dlopens libpython at startup, so the interpreter store path must be
+  # in the image. PYTHONPATH points at the bundled site-packages so any
+  # selected packages (e.g. numpy, requests) are importable from the REPL.
+  pythonSitePackages = "${pythonEnv}/${pythonEnv.sitePackages}";
 in
 pkgs.dockerTools.buildLayeredImage {
   name = "neuromance-runtime";
@@ -20,6 +26,7 @@ pkgs.dockerTools.buildLayeredImage {
 
   contents = [
     neuromance-runtime
+    pythonEnv
     pkgs.cacert
   ] ++ shellPackages ++ extraTools;
 
@@ -42,6 +49,7 @@ pkgs.dockerTools.buildLayeredImage {
       "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
       "SSL_CERT_DIR=${pkgs.cacert}/etc/ssl/certs"
       "NEUROMANCE_CONFIG=/etc/neuromance/config.toml"
+      "PYTHONPATH=${pythonSitePackages}"
       "RUST_BACKTRACE=1"
     ];
 

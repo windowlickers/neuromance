@@ -37,18 +37,23 @@
 
         src = craneLib.cleanCargoSource ./.;
 
-        python = pkgs.python3;
+        # Default Python package set for the embedded REPL — empty by design.
+        # Downstream flakes pass a custom selector to `lib.mkRuntimeImage` to
+        # bundle additional packages (e.g. `ps: with ps; [ requests numpy ]`).
+        defaultPythonPackages = _ps: [ ];
 
-        commonBuildInputs = with pkgs; [ openssl python ];
-        commonNativeBuildInputs = with pkgs; [ pkg-config ];
+        defaultPythonEnv = pkgs.python3.withPackages defaultPythonPackages;
 
-        commonArgs = {
+        mkCommonArgs = pythonEnv: {
           inherit src;
           pname = "neuromance";
           inherit version;
-          buildInputs = commonBuildInputs;
-          nativeBuildInputs = commonNativeBuildInputs;
+          buildInputs = [ pkgs.openssl pythonEnv ];
+          nativeBuildInputs = [ pkgs.pkg-config ];
+          PYO3_PYTHON = "${pythonEnv}/bin/python3";
         };
+
+        commonArgs = mkCommonArgs defaultPythonEnv;
 
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
@@ -105,30 +110,76 @@
           ];
         };
 
-        neuromance-runtime = craneLib.buildPackage (
-          commonArgs
-          // {
-            inherit cargoArtifacts;
-            pname = "neuromance-runtime";
-            cargoExtraArgs = "--package neuromance-runtime --features python-repl";
-            meta = runtimeMeta;
-          }
-        );
+        # Build a runtime binary linked against `pythonEnv`. PyO3 picks up the
+        # interpreter via `PYO3_PYTHON`; the embedded REPL loads its
+        # `libpython3.so` from the same store path at runtime.
+        mkRuntime =
+          {
+            pname,
+            pythonEnv,
+          }:
+          craneLib.buildPackage (
+            (mkCommonArgs pythonEnv)
+            // {
+              inherit cargoArtifacts pname;
+              cargoExtraArgs = "--package neuromance-runtime --features python-repl";
+              meta = runtimeMeta;
+            }
+          );
 
-        neuromance-runtime-toolkit = craneLib.buildPackage (
-          commonArgs
-          // {
-            inherit cargoArtifacts;
-            pname = "neuromance-runtime-toolkit";
-            cargoExtraArgs = "--package neuromance-runtime --features python-repl";
-            meta = runtimeMeta;
-          }
-        );
+        # Bundle a pre-built `neuromance-runtime` binary with its matching
+        # `pythonEnv` into a container image. The runtime and pythonEnv must
+        # have been built together so the dlopened libpython matches.
+        mkRuntimeImage =
+          {
+            runtime,
+            pythonEnv,
+            variant ? "minimal",
+            extraTools ? [ ],
+            includeShell ? false,
+          }:
+          import ./image.nix {
+            inherit
+              pkgs
+              version
+              variant
+              extraTools
+              includeShell
+              pythonEnv
+              ;
+            neuromance-runtime = runtime;
+          };
 
-        neuromanceImage = import ./image.nix {
-          inherit pkgs neuromance-runtime version;
-          variant = "minimal";
-        };
+        # Convenience: build runtime + image together from a `pythonPackages`
+        # selector. Returns `{ runtime, image }`.
+        mkRuntimeBundle =
+          {
+            variant ? "minimal",
+            pythonPackages ? defaultPythonPackages,
+            extraTools ? [ ],
+            includeShell ? false,
+          }:
+          let
+            pythonEnv = pkgs.python3.withPackages pythonPackages;
+            runtime = mkRuntime {
+              pname = "neuromance-runtime-${variant}";
+              inherit pythonEnv;
+            };
+          in
+          {
+            inherit runtime;
+            image = mkRuntimeImage {
+              inherit
+                runtime
+                pythonEnv
+                variant
+                extraTools
+                includeShell
+                ;
+            };
+          };
+
+        minimalBundle = mkRuntimeBundle { variant = "minimal"; };
 
         toolkitTools = with pkgs; [
           busybox
@@ -140,13 +191,16 @@
           python3
         ];
 
-        neuromanceImageToolkit = import ./image.nix {
-          inherit pkgs version;
-          neuromance-runtime = neuromance-runtime-toolkit;
+        toolkitBundle = mkRuntimeBundle {
           variant = "toolkit";
           extraTools = toolkitTools;
           includeShell = true;
         };
+
+        neuromance-runtime = minimalBundle.runtime;
+        neuromance-runtime-toolkit = toolkitBundle.runtime;
+        neuromanceImage = minimalBundle.image;
+        neuromanceImageToolkit = toolkitBundle.image;
 
         mkLoad = image: variant: pkgs.writeShellScriptBin "load-${variant}" ''
           set -euo pipefail
@@ -201,6 +255,20 @@
           default = neuromance;
         };
 
+        # Exposed for downstream flakes that want to bundle additional Python
+        # packages into the runtime image:
+        #
+        #   neuromance.lib.${system}.mkRuntimeBundle {
+        #     variant = "data-science";
+        #     pythonPackages = ps: with ps; [ requests numpy pandas ];
+        #   }
+        #
+        # Returns `{ runtime, image }`. Use `mkRuntime` / `mkRuntimeImage`
+        # directly for finer-grained control.
+        lib = {
+          inherit mkRuntime mkRuntimeImage mkRuntimeBundle;
+        };
+
         apps = {
           fmt = {
             type = "app";
@@ -246,7 +314,9 @@
 
         devShells.default = craneLib.devShell {
           checks = self.checks.${system};
-          packages = with pkgs; [
+          packages = [
+            defaultPythonEnv
+          ] ++ (with pkgs; [
             cargo-watch
             cargo-edit
             cargo-outdated
@@ -255,11 +325,10 @@
             just
             skopeo
             dive
-            python
-          ];
+          ]);
 
           RUST_BACKTRACE = "1";
-          PYO3_PYTHON = "${python}/bin/python3";
+          PYO3_PYTHON = "${defaultPythonEnv}/bin/python3";
         };
 
         formatter = pkgs.nixpkgs-fmt;
