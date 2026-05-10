@@ -313,6 +313,7 @@ mod tests {
         assert!(parsed["stdout"].as_str().unwrap().contains("hello"));
         assert!(parsed["execution_time_ms"].is_number());
         assert!(parsed.get("return_value").is_some());
+        assert!(parsed.get("stderr").is_none());
     }
 
     #[tokio::test]
@@ -329,6 +330,8 @@ mod tests {
                 .contains("ZeroDivisionError")
         );
         assert!(parsed["execution_time_ms"].is_number());
+        assert!(parsed.get("stdout").is_none());
+        assert!(parsed.get("return_value").is_none());
     }
 
     #[test]
