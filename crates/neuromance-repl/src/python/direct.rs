@@ -904,11 +904,9 @@ for i in range(1, 11):
 
         let repl = PythonRepl::new().unwrap();
 
-        // Counter to track how many times the callback is created
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count_clone = Arc::clone(&call_count);
 
-        // Inject a callback that tracks creation
         repl.inject_function(
             "track_calls",
             Box::new(move |args: Vec<String>, _kwargs: HashMap<String, String>| {
@@ -921,32 +919,49 @@ for i in range(1, 11):
         )
         .unwrap();
 
-        // Execute multiple times - callback should only be injected once
+        // Capture id(track_calls) on every execute. If the gate in
+        // inject_callbacks_if_needed regressed and rebuilt the
+        // PyCFunction each call, these ids would diverge.
         for i in 0..5 {
-            let _ = repl
-                .execute(&format!("result_{i} = track_calls('test_{i}')"))
-                .await
-                .unwrap();
+            let code =
+                format!("result_{i} = track_calls('test_{i}')\ntrack_id_{i} = id(track_calls)");
+            let _ = repl.execute(&code).await.unwrap();
         }
 
-        // Verify all calls succeeded
+        let id0 = repl.get_variable("track_id_0").await.unwrap();
+        assert!(id0.is_some(), "track_id_0 should have been bound");
+        for i in 1..5 {
+            let id_i = repl.get_variable(&format!("track_id_{i}")).await.unwrap();
+            assert_eq!(
+                id_i, id0,
+                "track_calls was re-injected on execute #{i}; \
+                 expected the same PyCFunction across calls"
+            );
+        }
+
         for i in 0..5 {
             let var = repl.get_variable(&format!("result_{i}")).await.unwrap();
             assert!(var.is_some());
             assert!(var.unwrap().contains(&format!("test_{i}")));
         }
-
-        // Callback was called 5 times
         assert_eq!(call_count.load(Ordering::SeqCst), 5);
 
-        // After reset, callbacks should be re-injected on next execute
         repl.reset().await.unwrap();
 
-        // Execute again - callback should be re-injected
         let _ = repl
-            .execute("result_after_reset = track_calls('after_reset')")
+            .execute(
+                "result_after_reset = track_calls('after_reset')\n\
+                 track_id_after_reset = id(track_calls)",
+            )
             .await
             .unwrap();
+
+        let id_after_reset = repl.get_variable("track_id_after_reset").await.unwrap();
+        assert!(id_after_reset.is_some());
+        assert_ne!(
+            id_after_reset, id0,
+            "reset() did not force re-injection; PyCFunction id was unchanged"
+        );
 
         let var = repl.get_variable("result_after_reset").await.unwrap();
         assert!(var.unwrap().contains("after_reset"));
