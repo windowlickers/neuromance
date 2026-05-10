@@ -46,12 +46,12 @@ impl CapturedStreams<'_> {
     /// captured (stdout, stderr) strings.
     pub(super) fn restore(self, py: Python<'_>) -> Result<(String, String), ReplError> {
         let sys_module = py.import("sys").at("import sys (restore)")?;
-        if let Err(e) = sys_module.setattr("stdout", &self.old_stdout) {
-            log::warn!("failed to restore sys.stdout: {e}");
-        }
-        if let Err(e) = sys_module.setattr("stderr", &self.old_stderr) {
-            log::warn!("failed to restore sys.stderr: {e}");
-        }
+        sys_module
+            .setattr("stdout", &self.old_stdout)
+            .at("setattr sys.stdout (restore)")?;
+        sys_module
+            .setattr("stderr", &self.old_stderr)
+            .at("setattr sys.stderr (restore)")?;
 
         let stdout = self
             .stdout_capture
