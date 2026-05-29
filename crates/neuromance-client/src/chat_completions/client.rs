@@ -105,7 +105,6 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures::stream::Stream;
-use log::{debug, error, warn};
 use reqwest_middleware::ClientWithMiddleware;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -114,6 +113,7 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
+use tracing::{debug, error, warn};
 
 use neuromance_common::chat::Message;
 use neuromance_common::client::{ChatChunk, ChatRequest, ChatResponse, Config, ProxyConfig, Usage};
@@ -312,8 +312,6 @@ pub struct ChatCompletionsClient {
     base_url: String,
     config: Arc<Config>,
     proxy_config: Option<ProxyConfig>,
-    /// Target host for proxy routing (derived from `base_url`)
-    target_host: String,
 }
 
 // Custom Debug implementation to avoid exposing API key
@@ -324,7 +322,6 @@ impl std::fmt::Debug for ChatCompletionsClient {
             .field("base_url", &self.base_url)
             .field("config", &self.config)
             .field("proxy_config", &self.proxy_config)
-            .field("target_host", &self.target_host)
             .finish_non_exhaustive()
     }
 }
@@ -342,34 +339,41 @@ pub fn convert_chunk_to_chat_chunk(chunk: &ChatCompletionChunk) -> ChatChunk {
         .and_then(|c| c.finish_reason.as_ref())
         .and_then(|reason| reason.parse().ok());
 
-    // Convert tool call deltas if present
+    // Convert tool call deltas if present.
+    //
+    // OpenAI streaming sends `id`, `type`, and `function.name` only in the
+    // first chunk for a given tool call; subsequent chunks carry only `index`
+    // and an `arguments` fragment. We must propagate every chunk (including
+    // those without an `id`) and tag each with `delta.index` so that
+    // `ToolCall::merge_deltas` can stitch fragments by slot.
     let delta_tool_calls =
         choice
             .and_then(|c| c.delta.tool_calls.as_ref())
             .map(|tool_call_deltas| {
-                // Pre-allocate capacity based on the number of deltas in this chunk
-                // This avoids reallocations during collection
                 let mut result = Vec::with_capacity(tool_call_deltas.len());
 
                 for delta in tool_call_deltas {
-                    // We need at least an ID to create a ToolCall
-                    if let Some(id) = delta.id.as_ref() {
-                        let call_type = delta
-                            .r#type
-                            .clone()
-                            .unwrap_or_else(|| "function".to_string());
+                    let id = delta.id.clone().unwrap_or_default();
+                    let call_type = delta
+                        .r#type
+                        .clone()
+                        .unwrap_or_else(|| "function".to_string());
+                    let (name, arguments) = delta.function.as_ref().map_or_else(
+                        || (String::new(), String::new()),
+                        |f| {
+                            (
+                                f.name.clone().unwrap_or_default(),
+                                f.arguments.clone().unwrap_or_default(),
+                            )
+                        },
+                    );
 
-                        if let Some(function) = delta.function.as_ref() {
-                            let name = function.name.clone().unwrap_or_default();
-                            let arguments = function.arguments.clone().unwrap_or_default();
-
-                            result.push(ToolCall {
-                                id: id.clone(),
-                                call_type,
-                                function: FunctionCall { name, arguments },
-                            });
-                        }
-                    }
+                    result.push(ToolCall {
+                        id,
+                        call_type,
+                        function: FunctionCall { name, arguments },
+                        index: Some(delta.index),
+                    });
                 }
 
                 result
@@ -434,7 +438,6 @@ impl ChatCompletionsClient {
     ///     .with_proxy(ProxyConfig {
     ///         proxy_url: "http://tokenizer.internal:8080".to_string(),
     ///         token_header: "X-Tokenizer-Token".to_string(),
-    ///         target_host_header: Some("X-Target-Host".to_string()),
     ///     });
     ///
     /// let client = ChatCompletionsClient::new(config)?;
@@ -454,7 +457,6 @@ impl ChatCompletionsClient {
             base_url: r.base_url,
             config: r.config,
             proxy_config: r.proxy_config,
-            target_host: r.target_host,
         })
     }
 
@@ -506,12 +508,8 @@ impl ChatCompletionsClient {
             .header("Content-Type", "application/json");
 
         // Add proxy headers if configured
-        request_builder = add_proxy_headers(
-            request_builder,
-            self.proxy_config.as_ref(),
-            &self.api_key,
-            &self.target_host,
-        );
+        request_builder =
+            add_proxy_headers(request_builder, self.proxy_config.as_ref(), &self.api_key);
 
         let response = request_builder
             .body(serde_json::to_string(body).map_err(ClientError::SerializationError)?)
@@ -599,6 +597,7 @@ impl ChatCompletionsClient {
                         name: tc.function.name.to_string(),
                         arguments: tc.function.arguments.to_string(),
                     },
+                    index: None,
                 });
             }
         }
@@ -711,12 +710,8 @@ impl LLMClient for ChatCompletionsClient {
             )
             .header("Content-Type", "application/json");
 
-        request_builder = add_proxy_headers(
-            request_builder,
-            self.proxy_config.as_ref(),
-            &self.api_key,
-            &self.target_host,
-        );
+        request_builder =
+            add_proxy_headers(request_builder, self.proxy_config.as_ref(), &self.api_key);
 
         let request_builder = request_builder.json(&chat_request);
 
@@ -1150,11 +1145,12 @@ mod tests {
     async fn test_proxy_headers_sent() {
         let mock_server = MockServer::start().await;
 
-        // Verify proxy headers are sent with correct values
+        // Verify the sealed-token header is sent and the upstream path
+        // (including the `/v1` prefix from the default base URL) is preserved
+        // when reqwest routes requests through the forward proxy.
         Mock::given(method("POST"))
-            .and(path("/chat/completions"))
+            .and(path("/v1/chat/completions"))
             .and(header("X-Tokenizer-Token", "sealed.test-token"))
-            .and(header("X-Target-Host", "api.openai.com"))
             .respond_with(ResponseTemplate::new(200).set_body_json(create_successful_response()))
             .expect(1)
             .mount(&mock_server)
@@ -1165,7 +1161,6 @@ mod tests {
             .with_proxy(ProxyConfig {
                 proxy_url: mock_server.uri(),
                 token_header: "X-Tokenizer-Token".to_string(),
-                target_host_header: Some("X-Target-Host".to_string()),
             });
 
         let client = ChatCompletionsClient::new(config).unwrap();
@@ -1178,14 +1173,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_proxy_with_custom_headers() {
+    async fn test_proxy_with_custom_token_header() {
         let mock_server = MockServer::start().await;
 
-        // Use custom header names
+        // Use a custom token header name; the upstream host is in the URL,
+        // not a side-band header, so no target-host header is expected.
         Mock::given(method("POST"))
-            .and(path("/chat/completions"))
+            .and(path("/v1/chat/completions"))
             .and(header("X-Custom-Token", "sealed.custom-token"))
-            .and(header("X-Custom-Target", "api.openai.com"))
             .respond_with(ResponseTemplate::new(200).set_body_json(create_successful_response()))
             .expect(1)
             .mount(&mock_server)
@@ -1196,37 +1191,6 @@ mod tests {
             .with_proxy(ProxyConfig {
                 proxy_url: mock_server.uri(),
                 token_header: "X-Custom-Token".to_string(),
-                target_host_header: Some("X-Custom-Target".to_string()),
-            });
-
-        let client = ChatCompletionsClient::new(config).unwrap();
-
-        let message = create_test_message();
-        let request = ChatRequest::new(vec![message]);
-
-        let response = client.chat(&request).await.unwrap();
-        assert_eq!(response.message.content, "Response via proxy");
-    }
-
-    #[tokio::test]
-    async fn test_proxy_without_target_host_header() {
-        let mock_server = MockServer::start().await;
-
-        // Target host header is optional - verify request works without it
-        Mock::given(method("POST"))
-            .and(path("/chat/completions"))
-            .and(header("X-Tokenizer-Token", "sealed.no-target"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(create_successful_response()))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let config = Config::new("openai", "gpt-4")
-            .with_api_key("sealed.no-target")
-            .with_proxy(ProxyConfig {
-                proxy_url: mock_server.uri(),
-                token_header: "X-Tokenizer-Token".to_string(),
-                target_host_header: None, // No target host header
             });
 
         let client = ChatCompletionsClient::new(config).unwrap();
@@ -1281,9 +1245,8 @@ mod tests {
 
         // Verify proxy headers are sent on the streaming path
         Mock::given(method("POST"))
-            .and(path("/chat/completions"))
+            .and(path("/v1/chat/completions"))
             .and(header("X-Tokenizer-Token", "sealed.test-token"))
-            .and(header("X-Target-Host", "api.openai.com"))
             .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
             .expect(1)
             .mount(&mock_server)
@@ -1294,7 +1257,6 @@ mod tests {
             .with_proxy(ProxyConfig {
                 proxy_url: mock_server.uri(),
                 token_header: "X-Tokenizer-Token".to_string(),
-                target_host_header: Some("X-Target-Host".to_string()),
             });
 
         let client = ChatCompletionsClient::new(config).unwrap();
@@ -1318,14 +1280,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_proxy_extracts_target_host_from_custom_base_url() {
+    async fn test_proxy_preserves_custom_base_url_path() {
         let mock_server = MockServer::start().await;
 
-        // When using a custom base URL, the target host should be extracted from it
+        // With a custom base URL like `https://host/v1`, the forward proxy
+        // should still receive the full upstream path in absolute form.
         Mock::given(method("POST"))
-            .and(path("/chat/completions"))
+            .and(path("/v1/chat/completions"))
             .and(header("X-Tokenizer-Token", "sealed.custom-base"))
-            .and(header("X-Target-Host", "custom.api.example.com"))
             .respond_with(ResponseTemplate::new(200).set_body_json(create_successful_response()))
             .expect(1)
             .mount(&mock_server)
@@ -1337,7 +1299,6 @@ mod tests {
             .with_proxy(ProxyConfig {
                 proxy_url: mock_server.uri(),
                 token_header: "X-Tokenizer-Token".to_string(),
-                target_host_header: Some("X-Target-Host".to_string()),
             });
 
         let client = ChatCompletionsClient::new(config).unwrap();
@@ -1347,6 +1308,192 @@ mod tests {
 
         let response = client.chat(&request).await.unwrap();
         assert_eq!(response.message.content, "Response via proxy");
+    }
+
+    /// Reproduces the canonical `OpenAI` streaming shape where `id`, `type`, and
+    /// `function.name` are sent only in the first chunk for a given tool call,
+    /// and subsequent chunks carry just `index` plus a fragment of `arguments`.
+    /// Before this regression test, the converter dropped every non-first chunk
+    /// because it gated emission on `delta.id.is_some()`, leaving the
+    /// downstream tool dispatcher with empty arguments.
+    #[test]
+    fn test_convert_chunk_stitches_streamed_tool_call_arguments() {
+        // Frame 1: id + name + opening of args.
+        // Frames 2-4: arguments-only deltas (no id, no name) — the case that
+        // used to be silently dropped.
+        let chunks_json = [
+            r#"{
+                "id": "chatcmpl-1",
+                "object": "chat.completion.chunk",
+                "created": 1700000000,
+                "model": "qwen3",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_abc",
+                            "type": "function",
+                            "function": {"name": "bash", "arguments": "{\""}
+                        }]
+                    },
+                    "finish_reason": null
+                }]
+            }"#,
+            r#"{
+                "id": "chatcmpl-1",
+                "object": "chat.completion.chunk",
+                "created": 1700000000,
+                "model": "qwen3",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "function": {"arguments": "command\": "}
+                        }]
+                    },
+                    "finish_reason": null
+                }]
+            }"#,
+            r#"{
+                "id": "chatcmpl-1",
+                "object": "chat.completion.chunk",
+                "created": 1700000000,
+                "model": "qwen3",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "function": {"arguments": "\"ls /\""}
+                        }]
+                    },
+                    "finish_reason": null
+                }]
+            }"#,
+            r#"{
+                "id": "chatcmpl-1",
+                "object": "chat.completion.chunk",
+                "created": 1700000000,
+                "model": "qwen3",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "function": {"arguments": "}"}
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }]
+            }"#,
+        ];
+
+        let mut tool_calls: Vec<neuromance_common::tools::ToolCall> = Vec::new();
+        for raw in chunks_json {
+            let chunk: ChatCompletionChunk =
+                serde_json::from_str(raw).expect("test chunk should deserialize");
+            let chat_chunk = convert_chunk_to_chat_chunk(&chunk);
+            if let Some(deltas) = chat_chunk.delta_tool_calls.as_deref() {
+                tool_calls = neuromance_common::tools::ToolCall::merge_deltas(tool_calls, deltas);
+            }
+        }
+
+        assert_eq!(tool_calls.len(), 1, "should stitch into a single tool call");
+        let merged = &tool_calls[0];
+        assert_eq!(merged.id, "call_abc");
+        assert_eq!(merged.function.name, "bash");
+        assert_eq!(merged.function.arguments, r#"{"command": "ls /"}"#);
+        // Round-trip the merged arguments to ensure they form valid JSON object
+        // ready for the tool dispatcher (which calls `as_object()`).
+        let parsed: serde_json::Value =
+            serde_json::from_str(&merged.function.arguments).expect("merged args must be JSON");
+        assert!(parsed.is_object());
+        assert_eq!(parsed["command"], "ls /");
+    }
+
+    /// Parallel tool calls arrive interleaved across chunks with distinct
+    /// `index` values; only the first chunk per index carries `id`/`name`.
+    #[test]
+    fn test_convert_chunk_stitches_parallel_streamed_tool_calls() {
+        let chunks_json = [
+            // First chunk opens both slots in one frame.
+            r#"{
+                "id": "chatcmpl-2",
+                "object": "chat.completion.chunk",
+                "created": 1700000000,
+                "model": "qwen3",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {"index": 0, "id": "call_a", "type": "function",
+                             "function": {"name": "read", "arguments": "{\"p"}},
+                            {"index": 1, "id": "call_b", "type": "function",
+                             "function": {"name": "bash", "arguments": "{\"c"}}
+                        ]
+                    },
+                    "finish_reason": null
+                }]
+            }"#,
+            // Subsequent frames extend each slot independently.
+            r#"{
+                "id": "chatcmpl-2",
+                "object": "chat.completion.chunk",
+                "created": 1700000000,
+                "model": "qwen3",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {"index": 0, "function": {"arguments": "ath\": \"/etc\"}"}}
+                        ]
+                    },
+                    "finish_reason": null
+                }]
+            }"#,
+            r#"{
+                "id": "chatcmpl-2",
+                "object": "chat.completion.chunk",
+                "created": 1700000000,
+                "model": "qwen3",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {"index": 1, "function": {"arguments": "ommand\": \"ls\"}"}}
+                        ]
+                    },
+                    "finish_reason": "tool_calls"
+                }]
+            }"#,
+        ];
+
+        let mut tool_calls: Vec<neuromance_common::tools::ToolCall> = Vec::new();
+        for raw in chunks_json {
+            let chunk: ChatCompletionChunk =
+                serde_json::from_str(raw).expect("test chunk should deserialize");
+            let chat_chunk = convert_chunk_to_chat_chunk(&chunk);
+            if let Some(deltas) = chat_chunk.delta_tool_calls.as_deref() {
+                tool_calls = neuromance_common::tools::ToolCall::merge_deltas(tool_calls, deltas);
+            }
+        }
+
+        assert_eq!(tool_calls.len(), 2);
+        let by_id: std::collections::HashMap<_, _> =
+            tool_calls.iter().map(|tc| (tc.id.as_str(), tc)).collect();
+        assert_eq!(
+            by_id["call_a"].function.arguments, r#"{"path": "/etc"}"#,
+            "slot 0 should accumulate independently of slot 1",
+        );
+        assert_eq!(
+            by_id["call_b"].function.arguments, r#"{"command": "ls"}"#,
+            "slot 1 should accumulate independently of slot 0",
+        );
+        assert_eq!(by_id["call_a"].function.name, "read");
+        assert_eq!(by_id["call_b"].function.name, "bash");
     }
 }
 

@@ -64,7 +64,7 @@ fn parse_reasoning_level(s: &str) -> ReasoningLevel {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::init();
+    tracing_subscriber::fmt::init();
 
     let args = Args::parse();
 

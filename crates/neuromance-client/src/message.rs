@@ -195,6 +195,7 @@ mod tests {
                 name: "f".into(),
                 arguments: "{}".into(),
             },
+            index: None,
         });
         b.push_tool_call(ToolCall {
             id: "b".into(),
@@ -203,6 +204,7 @@ mod tests {
                 name: "g".into(),
                 arguments: "{}".into(),
             },
+            index: None,
         });
         let msg = b.build();
         assert_eq!(msg.tool_calls.len(), 2);

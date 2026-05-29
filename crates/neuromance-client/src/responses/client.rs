@@ -5,13 +5,13 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures::stream::Stream;
-use log::{debug, error, warn};
 use reqwest_middleware::ClientWithMiddleware;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
+use tracing::{debug, error, warn};
 
 use neuromance_common::chat::MessageRole;
 use neuromance_common::client::{ChatChunk, ChatRequest, ChatResponse, Config, Usage};
@@ -414,6 +414,7 @@ fn convert_event_to_chunk(
                     name: function_name,
                     arguments,
                 },
+                index: None,
             };
 
             Some(Ok(ChatChunk {

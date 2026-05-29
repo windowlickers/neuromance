@@ -921,6 +921,7 @@ impl StreamingToolCall {
                 name: self.name,
                 arguments: input.to_string(),
             },
+            index: None,
         })
     }
 }

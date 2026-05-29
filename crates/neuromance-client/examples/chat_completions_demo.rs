@@ -227,7 +227,7 @@ fn execute_tool(name: &str, arguments: &str, todos: &mut Vec<TodoItem>) -> Resul
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::init();
+    tracing_subscriber::fmt::init();
 
     let args = Args::parse();
 

@@ -30,12 +30,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::prelude::*;
-use log::{debug, error, warn};
 use reqwest_middleware::ClientWithMiddleware;
 use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
 use reqwest_retry_after::RetryAfterMiddleware;
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
+use tracing::{debug, error, warn};
 
 use crate::embedding::{
     Embedding, EmbeddingClient, EmbeddingConfig, EmbeddingInput, EmbeddingRequest,
@@ -232,8 +232,9 @@ impl OpenAIEmbedding {
             None => reqwest::Client::builder().build()?,
         };
 
-        // Create client with retry middleware
+        // Create client with retry middleware (logging first so it sees every attempt).
         let client = reqwest_middleware::ClientBuilder::new(reqwest_client)
+            .with(crate::retry_logging::RetryLoggingMiddleware)
             .with(RetryAfterMiddleware::new())
             .with(RetryTransientMiddleware::new_with_policy(retry_policy))
             .build();

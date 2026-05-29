@@ -48,12 +48,12 @@
 use async_trait::async_trait;
 use chrono::Utc;
 use futures::stream::Stream;
-use log::{debug, error, warn};
 use reqwest_middleware::ClientWithMiddleware;
 use secrecy::{ExposeSecret, SecretString};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
+use tracing::{debug, error, warn};
 
 use neuromance_common::chat::{Message, MessageRole};
 use neuromance_common::client::{ChatChunk, ChatRequest, ChatResponse, Config, ProxyConfig, Usage};
@@ -93,8 +93,6 @@ pub struct AnthropicClient {
     base_url: String,
     config: Arc<Config>,
     proxy_config: Option<ProxyConfig>,
-    /// Target host for proxy routing (derived from `base_url`)
-    target_host: String,
 }
 
 impl std::fmt::Debug for AnthropicClient {
@@ -104,7 +102,6 @@ impl std::fmt::Debug for AnthropicClient {
             .field("base_url", &self.base_url)
             .field("config", &self.config)
             .field("proxy_config", &self.proxy_config)
-            .field("target_host", &self.target_host)
             .finish_non_exhaustive()
     }
 }
@@ -144,7 +141,6 @@ impl AnthropicClient {
     ///     .with_proxy(ProxyConfig {
     ///         proxy_url: "http://tokenizer.internal:8080".to_string(),
     ///         token_header: "X-Tokenizer-Token".to_string(),
-    ///         target_host_header: Some("X-Target-Host".to_string()),
     ///     });
     ///
     /// let client = AnthropicClient::new(config)?;
@@ -164,7 +160,6 @@ impl AnthropicClient {
             base_url: r.base_url,
             config: r.config,
             proxy_config: r.proxy_config,
-            target_host: r.target_host,
         })
     }
 
@@ -214,12 +209,8 @@ impl AnthropicClient {
         }
 
         // Add proxy headers if configured
-        request_builder = add_proxy_headers(
-            request_builder,
-            self.proxy_config.as_ref(),
-            &self.api_key,
-            &self.target_host,
-        );
+        request_builder =
+            add_proxy_headers(request_builder, self.proxy_config.as_ref(), &self.api_key);
 
         let response = request_builder
             .body(serde_json::to_string(body).map_err(ClientError::SerializationError)?)
@@ -290,6 +281,7 @@ impl AnthropicClient {
                             name: name.clone(),
                             arguments: input.to_string(),
                         },
+                        index: None,
                     });
                 }
                 ResponseContentBlock::Thinking {
@@ -566,12 +558,8 @@ impl LLMClient for AnthropicClient {
             request_builder = request_builder.header("anthropic-beta", INTERLEAVED_THINKING_BETA);
         }
 
-        request_builder = add_proxy_headers(
-            request_builder,
-            self.proxy_config.as_ref(),
-            &self.api_key,
-            &self.target_host,
-        );
+        request_builder =
+            add_proxy_headers(request_builder, self.proxy_config.as_ref(), &self.api_key);
 
         let request_builder = request_builder.json(&anthropic_request);
 
@@ -1352,6 +1340,7 @@ mod tests {
                 name: "calculate".to_string(),
                 arguments: r#"{"expression":"2+2"}"#.to_string(),
             },
+            index: None,
         });
 
         let assistant_message = Message {
@@ -1550,7 +1539,6 @@ mod tests {
             .with_proxy(ProxyConfig {
                 proxy_url: proxy_url.to_string(),
                 token_header: "X-Tokenizer-Token".to_string(),
-                target_host_header: Some("X-Target-Host".to_string()),
             })
     }
 
@@ -1576,11 +1564,12 @@ mod tests {
     async fn test_proxy_headers_sent() {
         let mock_server = MockServer::start().await;
 
-        // Verify proxy headers are sent with correct values
+        // Verify the sealed-token header is sent and the upstream path
+        // (including the `/v1` prefix from the default base URL) is preserved
+        // when reqwest routes requests through the forward proxy.
         Mock::given(method("POST"))
-            .and(path("/messages"))
+            .and(path("/v1/messages"))
             .and(header("X-Tokenizer-Token", "sealed.test-token"))
-            .and(header("X-Target-Host", "api.anthropic.com"))
             .respond_with(ResponseTemplate::new(200).set_body_json(create_successful_response()))
             .expect(1)
             .mount(&mock_server)
@@ -1597,14 +1586,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_proxy_with_custom_headers() {
+    async fn test_proxy_with_custom_token_header() {
         let mock_server = MockServer::start().await;
 
-        // Use custom header names
+        // Use a custom token header name; the upstream host is in the URL,
+        // not a side-band header, so no target-host header is expected.
         Mock::given(method("POST"))
-            .and(path("/messages"))
+            .and(path("/v1/messages"))
             .and(header("X-Custom-Token", "sealed.custom-token"))
-            .and(header("X-Custom-Target", "api.anthropic.com"))
             .respond_with(ResponseTemplate::new(200).set_body_json(create_successful_response()))
             .expect(1)
             .mount(&mock_server)
@@ -1615,37 +1604,6 @@ mod tests {
             .with_proxy(ProxyConfig {
                 proxy_url: mock_server.uri(),
                 token_header: "X-Custom-Token".to_string(),
-                target_host_header: Some("X-Custom-Target".to_string()),
-            });
-
-        let client = AnthropicClient::new(config).unwrap();
-
-        let message = create_test_message();
-        let request = ChatRequest::new(vec![message]).with_max_tokens(1024);
-
-        let response = client.chat(&request).await.unwrap();
-        assert_eq!(response.message.content, "Response via proxy");
-    }
-
-    #[tokio::test]
-    async fn test_proxy_without_target_host_header() {
-        let mock_server = MockServer::start().await;
-
-        // Target host header is optional - verify request works without it
-        Mock::given(method("POST"))
-            .and(path("/messages"))
-            .and(header("X-Tokenizer-Token", "sealed.no-target"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(create_successful_response()))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let config = Config::new("anthropic", "claude-sonnet-4-5-20250929")
-            .with_api_key("sealed.no-target")
-            .with_proxy(ProxyConfig {
-                proxy_url: mock_server.uri(),
-                token_header: "X-Tokenizer-Token".to_string(),
-                target_host_header: None, // No target host header
             });
 
         let client = AnthropicClient::new(config).unwrap();
@@ -1725,9 +1683,8 @@ mod tests {
 
         // Verify proxy headers are sent on the streaming path
         Mock::given(method("POST"))
-            .and(path("/messages"))
+            .and(path("/v1/messages"))
             .and(header("X-Tokenizer-Token", "sealed.test-token"))
-            .and(header("X-Target-Host", "api.anthropic.com"))
             .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
             .expect(1)
             .mount(&mock_server)
@@ -1755,14 +1712,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_proxy_extracts_target_host_from_custom_base_url() {
+    async fn test_proxy_preserves_custom_base_url_path() {
         let mock_server = MockServer::start().await;
 
-        // When using a custom base URL, the target host should be extracted from it
+        // With a custom base URL like `https://host/v1`, the forward proxy
+        // should still receive the full upstream path in absolute form.
         Mock::given(method("POST"))
-            .and(path("/messages"))
+            .and(path("/v1/messages"))
             .and(header("X-Tokenizer-Token", "sealed.custom-base"))
-            .and(header("X-Target-Host", "custom.api.example.com"))
             .respond_with(ResponseTemplate::new(200).set_body_json(create_successful_response()))
             .expect(1)
             .mount(&mock_server)
@@ -1774,7 +1731,6 @@ mod tests {
             .with_proxy(ProxyConfig {
                 proxy_url: mock_server.uri(),
                 token_header: "X-Tokenizer-Token".to_string(),
-                target_host_header: Some("X-Target-Host".to_string()),
             });
 
         let client = AnthropicClient::new(config).unwrap();

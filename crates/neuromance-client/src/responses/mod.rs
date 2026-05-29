@@ -5,8 +5,8 @@
 
 use std::collections::HashMap;
 
-use log::warn;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 use typed_builder::TypedBuilder;
 
 use neuromance_common::chat::{Message, MessageRole};
@@ -45,9 +45,9 @@ impl From<MessageRole> for ResponsesRole {
             // not mapped to a role. This fallback exists for safety but indicates
             // a bug in the calling code if reached.
             other => {
-                log::warn!(
-                    "Unexpected role {other:?} converted to ResponsesRole::User; \
-                     Tool messages should use InputItem::FunctionCallOutput instead"
+                warn!(
+                    role = ?other,
+                    "unexpected role converted to ResponsesRole::User; tool messages should use InputItem::FunctionCallOutput",
                 );
                 Self::User
             }
@@ -937,6 +937,7 @@ impl StreamingFunctionCall {
                 name: self.name,
                 arguments,
             },
+            index: None,
         }
     }
 }
@@ -977,6 +978,7 @@ pub fn convert_response_to_message(
                         name: name.clone(),
                         arguments: arguments.clone(),
                     },
+                    index: None,
                 });
             }
             OutputItem::Reasoning {

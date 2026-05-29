@@ -22,18 +22,22 @@ impl WithHeader for reqwest_middleware::RequestBuilder {
     }
 }
 
-/// Adds proxy headers to a request builder if proxy is configured.
+/// Adds the sealed-token header to a request when proxy mode is active.
+///
+/// The proxy URL is configured on the underlying `reqwest::Client` so the
+/// transport itself routes requests through the proxy in forward-proxy
+/// (absolute-form) mode; the upstream target host therefore travels in the
+/// request URL, not a side-band header. This function only needs to attach
+/// the sealed-token header so the proxy can decrypt and inject the real
+/// upstream credential.
 pub fn add_proxy_headers<B: WithHeader>(
-    mut builder: B,
+    builder: B,
     proxy_config: Option<&ProxyConfig>,
     api_key: &SecretString,
-    target_host: &str,
 ) -> B {
     if let Some(proxy) = proxy_config {
-        builder = builder.header(&proxy.token_header, api_key.expose_secret());
-        if let Some(ref host_header) = proxy.target_host_header {
-            builder = builder.header(host_header, target_host);
-        }
+        builder.header(&proxy.token_header, api_key.expose_secret())
+    } else {
+        builder
     }
-    builder
 }

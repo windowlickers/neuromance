@@ -9,9 +9,9 @@
 use std::pin::Pin;
 
 use futures::{Stream, StreamExt};
-use log::{debug, error, warn};
 use reqwest_eventsource::{Event, EventSource};
 use serde::de::DeserializeOwned;
+use tracing::{debug, error, warn};
 
 use neuromance_common::client::ChatChunk;
 

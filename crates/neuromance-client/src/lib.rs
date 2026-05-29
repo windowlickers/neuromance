@@ -29,6 +29,7 @@ pub mod embedding;
 mod error;
 pub(crate) mod message;
 pub mod responses;
+pub(crate) mod retry_logging;
 pub(crate) mod streaming;
 pub(crate) mod transport;
 
@@ -54,19 +55,26 @@ pub(crate) struct ClientResources {
     pub base_url: String,
     pub config: Arc<Config>,
     pub proxy_config: Option<ProxyConfig>,
-    pub target_host: String,
 }
 
 /// Build the shared HTTP client resources from a [`Config`].
 ///
-/// Extracts the API key, resolves the base URL (with proxy override),
-/// parses the target host, builds the retry policy, and constructs both
-/// the middleware-wrapped and raw reqwest clients.
+/// Extracts the API key, resolves the base URL, builds the retry policy, and
+/// constructs both the middleware-wrapped and raw reqwest clients.
+///
+/// When a [`ProxyConfig`] is set, the reqwest client is configured as an HTTP
+/// forward proxy client: the base URL's scheme is rewritten to `http://` so
+/// reqwest emits absolute-form requests in cleartext to the proxy (RFC 7230
+/// §5.3.2), and the proxy is attached via [`reqwest::Proxy::http`]. The proxy
+/// then terminates the connection, validates the sealed token, and originates
+/// a fresh upstream connection (scheme controlled by the proxy / its token)
+/// to the real provider. The original upstream authority and path are carried
+/// in the request URL, so no `X-Target-Host` side-band header is needed.
 ///
 /// # Errors
 ///
-/// Returns `ClientError::ConfigurationError` if the API key is missing or the
-/// base URL cannot be parsed into a valid host.
+/// Returns `ClientError::ConfigurationError` if the API key is missing, the
+/// base URL is unparseable, or the proxy URL cannot be parsed by reqwest.
 pub(crate) fn build_client_resources(
     config: Config,
     default_base_url: &str,
@@ -76,28 +84,37 @@ pub(crate) fn build_client_resources(
         .clone()
         .ok_or_else(|| ClientError::ConfigurationError("API key is required".to_string()))?;
 
-    // Determine the original target URL (before any proxy override)
     let original_url = config
         .base_url
         .clone()
         .unwrap_or_else(|| default_base_url.to_string());
 
-    // Extract the host from the original URL for proxy routing
-    let target_host = url::Url::parse(&original_url)
-        .ok()
-        .and_then(|u| u.host_str().map(String::from))
-        .ok_or_else(|| {
-            ClientError::ConfigurationError(format!(
-                "cannot extract host from base URL: {original_url}"
-            ))
-        })?;
+    // In proxy mode, rewrite the base URL scheme to plaintext HTTP. reqwest
+    // tunnels HTTPS proxies via CONNECT — that hides the request from the
+    // proxy and prevents token injection — so the upstream URL must travel
+    // in cleartext absolute-form. The proxy upgrades to TLS itself when
+    // dialing the real upstream.
+    let (base_url, proxy_config) = match config.proxy.as_ref() {
+        Some(proxy) => {
+            let mut url = url::Url::parse(&original_url).map_err(|e| {
+                ClientError::ConfigurationError(format!("invalid base URL '{original_url}': {e}"))
+            })?;
+            url.set_scheme("http").map_err(|()| {
+                ClientError::ConfigurationError(format!(
+                    "cannot rewrite base URL '{original_url}' to http scheme",
+                ))
+            })?;
+            let mut as_str = url.to_string();
+            // url::Url always preserves the trailing slash on the path; trim
+            // it so callers building `{base_url}/{endpoint}` don't double-slash.
+            if as_str.ends_with('/') && url.path() == "/" {
+                as_str.pop();
+            }
+            (as_str, Some(proxy.clone()))
+        }
+        None => (original_url, None),
+    };
 
-    // If proxy configured, use proxy URL; otherwise use the original URL
-    let (base_url, proxy_config) = config.proxy.as_ref().map_or((original_url, None), |proxy| {
-        (proxy.proxy_url.clone(), Some(proxy.clone()))
-    });
-
-    // Build retry policy from config
     let retry_policy = ExponentialBackoff::builder()
         .retry_bounds(
             config.retry_config.initial_delay,
@@ -105,21 +122,25 @@ pub(crate) fn build_client_resources(
         )
         .build_with_max_retries(config.retry_config.max_retries);
 
-    // Create reqwest client with timeout configuration
-    let reqwest_client = match config.timeout_seconds {
-        Some(timeout) => reqwest::Client::builder()
-            .timeout(Duration::from_secs(timeout))
-            .build()
-            .map_err(ClientError::NetworkError)?,
-        None => reqwest::Client::builder()
-            .build()
-            .map_err(ClientError::NetworkError)?,
-    };
+    let mut client_builder = reqwest::Client::builder();
+    if let Some(timeout) = config.timeout_seconds {
+        client_builder = client_builder.timeout(Duration::from_secs(timeout));
+    }
+    if let Some(ref proxy) = proxy_config {
+        let proxy = reqwest::Proxy::http(&proxy.proxy_url).map_err(|e| {
+            ClientError::ConfigurationError(format!("invalid proxy URL '{}': {e}", proxy.proxy_url))
+        })?;
+        client_builder = client_builder.proxy(proxy);
+    }
+    let reqwest_client = client_builder.build().map_err(ClientError::NetworkError)?;
 
-    // Create client with retry middleware
+    // Create client with retry middleware.
     // RetryAfterMiddleware is added before RetryTransientMiddleware
-    // so that Retry-After headers are respected before falling back to exponential backoff
+    // so that Retry-After headers are respected before falling back to exponential backoff.
+    // RetryLoggingMiddleware sits before the retry middleware so it observes
+    // every attempt (including the original).
     let client = reqwest_middleware::ClientBuilder::new(reqwest_client.clone())
+        .with(retry_logging::RetryLoggingMiddleware)
         .with(RetryAfterMiddleware::new())
         .with(RetryTransientMiddleware::new_with_policy(retry_policy))
         .build();
@@ -131,7 +152,6 @@ pub(crate) fn build_client_resources(
         base_url,
         config: Arc::new(config),
         proxy_config,
-        target_host,
     })
 }
 

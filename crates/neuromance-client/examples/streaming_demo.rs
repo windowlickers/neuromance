@@ -3,7 +3,7 @@ use std::io::Write;
 use anyhow::Result;
 use clap::Parser;
 use futures::StreamExt;
-use log::info;
+use tracing::info;
 use uuid::Uuid;
 
 use neuromance_client::{ChatCompletionsClient, LLMClient};
@@ -31,7 +31,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::init();
+    tracing_subscriber::fmt::init();
 
     let args = Args::parse();
 
