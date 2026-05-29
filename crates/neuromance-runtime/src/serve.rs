@@ -227,12 +227,18 @@ fn seed_new_conversation(state: &ServeState) -> Uuid {
 
 /// Resolve a request's `conversation_id`: reuse if it exists, mint and seed
 /// a fresh record if omitted, reject unknown ids.
-fn resolve_conversation(state: &ServeState, requested: Option<Uuid>) -> Result<Uuid, EnqueueError> {
+///
+/// Returns the id and whether a fresh conversation was seeded in this call, so
+/// the caller can roll the seed back if the task ultimately fails to enqueue.
+fn resolve_conversation(
+    state: &ServeState,
+    requested: Option<Uuid>,
+) -> Result<(Uuid, bool), EnqueueError> {
     requested.map_or_else(
-        || Ok(seed_new_conversation(state)),
+        || Ok((seed_new_conversation(state), true)),
         |id| {
             if state.conversations.contains_key(&id) {
-                Ok(id)
+                Ok((id, false))
             } else {
                 Err(EnqueueError::ConversationNotFound(id))
             }
@@ -245,7 +251,7 @@ fn try_enqueue(
     user: String,
     conversation_id: Option<Uuid>,
 ) -> Result<TaskRecord, EnqueueError> {
-    let conversation_id = resolve_conversation(state, conversation_id)?;
+    let (conversation_id, seeded) = resolve_conversation(state, conversation_id)?;
     let task_id = Uuid::new_v4();
     let now = Utc::now();
     let depth = queue_depth(&state.work_tx);
@@ -273,6 +279,9 @@ fn try_enqueue(
         }
         Err(mpsc::error::TrySendError::Full(_)) => {
             state.tasks.remove(&task_id);
+            if seeded {
+                state.conversations.remove(&conversation_id);
+            }
             counter!("neuromance_enqueue_rejections_total", "reason" => "queue_full").increment(1);
             Err(EnqueueError::QueueFull {
                 depth,
@@ -284,6 +293,9 @@ fn try_enqueue(
                 entry.status = TaskStatus::Failed;
                 entry.error = Some("worker shutting down".to_string());
                 entry.updated_at = Utc::now();
+            }
+            if seeded {
+                state.conversations.remove(&conversation_id);
             }
             counter!("neuromance_enqueue_rejections_total", "reason" => "worker_shutdown")
                 .increment(1);
@@ -912,6 +924,11 @@ mod tests {
         assert!(state.tasks.contains_key(&first.id));
         assert!(state.tasks.contains_key(&second.id));
         assert_eq!(state.tasks.len(), 2, "rejected task must not linger");
+        assert_eq!(
+            state.conversations.len(),
+            2,
+            "rejected enqueue must not leak a seeded conversation"
+        );
     }
 
     #[test]
@@ -934,6 +951,10 @@ mod tests {
         };
         assert_eq!(status, TaskStatus::Failed);
         assert_eq!(error.as_deref(), Some("worker shutting down"));
+        assert!(
+            state.conversations.is_empty(),
+            "worker-shutdown rejection must not leak a seeded conversation"
+        );
     }
 
     #[test]
