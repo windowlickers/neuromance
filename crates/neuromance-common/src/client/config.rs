@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::time::Duration;
 
-use log::warn;
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use super::enums::resolve_model_prefix;
 
@@ -72,17 +72,21 @@ impl Default for RetryConfig {
 ///     .expect("Invalid proxy URL");
 /// ```
 ///
-/// Or with all options:
+/// Or overriding the token header:
 ///
 /// ```
 /// use neuromance_common::ProxyConfig;
 ///
-/// let proxy = ProxyConfig::with_options(
+/// let proxy = ProxyConfig::with_token_header(
 ///     "http://tokenizer.internal:8080",
 ///     "X-Tokenizer-Token",
-///     Some("X-Target-Host"),
 /// ).expect("Invalid proxy URL");
 /// ```
+///
+/// The upstream target host is carried in the request URL itself: the LLM
+/// client treats the proxy as an HTTP forward proxy (RFC 7230 §5.3.2
+/// absolute-form), so the proxy decodes the target authority from the request
+/// line. No side-band `X-Target-Host` header is needed or read.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyConfig {
     /// URL of the tokenizer proxy (e.g., `"http://localhost:5000"`).
@@ -93,13 +97,6 @@ pub struct ProxyConfig {
     /// Defaults to `"X-Tokenizer-Token"` when deserialized.
     #[serde(default = "default_token_header")]
     pub token_header: String,
-
-    /// Optional header name for forwarding the original target host.
-    ///
-    /// When set, the proxy can use this to route requests to the correct
-    /// backend API (e.g., `"X-Target-Host"` with value `"api.anthropic.com"`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub target_host_header: Option<String>,
 }
 
 impl ProxyConfig {
@@ -129,17 +126,15 @@ impl ProxyConfig {
         Ok(Self {
             proxy_url,
             token_header: default_token_header(),
-            target_host_header: None,
         })
     }
 
-    /// Creates a new proxy configuration with all options.
+    /// Creates a new proxy configuration with a custom token header.
     ///
     /// # Arguments
     ///
     /// * `proxy_url` - URL of the tokenizer proxy
     /// * `token_header` - Header name for the sealed token
-    /// * `target_host_header` - Optional header name for the target host
     ///
     /// # Errors
     ///
@@ -150,23 +145,20 @@ impl ProxyConfig {
     /// ```
     /// use neuromance_common::ProxyConfig;
     ///
-    /// let proxy = ProxyConfig::with_options(
+    /// let proxy = ProxyConfig::with_token_header(
     ///     "http://tokenizer.internal:8080",
     ///     "X-My-Token",
-    ///     Some("X-Target-Host"),
     /// ).unwrap();
     /// ```
-    pub fn with_options(
+    pub fn with_token_header(
         proxy_url: impl Into<String>,
         token_header: impl Into<String>,
-        target_host_header: Option<impl Into<String>>,
     ) -> anyhow::Result<Self> {
         let proxy_url = proxy_url.into();
         Self::validate_url(&proxy_url)?;
         Ok(Self {
             proxy_url,
             token_header: token_header.into(),
-            target_host_header: target_host_header.map(Into::into),
         })
     }
 
@@ -188,7 +180,6 @@ impl ProxyConfig {
     /// let valid = ProxyConfig {
     ///     proxy_url: "http://localhost:8080".to_string(),
     ///     token_header: "X-Token".to_string(),
-    ///     target_host_header: None,
     /// };
     /// assert!(valid.validate().is_ok());
     ///
@@ -196,7 +187,6 @@ impl ProxyConfig {
     /// let invalid = ProxyConfig {
     ///     proxy_url: "not-a-valid-url".to_string(),
     ///     token_header: "X-Token".to_string(),
-    ///     target_host_header: None,
     /// };
     /// assert!(invalid.validate().is_err());
     /// ```
@@ -222,9 +212,8 @@ impl ProxyConfig {
         // Warn about non-HTTPS proxy URLs
         if scheme == "http" {
             warn!(
-                "Proxy URL '{url}' uses plain HTTP. \
-                 Sealed tokens will be transmitted unencrypted. \
-                 Consider using HTTPS in production."
+                proxy_url = %url,
+                "proxy URL uses plain HTTP; sealed tokens will be transmitted unencrypted",
             );
         }
 
@@ -586,7 +575,6 @@ impl Config {
     ///     .with_proxy(ProxyConfig {
     ///         proxy_url: "http://tokenizer.internal:8080".to_string(),
     ///         token_header: "X-Tokenizer-Token".to_string(),
-    ///         target_host_header: Some("X-Target-Host".to_string()),
     ///     });
     /// // Validation will fail later if proxy_url is invalid
     /// config.validate().unwrap();

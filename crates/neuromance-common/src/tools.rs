@@ -2,8 +2,8 @@
 
 use std::collections::HashMap;
 
-use log::warn;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 use typed_builder::TypedBuilder;
 use uuid::Uuid;
 
@@ -192,7 +192,7 @@ impl From<Parameters> for serde_json::Value {
         match serde_json::to_value(params) {
             Ok(value) => value,
             Err(e) => {
-                warn!("Parameters serialization unexpectedly failed: {e}");
+                warn!(error = %e, "tool parameters serialization unexpectedly failed");
                 Self::Null
             }
         }
@@ -256,6 +256,12 @@ pub struct ToolCall {
     pub function: FunctionCall,
     /// The type of call, typically "function".
     pub call_type: String,
+    /// Streaming-chunk slot index. Set on partial deltas from streaming
+    /// providers that only send `id` in the first chunk per tool call;
+    /// `merge_deltas` uses it to stitch later argument fragments.
+    /// `None` on complete (non-streaming) tool calls.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub index: Option<u32>,
 }
 
 impl ToolCall {
@@ -268,21 +274,40 @@ impl ToolCall {
                 arguments: arguments.into(),
             },
             call_type: "function".to_string(),
+            index: None,
         }
     }
 
-    /// Merges tool call deltas by ID, concatenating argument fragments.
+    /// Merges streaming tool-call deltas, concatenating argument fragments.
     ///
-    /// Used when processing streaming LLM responses where tool calls arrive incrementally.
-    /// Argument fragments are concatenated for matching IDs.
+    /// OpenAI-compatible streaming sends `id` and `function.name` only on the
+    /// first chunk for a given tool call; subsequent chunks carry just `index`
+    /// and an `arguments` fragment. When `index` is set, deltas are stitched
+    /// by index (preserving the id and name captured on the first chunk).
+    /// When `index` is `None` (e.g. non-streaming clients that already
+    /// accumulate internally) deltas are matched by `id` instead.
     #[must_use]
     pub fn merge_deltas(mut accumulated: Vec<Self>, deltas: &[Self]) -> Vec<Self> {
         for delta in deltas {
-            if let Some(existing) = accumulated.iter_mut().find(|tc| tc.id == delta.id) {
+            let existing = if delta.index.is_some() {
+                accumulated.iter_mut().find(|tc| tc.index == delta.index)
+            } else {
+                accumulated.iter_mut().find(|tc| tc.id == delta.id)
+            };
+
+            if let Some(existing) = existing {
                 existing
                     .function
                     .arguments
                     .push_str(&delta.function.arguments);
+                // Late-arriving id/name (rare, but possible if a provider
+                // emits an arguments-only chunk before the metadata chunk).
+                if existing.id.is_empty() && !delta.id.is_empty() {
+                    existing.id.clone_from(&delta.id);
+                }
+                if existing.function.name.is_empty() && !delta.function.name.is_empty() {
+                    existing.function.name.clone_from(&delta.function.name);
+                }
             } else {
                 accumulated.push(delta.clone());
             }
@@ -586,6 +611,7 @@ mod tests {
                     name: "test_function".to_string(),
                     arguments: r#"{"param1": ""#.to_string(),
                 },
+                index: None,
             },
             ToolCall {
                 id: "call_123".to_string(),
@@ -594,6 +620,7 @@ mod tests {
                     name: "test_function".to_string(),
                     arguments: r#"hello", "param2": "#.to_string(),
                 },
+                index: None,
             },
             ToolCall {
                 id: "call_123".to_string(),
@@ -602,6 +629,7 @@ mod tests {
                     name: "test_function".to_string(),
                     arguments: r"123}".to_string(),
                 },
+                index: None,
             },
         ];
 
@@ -636,6 +664,7 @@ mod tests {
                     name: "func1".to_string(),
                     arguments: r#"{"a":"#.to_string(),
                 },
+                index: None,
             },
             ToolCall {
                 id: "call_2".to_string(),
@@ -644,6 +673,7 @@ mod tests {
                     name: "func2".to_string(),
                     arguments: r#"{"b":"#.to_string(),
                 },
+                index: None,
             },
             ToolCall {
                 id: "call_1".to_string(),
@@ -652,6 +682,7 @@ mod tests {
                     name: "func1".to_string(),
                     arguments: r"1}".to_string(),
                 },
+                index: None,
             },
             ToolCall {
                 id: "call_2".to_string(),
@@ -660,6 +691,7 @@ mod tests {
                     name: "func2".to_string(),
                     arguments: r"2}".to_string(),
                 },
+                index: None,
             },
         ];
 
