@@ -110,6 +110,7 @@ mod tests {
                     name: "n".into(),
                     arguments: String::new(),
                 },
+                index: None,
             },
             responder: tx,
         });

@@ -29,8 +29,10 @@
 //! # }
 //! ```
 
-use log::info;
+use std::time::Instant;
+
 use tokio_util::sync::CancellationToken;
+use tracing::info;
 use uuid::Uuid;
 
 use neuromance::Core;
@@ -121,7 +123,32 @@ impl<C: LLMClient + Send + Sync> Agent<C> {
         messages: Option<Vec<Message>>,
         cancel: CancellationToken,
     ) -> Result<AgentResponse, CoreError> {
-        info!("Agent {} executing", self.id);
+        self.execute_with_history(messages, cancel)
+            .await
+            .map(|(response, _)| response)
+    }
+
+    /// Like [`execute`](Self::execute), but also returns the full message
+    /// history produced by [`Core::chat_with_tool_loop`] — including every
+    /// intermediate assistant turn from multi-step tool loops.
+    ///
+    /// Callers that want to drive a long-running conversation pass the returned
+    /// vec back as `Some(messages)` on the next call.
+    ///
+    /// # Errors
+    /// Same conditions as [`execute`](Self::execute).
+    #[tracing::instrument(
+        name = "agent.execute",
+        skip_all,
+        fields(agent_id = %self.id, conversation_id = %self.conversation_id),
+    )]
+    pub async fn execute_with_history(
+        &mut self,
+        messages: Option<Vec<Message>>,
+        cancel: CancellationToken,
+    ) -> Result<(AgentResponse, Vec<Message>), CoreError> {
+        let exec_start = Instant::now();
+        info!("agent executing");
         self.core.tool_choice = self.tool_choice.clone();
 
         let mut messages = messages.unwrap_or_else(|| self.messages.clone());
@@ -165,6 +192,17 @@ impl<C: LLMClient + Send + Sync> Agent<C> {
             self.state.stats.failed_tool_calls += run_stats.failed_tool_calls as usize;
         }
 
+        let duration_ms = u64::try_from(exec_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        info!(
+            duration_ms,
+            turns = run_stats.cache_metrics.total_requests,
+            input_tokens = run_stats.cache_metrics.total_input_tokens,
+            output_tokens = run_stats.cache_metrics.total_output_tokens,
+            tools_succeeded = run_stats.successful_tool_calls,
+            tools_failed = run_stats.failed_tool_calls,
+            "agent finished",
+        );
+
         let content = messages
             .iter()
             .rfind(|m| m.role == MessageRole::Assistant)
@@ -194,7 +232,7 @@ impl<C: LLMClient + Send + Sync> Agent<C> {
             .conversation_history
             .push((AgentMessage::UserInput(user_content), response.clone()));
 
-        Ok(response)
+        Ok((response, messages))
     }
 }
 

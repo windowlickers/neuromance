@@ -5,8 +5,8 @@ use std::time::Instant;
 use anyhow::Result;
 use clap::Parser;
 use futures::StreamExt;
-use log::info;
 use tokio_util::sync::CancellationToken;
+use tracing::info;
 use uuid::Uuid;
 
 use neuromance::{Core, CoreEvent};
@@ -46,7 +46,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::init();
+    tracing_subscriber::fmt::init();
     // Parse command line arguments
     let args = Args::parse();
 

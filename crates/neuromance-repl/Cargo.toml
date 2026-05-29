@@ -23,7 +23,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
-log = { workspace = true }
+tracing = { workspace = true }
 
 # Optional Python support
 pyo3 = { version = "0.27.2", features = ["auto-initialize"], optional = true }
@@ -35,8 +35,7 @@ neuromance-tools = { workspace = true, optional = true }
 [dev-dependencies]
 tokio = { version = "1.0", features = ["full", "test-util"] }
 clap = { version = "4.5", features = ["derive"] }
-env_logger = "0.11"
-log = "0.4"
+tracing-subscriber = { workspace = true }
 serial_test = "3"
 proptest = "1.4"
 neuromance = { workspace = true }

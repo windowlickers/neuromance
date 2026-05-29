@@ -1,14 +1,19 @@
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use async_stream::try_stream;
 use chrono::Utc;
 use futures::{Stream, StreamExt};
-use log::{debug, info};
+use metrics::{counter, histogram};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
+use tracing::{debug, info, info_span};
+
+/// How often to emit an info-level "still streaming" progress log while a
+/// single turn is in flight. Keeps long completions visible without flooding.
+const STREAM_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 
 use neuromance_client::LLMClient;
 use neuromance_common::chat::{Message, MessageRole};
@@ -217,15 +222,23 @@ impl<C: LLMClient> Core<C> {
                     .with_tool_choice(self.tool_choice.clone());
                 request = request.with_thinking_mode(self.thinking);
 
-                info!(
-                    "Executing chat turn ({}/{})",
-                    turn_count + 1,
-                    self.max_turns
-                        .map_or_else(|| "unlimited".to_string(), |max| max.to_string()),
+                let turn_number = turn_count + 1;
+                let max_turns_label = self
+                    .max_turns
+                    .map_or_else(|| "unlimited".to_string(), |max| max.to_string());
+                let turn_start = Instant::now();
+                let turn_span = info_span!(
+                    "chat_turn",
+                    turn = turn_number,
+                    max_turns = %max_turns_label,
+                    model = tracing::field::Empty,
+                    finish_reason = tracing::field::Empty,
                 );
-                if log::log_enabled!(log::Level::Debug) {
+                let _turn_enter = turn_span.enter();
+                info!(turn = turn_number, max_turns = %max_turns_label, "executing chat turn");
+                if tracing::enabled!(tracing::Level::DEBUG) {
                     let pretty = serde_json::to_string_pretty(&request)?;
-                    debug!("Chat request:\n {pretty}");
+                    debug!(request = %pretty, "chat request");
                 }
 
                 let response = if self.streaming {
@@ -236,6 +249,11 @@ impl<C: LLMClient> Core<C> {
                     let mut tool_calls: Vec<ToolCall> = Vec::with_capacity(4);
                     let mut finish_reason = None;
                     let mut accumulated_usage: Option<neuromance_common::Usage> = None;
+                    let mut first_chunk_at: Option<Instant> = None;
+                    let mut last_progress_log = turn_start;
+                    let mut tool_call_deltas_seen: u32 = 0;
+                    let mut reasoning_bytes: usize = 0;
+                    let mut chunks_seen: u32 = 0;
 
                     loop {
                         let next_chunk: Result<_, CoreError> = tokio::select! {
@@ -245,10 +263,29 @@ impl<C: LLMClient> Core<C> {
                         };
                         let Some(chunk_result) = next_chunk? else { break };
                         let chunk = chunk_result?;
+                        chunks_seen = chunks_seen.saturating_add(1);
+
+                        if first_chunk_at.is_none() {
+                            let now = Instant::now();
+                            first_chunk_at = Some(now);
+                            let latency = now.duration_since(turn_start);
+                            let latency_ms = u64::try_from(latency.as_millis()).unwrap_or(u64::MAX);
+                            info!(
+                                turn = turn_number,
+                                latency_ms,
+                                "first stream chunk received",
+                            );
+                            histogram!("neuromance_first_chunk_latency_seconds")
+                                .record(latency.as_secs_f64());
+                        }
 
                         if let Some(ref content) = chunk.delta_content {
                             accumulated_content.push_str(content);
                             yield CoreEvent::Delta(content.clone());
+                        }
+
+                        if let Some(ref reasoning) = chunk.delta_reasoning_content {
+                            reasoning_bytes = reasoning_bytes.saturating_add(reasoning.len());
                         }
 
                         if role.is_none() {
@@ -256,8 +293,27 @@ impl<C: LLMClient> Core<C> {
                         }
 
                         if let Some(ref delta_tool_calls) = chunk.delta_tool_calls {
-                            debug!("Received {} tool call delta(s)", delta_tool_calls.len());
+                            let delta_count = delta_tool_calls.len();
+                            tool_call_deltas_seen = tool_call_deltas_seen
+                                .saturating_add(u32::try_from(delta_count).unwrap_or(u32::MAX));
+                            debug!(deltas = delta_count, "received tool call deltas");
                             tool_calls = ToolCall::merge_deltas(tool_calls, delta_tool_calls);
+                        }
+
+                        if last_progress_log.elapsed() >= STREAM_PROGRESS_INTERVAL {
+                            let elapsed_ms =
+                                u64::try_from(turn_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                            let content_bytes = accumulated_content.len();
+                            info!(
+                                turn = turn_number,
+                                elapsed_ms,
+                                chunks_seen,
+                                content_bytes,
+                                reasoning_bytes,
+                                tool_call_deltas_seen,
+                                "stream progress",
+                            );
+                            last_progress_log = Instant::now();
                         }
 
                         if chunk.finish_reason.is_some() {
@@ -334,27 +390,74 @@ impl<C: LLMClient> Core<C> {
                     outcome?
                 };
 
-                debug!("Received response from LLM");
-                if log::log_enabled!(log::Level::Debug) {
+                debug!("received response from LLM");
+                if tracing::enabled!(tracing::Level::DEBUG) {
                     let pretty = serde_json::to_string_pretty(&response)?;
-                    debug!("Assistant Response:\n {pretty}");
+                    debug!(response = %pretty, "assistant response");
                 }
 
                 if let Some(ref usage) = response.usage {
                     yield CoreEvent::Usage(usage.clone());
                 }
 
+                let turn_duration = turn_start.elapsed();
+                let turn_duration_ms =
+                    u64::try_from(turn_duration.as_millis()).unwrap_or(u64::MAX);
                 let conversation_id = response.message.conversation_id;
                 let tool_calls = response.message.tool_calls.clone();
                 let tool_calls_count = tool_calls.len();
+                let finish_label = response
+                    .finish_reason
+                    .as_ref()
+                    .map_or_else(|| "unknown".to_string(), ToString::to_string);
+                let (prompt_tokens, completion_tokens) = response
+                    .usage
+                    .as_ref()
+                    .map_or((0_u32, 0_u32), |u| (u.prompt_tokens, u.completion_tokens));
+                turn_span.record("model", tracing::field::display(&response.model));
+                turn_span.record("finish_reason", tracing::field::display(&finish_label));
+                info!(
+                    turn = turn_number,
+                    duration_ms = turn_duration_ms,
+                    finish = %finish_label,
+                    prompt_tokens,
+                    completion_tokens,
+                    tool_calls = tool_calls_count,
+                    "chat turn completed",
+                );
+                let model_label = response.model.clone();
+                histogram!(
+                    "neuromance_turn_duration_seconds",
+                    "model" => model_label.clone(),
+                )
+                .record(turn_duration.as_secs_f64());
+                counter!(
+                    "neuromance_chat_turns_total",
+                    "model" => model_label.clone(),
+                    "finish_reason" => finish_label.clone(),
+                )
+                .increment(1);
+                counter!(
+                    "neuromance_tokens_total",
+                    "kind" => "prompt",
+                    "model" => model_label.clone(),
+                )
+                .increment(u64::from(prompt_tokens));
+                counter!(
+                    "neuromance_tokens_total",
+                    "kind" => "completion",
+                    "model" => model_label,
+                )
+                .increment(u64::from(completion_tokens));
                 messages.push(response.message);
 
                 if tool_calls.is_empty() {
-                    let duration = start_time.elapsed();
-                    debug!(
-                        "No tool calls in response, chat completed in {} turns ({:.2?})",
-                        turn_count + 1,
-                        duration
+                    let total_ms =
+                        u64::try_from(start_time.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    info!(
+                        turns = turn_number,
+                        duration_ms = total_ms,
+                        "chat completed",
                     );
                     yield CoreEvent::Completed(messages);
                     return;
@@ -363,12 +466,18 @@ impl<C: LLMClient> Core<C> {
                 for tool_call in &tool_calls {
                     let tool_name = &tool_call.function.name;
                     let call_id = &tool_call.id;
-                    debug!("Tool Name: {tool_name} (id: {call_id})");
-                    debug!("Tool Arguments: {:?}", tool_call.function.arguments);
+                    let tool_span = info_span!(
+                        "tool_call",
+                        tool = %tool_name,
+                        call_id = %call_id,
+                    );
+                    let _tool_enter = tool_span.enter();
+                    info!(tool = %tool_name, call_id = %call_id, "tool call requested");
+                    debug!(arguments = ?tool_call.function.arguments, "tool arguments");
 
                     let is_auto_approved = self.auto_approve_tools
                         || self.tool_executor.is_tool_auto_approved(tool_name);
-                    debug!("Tool auto-approved: {is_auto_approved}");
+                    debug!(auto_approved = is_auto_approved, "tool approval policy");
 
                     let approval = if is_auto_approved {
                         ToolApproval::Approved
@@ -395,19 +504,40 @@ impl<C: LLMClient> Core<C> {
                         outcome?
                     };
 
-                    debug!("Tool Approval Status: {approval:?}");
+                    debug!(approval = ?approval, "tool approval decided");
 
                     match approval {
                         ToolApproval::Approved => {
-                            debug!("Executing tool: {tool_name}");
+                            info!(tool = %tool_name, "executing tool");
+                            let tool_start = Instant::now();
                             let exec_outcome: Result<Result<String, ToolExecutorError>, CoreError> = tokio::select! {
                                 biased;
                                 () = cancel.cancelled() => Err(CoreError::Cancelled("tool execution".to_string())),
                                 r = self.tool_executor.execute_tool(tool_call) => Ok(r),
                             };
+                            let tool_duration_ms = u64::try_from(tool_start.elapsed().as_millis())
+                                .unwrap_or(u64::MAX);
+                            let tool_elapsed = tool_start.elapsed();
+                            histogram!(
+                                "neuromance_tool_duration_seconds",
+                                "tool" => tool_name.clone(),
+                            )
+                            .record(tool_elapsed.as_secs_f64());
                             match exec_outcome? {
                                 Ok(result) => {
-                                    debug!("Tool {tool_name} executed successfully");
+                                    let bytes = result.len();
+                                    info!(
+                                        tool = %tool_name,
+                                        duration_ms = tool_duration_ms,
+                                        bytes,
+                                        "tool call succeeded",
+                                    );
+                                    counter!(
+                                        "neuromance_tool_calls_total",
+                                        "tool" => tool_name.clone(),
+                                        "outcome" => "success",
+                                    )
+                                    .increment(1);
                                     yield CoreEvent::ToolResult {
                                         name: tool_name.clone(),
                                         result: result.clone(),
@@ -423,7 +553,18 @@ impl<C: LLMClient> Core<C> {
                                     messages.push(tool_message);
                                 }
                                 Err(e) => {
-                                    debug!("Tool {tool_name} execution failed: {e}");
+                                    info!(
+                                        tool = %tool_name,
+                                        duration_ms = tool_duration_ms,
+                                        error = %e,
+                                        "tool call failed",
+                                    );
+                                    counter!(
+                                        "neuromance_tool_calls_total",
+                                        "tool" => tool_name.clone(),
+                                        "outcome" => "failure",
+                                    )
+                                    .increment(1);
                                     let error_msg = format!("Tool execution failed: {e}");
                                     yield CoreEvent::ToolResult {
                                         name: tool_name.clone(),
@@ -442,7 +583,7 @@ impl<C: LLMClient> Core<C> {
                             }
                         }
                         ToolApproval::Denied(reason) => {
-                            debug!("Tool {tool_name} denied: {reason}");
+                            info!(tool = %tool_name, reason = %reason, "tool call denied");
                             let denial_message = Message::tool(
                                 conversation_id,
                                 format!("Tool execution denied: {reason}"),
@@ -453,7 +594,7 @@ impl<C: LLMClient> Core<C> {
                             messages.push(denial_message);
                         }
                         ToolApproval::Quit => {
-                            debug!("User quit during tool approval");
+                            debug!("user quit during tool approval");
                             Err(CoreError::UserQuit(
                                 "User quit during tool approval".to_string(),
                             ))?;
@@ -461,7 +602,7 @@ impl<C: LLMClient> Core<C> {
                     }
                 }
 
-                debug!("Completed processing {tool_calls_count} tool calls, continuing");
+                debug!(tool_calls = tool_calls_count, "completed tool calls; continuing");
 
                 if let Some(ref callback) = self.turn_callback {
                     let outcome: Result<Result<Vec<Message>, anyhow::Error>, CoreError> = tokio::select! {

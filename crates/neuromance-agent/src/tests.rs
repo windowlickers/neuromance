@@ -256,6 +256,55 @@ async fn execute_records_conversation_history() {
     assert_eq!(resp.content.role, MessageRole::Assistant);
 }
 
+// -- execute_with_history tests --
+
+#[tokio::test]
+async fn execute_with_history_returns_full_message_vec() {
+    let client = MockLLMClient::new();
+    let mut agent = Agent::new("test".into(), Core::new(client));
+    let conv_id = agent.conversation_id;
+
+    let (response, history) = agent
+        .execute_with_history(Some(make_messages(conv_id)), CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(response.content.role, MessageRole::Assistant);
+    // History must include the input we sent and the assistant reply, in order,
+    // so callers can replay it verbatim on the next turn.
+    assert!(
+        history.len() >= 3,
+        "expected at least [system, user, assistant], got {}",
+        history.len()
+    );
+    assert_eq!(history[0].role, MessageRole::System);
+    assert_eq!(history[1].role, MessageRole::User);
+    assert!(history.iter().any(|m| m.role == MessageRole::Assistant));
+}
+
+#[tokio::test]
+async fn execute_with_history_round_trips_as_next_turn_input() {
+    let client = MockLLMClient::new();
+    let mut agent = Agent::new("test".into(), Core::new(client));
+    let conv_id = agent.conversation_id;
+
+    let (_first, mut history) = agent
+        .execute_with_history(Some(make_messages(conv_id)), CancellationToken::new())
+        .await
+        .unwrap();
+
+    history.push(Message::user(conv_id, "follow-up"));
+
+    let (_second, history2) = agent
+        .execute_with_history(Some(history.clone()), CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert!(history2.len() > history.len());
+    assert_eq!(history2[0].role, MessageRole::System);
+    assert_eq!(history2[1].role, MessageRole::User);
+}
+
 // -- context_prompt() tests --
 
 #[test]

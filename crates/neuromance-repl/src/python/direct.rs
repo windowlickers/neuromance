@@ -118,7 +118,7 @@ impl PythonRepl {
                         .at("set_item user-configured module in globals")?;
                 }
                 Err(e) => {
-                    log::warn!("Failed to import Python module '{module_name}': {e}");
+                    tracing::warn!(module = %module_name, error = %e, "failed to import python module");
                 }
             }
         }

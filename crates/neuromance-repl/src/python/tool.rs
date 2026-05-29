@@ -129,7 +129,7 @@ impl ToolImplementation for PythonReplTool {
             ToolError::InvalidArguments("Missing or invalid 'code' argument".into())
         })?;
 
-        log::debug!("Executing Python code:\n```python\n{code}\n```");
+        tracing::debug!(code, "executing python code");
 
         let result = self
             .backend
@@ -138,20 +138,23 @@ impl ToolImplementation for PythonReplTool {
             .map_err(|e| ToolError::Execution(e.into()))?;
 
         if result.success {
-            log::debug!(
-                "Python execution succeeded in {}ms",
-                result.execution_time_ms
+            tracing::debug!(
+                duration_ms = result.execution_time_ms,
+                "python execution succeeded",
             );
             if !result.stdout.is_empty() {
-                log::debug!("stdout:\n{}", result.stdout);
+                tracing::debug!(stdout = %result.stdout, "python stdout");
             }
             if let Some(ref return_value) = result.return_value {
-                log::debug!("Return value: {return_value}");
+                tracing::debug!(return_value = %return_value, "python return value");
             }
         } else {
-            log::warn!("Python execution failed in {}ms", result.execution_time_ms);
+            tracing::warn!(
+                duration_ms = result.execution_time_ms,
+                "python execution failed",
+            );
             if !result.stderr.is_empty() {
-                log::warn!("stderr:\n{}", result.stderr);
+                tracing::warn!(stderr = %result.stderr, "python stderr");
             }
         }
 
@@ -235,7 +238,7 @@ impl ToolFactory for PythonReplToolFactory {
         let tool = if cfg.restricted {
             PythonReplTool::new(Arc::new(PythonRepl::new()?))
         } else {
-            log::warn!(
+            tracing::warn!(
                 "execute_python registered in unrestricted mode: full builtins and unfiltered imports"
             );
             PythonReplTool::with_interactive(Arc::new(InteractivePythonRepl::new()?))

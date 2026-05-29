@@ -3,7 +3,7 @@ use std::time::Instant;
 use anyhow::Result;
 use clap::Parser;
 use colored::Colorize;
-use log::info;
+use tracing::info;
 use uuid::Uuid;
 
 use neuromance_client::LLMClient;
@@ -47,7 +47,7 @@ fn strip_think_tags(content: &str) -> String {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::init();
+    tracing_subscriber::fmt::init();
     let args = Args::parse();
 
     info!("Self Conversation Demo");
