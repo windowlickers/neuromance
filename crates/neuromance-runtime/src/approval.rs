@@ -105,19 +105,16 @@ impl WebhookApprover {
                 let outcome = match client.post(&*webhook_url).json(&req).send().await {
                     Ok(resp) => {
                         let status = resp.status();
-                        let duration_ms =
-                            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                         if status.is_success() {
-                            match resp.json::<WebhookResponse>().await {
+                            let parsed = resp.json::<WebhookResponse>().await;
+                            let duration_ms =
+                                u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                            match parsed {
                                 Ok(parsed) if parsed.approved => {
-                                    let duration_ms = u64::try_from(started.elapsed().as_millis())
-                                        .unwrap_or(u64::MAX);
                                     info!(duration_ms, "approval granted");
                                     ("approved", ToolApproval::Approved)
                                 }
                                 Ok(parsed) => {
-                                    let duration_ms = u64::try_from(started.elapsed().as_millis())
-                                        .unwrap_or(u64::MAX);
                                     let reason = parsed
                                         .reason
                                         .unwrap_or_else(|| "denied by webhook".to_string());
@@ -125,8 +122,6 @@ impl WebhookApprover {
                                     ("denied", ToolApproval::Denied(reason))
                                 }
                                 Err(e) => {
-                                    let duration_ms = u64::try_from(started.elapsed().as_millis())
-                                        .unwrap_or(u64::MAX);
                                     // Don't surface `e` to the caller: reqwest's parse
                                     // errors include the URL, which may carry an auth
                                     // token in its query string.
@@ -141,6 +136,8 @@ impl WebhookApprover {
                                 }
                             }
                         } else {
+                            let duration_ms =
+                                u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                             warn!(
                                 %status,
                                 duration_ms,
