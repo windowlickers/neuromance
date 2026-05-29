@@ -41,22 +41,31 @@ nix build
 
 `nix flake check` runs clippy with `-D warnings`, so any warning fails CI even if `cargo clippy` is clean locally.
 
+Individual checks (cached via crane):
+
+```bash
+nix run .#fmt
+nix run .#clippy
+nix run .#test
+```
+
 ### Container Images
 
 The flake produces two runtime image variants:
 
 ```bash
 # Build images
-nix build .#neuromance-image          # minimal runtime image
-nix build .#neuromance-image-toolkit  # adds busybox, git, curl, jq, node, python3, shell
+nix build .#neuromance-image           # minimal runtime image
+nix build .#neuromance-toolkit-image   # adds busybox, git, curl, jq, node, python3, shell
 
-# Load into local docker
-nix run .#load-minimal
-nix run .#load-toolkit
-
-# Push to a registry (defaults to ghcr.io/windowlickers)
-nix run .#push-minimal -- <registry>
-nix run .#push-toolkit -- <registry>
+# Generic image verbs — pass the image short-name as the first arg:
+#   <image> ∈ { neuromance, neuromance-toolkit }
+nix run .#list                                        # list available images
+nix run .#load    -- <image>
+nix run .#push    -- <image> <registry> <namespace> [tag]
+nix run .#release -- <image> <registry> <namespace>   # pushes :imageTag + :floatingTag
+nix run .#inspect -- <image>                          # opens dive
+nix run .#info    -- <image>                          # name, tags, store path, size
 ```
 
 ## Architecture
@@ -75,7 +84,20 @@ Neuromance is a Rust library for LLM orchestration, organized as a Cargo workspa
 
 - **neuromance-agent**: Agent framework for autonomous multi-turn task execution. `Agent<C: LLMClient>` wraps `Core` with state, memory, and a sequential tool-using execution loop; constructed via `AgentBuilder` (`Agent::builder(id, client)`).
 
-- **neuromance-runtime**: Container runtime binary that boots an `Agent` from TOML config and runs in `oneshot` mode (single task, write JSON, exit — for k8s `Job`s) or `serve` mode (HTTP intake at `POST /tasks` / `GET /tasks/{id}` until SIGTERM — for `Deployment`s). Tools are registered at startup via `ToolFactoryRegistry::with_builtin()`. Approval is `auto` or `async` (webhook). State is in-memory only; postgres persistence is future work. Set `RUST_LOG_FORMAT=json` for structured logs (k8s ingestion); default is human-readable.
+- **neuromance-repl**: Embedded Python REPL via PyO3. Stateful sessions, Rust-backed callbacks, and a `ToolImplementation` wrapper so agents can drive a Python interpreter as a tool.
+
+- **neuromance-runtime**: Container runtime binary that boots an `Agent` from TOML config and runs in `oneshot` mode (single task, write JSON, exit — for k8s `Job`s) or `serve` mode (HTTP intake at `POST /tasks/new` / `GET /tasks` / `GET /tasks/{id}` until SIGTERM — for `Deployment`s). Health and readiness are exposed on `runtime.health_addr` (default `:8081`); the task port is not a probe target. Tools are registered at startup via `ToolFactoryRegistry::with_builtin()`. Approval is `auto` or `async` (webhook). State is in-memory only; postgres persistence is future work. Set `RUST_LOG_FORMAT=json` for structured logs (k8s ingestion); default is human-readable.
+
+## Tokenizer Proxy
+
+When the runtime is deployed behind a tokenizer proxy, the agent pod never holds the plaintext provider credential — it sends a sealed token under `X-Tokenizer-Token` and the proxy injects the real provider key server-side.
+
+Two distinct URLs are involved:
+
+- `agent.base_url` — the **upstream** LLM endpoint. Falls back to the provider default from the `model` prefix (e.g. `openai:gpt-4o` → `https://api.openai.com/v1`).
+- `[proxy].base_url` — the **tokenizer proxy** itself. The client attaches it as an HTTP forward proxy, so requests leave the pod in absolute-form with the upstream authority in the request URL; no side-band routing header is needed.
+
+See `README.md` for the full TOML config example.
 
 ## Common Patterns
 
@@ -151,4 +173,4 @@ CI runs on Forgejo (`.forgejo/workflows/nix-ci.yaml`), not GitHub Actions.
 
 ## Rust Version
 
-Requires Rust 1.90+ (Edition 2024). The `rust-toolchain.toml` pins to stable channel.
+Requires Rust 1.95+ (Edition 2024, set in `[workspace.package]`). The `rust-toolchain.toml` pins to stable channel.

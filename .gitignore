@@ -27,3 +27,4 @@ flamegraph.svg
 mcp_config.toml
 .direnv
 result
+.claude/scheduled_tasks.lock

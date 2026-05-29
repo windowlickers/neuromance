@@ -31,6 +31,11 @@
         workspaceCargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
         version = workspaceCargoToml.workspace.package.version;
 
+        # Git revision of the flake input. `self.rev` is set for clean git
+        # trees; `self.dirtyRev` is set when uncommitted changes are present.
+        # Falls back to "unknown" for non-git sources (e.g. tarball builds).
+        revision = self.rev or self.dirtyRev or "unknown";
+
         # Use Rust version from rust-toolchain.toml
         rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
@@ -55,7 +60,25 @@
 
         commonArgs = mkCommonArgs defaultPythonEnv;
 
-        cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+        # Build deps with `--all-features` so every downstream package and
+        # check reuses the same artifact. Without this, feature-gated deps
+        # (pyo3 from runtime's `python-repl`) get recompiled in each package
+        # build.
+        #
+        # Parameterized by `pythonEnv` because PYO3_PYTHON keys pyo3's build
+        # script; runtimes built against a custom pythonEnv need their own
+        # deps artifact. Nix dedupes identical inputs, so callers using
+        # `defaultPythonEnv` share the cached `cargoArtifacts` below.
+        mkCargoArtifacts =
+          pythonEnv:
+          craneLib.buildDepsOnly (
+            (mkCommonArgs pythonEnv)
+            // {
+              cargoExtraArgs = "--all-features";
+            }
+          );
+
+        cargoArtifacts = mkCargoArtifacts defaultPythonEnv;
 
         fmtCheck = craneLib.cargoFmt { inherit src; };
 
@@ -121,7 +144,8 @@
           craneLib.buildPackage (
             (mkCommonArgs pythonEnv)
             // {
-              inherit cargoArtifacts pname;
+              cargoArtifacts = mkCargoArtifacts pythonEnv;
+              inherit pname;
               cargoExtraArgs = "--package neuromance-runtime --features python-repl";
               meta = runtimeMeta;
             }
@@ -142,12 +166,22 @@
             inherit
               pkgs
               version
+              revision
               variant
               extraTools
               includeShell
               pythonEnv
               ;
-            neuromance-runtime = runtime;
+            package = runtime;
+            binName = "neuromance-runtime";
+            title = "Neuromance Runtime";
+            description = "Container runtime that executes a Neuromance agent from config (oneshot or serve mode)";
+            exposedPorts = {
+              "8080/tcp" = { };
+              "8081/tcp" = { };
+            };
+            extraEnv = [ "NEUROMANCE_CONFIG=/etc/neuromance/config.toml" ];
+            configDir = "etc/neuromance";
           };
 
         # Convenience: build runtime + image together from a `pythonPackages`
@@ -184,11 +218,22 @@
         toolkitTools = with pkgs; [
           busybox
           coreutils
-          git
+          findutils
+          gnused
+          gnugrep
+          gawk
+          gnutar
+          gzip
+          less
+          procps
+          which
           curl
+          git
+          openssh
           jq
           nodejs
           python3
+          nix
         ];
 
         toolkitBundle = mkRuntimeBundle {
@@ -199,59 +244,193 @@
 
         neuromance-runtime = minimalBundle.runtime;
         neuromance-runtime-toolkit = toolkitBundle.runtime;
-        neuromanceImage = minimalBundle.image;
-        neuromanceImageToolkit = toolkitBundle.image;
+        # `floatingTag` is the moving alias `release` publishes alongside the
+        # immutable `imageTag` (e.g. `:minimal` always points at the latest
+        # minimal build). `info` and `release` read it back via `nix eval`.
+        neuromanceImage = minimalBundle.image // { floatingTag = "minimal"; };
+        neuromanceImageToolkit = toolkitBundle.image // { floatingTag = "toolkit"; };
 
-        mkLoad = image: variant: pkgs.writeShellScriptBin "load-${variant}" ''
-          set -euo pipefail
-          echo "Loading neuromance-runtime:${version}-${variant} into Docker..."
-          ${pkgs.docker}/bin/docker load < ${image}
-          echo "Loaded neuromance-runtime:${version}-${variant}"
+        # Generic image apps: each takes the image as an argument and looks up
+        # `.#<image>-image` for metadata, replacing one app per (verb × image)
+        # combo.
+        # Single source of truth for the verb apps. `list` reads name/tag/
+        # floating off each image at eval time and bakes them into its script
+        # — no `nix eval` calls at runtime.
+        imagePackages = {
+          neuromance = neuromanceImage;
+          neuromance-toolkit = neuromanceImageToolkit;
+        };
+        imageKeys = builtins.attrNames imagePackages;
+
+        buildHelper = ''
+          build_image() {
+            local img="$1"
+            if ! nix eval --raw ".#$img-image.imageName" >/dev/null 2>&1; then
+              echo "Error: package .#$img-image not found in this flake" >&2
+              exit 1
+            fi
+            nix build ".#$img-image"
+          }
         '';
 
-        defaultRegistry = "ghcr.io/windowlickers";
-        mkPush = image: variant: pkgs.writeShellScriptBin "push-${variant}" ''
-          set -euo pipefail
-          registry="''${1:-''${REGISTRY:-${defaultRegistry}}}"
-          echo "Pushing to $registry/neuromance-runtime:${version}-${variant}..."
-          ${pkgs.skopeo}/bin/skopeo --insecure-policy copy \
-            docker-archive:${image} \
-            "docker://$registry/neuromance-runtime:${version}-${variant}"
-          echo "Pushing to $registry/neuromance-runtime:${variant}..."
-          ${pkgs.skopeo}/bin/skopeo --insecure-policy copy \
-            docker-archive:${image} \
-            "docker://$registry/neuromance-runtime:${variant}"
-          echo "Pushed ${version}-${variant}"
-        '';
-
-        loadMinimal = mkLoad neuromanceImage "minimal";
-        loadToolkit = mkLoad neuromanceImageToolkit "toolkit";
-        pushMinimal = mkPush neuromanceImage "minimal";
-        pushToolkit = mkPush neuromanceImageToolkit "toolkit";
-
-        mkAppMeta = description: with pkgs.lib; {
-          inherit description;
-          license = licenses.asl20;
-          platforms = platforms.linux;
+        load = pkgs.writeShellApplication {
+          name = "load";
+          runtimeInputs = with pkgs; [ docker nix ];
+          text = ''
+            ${buildHelper}
+            if [ $# -ne 1 ]; then
+              echo "usage: nix run .#load -- <image>" >&2
+              exit 2
+            fi
+            build_image "$1"
+            docker load < result
+          '';
         };
 
-        mkCraneApp = name: drv: pkgs.writeShellScriptBin name ''
-          echo "${name} ok: ${drv}"
-        '';
+        push = pkgs.writeShellApplication {
+          name = "push";
+          runtimeInputs = with pkgs; [ skopeo nix ];
+          text = ''
+            ${buildHelper}
+            if [ $# -lt 3 ] || [ $# -gt 4 ]; then
+              echo "usage: nix run .#push -- <image> <registry> <namespace> [tag]" >&2
+              exit 2
+            fi
+            image="$1"
+            registry="$2"
+            namespace="$3"
+            name=$(nix eval --raw ".#$image-image.imageName")
+            tag="''${4:-$(nix eval --raw ".#$image-image.imageTag")}"
+            build_image "$image"
+            skopeo --insecure-policy copy "docker-archive:result" \
+              "docker://$registry/$namespace/$name:$tag"
+          '';
+        };
+
+        release = pkgs.writeShellApplication {
+          name = "release";
+          runtimeInputs = with pkgs; [ skopeo nix ];
+          text = ''
+            ${buildHelper}
+            if [ $# -ne 3 ]; then
+              echo "usage: nix run .#release -- <image> <registry> <namespace>" >&2
+              exit 2
+            fi
+            image="$1"
+            registry="$2"
+            namespace="$3"
+            build_image "$image"
+            name=$(nix eval --raw ".#$image-image.imageName")
+            version=$(nix eval --raw ".#$image-image.imageTag")
+            floating=$(nix eval --raw ".#$image-image.floatingTag")
+            echo "Publishing $name:$version (and :$floating)"
+            skopeo --insecure-policy copy "docker-archive:result" \
+              "docker://$registry/$namespace/$name:$version"
+            skopeo --insecure-policy copy "docker-archive:result" \
+              "docker://$registry/$namespace/$name:$floating"
+          '';
+        };
+
+        inspect = pkgs.writeShellApplication {
+          name = "inspect";
+          runtimeInputs = with pkgs; [ docker dive nix ];
+          text = ''
+            ${buildHelper}
+            if [ $# -ne 1 ]; then
+              echo "usage: nix run .#inspect -- <image>" >&2
+              exit 2
+            fi
+            image="$1"
+            build_image "$image"
+            docker load < result
+            name=$(nix eval --raw ".#$image-image.imageName")
+            tag=$(nix eval --raw ".#$image-image.imageTag")
+            dive "$name:$tag"
+          '';
+        };
+
+        list = pkgs.writeShellApplication {
+          name = "list";
+          runtimeInputs = [ ];
+          text = ''
+            if [ $# -ne 0 ]; then
+              echo "usage: nix run .#list" >&2
+              exit 2
+            fi
+            printf '%-22s %-22s %-15s %s\n' IMAGE NAME TAG FLOATING
+            ${pkgs.lib.concatMapStringsSep "\n" (img:
+              let m = imagePackages.${img}; in
+              "printf '%-22s %-22s %-15s %s\\n' "
+              + pkgs.lib.escapeShellArg img + " "
+              + pkgs.lib.escapeShellArg m.imageName + " "
+              + pkgs.lib.escapeShellArg m.imageTag + " "
+              + pkgs.lib.escapeShellArg m.floatingTag
+            ) imageKeys}
+          '';
+        };
+
+        info = pkgs.writeShellApplication {
+          name = "info";
+          runtimeInputs = with pkgs; [ nix coreutils ];
+          text = ''
+            if [ $# -ne 1 ]; then
+              echo "usage: nix run .#info -- <image>" >&2
+              exit 2
+            fi
+            image="$1"
+            if ! nix eval --raw ".#$image-image.imageName" >/dev/null 2>&1; then
+              echo "Error: package .#$image-image not found in this flake" >&2
+              exit 1
+            fi
+            name=$(nix eval --raw ".#$image-image.imageName")
+            tag=$(nix eval --raw ".#$image-image.imageTag")
+            floating=$(nix eval --raw ".#$image-image.floatingTag")
+            store=$(nix eval --raw ".#$image-image")
+            echo "name:     $name"
+            echo "tag:      $tag"
+            echo "floating: $floating"
+            echo "store:    $store"
+            if [ -e "$store" ]; then
+              size=$(du -h "$store" | cut -f1)
+              echo "size:     $size"
+            fi
+          '';
+        };
+
+        mkAppMeta =
+          description: with pkgs.lib; {
+            inherit description;
+            license = licenses.asl20;
+            platforms = platforms.linux;
+          };
+
+        mkCraneApp =
+          name: drv:
+          pkgs.writeShellScriptBin name ''
+            echo "${name} ok: ${drv}"
+          '';
 
       in
       {
         checks = {
-          inherit neuromance neuromance-runtime neuromance-runtime-toolkit;
+          inherit
+            neuromance
+            neuromance-runtime
+            neuromance-runtime-toolkit
+            ;
           fmt = fmtCheck;
           clippy = clippyCheck;
           tests = testCheck;
         };
 
         packages = {
-          inherit neuromance neuromance-runtime neuromance-runtime-toolkit;
+          inherit
+            neuromance
+            neuromance-runtime
+            neuromance-runtime-toolkit
+            ;
           neuromance-image = neuromanceImage;
-          neuromance-image-toolkit = neuromanceImageToolkit;
+          neuromance-toolkit-image = neuromanceImageToolkit;
           default = neuromance;
         };
 
@@ -290,25 +469,35 @@
             program = "${mkCraneApp "build" neuromance}/bin/build";
             meta = mkAppMeta "Build neuromance via crane (cached)";
           };
-          load-minimal = {
+          list = {
             type = "app";
-            program = "${loadMinimal}/bin/load-minimal";
-            meta = mkAppMeta "Load the minimal neuromance-runtime image into Docker";
+            program = "${list}/bin/list";
+            meta = mkAppMeta "List available container images with their tags";
           };
-          load-toolkit = {
+          load = {
             type = "app";
-            program = "${loadToolkit}/bin/load-toolkit";
-            meta = mkAppMeta "Load the toolkit neuromance-runtime image into Docker";
+            program = "${load}/bin/load";
+            meta = mkAppMeta "Build a container image and docker load it";
           };
-          push-minimal = {
+          push = {
             type = "app";
-            program = "${pushMinimal}/bin/push-minimal";
-            meta = mkAppMeta "Push the minimal neuromance-runtime image to a registry";
+            program = "${push}/bin/push";
+            meta = mkAppMeta "Build and push <image> to <registry>/<namespace>/<image>:[tag]";
           };
-          push-toolkit = {
+          release = {
             type = "app";
-            program = "${pushToolkit}/bin/push-toolkit";
-            meta = mkAppMeta "Push the toolkit neuromance-runtime image to a registry";
+            program = "${release}/bin/release";
+            meta = mkAppMeta "Build and push :<version> and :<floating> tags to the registry";
+          };
+          inspect = {
+            type = "app";
+            program = "${inspect}/bin/inspect";
+            meta = mkAppMeta "Build, load, and open the image in dive";
+          };
+          info = {
+            type = "app";
+            program = "${info}/bin/info";
+            meta = mkAppMeta "Show image name, tag, floating tag, store path, and tarball size";
           };
         };
 
@@ -322,6 +511,7 @@
             cargo-outdated
             cargo-audit
             cargo-expand
+            cargo-release
             just
             skopeo
             dive
