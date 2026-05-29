@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tracing::{error, info};
 
 use super::adapter::McpToolAdapter;
 use super::client::McpClientWrapper;
@@ -49,32 +50,32 @@ impl McpManager {
         let mut clients = self.clients.write().await;
 
         for server_config in &self.config.servers {
-            log::info!("Connecting to MCP server '{}'...", server_config.id);
+            info!(server = %server_config.id, "connecting to MCP server");
 
             match McpClientWrapper::connect(server_config.clone()).await {
                 Ok(client) => {
                     let tools_count = client.get_tools().await.len();
-                    log::info!(
-                        "Successfully connected to '{}' with {} tools available",
-                        server_config.id,
-                        tools_count
+                    info!(
+                        server = %server_config.id,
+                        tools = tools_count,
+                        "MCP server connected",
                     );
                     clients.insert(server_config.id.clone(), Arc::new(client));
                 }
                 Err(e) => {
-                    log::error!(
-                        "Failed to connect to MCP server '{}': {}",
-                        server_config.id,
-                        e
+                    error!(
+                        server = %server_config.id,
+                        error = %e,
+                        "MCP server connection failed",
                     );
                     if self.config.settings.max_retries > 0 {
                         // Try reconnecting with retries
                         for attempt in 1..=self.config.settings.max_retries {
-                            log::info!(
-                                "Retrying connection to '{}' (attempt {}/{})",
-                                server_config.id,
+                            info!(
+                                server = %server_config.id,
                                 attempt,
-                                self.config.settings.max_retries
+                                max_retries = self.config.settings.max_retries,
+                                "retrying MCP server connection",
                             );
 
                             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
@@ -83,10 +84,11 @@ impl McpManager {
                                 McpClientWrapper::connect(server_config.clone()).await
                             {
                                 let tools_count = client.get_tools().await.len();
-                                log::info!(
-                                    "Successfully connected to '{}' on retry with {} tools",
-                                    server_config.id,
-                                    tools_count
+                                info!(
+                                    server = %server_config.id,
+                                    tools = tools_count,
+                                    attempt,
+                                    "MCP server connected on retry",
                                 );
                                 clients.insert(server_config.id.clone(), Arc::new(client));
                                 break;
@@ -205,7 +207,7 @@ impl McpManager {
     /// Returns an error if refreshing tools fails on any server.
     pub async fn refresh_all_tools(&self) -> Result<()> {
         for (server_id, client) in self.clients.read().await.iter() {
-            log::info!("Refreshing tools for server '{server_id}'...");
+            info!(server = %server_id, "refreshing MCP server tools");
             client.refresh_tools().await?;
         }
 
@@ -242,7 +244,7 @@ impl McpManager {
     /// Returns an error if shutting down a client fails.
     pub async fn shutdown(self) -> Result<()> {
         for (server_id, client) in self.clients.write().await.drain() {
-            log::info!("Shutting down connection to '{server_id}'");
+            info!(server = %server_id, "shutting down MCP server connection");
             if let Ok(client) = Arc::try_unwrap(client) {
                 client.shutdown().await?;
             }

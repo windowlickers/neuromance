@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tracing::info;
 
 use crate::{ToolError, ToolImplementation};
 use neuromance_common::tools::{Function, ObjectSchema, Parameters, Property, Tool};
@@ -134,11 +135,11 @@ impl ToolImplementation for McpToolAdapter {
     async fn execute(&self, args: &Value) -> Result<String, ToolError> {
         let args_str =
             serde_json::to_string_pretty(args).map_err(|e| ToolError::Execution(e.into()))?;
-        log::info!(
-            "Executing MCP tool '{}' on server '{}' with args: {}",
-            self.tool_name,
-            self.server_id,
-            args_str
+        info!(
+            server = %self.server_id,
+            tool = %self.tool_name,
+            args = %args_str,
+            "executing MCP tool",
         );
 
         let result = self

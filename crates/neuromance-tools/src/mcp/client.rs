@@ -8,6 +8,7 @@ use rmcp::{
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tracing::{debug, info};
 
 use super::config::{McpServerConfig, McpTransportConfig};
 
@@ -24,7 +25,7 @@ impl McpClientWrapper {
     /// # Errors
     /// Returns an error if the connection fails.
     pub async fn connect(config: McpServerConfig) -> Result<Self> {
-        log::info!("Connecting to MCP server '{}'...", config.id);
+        info!(server = %config.id, "connecting to MCP server");
 
         // Create the appropriate transport based on configuration
         let service = match &config.transport {
@@ -48,22 +49,26 @@ impl McpClientWrapper {
         };
 
         // Get server info
-        if let Some(info) = service.peer_info() {
-            log::info!(
-                "Connected to MCP server '{}' - {}",
-                config.id,
-                info.server_info.name
+        if let Some(peer_info) = service.peer_info() {
+            info!(
+                server = %config.id,
+                server_name = %peer_info.server_info.name,
+                "connected to MCP server",
             );
         }
 
         // Fetch available tools
         let tools_list = service.list_all_tools().await?;
 
-        log::info!("Server '{}' provides {} tools", config.id, tools_list.len());
+        info!(
+            server = %config.id,
+            tools = tools_list.len(),
+            "MCP server tools listed",
+        );
 
         let mut tools_map = HashMap::new();
         for tool in tools_list {
-            log::debug!("  - Tool: {}", tool.name);
+            debug!(server = %config.id, tool = %tool.name, "MCP tool available");
             tools_map.insert(tool.name.clone().to_string(), tool);
         }
 
@@ -89,10 +94,10 @@ impl McpClientWrapper {
         name: &str,
         arguments: serde_json::Value,
     ) -> Result<CallToolResult> {
-        log::debug!(
-            "Calling tool '{}' on server '{}'",
-            name,
-            self.server_config.id
+        debug!(
+            server = %self.server_config.id,
+            tool = %name,
+            "calling MCP tool",
         );
 
         let arguments = match arguments {
@@ -116,7 +121,7 @@ impl McpClientWrapper {
     /// # Errors
     /// Returns an error if fetching tools fails.
     pub async fn refresh_tools(&self) -> Result<()> {
-        log::debug!("Refreshing tools for server '{}'", self.server_config.id);
+        debug!(server = %self.server_config.id, "refreshing MCP tools");
 
         let tools_list = self.service.list_all_tools().await?;
 
