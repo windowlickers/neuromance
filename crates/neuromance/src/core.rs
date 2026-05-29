@@ -515,9 +515,9 @@ impl<C: LLMClient> Core<C> {
                                 () = cancel.cancelled() => Err(CoreError::Cancelled("tool execution".to_string())),
                                 r = self.tool_executor.execute_tool(tool_call) => Ok(r),
                             };
-                            let tool_duration_ms = u64::try_from(tool_start.elapsed().as_millis())
-                                .unwrap_or(u64::MAX);
                             let tool_elapsed = tool_start.elapsed();
+                            let tool_duration_ms =
+                                u64::try_from(tool_elapsed.as_millis()).unwrap_or(u64::MAX);
                             histogram!(
                                 "neuromance_tool_duration_seconds",
                                 "tool" => tool_name.clone(),
