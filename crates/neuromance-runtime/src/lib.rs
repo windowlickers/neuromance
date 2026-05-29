@@ -5,8 +5,9 @@
 //!
 //! - **`oneshot`** — execute a single configured input, write the result, exit.
 //!   Designed for Kubernetes Jobs.
-//! - **`serve`** — bind an HTTP intake (`POST /tasks`, `GET /tasks/{id}`) and
-//!   process tasks sequentially until SIGTERM. Designed for Deployments.
+//! - **`serve`** — bind an HTTP intake (`POST /tasks/new`, `GET /tasks`,
+//!   `GET /tasks/{id}`) and process tasks sequentially until SIGTERM.
+//!   Designed for Deployments.
 //!
 //! Approval is `auto` (every tool call approved) or `async` (each
 //! non-auto-approved tool call is `POST`ed to a webhook for an approve/deny
@@ -21,10 +22,14 @@ pub mod config;
 pub mod error;
 pub mod health;
 pub mod lifecycle;
+pub mod metrics;
 pub mod oneshot;
+pub mod proxy;
 pub mod serve;
+pub mod telemetry;
 
 pub use config::{
-    AgentConfig, ApprovalConfig, ApprovalMode, Mode, OneshotConfig, RuntimeConfig, RuntimeSettings,
+    AgentConfig, ApprovalConfig, ApprovalMode, Mode, OneshotConfig, ProxyTomlConfig, RuntimeConfig,
+    RuntimeSettings,
 };
 pub use error::RuntimeError;

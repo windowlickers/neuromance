@@ -8,10 +8,11 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use metrics::{counter, histogram};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::{Instrument, debug, info, info_span, warn};
 
 use neuromance_common::tools::{ToolApproval, ToolCall};
 
@@ -86,49 +87,99 @@ impl WebhookApprover {
         let tool_name = tool_call.function.name.clone();
         let arguments = tool_call.function.arguments_json().to_string();
 
-        Box::pin(async move {
-            let req = WebhookRequest {
-                agent_id: &agent_id,
-                tool_call_id: &tool_call_id,
-                tool_name: &tool_name,
-                arguments: &arguments,
-            };
+        let span = info_span!(
+            "approval_webhook",
+            tool = %tool_name,
+            call_id = %tool_call_id,
+        );
+        Box::pin(
+            async move {
+                let started = Instant::now();
+                let req = WebhookRequest {
+                    agent_id: &agent_id,
+                    tool_call_id: &tool_call_id,
+                    tool_name: &tool_name,
+                    arguments: &arguments,
+                };
 
-            match client.post(&*webhook_url).json(&req).send().await {
-                Ok(resp) => {
-                    let status = resp.status();
-                    if !status.is_success() {
-                        warn!(%status, tool=%tool_name, "approval webhook returned non-success");
-                        return ToolApproval::Denied(format!("approval webhook returned {status}"));
-                    }
-                    match resp.json::<WebhookResponse>().await {
-                        Ok(parsed) if parsed.approved => ToolApproval::Approved,
-                        Ok(parsed) => ToolApproval::Denied(
-                            parsed
-                                .reason
-                                .unwrap_or_else(|| "denied by webhook".to_string()),
-                        ),
-                        Err(e) => {
-                            // Don't surface `e` to the caller: reqwest's parse
-                            // errors include the URL, which may carry an auth
-                            // token in its query string.
-                            debug!(error=%e, tool=%tool_name, "approval response parse failed");
-                            warn!(tool=%tool_name, "approval response parse failed");
-                            ToolApproval::Denied("approval response parse failed".to_string())
+                let outcome = match client.post(&*webhook_url).json(&req).send().await {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        let duration_ms =
+                            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        if status.is_success() {
+                            match resp.json::<WebhookResponse>().await {
+                                Ok(parsed) if parsed.approved => {
+                                    let duration_ms = u64::try_from(started.elapsed().as_millis())
+                                        .unwrap_or(u64::MAX);
+                                    info!(duration_ms, "approval granted");
+                                    ("approved", ToolApproval::Approved)
+                                }
+                                Ok(parsed) => {
+                                    let duration_ms = u64::try_from(started.elapsed().as_millis())
+                                        .unwrap_or(u64::MAX);
+                                    let reason = parsed
+                                        .reason
+                                        .unwrap_or_else(|| "denied by webhook".to_string());
+                                    info!(duration_ms, reason = %reason, "approval denied");
+                                    ("denied", ToolApproval::Denied(reason))
+                                }
+                                Err(e) => {
+                                    let duration_ms = u64::try_from(started.elapsed().as_millis())
+                                        .unwrap_or(u64::MAX);
+                                    // Don't surface `e` to the caller: reqwest's parse
+                                    // errors include the URL, which may carry an auth
+                                    // token in its query string.
+                                    debug!(error = %e, "approval response parse failed");
+                                    warn!(duration_ms, "approval response parse failed");
+                                    (
+                                        "failed",
+                                        ToolApproval::Denied(
+                                            "approval response parse failed".to_string(),
+                                        ),
+                                    )
+                                }
+                            }
+                        } else {
+                            warn!(
+                                %status,
+                                duration_ms,
+                                "approval webhook returned non-success",
+                            );
+                            (
+                                "failed",
+                                ToolApproval::Denied(format!("approval webhook returned {status}")),
+                            )
                         }
                     }
-                }
-                Err(e) => {
-                    // Same reasoning: `e.to_string()` from reqwest typically
-                    // contains the full request URL.
-                    debug!(error=%e, tool=%tool_name, "approval webhook call failed");
-                    let status_hint = e
-                        .status()
-                        .map_or_else(|| "unreachable".to_string(), |s| format!("status={s}"));
-                    warn!(status=%status_hint, tool=%tool_name, "approval webhook call failed");
-                    ToolApproval::Denied(format!("approval webhook call failed: {status_hint}"))
-                }
+                    Err(e) => {
+                        let duration_ms =
+                            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        // Same reasoning: `e.to_string()` from reqwest typically
+                        // contains the full request URL.
+                        debug!(error = %e, "approval webhook call failed");
+                        let status_hint = e
+                            .status()
+                            .map_or_else(|| "unreachable".to_string(), |s| format!("status={s}"));
+                        warn!(
+                            status = %status_hint,
+                            duration_ms,
+                            "approval webhook call failed",
+                        );
+                        (
+                            "failed",
+                            ToolApproval::Denied(format!(
+                                "approval webhook call failed: {status_hint}"
+                            )),
+                        )
+                    }
+                };
+                let elapsed = started.elapsed().as_secs_f64();
+                histogram!("neuromance_approval_duration_seconds").record(elapsed);
+                counter!("neuromance_approvals_total", "outcome" => outcome.0).increment(1);
+                outcome.1
             }
-        })
+            .instrument(span),
+        )
     }
 }
