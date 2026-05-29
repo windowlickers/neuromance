@@ -154,7 +154,7 @@ fn build_agent(config: &RuntimeConfig) -> Result<Agent<Box<dyn LLMClient>>, Runt
     factories.register(neuromance_repl::python::PythonReplToolFactory);
     let staged = factories.build_all(&config.tools)?;
 
-    if matches!(config.approval.mode, ApprovalMode::Auto) && !config.approval.allow_unsafe_tools {
+    if matches!(config.approval.mode, ApprovalMode::Auto) {
         let mut needs_approval: Vec<String> = staged
             .tool_names()
             .into_iter()
@@ -162,13 +162,21 @@ fn build_agent(config: &RuntimeConfig) -> Result<Agent<Box<dyn LLMClient>>, Runt
             .collect();
         if !needs_approval.is_empty() {
             needs_approval.sort();
-            return Err(RuntimeError::Config(format!(
-                "approval.mode = \"auto\" but the following tools require explicit approval: \
-                 [{}]. Either remove them from [[tools]], set approval.mode = \"async\" with \
-                 an approval.webhook_url, or set approval.allow_unsafe_tools = true to opt out \
-                 of this safety check.",
-                needs_approval.join(", ")
-            )));
+            if config.approval.allow_unsafe_tools {
+                warn!(
+                    tools = %needs_approval.join(", "),
+                    "approval.allow_unsafe_tools is set: auto-approving tools that would \
+                     otherwise require explicit approval, bypassing the startup safety check"
+                );
+            } else {
+                return Err(RuntimeError::Config(format!(
+                    "approval.mode = \"auto\" but the following tools require explicit approval: \
+                     [{}]. Either remove them from [[tools]], set approval.mode = \"async\" with \
+                     an approval.webhook_url, or set approval.allow_unsafe_tools = true to opt out \
+                     of this safety check.",
+                    needs_approval.join(", ")
+                )));
+            }
         }
     }
 
