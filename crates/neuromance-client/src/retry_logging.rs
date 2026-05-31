@@ -16,8 +16,9 @@ use tracing::warn;
 
 /// Per-request attempt counter shared between middleware invocations.
 ///
-/// Stored in `task_local::Extensions` so each retry attempt sees the same
-/// counter even though `Middleware::handle` is called fresh each time.
+/// Stored in the request's `http::Extensions`, which `reqwest-retry` threads
+/// through every retry, so each attempt shares one counter even though
+/// `Middleware::handle` is called fresh each time.
 struct AttemptCounter(AtomicU32);
 
 /// Middleware that logs every retry attempt and the final outcome.
