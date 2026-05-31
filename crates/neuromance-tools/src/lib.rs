@@ -17,8 +17,11 @@
 //!
 //! - [`ReadTool`]: Read UTF-8 files with optional line offset/limit
 //! - [`WriteTool`]: Create or overwrite a file at an absolute path
-//! - [`EditTool`]: Exact-string replacement on a file
+//! - [`EditTool`]: String replacement on a file, single or batched
 //! - [`BashTool`]: Execute a shell command via `sh -c` with a timeout
+//! - [`GrepTool`]: Search file contents by regex, respecting `.gitignore`
+//! - [`FindTool`]: Find files by glob pattern, respecting `.gitignore`
+//! - [`LsTool`]: List the entries of a directory
 //!
 //! ## Example: Creating and Executing a Custom Tool
 //!
@@ -112,6 +115,7 @@
 //! The [`ToolRegistry`] uses `DashMap` for concurrent access, making it safe to use
 //! from multiple async tasks without additional synchronization.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -124,17 +128,64 @@ mod bash_tool;
 mod edit_tool;
 mod error;
 pub mod factory;
+mod find_tool;
 pub mod generic;
+mod grep_tool;
+mod ls_tool;
 pub mod mcp;
 pub mod proxy;
 mod read_tool;
+mod truncate;
 mod write_tool;
 pub use bash_tool::{BashTool, BashToolFactory};
 pub use edit_tool::{EditTool, EditToolFactory};
 pub use error::{ToolError, ToolExecutorError};
 pub use factory::{ToolConfig, ToolFactory, ToolFactoryRegistry};
+pub use find_tool::{FindTool, FindToolFactory};
+pub use grep_tool::{GrepTool, GrepToolFactory};
+pub use ls_tool::{LsTool, LsToolFactory};
 pub use read_tool::{ReadTool, ReadToolFactory};
 pub use write_tool::{WriteTool, WriteToolFactory};
+
+/// Resolves an optional `path` argument for the search tools (`grep`, `find`,
+/// `ls`) to an absolute directory or file.
+///
+/// When omitted, defaults to the current working directory. When provided it
+/// must be absolute, matching the path discipline of the other built-in tools.
+///
+/// # Errors
+/// Returns [`ToolError::InvalidArguments`] for a relative path, or
+/// [`ToolError::Execution`] if the current directory cannot be determined.
+pub(crate) fn resolve_search_path(raw: Option<&str>) -> Result<PathBuf, ToolError> {
+    match raw {
+        Some(p) => {
+            let path = PathBuf::from(p);
+            if !path.is_absolute() {
+                return Err(ToolError::InvalidArguments(format!(
+                    "'path' must be absolute, got: {}",
+                    path.display()
+                )));
+            }
+            Ok(path)
+        }
+        None => std::env::current_dir()
+            .map_err(|e| ToolError::execution(format!("cannot determine current directory: {e}"))),
+    }
+}
+
+/// Parses an optional non-negative integer argument, returning `default` when
+/// absent and an error when present but not a non-negative integer.
+///
+/// # Errors
+/// Returns [`ToolError::InvalidArguments`] if the value is the wrong type.
+pub(crate) fn opt_u64(v: Option<&Value>, name: &str, default: u64) -> Result<u64, ToolError> {
+    match v {
+        None | Some(Value::Null) => Ok(default),
+        Some(val) => val.as_u64().ok_or_else(|| {
+            ToolError::InvalidArguments(format!("'{name}' must be a non-negative integer"))
+        }),
+    }
+}
 
 #[async_trait]
 pub trait ToolImplementation: Send + Sync {

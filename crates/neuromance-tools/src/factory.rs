@@ -16,6 +16,9 @@ use crate::ToolRegistry;
 use crate::bash_tool::BashToolFactory;
 use crate::edit_tool::EditToolFactory;
 use crate::error::ToolError;
+use crate::find_tool::FindToolFactory;
+use crate::grep_tool::GrepToolFactory;
+use crate::ls_tool::LsToolFactory;
 use crate::read_tool::ReadToolFactory;
 use crate::write_tool::WriteToolFactory;
 
@@ -67,7 +70,7 @@ impl ToolFactoryRegistry {
     }
 
     /// Returns a registry pre-populated with the built-in factories:
-    /// `read`, `write`, `edit`, `bash`.
+    /// `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`.
     #[must_use]
     pub fn with_builtin() -> Self {
         let mut r = Self::new();
@@ -75,6 +78,9 @@ impl ToolFactoryRegistry {
         r.register(WriteToolFactory);
         r.register(EditToolFactory);
         r.register(BashToolFactory);
+        r.register(GrepToolFactory);
+        r.register(FindToolFactory);
+        r.register(LsToolFactory);
         r
     }
 
