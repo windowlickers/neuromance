@@ -11,13 +11,16 @@ use tokio::process::Command;
 use tokio::time::timeout;
 
 use crate::factory::ToolFactory;
+use crate::truncate::{TruncatedBy, truncate_tail};
 use crate::{ToolError, ToolImplementation, ToolRegistry};
 use neuromance_common::tools::{Function, Parameters, Property, Tool};
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
-/// Maximum bytes captured from each of stdout / stderr.
+/// Maximum bytes retained from each of stdout / stderr before truncation.
 const MAX_STREAM_BYTES: usize = 64 * 1024;
+/// Maximum lines retained from each of stdout / stderr before truncation.
+const MAX_STREAM_LINES: usize = 2000;
 
 /// Environment variables forwarded into the shell subprocess. Anything else —
 /// including secrets injected by k8s as env vars (`OPENAI_API_KEY`,
@@ -114,49 +117,104 @@ impl ToolImplementation for BashTool {
         })?;
 
         match timeout(Duration::from_millis(timeout_ms), child.wait_with_output()).await {
-            Ok(Ok(output)) => Ok(format_output(
+            Ok(Ok(output)) => Ok(render_output(
                 output.status.code().unwrap_or(-1),
-                &output.stdout,
-                &output.stderr,
+                output.stdout,
+                output.stderr,
                 None,
-            )),
+            )
+            .await),
             Ok(Err(e)) => Err(ToolError::execution(format!("error running command: {e}"))),
-            Err(_) => Ok(format_output(
+            Err(_) => Ok(render_output(
                 -1,
-                &[],
-                &[],
+                Vec::new(),
+                Vec::new(),
                 Some(format!("[timed out after {timeout_ms}ms]")),
-            )),
+            )
+            .await),
         }
     }
 }
 
-fn format_output(exit_code: i32, stdout: &[u8], stderr: &[u8], note: Option<String>) -> String {
-    let stdout_str = truncate_stream(stdout);
-    let stderr_str = truncate_stream(stderr);
+async fn render_output(
+    exit_code: i32,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    note: Option<String>,
+) -> String {
+    let stdout_section = render_stream(stdout).await;
+    let stderr_section = render_stream(stderr).await;
 
     let mut out = format!("exit_code: {exit_code}\n");
     if let Some(note) = note {
         let _ = writeln!(out, "{note}");
     }
     out.push_str("--- stdout ---\n");
-    out.push_str(&stdout_str);
-    if !stdout_str.is_empty() && !stdout_str.ends_with('\n') {
+    out.push_str(&stdout_section);
+    if !stdout_section.is_empty() && !stdout_section.ends_with('\n') {
         out.push('\n');
     }
     out.push_str("--- stderr ---\n");
-    out.push_str(&stderr_str);
+    out.push_str(&stderr_section);
     out
 }
 
-fn truncate_stream(bytes: &[u8]) -> String {
-    if bytes.len() <= MAX_STREAM_BYTES {
-        return String::from_utf8_lossy(bytes).into_owned();
+/// Renders one captured stream, keeping the **tail** (where errors and final
+/// results live) and spilling the full stream to a temp file when truncated.
+async fn render_stream(bytes: Vec<u8>) -> String {
+    let lossy = String::from_utf8_lossy(&bytes);
+    let truncated = truncate_tail(&lossy, MAX_STREAM_LINES, MAX_STREAM_BYTES);
+    drop(lossy);
+
+    let Some(by) = truncated.truncated_by else {
+        return truncated.content;
+    };
+
+    let mut s = truncated.content;
+    if !s.is_empty() && !s.ends_with('\n') {
+        s.push('\n');
     }
-    let mut s = String::from_utf8_lossy(&bytes[..MAX_STREAM_BYTES]).into_owned();
-    let extra = bytes.len() - MAX_STREAM_BYTES;
-    let _ = write!(s, "\n[truncated, {extra} more bytes]");
+    let unit = match by {
+        TruncatedBy::Lines => "lines",
+        TruncatedBy::Bytes => "bytes",
+    };
+    match spill_to_temp(bytes).await {
+        Some(path) => {
+            let _ = write!(
+                s,
+                "[output truncated by {unit}: showing last {} of {} lines; full output: {}]",
+                truncated.shown_lines,
+                truncated.total_lines,
+                path.display()
+            );
+        }
+        None => {
+            let _ = write!(
+                s,
+                "[output truncated by {unit}: showing last {} of {} lines]",
+                truncated.shown_lines, truncated.total_lines
+            );
+        }
+    }
     s
+}
+
+/// Writes the full stream to a persisted temp file so nothing is lost to
+/// truncation. Returns `None` if the spill fails — best-effort, never fatal.
+async fn spill_to_temp(bytes: Vec<u8>) -> Option<PathBuf> {
+    tokio::task::spawn_blocking(move || {
+        let mut file = tempfile::Builder::new()
+            .prefix("neuromance-bash-")
+            .suffix(".log")
+            .tempfile()
+            .ok()?;
+        std::io::Write::write_all(file.as_file_mut(), &bytes).ok()?;
+        let (_, path) = file.keep().ok()?;
+        Some(path)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// Factory that registers [`BashTool`] under the name `bash`.
@@ -269,6 +327,40 @@ mod tests {
     #[test]
     fn test_is_not_auto_approved() {
         assert!(!BashTool.is_auto_approved());
+    }
+
+    #[tokio::test]
+    async fn test_bash_truncation_keeps_tail() {
+        // 5000 lines exceeds MAX_STREAM_LINES (2000); the *last* line must
+        // survive (errors live at the end) and the full output is spilled.
+        let tool = BashTool;
+        let result = tool
+            .execute(&json!({ "command": "seq 1 5000" }))
+            .await
+            .unwrap();
+        assert!(result.contains("\n5000\n"), "tail line missing:\n{result}");
+        assert!(result.contains("output truncated by lines"));
+        assert!(result.contains("showing last 2000 of 5000 lines"));
+        assert!(result.contains("full output:"));
+    }
+
+    #[tokio::test]
+    async fn test_bash_spilled_file_has_full_output() {
+        let tool = BashTool;
+        let result = tool
+            .execute(&json!({ "command": "seq 1 5000" }))
+            .await
+            .unwrap();
+        let path = result
+            .lines()
+            .find_map(|l| l.split_once("full output: "))
+            .map(|(_, rest)| rest.trim_end_matches(']').to_string())
+            .expect("spill path should be present");
+        let spilled = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(spilled.lines().count(), 5000);
+        assert!(spilled.starts_with("1\n"));
+        assert!(spilled.trim_end().ends_with("5000"));
+        let _ = tokio::fs::remove_file(&path).await;
     }
 
     #[tokio::test]

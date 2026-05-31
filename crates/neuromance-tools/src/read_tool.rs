@@ -133,9 +133,11 @@ fn format_with_line_numbers(lines: &[&str], first_line_no: usize, total_lines: u
         let formatted = format!("{line_no:>6}\t{line}\n");
         if out.len() + formatted.len() > MAX_OUTPUT_BYTES {
             let remaining = lines.len() - i;
+            let next_offset = first_line_no + emitted;
             let _ = writeln!(
                 out,
-                "[truncated, {remaining} more lines (output capped at {MAX_OUTPUT_BYTES} bytes)]"
+                "[truncated at {MAX_OUTPUT_BYTES} bytes; {remaining} more line(s). \
+                 Use offset={next_offset} to continue.]"
             );
             return out;
         }
@@ -145,7 +147,14 @@ fn format_with_line_numbers(lines: &[&str], first_line_no: usize, total_lines: u
 
     if emitted > 0 {
         let last_emitted = first_line_no + emitted - 1;
-        if first_line_no > 1 || last_emitted < total_lines {
+        if last_emitted < total_lines {
+            let next_offset = last_emitted + 1;
+            let _ = writeln!(
+                out,
+                "[showing lines {first_line_no}-{last_emitted} of {total_lines}. \
+                 Use offset={next_offset} to continue.]"
+            );
+        } else if first_line_no > 1 {
             let _ = writeln!(
                 out,
                 "[showing lines {first_line_no}-{last_emitted} of {total_lines}]"
@@ -240,6 +249,41 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("must be absolute"));
+    }
+
+    #[tokio::test]
+    async fn test_read_limit_emits_continuation_hint() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("multi.txt");
+        tokio_fs::write(&path, "a\nb\nc\nd\ne\n").await.unwrap();
+
+        let tool = ReadTool;
+        let result = tool
+            .execute(&json!({
+                "path": path.to_str().unwrap(),
+                "limit": 2,
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.contains("showing lines 1-2 of 5"));
+        assert!(result.contains("Use offset=3 to continue."));
+    }
+
+    #[tokio::test]
+    async fn test_read_to_eof_has_no_continuation_hint() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tail.txt");
+        tokio_fs::write(&path, "a\nb\nc\n").await.unwrap();
+
+        let tool = ReadTool;
+        let result = tool
+            .execute(&json!({ "path": path.to_str().unwrap(), "offset": 2 }))
+            .await
+            .unwrap();
+
+        assert!(result.contains("showing lines 2-3 of 3"));
+        assert!(!result.contains("Use offset="));
     }
 
     #[tokio::test]
