@@ -5,8 +5,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use globset::{GlobBuilder, GlobMatcher};
+use grep::printer::StandardBuilder;
+use grep::regex::{RegexMatcher, RegexMatcherBuilder};
+use grep::searcher::{BinaryDetection, Searcher, SearcherBuilder};
 use ignore::WalkBuilder;
-use regex::{Regex, RegexBuilder};
 use serde_json::Value;
 
 use crate::factory::ToolFactory;
@@ -16,7 +18,8 @@ use neuromance_common::tools::{Function, Parameters, Property, Tool};
 
 /// Default cap on the number of matching lines returned.
 const DEFAULT_LIMIT: u64 = 100;
-/// Per-line character cap so one long line can't dominate the output.
+/// Per-line byte cap so one long line can't dominate the output; longer lines
+/// are shown as a truncated preview.
 const MAX_LINE_CHARS: usize = 500;
 
 /// Searches file contents by regular expression, respecting `.gitignore`.
@@ -107,7 +110,7 @@ impl ToolImplementation for GrepTool {
             .unwrap_or(usize::MAX);
 
         let query = GrepQuery {
-            regex: build_regex(pattern, literal, ignore_case)?,
+            matcher: build_matcher(pattern, literal, ignore_case)?,
             glob: build_glob(obj.get("glob").and_then(Value::as_str))?,
             context,
             limit,
@@ -125,21 +128,21 @@ impl ToolImplementation for GrepTool {
 
 /// A compiled grep request: the matcher plus the output budget.
 struct GrepQuery {
-    regex: Regex,
+    matcher: RegexMatcher,
     glob: Option<GlobMatcher>,
     context: usize,
     limit: usize,
 }
 
-fn build_regex(pattern: &str, literal: bool, ignore_case: bool) -> Result<Regex, ToolError> {
-    let source = if literal {
-        regex::escape(pattern)
-    } else {
-        pattern.to_string()
-    };
-    RegexBuilder::new(&source)
+fn build_matcher(
+    pattern: &str,
+    literal: bool,
+    ignore_case: bool,
+) -> Result<RegexMatcher, ToolError> {
+    RegexMatcherBuilder::new()
         .case_insensitive(ignore_case)
-        .build()
+        .fixed_strings(literal)
+        .build(pattern)
         .map_err(|e| ToolError::InvalidArguments(format!("invalid regex '{pattern}': {e}")))
 }
 
@@ -160,6 +163,13 @@ impl GrepQuery {
         let mut body = String::new();
         let mut matches = 0usize;
 
+        let mut searcher = SearcherBuilder::new()
+            .line_number(true)
+            .before_context(self.context)
+            .after_context(self.context)
+            .binary_detection(BinaryDetection::quit(0))
+            .build();
+
         for entry in WalkBuilder::new(root).require_git(false).build() {
             if matches >= self.limit {
                 break;
@@ -172,41 +182,39 @@ impl GrepQuery {
             if self.glob.as_ref().is_some_and(|g| !g.is_match(&display)) {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(entry.path()) else {
-                continue; // binary or unreadable file
-            };
-            matches += self.search_file(&display, &text, self.limit - matches, &mut body);
+            matches += self.search_file(&mut searcher, &display, entry.path(), &mut body);
         }
 
         self.finalize(&body, matches)
     }
 
-    fn search_file(&self, display: &str, text: &str, remaining: usize, out: &mut String) -> usize {
-        let lines: Vec<&str> = text.lines().collect();
-        let mut emitted = 0usize;
+    /// Searches one file with ripgrep's engine, appending `path:line:text` lines
+    /// to `out`, and returns the number of matching lines emitted.
+    fn search_file(
+        &self,
+        searcher: &mut Searcher,
+        display: &str,
+        path: &Path,
+        out: &mut String,
+    ) -> usize {
+        let mut printer = StandardBuilder::new()
+            .heading(false)
+            .max_columns(Some(MAX_LINE_CHARS as u64))
+            .max_columns_preview(true)
+            .build_no_color(Vec::new());
 
-        for (idx, line) in lines.iter().enumerate() {
-            if emitted >= remaining {
-                break;
-            }
-            if !self.regex.is_match(line) {
-                continue;
-            }
-            if self.context > 0 && !out.is_empty() {
-                out.push_str("--\n");
-            }
-            let start = idx.saturating_sub(self.context);
-            let end = (idx + self.context).min(lines.len().saturating_sub(1));
-            for (j, ctx_line) in lines.iter().enumerate().take(end + 1).skip(start) {
-                let line_no = j + 1;
-                let cell = truncate_cell(ctx_line);
-                let sep = if j == idx { ':' } else { '-' };
-                let _ = writeln!(out, "{display}{sep}{line_no}{sep}{cell}");
-            }
-            emitted += 1;
+        let mut sink = printer.sink_with_path(&self.matcher, display);
+        if searcher
+            .search_path(&self.matcher, path, &mut sink)
+            .is_err()
+        {
+            return 0; // unreadable file
         }
+        let count = usize::try_from(sink.match_count()).unwrap_or(usize::MAX);
+        drop(sink);
 
-        emitted
+        out.push_str(&String::from_utf8_lossy(&printer.into_inner().into_inner()));
+        count
     }
 
     fn finalize(&self, body: &str, matches: usize) -> String {
@@ -245,14 +253,6 @@ fn display_path(path: &Path, root: &Path, root_is_file: bool) -> String {
         .unwrap_or(path)
         .to_string_lossy()
         .replace('\\', "/")
-}
-
-fn truncate_cell(line: &str) -> String {
-    if line.chars().count() <= MAX_LINE_CHARS {
-        return line.to_string();
-    }
-    let head: String = line.chars().take(MAX_LINE_CHARS).collect();
-    format!("{head} [line truncated]")
 }
 
 /// Factory that registers [`GrepTool`] under the name `grep`.
@@ -300,6 +300,17 @@ mod tests {
 
         let out = grep(json!({ "pattern": "zzz", "path": dir.path().to_str().unwrap() })).await;
         assert_eq!(out, "No matches found.");
+    }
+
+    #[tokio::test]
+    async fn test_grep_skips_binary_file() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("data.bin"), b"needle\x00\x01\x02needle\n").unwrap();
+        std::fs::write(dir.path().join("text.txt"), "needle\n").unwrap();
+
+        let out = grep(json!({ "pattern": "needle", "path": dir.path().to_str().unwrap() })).await;
+        assert!(out.contains("text.txt"), "got:\n{out}");
+        assert!(!out.contains("data.bin"), "binary file searched:\n{out}");
     }
 
     #[tokio::test]
