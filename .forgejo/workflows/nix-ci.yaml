@@ -99,7 +99,7 @@ jobs:
       - name: Verify minimal image archive
         run: test -f result
       - name: Build toolkit image
-        run: nix build .#neuromance-image-toolkit --print-build-logs
+        run: nix build .#neuromance-toolkit-image --print-build-logs
       - name: Push toolkit image to attic
         run: attic push ci ./result
       - name: Verify toolkit image archive
