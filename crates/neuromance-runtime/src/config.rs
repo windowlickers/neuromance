@@ -262,6 +262,12 @@ impl RuntimeConfig {
                 ));
             }
         }
+
+        if self.runtime.max_queue_depth == 0 {
+            return Err(RuntimeError::Config(
+                "runtime.max_queue_depth must be at least 1".to_string(),
+            ));
+        }
         Ok(())
     }
 }
@@ -344,6 +350,23 @@ mod tests {
         let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
         let err = config.validate().err().unwrap();
         assert!(format!("{err}").contains("oneshot mode requires"));
+    }
+
+    #[test]
+    fn test_zero_max_queue_depth_fails_validation() {
+        let toml_str = r#"
+            mode = "serve"
+            [agent]
+            id = "x"
+            model = "openai:gpt-4o"
+            api_key_env = "K"
+            system_prompt = "be helpful"
+            [runtime]
+            max_queue_depth = 0
+        "#;
+        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        let err = config.validate().err().unwrap();
+        assert!(format!("{err}").contains("max_queue_depth"));
     }
 
     #[test]
