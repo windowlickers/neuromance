@@ -137,12 +137,13 @@ pub(crate) fn build_client_resources(
     // Create client with retry middleware.
     // RetryAfterMiddleware is added before RetryTransientMiddleware
     // so that Retry-After headers are respected before falling back to exponential backoff.
-    // RetryLoggingMiddleware sits before the retry middleware so it observes
-    // every attempt (including the original).
+    // RetryLoggingMiddleware is registered last so it is the innermost middleware:
+    // RetryTransientMiddleware re-invokes the chain below it on every retry, so the
+    // logging middleware observes each attempt (including the original).
     let client = reqwest_middleware::ClientBuilder::new(reqwest_client.clone())
-        .with(retry_logging::RetryLoggingMiddleware)
         .with(RetryAfterMiddleware::new())
         .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+        .with(retry_logging::RetryLoggingMiddleware)
         .build();
 
     Ok(ClientResources {

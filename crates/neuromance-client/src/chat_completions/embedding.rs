@@ -232,11 +232,12 @@ impl OpenAIEmbedding {
             None => reqwest::Client::builder().build()?,
         };
 
-        // Create client with retry middleware (logging first so it sees every attempt).
+        // Create client with retry middleware (logging registered last, so it is the
+        // innermost middleware the retry loop re-invokes on every attempt).
         let client = reqwest_middleware::ClientBuilder::new(reqwest_client)
-            .with(crate::retry_logging::RetryLoggingMiddleware)
             .with(RetryAfterMiddleware::new())
             .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+            .with(crate::retry_logging::RetryLoggingMiddleware)
             .build();
 
         Ok(Self {

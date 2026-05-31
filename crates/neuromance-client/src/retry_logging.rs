@@ -2,7 +2,8 @@
 //!
 //! `reqwest-retry` silently retries transient failures, so users have no
 //! visibility into how many attempts a request actually took. This middleware
-//! sits before `RetryTransientMiddleware` in the chain and logs every
+//! is registered after `RetryTransientMiddleware` so it sits innermost in the
+//! chain: the retry loop re-invokes it on every attempt, letting it log each
 //! re-entry plus the eventual outcome.
 
 use std::sync::Arc;
