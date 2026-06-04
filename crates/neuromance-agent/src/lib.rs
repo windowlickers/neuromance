@@ -42,9 +42,13 @@ use neuromance_common::chat::{Message, MessageRole};
 use neuromance_common::client::ToolChoice;
 
 pub mod builder;
+pub mod subagent;
 
 // --- Agent core ---
 pub use builder::AgentBuilder;
+
+// --- Subagents ---
+pub use subagent::{FanoutVote, LocalSubagent, Subagent, SubagentError, SubagentTool};
 
 // --- Agent state types (live in neuromance-common so they can be shared,
 //     surfaced here so agent consumers only need this crate) ---

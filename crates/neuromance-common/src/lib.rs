@@ -72,6 +72,9 @@ pub mod tools;
 
 pub mod agents;
 
+/// Task and outcome types for subagent delegation.
+pub mod task;
+
 pub use agents::{AgentContext, AgentMemory, AgentMessage, AgentResponse, AgentState, AgentStats};
 pub use chat::{Conversation, ConversationStatus, Message, MessageRole, ReasoningContent};
 pub use client::{
@@ -79,6 +82,7 @@ pub use client::{
     OutputTokensDetails, Provider, ProxyConfig, ReasoningEffort, RetryConfig, ToolChoice, Usage,
 };
 pub use features::{ReasoningLevel, ThinkingMode};
+pub use task::{Outcome, Task};
 pub use tools::{
     Function, FunctionCall, ObjectSchema, Parameters, Property, Tool, ToolApproval, ToolCall,
 };

@@ -18,6 +18,8 @@ workspace = true
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+futures = { workspace = true }
+thiserror = { workspace = true }
 tracing = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
@@ -34,7 +36,6 @@ neuromance-tools = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 colored = { workspace = true }
-futures = { workspace = true }
 tokio = { workspace = true }
 tracing-subscriber = { workspace = true }
 
@@ -45,3 +46,7 @@ path = "examples/sequential_agents.rs"
 [[example]]
 name = "sequential_agents_builder"
 path = "examples/sequential_agents_builder.rs"
+
+[[example]]
+name = "fanout_vote"
+path = "examples/fanout_vote.rs"
