@@ -72,6 +72,8 @@ pub mod tools;
 
 pub mod agents;
 
+/// The subagent contract (trait + error) for delegated work.
+pub mod subagent;
 /// Task and outcome types for subagent delegation.
 pub mod task;
 
@@ -82,6 +84,7 @@ pub use client::{
     OutputTokensDetails, Provider, ProxyConfig, ReasoningEffort, RetryConfig, ToolChoice, Usage,
 };
 pub use features::{ReasoningLevel, ThinkingMode};
+pub use subagent::{Subagent, SubagentError};
 pub use task::{Outcome, Task};
 pub use tools::{
     Function, FunctionCall, ObjectSchema, Parameters, Property, Tool, ToolApproval, ToolCall,

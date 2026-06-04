@@ -32,6 +32,9 @@ pyo3 = { version = "0.27.2", features = ["auto-initialize"], optional = true }
 neuromance-common = { workspace = true, optional = true }
 neuromance-tools = { workspace = true, optional = true }
 
+# Optional subagent bridge support
+tokio-util = { workspace = true, optional = true }
+
 [dev-dependencies]
 tokio = { version = "1.0", features = ["full", "test-util"] }
 clap = { version = "4.5", features = ["derive"] }
@@ -39,6 +42,7 @@ tracing-subscriber = { workspace = true }
 serial_test = "3"
 proptest = "1.4"
 neuromance = { workspace = true }
+neuromance-agent = { workspace = true }
 neuromance-client = { workspace = true }
 neuromance-common = { workspace = true }
 neuromance-tools = { workspace = true }
@@ -50,7 +54,15 @@ sysinfo = "0.33"  # For tracking memory/CPU usage
 default = []
 python = ["pyo3"]
 tools = ["neuromance-common", "neuromance-tools"]
+# Inject subagents into the Python namespace. Depends only on the `common`
+# subagent contract (via `tools`), so the repl crate never depends on the agent
+# crate — keeping `agent -> repl` (repl-as-a-tool) cycle-free.
+subagent = ["python", "tools", "dep:tokio-util"]
 full = ["python", "tools"]
+
+[[example]]
+name = "python_subagent"
+required-features = ["subagent"]
 
 [[example]]
 name = "recursive_llm_query"

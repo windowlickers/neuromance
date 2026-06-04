@@ -56,7 +56,10 @@ impl<C: LLMClient> Subagent for LocalSubagent<C> {
                 Message::system(conv_id, self.system_prompt.as_str()),
                 Message::user(conv_id, user_content),
             ];
-            agent.execute(Some(messages), cancel).await?
+            agent
+                .execute(Some(messages), cancel)
+                .await
+                .map_err(SubagentError::execution)?
         };
 
         Ok(Outcome {

@@ -47,6 +47,9 @@ pub(crate) mod state;
 #[cfg(feature = "tools")]
 pub mod tool;
 
+#[cfg(feature = "subagent")]
+pub mod subagent;
+
 // Re-export main types
 pub use callback::PythonCallback;
 pub use direct::PythonRepl;
@@ -56,6 +59,10 @@ pub(crate) use state::WithShared;
 // Re-export tool implementation
 #[cfg(feature = "tools")]
 pub use tool::{PythonReplTool, PythonReplToolFactory};
+
+// Re-export subagent bridge
+#[cfg(feature = "subagent")]
+pub use subagent::SubagentRepl;
 
 /// Register a callback, marking it for re-injection if it replaces
 /// an existing one with the same name.

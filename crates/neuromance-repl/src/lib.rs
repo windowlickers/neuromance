@@ -71,6 +71,9 @@ pub use python::{InteractivePythonRepl, PythonCallback, PythonRepl, PythonReplCo
 #[cfg(all(feature = "python", feature = "tools"))]
 pub use python::PythonReplTool;
 
+#[cfg(feature = "subagent")]
+pub use python::SubagentRepl;
+
 /// Result of executing code in a REPL environment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[must_use]
