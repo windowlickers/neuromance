@@ -113,7 +113,7 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, trace, warn};
 
 use neuromance_common::chat::Message;
 use neuromance_common::client::{ChatChunk, ChatRequest, ChatResponse, Config, ProxyConfig, Usage};
@@ -551,10 +551,7 @@ impl ChatCompletionsClient {
         }
 
         let response_text = response.text().await?;
-        debug!(
-            "Raw API response: {}",
-            &response_text.chars().collect::<String>()
-        );
+        trace!(target: "neuromance::wire", body = %response_text, "raw API response");
         let parsed_response: T =
             serde_json::from_str(&response_text).map_err(ClientError::SerializationError)?;
 

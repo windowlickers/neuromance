@@ -9,7 +9,7 @@ use futures::{Stream, StreamExt};
 use metrics::{counter, histogram};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, info_span};
+use tracing::{debug, info, info_span, trace};
 
 /// How often to emit an info-level "still streaming" progress log while a
 /// single turn is in flight. Keeps long completions visible without flooding.
@@ -266,9 +266,15 @@ impl<C: LLMClient> Core<C> {
                 );
                 let _turn_enter = turn_span.enter();
                 info!(turn = turn_number, max_turns = %max_turns_label, "executing chat turn");
-                if tracing::enabled!(tracing::Level::DEBUG) {
-                    let pretty = serde_json::to_string_pretty(&request)?;
-                    debug!(request = %pretty, "chat request");
+                debug!(
+                    model = request.model.as_deref().unwrap_or("default"),
+                    messages = request.messages.len(),
+                    tools = request.tools.as_ref().map_or(0, Vec::len),
+                    "chat request",
+                );
+                if tracing::enabled!(target: "neuromance::wire", tracing::Level::TRACE) {
+                    let body = serde_json::to_string(&request)?;
+                    trace!(target: "neuromance::wire", %body, "chat request body");
                 }
 
                 let response = if self.streaming {
@@ -420,10 +426,9 @@ impl<C: LLMClient> Core<C> {
                     outcome?
                 };
 
-                debug!("received response from LLM");
-                if tracing::enabled!(tracing::Level::DEBUG) {
-                    let pretty = serde_json::to_string_pretty(&response)?;
-                    debug!(response = %pretty, "assistant response");
+                if tracing::enabled!(target: "neuromance::wire", tracing::Level::TRACE) {
+                    let body = serde_json::to_string(&response)?;
+                    trace!(target: "neuromance::wire", %body, "assistant response body");
                 }
 
                 if let Some(ref usage) = response.usage {

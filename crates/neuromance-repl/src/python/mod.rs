@@ -174,6 +174,17 @@ impl Default for PythonReplConfig {
 }
 
 impl PythonReplConfig {
+    /// Set the per-execution timeout, returning the updated config.
+    ///
+    /// Raise this when injected callbacks may block for a long time — e.g. a
+    /// `run_subagent` call that drives a nested LLM turn can run for minutes,
+    /// far past the 30s default.
+    #[must_use]
+    pub const fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
     /// Append modules to [`Self::python_modules`], returning the updated config.
     ///
     /// Extends rather than replaces so chaining onto

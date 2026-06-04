@@ -11,7 +11,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, trace, warn};
 
 use neuromance_common::chat::MessageRole;
 use neuromance_common::client::{ChatChunk, ChatRequest, ChatResponse, Config, Usage};
@@ -160,7 +160,7 @@ impl ResponsesClient {
         }
 
         let response_text = response.text().await?;
-        debug!("Raw API response: {response_text}");
+        trace!(target: "neuromance::wire", body = %response_text, "raw API response");
         let parsed_response: T =
             serde_json::from_str(&response_text).map_err(ClientError::SerializationError)?;
 
