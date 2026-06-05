@@ -73,7 +73,7 @@ fn with_think(base: &str, no_think: bool) -> String {
 }
 
 /// System prompt: teaches the orchestrator the adversarial technique and the
-/// `run_subagent` primitive available inside `execute_python`.
+/// `run_subagent` / `spawn_agents` primitives available inside `execute_python`.
 const ORCHESTRATOR_SYSTEM_PROMPT: &str = r#"You are an orchestrator. You do NOT answer the user directly from your own knowledge.
 Instead, you delegate to specialist subagents by running Python, then synthesize their work.
 
@@ -81,12 +81,15 @@ The ONLY way to run Python is to make an execute_python tool call. Never write P
 message text — code in your reply does nothing. You cannot see any subagent output until you
 actually call the execute_python tool and read its result.
 
-Inside that Python environment one function is ALREADY DEFINED as a global:
+Inside that Python environment these functions are ALREADY DEFINED as globals:
 
     run_subagent(name, instructions, context=None) -> str
+    spawn_agents([Agent(name, instructions, context=None), ...]) -> list[str]
 
-It runs the named subagent and returns its answer as a string. It is a builtin — never
-import it, and never `import` anything else. Available subagents:
+run_subagent runs one subagent and returns its answer — use it for dependent steps where each
+call needs the previous answer. spawn_agents runs a batch concurrently and returns their answers
+in order — use it for independent fan-out instead of calling run_subagent in a loop. They are
+builtins — never import them, and never `import` anything else. Available subagents:
   - 'solver': proposes an answer to a problem.
   - 'critic': adversarially attacks an answer, listing concrete flaws, gaps, and counterexamples.
   - 'judge': given the full record, returns the single best final answer.

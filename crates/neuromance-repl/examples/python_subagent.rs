@@ -1,8 +1,8 @@
 //! Drive subagents from inside the Python REPL.
 //!
-//! Registers a `worker` and a `judge` subagent, exposes them to Python as
-//! `run_subagent(...)`, and lets the *Python code* define the orchestration
-//! technique (here: fan out to the worker, then have the judge pick the best).
+//! Registers a `worker` and a `judge` subagent, exposes them to Python, and lets
+//! the *Python code* define the orchestration technique (here: fan the worker out
+//! concurrently with `spawn_agents`, then have the judge pick the best).
 //!
 //! Run with a local OpenAI-compatible server (e.g. llama.cpp on :8080):
 //! ```bash
@@ -79,10 +79,12 @@ async fn main() -> Result<()> {
     let repl = Arc::new(PythonRepl::new()?);
     let bridge = SubagentRepl::new(repl, subagents, CancellationToken::new())?;
 
-    // The technique lives in Python, not Rust: fan out, then vote.
+    // The technique lives in Python, not Rust: fan out concurrently, then vote.
+    // spawn_agents runs the three workers in parallel; run_subagent makes the
+    // single dependent judge call once their answers are in.
     let code = r#"
 question = "What is the capital of France, and why is it significant?"
-answers = [run_subagent('worker', question) for _ in range(3)]
+answers = spawn_agents([Agent('worker', question) for _ in range(3)])
 verdict = run_subagent('judge', 'Pick the best answer:\n\n' + '\n\n'.join(answers))
 print(verdict)
 "#;

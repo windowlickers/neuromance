@@ -249,6 +249,39 @@ impl PythonRepl {
         super::inject_function(&self.state, name, Box::new(callback))
     }
 
+    /// Define setup code in the REPL's globals.
+    ///
+    /// Top-level `def`s and assignments bind into the globals dict rather than
+    /// locals, so they survive [`reset`](Self::reset) (which clears only locals
+    /// and the injected-callback tracking). Use this for prelude helpers that
+    /// must outlive a state reset, the way injected Rust callbacks do.
+    ///
+    /// Runs synchronously: the code must not call any injected Rust callback,
+    /// since no Tokio runtime handle is established here. It is meant for pure
+    /// Python definitions evaluated once at construction.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ReplError` if the state mutex is poisoned, the code contains an
+    /// interior NUL byte, or Python evaluation fails.
+    pub fn define_prelude(&self, code: &str) -> Result<(), ReplError> {
+        let guard = self
+            .state
+            .lock()
+            .map_err(|e| ReplError::StatePoisoned(e.to_string()))?;
+        Python::attach(|py| {
+            let globals_ref = guard.globals.bind(py);
+            let c_code = CString::new(code).map_err(|e| {
+                ReplError::InvalidInput(format!(
+                    "prelude contains an interior NUL byte at position {}",
+                    e.nul_position()
+                ))
+            })?;
+            py.run(c_code.as_c_str(), Some(globals_ref), Some(globals_ref))
+                .map_err(ReplError::PythonExec)
+        })
+    }
+
     /// Get a variable's string representation from the REPL.
     ///
     /// # Errors
