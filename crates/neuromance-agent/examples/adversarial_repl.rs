@@ -110,11 +110,13 @@ Rules:
 
 fn build_subagent(id: &str, system_prompt: &str, config: &Config) -> Result<Arc<dyn Subagent>> {
     let client = ChatCompletionsClient::new(config.clone())?;
-    let agent = Agent::builder(id, client)
-        .max_turns(3)
-        .auto_approve_tools(true)
-        .build();
-    Ok(Arc::new(LocalSubagent::new(agent, system_prompt)))
+    let agent_id = id.to_string();
+    Ok(Arc::new(LocalSubagent::new(id, system_prompt, move || {
+        Agent::builder(agent_id.clone(), client.clone())
+            .max_turns(3)
+            .auto_approve_tools(true)
+            .build()
+    })))
 }
 
 #[tokio::main]
