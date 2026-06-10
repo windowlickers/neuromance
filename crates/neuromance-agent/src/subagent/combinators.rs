@@ -30,15 +30,14 @@ impl FanoutVote {
     /// Build a fanout-vote over `members`, adjudicated by `judge`.
     ///
     /// # Errors
-    /// Returns [`SubagentError::NoOutcomes`] if `members` is empty — a fanout
-    /// with no members can never produce an outcome.
+    /// Returns [`SubagentError::EmptyMembers`] if `members` is empty.
     pub fn new(
         id: impl Into<String>,
         members: Vec<Arc<dyn Subagent>>,
         judge: Arc<dyn Subagent>,
     ) -> Result<Self, SubagentError> {
         if members.is_empty() {
-            return Err(SubagentError::NoOutcomes);
+            return Err(SubagentError::EmptyMembers);
         }
         Ok(Self {
             id: id.into(),
@@ -229,7 +228,7 @@ mod tests {
     fn test_new_rejects_empty_members() {
         let judge = MockSubagent::new("judge", "v");
         let result = FanoutVote::new("vote", vec![], judge as Arc<dyn Subagent>);
-        assert!(matches!(result, Err(SubagentError::NoOutcomes)));
+        assert!(matches!(result, Err(SubagentError::EmptyMembers)));
     }
 
     #[test]

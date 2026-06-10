@@ -26,6 +26,10 @@ pub enum SubagentError {
     /// A fanout completed but no member produced a successful outcome.
     #[error("fanout produced no successful member outcomes")]
     NoOutcomes,
+
+    /// A combinator was constructed with no member subagents.
+    #[error("combinator requires at least one member subagent")]
+    EmptyMembers,
 }
 
 impl SubagentError {
