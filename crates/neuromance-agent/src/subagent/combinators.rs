@@ -10,6 +10,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::future::join_all;
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
 
 use neuromance_common::task::{Outcome, Task};
 
@@ -83,10 +84,17 @@ impl Subagent for FanoutVote {
     }
 
     async fn run(&self, task: Task, cancel: CancellationToken) -> Result<Outcome, SubagentError> {
-        let runs = self
-            .members
-            .iter()
-            .map(|m| m.run(task.clone(), cancel.clone()));
+        let runs = self.members.iter().map(|m| {
+            let task = task.clone();
+            let cancel = cancel.clone();
+            async move {
+                let result = m.run(task, cancel).await;
+                if let Err(error) = &result {
+                    warn!(member = m.id(), %error, "fanout member failed; dropping its candidate");
+                }
+                result
+            }
+        });
         let candidates: Vec<Outcome> = join_all(runs)
             .await
             .into_iter()
@@ -163,7 +171,7 @@ mod tests {
             _task: Task,
             _cancel: CancellationToken,
         ) -> Result<Outcome, SubagentError> {
-            Err(SubagentError::NoOutcomes)
+            Err(SubagentError::execution("failing subagent boom"))
         }
     }
 
@@ -221,6 +229,36 @@ mod tests {
         assert!(
             judge.last_instructions.lock().expect("lock").is_none(),
             "judge must not run when there are no candidates",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_failed_members_are_dropped_and_survivors_reach_judge() {
+        let good = MockSubagent::new("good", "answer G");
+        let judge = MockSubagent::new("judge", "final verdict");
+        let fanout = FanoutVote::new(
+            "vote",
+            vec![Arc::new(FailingSubagent), good],
+            Arc::clone(&judge) as Arc<dyn Subagent>,
+        )
+        .expect("non-empty members");
+
+        let outcome = fanout
+            .run(Task::new("q"), CancellationToken::new())
+            .await
+            .expect("surviving member keeps the fanout alive");
+        assert_eq!(outcome.content, "final verdict");
+
+        let judge_prompt = judge
+            .last_instructions
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("judge ran");
+        assert!(judge_prompt.contains("answer G"));
+        assert!(
+            !judge_prompt.contains("Candidate 2"),
+            "only the surviving candidate is presented to the judge",
         );
     }
 
