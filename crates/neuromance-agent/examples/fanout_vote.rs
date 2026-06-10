@@ -86,6 +86,7 @@ async fn main() -> Result<()> {
         fanout as Arc<dyn Subagent>,
         "delegate",
         "Delegate a task to a panel of agents that vote on the best answer.",
+        CancellationToken::new(),
     );
     info!("FanoutVote is also usable as a tool via SubagentTool::new");
 

@@ -23,20 +23,28 @@ pub struct SubagentTool {
     inner: Arc<dyn Subagent>,
     name: String,
     description: String,
+    cancel: CancellationToken,
 }
 
 impl SubagentTool {
     /// Wrap `inner`, exposing it under `name` with `description` in the tool schema.
+    ///
+    /// `cancel` is passed to every delegated run, so cancelling it aborts
+    /// in-flight delegations. [`ToolImplementation::execute`] provides no
+    /// per-call token, so this construction-time token is the only way for a
+    /// host to reach work the tool has delegated.
     #[must_use]
     pub fn new(
         inner: Arc<dyn Subagent>,
         name: impl Into<String>,
         description: impl Into<String>,
+        cancel: CancellationToken,
     ) -> Self {
         Self {
             inner,
             name: name.into(),
             description: description.into(),
+            cancel,
         }
     }
 }
@@ -85,7 +93,7 @@ impl ToolImplementation for SubagentTool {
 
         let outcome = self
             .inner
-            .run(task, CancellationToken::new())
+            .run(task, self.cancel.clone())
             .await
             .map_err(|e| ToolError::execution(format!("subagent '{}' failed: {e}", self.name)))?;
         Ok(outcome.content)
@@ -119,15 +127,22 @@ mod tests {
         async fn run(
             &self,
             task: Task,
-            _cancel: CancellationToken,
+            cancel: CancellationToken,
         ) -> Result<Outcome, SubagentError> {
+            if cancel.is_cancelled() {
+                return Err(SubagentError::execution("run cancelled"));
+            }
             Ok(Outcome::new(task.id, format!("ran: {}", task.instructions)))
         }
     }
 
+    fn delegate_tool(cancel: CancellationToken) -> SubagentTool {
+        SubagentTool::new(Arc::new(MockSubagent), "delegate", "Delegate work.", cancel)
+    }
+
     #[tokio::test]
     async fn test_execute_returns_outcome_content() {
-        let tool = SubagentTool::new(Arc::new(MockSubagent), "delegate", "Delegate work.");
+        let tool = delegate_tool(CancellationToken::new());
         let result = tool
             .execute(&json!({ "instructions": "do it" }))
             .await
@@ -137,7 +152,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_rejects_missing_instructions() {
-        let tool = SubagentTool::new(Arc::new(MockSubagent), "delegate", "Delegate work.");
+        let tool = delegate_tool(CancellationToken::new());
         let err = tool
             .execute(&json!({ "context": "no instructions here" }))
             .await
@@ -145,9 +160,25 @@ mod tests {
         assert!(matches!(err, ToolError::InvalidArguments(_)));
     }
 
+    #[tokio::test]
+    async fn test_cancellation_reaches_delegated_run() {
+        let cancel = CancellationToken::new();
+        let tool = delegate_tool(cancel.clone());
+        cancel.cancel();
+
+        let err = tool
+            .execute(&json!({ "instructions": "do it" }))
+            .await
+            .expect_err("cancelled token must reach the subagent");
+        assert!(
+            err.to_string().contains("run cancelled"),
+            "unexpected error: {err}",
+        );
+    }
+
     #[test]
     fn test_definition_requires_instructions() {
-        let tool = SubagentTool::new(Arc::new(MockSubagent), "delegate", "Delegate work.");
+        let tool = delegate_tool(CancellationToken::new());
         let def = tool.get_definition();
         assert_eq!(def.function.name, "delegate");
         assert_eq!(def.function.parameters["required"], json!(["instructions"]));
@@ -155,7 +186,7 @@ mod tests {
 
     #[test]
     fn test_not_auto_approved() {
-        let tool = SubagentTool::new(Arc::new(MockSubagent), "delegate", "Delegate work.");
+        let tool = delegate_tool(CancellationToken::new());
         assert!(!tool.is_auto_approved());
     }
 }
