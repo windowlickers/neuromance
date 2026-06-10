@@ -53,17 +53,17 @@ struct Args {
     question: String,
 
     /// Per-execution REPL timeout, in seconds. Must exceed the total time of all
-    /// nested run_subagent calls in one script (each can take minutes).
+    /// nested `run_subagent` calls in one script (each can take minutes).
     #[arg(long, default_value_t = 300)]
     repl_timeout_secs: u64,
 
-    /// Append "/no_think" to every prompt to disable reasoning traces on models
+    /// Append `/no_think` to every prompt to disable reasoning traces on models
     /// that support it (e.g. Qwen3) — much faster for a live demo.
     #[arg(long, default_value_t = false)]
     no_think: bool,
 }
 
-/// Optionally append the Qwen-style "/no_think" directive to a prompt.
+/// Optionally append the Qwen-style `/no_think` directive to a prompt.
 fn with_think(base: &str, no_think: bool) -> String {
     if no_think {
         format!("{base}\n\n/no_think")
