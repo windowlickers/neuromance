@@ -407,6 +407,24 @@ mod tests {
     }
 
     #[test]
+    fn test_string_methods_require_arguments() {
+        let s = Value::from("hello");
+
+        for method in ["split", "endswith", "startswith"] {
+            let err = handle_string_method(&s, method, &[]).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                ErrorKind::MissingArgument,
+                "{method} with no args should report MissingArgument"
+            );
+        }
+
+        // replace needs two arguments; one is not enough.
+        let err = handle_string_method(&s, "replace", &[Value::from("a")]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::MissingArgument);
+    }
+
+    #[test]
     fn test_upper_lower() {
         let mut env = create_env();
         env.add_template("test", "{{ 'Hello'.upper() }}-{{ 'Hello'.lower() }}")
