@@ -60,9 +60,19 @@ pub enum TokenCounterError {
     #[error("Failed to extract tokenizer from GGUF: {0}")]
     GgufTokenizerExtraction(String),
 
-    /// Chat template missing, or a template operation failed.
+    /// Chat template missing or otherwise invalid.
     #[error("Chat template error: {0}")]
     Template(String),
+
+    /// A chat template failed to compile or render.
+    #[error("Chat template error for model '{model}'")]
+    TemplateRender {
+        /// The model repository whose template failed.
+        model: String,
+        /// The underlying template engine error.
+        #[source]
+        source: minijinja::Error,
+    },
 
     /// Invalid regex pattern.
     #[error("Invalid regex pattern")]
