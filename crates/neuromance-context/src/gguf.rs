@@ -19,11 +19,11 @@
 
 use crate::TokenCounterError;
 use candle_core::quantized::gguf_file;
-use tracing::{debug, warn};
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 use tokenizers::Tokenizer;
+use tracing::{debug, warn};
 
 /// GGUF model metadata extracted without loading tensor data.
 ///
