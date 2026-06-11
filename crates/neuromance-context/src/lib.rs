@@ -36,6 +36,7 @@ use tracing::{debug, error};
 use minijinja::Environment;
 use neuromance_common::{Conversation, Message, MessageRole};
 use regex::Regex;
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -61,8 +62,12 @@ pub struct ModelConfig {
     /// The Hugging Face model repository (e.g., "openai/gpt-oss-20b")
     pub model_repo: String,
 
-    /// Optional Hugging Face API token for accessing gated models
-    pub hf_token: Option<String>,
+    /// Optional Hugging Face API token for accessing gated models.
+    ///
+    /// Wrapped in `SecretString` to prevent accidental logging; skipped during
+    /// serialization so the credential is never written to config output.
+    #[serde(skip_serializing, default)]
+    pub hf_token: Option<SecretString>,
 
     /// Optional local path to a tokenizer.json file (bypasses HF download)
     pub local_tokenizer_path: Option<PathBuf>,
@@ -138,7 +143,7 @@ impl ModelConfig {
 
     /// Sets the Hugging Face API token.
     pub fn with_hf_token(mut self, token: impl Into<String>) -> Self {
-        self.hf_token = Some(token.into());
+        self.hf_token = Some(SecretString::new(token.into().into()));
         self
     }
 
@@ -367,7 +372,7 @@ impl TokenCounter {
 
         let mut api_builder = ApiBuilder::new();
         if let Some(token) = &config.hf_token {
-            api_builder = api_builder.with_token(Some(token.clone()));
+            api_builder = api_builder.with_token(Some(token.expose_secret().to_string()));
         }
         let api = api_builder.build().map_err(|e| {
             TokenCounterError::HuggingFaceDownload(format!("Failed to build HF API client: {e}"))
@@ -471,7 +476,10 @@ impl TokenCounter {
         // Build request with optional HF token
         let mut request = client.get(&url);
         if let Some(token) = &config.hf_token {
-            request = request.header("Authorization", format!("Bearer {}", token));
+            request = request.header(
+                "Authorization",
+                format!("Bearer {}", token.expose_secret()),
+            );
         }
 
         // Download the file
@@ -987,7 +995,10 @@ mod tests {
 
         let config = ModelConfig::custom("test/model").with_hf_token("token123");
         assert_eq!(config.model_repo, "test/model");
-        assert_eq!(config.hf_token.as_deref(), Some("token123"));
+        assert_eq!(
+            config.hf_token.as_ref().map(|t| t.expose_secret()),
+            Some("token123")
+        );
     }
 
     #[test]
