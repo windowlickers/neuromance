@@ -516,6 +516,7 @@ mod tests {
 
     #[cfg(feature = "online-tests")]
     #[tokio::test]
+    #[ignore = "requires HF_TOKEN and network access"]
     async fn test_token_counter_creation() {
         let token = std::env::var("HF_TOKEN").expect("HF_TOKEN not set");
         let config = ModelConfig::gpt_oss_20b().with_hf_token(token);
@@ -531,6 +532,7 @@ mod tests {
 
     #[cfg(feature = "online-tests")]
     #[tokio::test]
+    #[ignore = "requires HF_TOKEN and network access"]
     async fn test_conversation_token_counting() {
         let token = std::env::var("HF_TOKEN").expect("HF_TOKEN not set");
         let config = ModelConfig::gpt_oss_20b().with_hf_token(token);

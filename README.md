@@ -247,6 +247,26 @@ args = [
 token_env = "FORGEJO_TOKEN"
 ```
 
+## Context compaction
+
+An optional `[context]` section enables automatic conversation compaction in the runtime. Once the conversation grows past a ratio of the model's context window, older turns are summarized by the LLM and replaced with the summary, preserving the system prompt and the most recent turns.
+
+Conversation size is measured from the provider-reported usage of the most recent response, so no tokenizer is downloaded at startup. One known lag: the first request of a resumed conversation is sent uncompacted because no usage exists yet in that run — compaction at the end of the previous run keeps stored histories under target.
+
+```toml
+[context]
+# Model context window in tokens. Required; everything else is optional.
+context_window_size = 128000
+# Compact once usage exceeds this ratio of the window (default 0.8).
+compaction_threshold_ratio = 0.8
+# Aim for this ratio of the window after compaction (default 0.5).
+target_ratio = 0.5
+# Recent user+assistant turns preserved verbatim (default 3).
+preserve_recent_turns = 3
+# one_shot (default) | hierarchical | truncate
+strategy = "one_shot"
+```
+
 ## Model Context Protocol (MCP) Support
 
 Neuromance supports the [Model Context Protocol](https://modelcontextprotocol.io/) for connecting to external tool servers via the `neuromance-tools` crate.

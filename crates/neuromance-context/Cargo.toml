@@ -51,6 +51,7 @@ minijinja = "2.13"
 ahash = { version = "0.8", optional = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 tokio = { workspace = true }
 tracing-subscriber = { workspace = true }
 env_logger = { workspace = true }

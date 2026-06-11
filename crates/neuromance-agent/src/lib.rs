@@ -258,6 +258,7 @@ impl<C: LLMClient + Send + Sync> Agent<C> {
             output_tokens = run_stats.cache_metrics.total_output_tokens,
             tools_succeeded = run_stats.successful_tool_calls,
             tools_failed = run_stats.failed_tool_calls,
+            compactions = run_stats.compactions,
             "agent finished",
         );
 
