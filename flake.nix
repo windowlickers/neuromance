@@ -40,7 +40,18 @@
         rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
-        src = craneLib.cleanCargoSource ./.;
+        # Like `cleanCargoSource`, but also keeps sqlx's embedded migrations
+        # and the committed `.sqlx/` offline query metadata, which the default
+        # filter would strip (silently breaking the query macros in CI only).
+        src = pkgs.lib.cleanSourceWith {
+          src = ./.;
+          name = "source";
+          filter =
+            path: type:
+            (craneLib.filterCargoSources path type)
+            || (builtins.match ".*/migrations/.*\\.sql$" path != null)
+            || (builtins.match ".*/\\.sqlx/query-.*\\.json$" path != null);
+        };
 
         # Default Python package set for the embedded REPL — empty by design.
         # Downstream flakes pass a custom selector to `lib.mkRuntimeImage` to
@@ -56,6 +67,9 @@
           buildInputs = [ pkgs.openssl pythonEnv ];
           nativeBuildInputs = [ pkgs.pkg-config ];
           PYO3_PYTHON = "${pythonEnv}/bin/python3";
+          # Compile sqlx query macros from the committed .sqlx/ metadata —
+          # build sandboxes have no database.
+          SQLX_OFFLINE = "true";
         };
 
         commonArgs = mkCommonArgs defaultPythonEnv;
@@ -515,6 +529,8 @@
             just
             skopeo
             dive
+            sqlx-cli
+            postgresql
           ]);
 
           RUST_BACKTRACE = "1";
