@@ -47,6 +47,17 @@ pkgs.dockerTools.buildLayeredImage {
     pkgs.cacert
   ] ++ pythonContents ++ shellPackages ++ extraTools;
 
+  # Make the baked /nix/store usable by nix inside the container: register the
+  # image closure in /nix/var/nix/db so baked paths are reused instead of
+  # refetched, and own every layer as nonroot so the single-user nix running as
+  # 65532 can write new store paths. Ownership is tar-header metadata set at
+  # stream time; it does not duplicate layers.
+  includeNixDB = true;
+  uid = 65532;
+  gid = 65532;
+  uname = "nonroot";
+  gname = "nonroot";
+
   extraCommands = ''
     mkdir -p tmp var/tmp bin etc etc/nix home/nonroot etc/ssl/certs
     chmod 1777 tmp var/tmp
@@ -64,9 +75,16 @@ pkgs.dockerTools.buildLayeredImage {
     experimental-features = nix-command flakes pipe-operators
     sandbox = false
     build-users-group =
-    store = /tmp/nix
     EOF
   '' + configDirCommands + shellExtraCommands;
+
+  # uid/gid above only rewrite the store layers; the customisation layer built
+  # from extraCommands (including the nix db) is appended as-is, so chown it
+  # here under fakeroot. Without this the db at /nix/var/nix/db stays
+  # root-owned and nonroot nix cannot open it read-write.
+  fakeRootCommands = ''
+    chown -R 65532:65532 ./nix ./home/nonroot
+  '';
 
   config = {
     Entrypoint = [ "${package}/bin/${binName}" ];
