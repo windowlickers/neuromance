@@ -595,7 +595,8 @@ Summary:"#,
         new_conversation.description = original.description.clone();
         new_conversation.metadata = original.metadata.clone();
 
-        let map_conv_err = |e: anyhow::Error| TokenCounterError::Compaction(e.to_string());
+        let map_conv_err =
+            |e: anyhow::Error| TokenCounterError::ConversationRebuild(format!("{e:#}"));
 
         if let Some(system) = system_msg {
             new_conversation
