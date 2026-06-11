@@ -58,7 +58,9 @@ async fn main() -> Result<()> {
     .await
     .context("start health server")?;
 
-    let store = init_store(&config).await?;
+    let store = init_store(&config)
+        .await
+        .context("initialize database store")?;
     let agent = build_agent(&config, store.clone()).map_err(anyhow::Error::from)?;
     readiness.set_ready(true);
 
@@ -158,7 +160,7 @@ async fn init_store(config: &RuntimeConfig) -> Result<Option<Arc<PgConversationS
         Duration::from_secs(database.acquire_timeout_seconds),
     )
     .await
-    .context("connect to postgres (database.url_env)")?;
+    .with_context(|| format!("connect to postgres (env: {})", database.url_env))?;
     store.migrate().await.context("run database migrations")?;
     info!(
         max_connections = database.max_connections,

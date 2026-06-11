@@ -12,7 +12,7 @@ use sqlx::postgres::PgPoolOptions;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::error::DbError;
+use crate::error::{DbError, SqlxResultExt};
 use crate::rows::{MessageRow, message_to_columns, status_from_str, status_to_string};
 use crate::sink::ConversationSink;
 
@@ -70,7 +70,8 @@ impl PgConversationStore {
             .max_connections(max_connections)
             .acquire_timeout(acquire_timeout)
             .connect(url)
-            .await?;
+            .await
+            .op("connect to database")?;
         Ok(Self::new(pool))
     }
 
@@ -96,6 +97,7 @@ impl PgConversationStore {
         let status = status_to_string(&conversation.status, conversation.id)?;
         let metadata =
             serde_json::to_value(&conversation.metadata).map_err(|source| DbError::Encode {
+                table: "conversations",
                 column: "metadata",
                 id: conversation.id,
                 source,
@@ -120,7 +122,8 @@ impl PgConversationStore {
             conversation.updated_at,
         )
         .execute(&self.pool)
-        .await?;
+        .await
+        .op("upsert conversation")?;
         Ok(())
     }
 
@@ -144,7 +147,8 @@ impl PgConversationStore {
             status,
         )
         .execute(&self.pool)
-        .await?;
+        .await
+        .op("set conversation status")?;
         Ok(())
     }
 
@@ -165,7 +169,8 @@ impl PgConversationStore {
             id,
         )
         .fetch_optional(&self.pool)
-        .await?
+        .await
+        .op("select conversation")?
         else {
             return Ok(None);
         };
@@ -180,12 +185,14 @@ impl PgConversationStore {
             id,
         )
         .fetch_all(&self.pool)
-        .await?
+        .await
+        .op("select conversation messages")?
         .into_iter()
         .map(MessageRow::into_message)
         .collect::<Result<Vec<_>, _>>()?;
 
         let metadata = serde_json::from_value(row.metadata).map_err(|source| DbError::Decode {
+            table: "conversations",
             column: "metadata",
             id,
             source,
@@ -227,7 +234,8 @@ impl PgConversationStore {
             offset,
         )
         .fetch_all(&self.pool)
-        .await?;
+        .await
+        .op("list conversations")?;
 
         rows.into_iter()
             .map(|row| {
@@ -270,7 +278,7 @@ impl ConversationSink for PgConversationStore {
             return Ok(0);
         }
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin().await.op("begin transaction")?;
 
         // Ensure the FK target exists; other columns take their defaults.
         sqlx::query!(
@@ -278,7 +286,8 @@ impl ConversationSink for PgConversationStore {
             conversation_id,
         )
         .execute(&mut *tx)
-        .await?;
+        .await
+        .op("insert conversation row")?;
 
         // Serialize writers per conversation so the max-seq read below is
         // race-free across concurrent agents sharing this conversation.
@@ -287,20 +296,23 @@ impl ConversationSink for PgConversationStore {
             conversation_id,
         )
         .fetch_one(&mut *tx)
-        .await?;
+        .await
+        .op("lock conversation for update")?;
 
         let mut next_seq = sqlx::query_scalar!(
             r#"SELECT COALESCE(MAX(seq) + 1, 0) AS "base!" FROM messages WHERE conversation_id = $1"#,
             conversation_id,
         )
         .fetch_one(&mut *tx)
-        .await?;
+        .await
+        .op("select next message seq")?;
 
         let ids: Vec<Uuid> = candidates.iter().map(|m| m.id).collect();
         let existing: HashSet<Uuid> =
             sqlx::query_scalar!("SELECT id FROM messages WHERE id = ANY($1)", &ids)
                 .fetch_all(&mut *tx)
-                .await?
+                .await
+                .op("select existing message ids")?
                 .into_iter()
                 .collect();
 
@@ -330,7 +342,8 @@ impl ConversationSink for PgConversationStore {
                 message.timestamp,
             )
             .execute(&mut *tx)
-            .await?;
+            .await
+            .op("insert message")?;
             inserted += result.rows_affected();
             next_seq += 1;
         }
@@ -340,9 +353,10 @@ impl ConversationSink for PgConversationStore {
             conversation_id,
         )
         .execute(&mut *tx)
-        .await?;
+        .await
+        .op("touch conversation updated_at")?;
 
-        tx.commit().await?;
+        tx.commit().await.op("commit transaction")?;
         Ok(inserted)
     }
 }
