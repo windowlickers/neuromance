@@ -23,22 +23,29 @@ use crate::error::DbError;
 /// enums later.
 fn enum_to_db_string<T: Serialize>(
     value: &T,
+    table: &'static str,
     column: &'static str,
     id: Uuid,
 ) -> Result<String, DbError> {
     match serde_json::to_value(value) {
         Ok(Value::String(s)) => Ok(s),
         Ok(other) => Err(DbError::Encode {
+            table,
             column,
             id,
             source: serde::ser::Error::custom(format!("expected a JSON string, got {other}")),
         }),
-        Err(source) => Err(DbError::Encode { column, id, source }),
+        Err(source) => Err(DbError::Encode {
+            table,
+            column,
+            id,
+            source,
+        }),
     }
 }
 
 pub fn role_to_string(role: MessageRole, message_id: Uuid) -> Result<String, DbError> {
-    enum_to_db_string(&role, "role", message_id)
+    enum_to_db_string(&role, "messages", "role", message_id)
 }
 
 pub fn role_from_str(value: &str, message_id: Uuid) -> Result<MessageRole, DbError> {
@@ -58,7 +65,7 @@ pub fn status_to_string(
     status: &ConversationStatus,
     conversation_id: Uuid,
 ) -> Result<String, DbError> {
-    enum_to_db_string(status, "status", conversation_id)
+    enum_to_db_string(status, "conversations", "status", conversation_id)
 }
 
 pub fn status_from_str(value: &str, conversation_id: Uuid) -> Result<ConversationStatus, DbError> {
@@ -84,6 +91,7 @@ pub struct MessageColumns {
 
 pub fn message_to_columns(message: &Message) -> Result<MessageColumns, DbError> {
     let encode = |column: &'static str, source: serde_json::Error| DbError::Encode {
+        table: "messages",
         column,
         id: message.id,
         source,
@@ -120,6 +128,7 @@ impl MessageRow {
     pub fn into_message(self) -> Result<Message, DbError> {
         let id = self.id;
         let decode = move |column: &'static str, source: serde_json::Error| DbError::Decode {
+            table: "messages",
             column,
             id,
             source,
