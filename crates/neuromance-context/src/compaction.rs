@@ -613,13 +613,8 @@ Summary:"#,
         new_conversation.description = original.description.clone();
         new_conversation.metadata = original.metadata.clone();
 
-        let map_conv_err =
-            |e: anyhow::Error| TokenCounterError::ConversationRebuild(format!("{e:#}"));
-
         if let Some(system) = system_msg {
-            new_conversation
-                .add_message(system.clone())
-                .map_err(map_conv_err)?;
+            new_conversation.add_message(system.clone())?;
         }
 
         if !summary.is_empty() {
@@ -632,15 +627,11 @@ Summary:"#,
                     summary
                 ),
             );
-            new_conversation
-                .add_message(summary_msg)
-                .map_err(map_conv_err)?;
+            new_conversation.add_message(summary_msg)?;
         }
 
         for msg in recent_msgs {
-            new_conversation
-                .add_message((*msg).clone())
-                .map_err(map_conv_err)?;
+            new_conversation.add_message((*msg).clone())?;
         }
 
         Ok(new_conversation)
