@@ -353,6 +353,43 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
     use neuromance_common::chat::{Conversation, Message};
+    use proptest::prelude::*;
+
+    /// Strategy yielding (role, content) pairs from a small alphabet so that
+    /// duplicate messages occur frequently enough to exercise deduplication.
+    fn message_spec() -> impl Strategy<Value = (MessageRole, String)> {
+        let role = prop_oneof![
+            Just(MessageRole::System),
+            Just(MessageRole::User),
+            Just(MessageRole::Assistant),
+            Just(MessageRole::Tool),
+        ];
+        let content = prop::sample::select(vec!["a", "b", "c", ""]).prop_map(String::from);
+        (role, content)
+    }
+
+    proptest! {
+        #[test]
+        fn prop_deduplicate_is_idempotent(
+            specs in prop::collection::vec(message_spec(), 0..12)
+        ) {
+            let mut conv = Conversation::new();
+            for (role, content) in specs {
+                conv.add_message(Message::new(conv.id, role, content)).unwrap();
+            }
+
+            let once = deduplicate_messages(conv);
+            let twice = deduplicate_messages(once.clone());
+
+            let project = |c: &Conversation| -> Vec<(MessageRole, String)> {
+                c.get_messages()
+                    .iter()
+                    .map(|m| (m.role, m.content.clone()))
+                    .collect()
+            };
+            prop_assert_eq!(project(&once), project(&twice));
+        }
+    }
 
     #[test]
     fn test_filter_criteria_fluent() {
