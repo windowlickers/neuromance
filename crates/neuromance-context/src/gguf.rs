@@ -187,20 +187,18 @@ impl GGUFModelInfo {
 
         debug!("Tokenizer model type: {}", model_type);
 
-        // Build tokenizer based on model type
-        let tokenizer = match model_type.as_str() {
-            "bpe" | "gpt2" => Self::build_bpe_tokenizer(tokens, merges)?,
-            "llama" => Self::build_bpe_tokenizer(tokens, merges)?,
-            _ => {
-                warn!(
-                    "Unknown tokenizer model type '{}', attempting BPE",
-                    model_type
-                );
-                Self::build_bpe_tokenizer(tokens, merges)?
-            }
-        };
+        // Only "bpe"/"gpt2" are byte-level BPE. Other types (notably "llama",
+        // which is SentencePiece-based) have no dedicated builder yet, so they
+        // fall back to BPE and produce approximate token counts.
+        if !matches!(model_type.as_str(), "bpe" | "gpt2") {
+            warn!(
+                "Tokenizer model type '{}' is not byte-level BPE; falling back to a BPE \
+                 tokenizer, so token counts will be approximate",
+                model_type
+            );
+        }
 
-        Ok(tokenizer)
+        Self::build_bpe_tokenizer(tokens, merges)
     }
 
     /// Prints a human-readable summary of the model metadata.
