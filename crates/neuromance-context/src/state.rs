@@ -53,17 +53,3 @@ mod private {
     impl Sealed for Transformed {}
     impl Sealed for Ready {}
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_state_types_exist() {
-        // Just verify that all state types can be constructed
-        let _raw = Raw;
-        let _filtered = Filtered;
-        let _transformed = Transformed;
-        let _ready = Ready;
-    }
-}
