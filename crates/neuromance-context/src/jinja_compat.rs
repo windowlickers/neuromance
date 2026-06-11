@@ -256,14 +256,6 @@ fn handle_map_method(value: &Value, method: &str, _args: &[Value]) -> Result<Val
             )),
         },
 
-        "get" => {
-            // dict.get(key, default) - already handled by minijinja, but we provide fallback
-            Err(Error::new(
-                ErrorKind::UnknownMethod,
-                format!("map has no method named '{}'", method),
-            ))
-        }
-
         _ => Err(Error::new(
             ErrorKind::UnknownMethod,
             format!("map has no method named '{}'", method),
