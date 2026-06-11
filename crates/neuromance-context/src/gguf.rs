@@ -29,7 +29,7 @@ use tracing::{debug, warn};
 ///
 /// This struct contains common metadata fields found in GGUF files.
 /// Fields are optional because not all models include all metadata keys.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GGUFModelInfo {
     /// Model name (e.g., "unsloth/gpt-oss-20b-GGUF")
     pub model_name: Option<String>,
@@ -66,7 +66,7 @@ pub struct GGUFModelInfo {
 }
 
 /// Simplified metadata value type for easier access.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum MetadataValue {
     /// String value
     String(String),
@@ -86,6 +86,40 @@ pub enum MetadataValue {
     Bool(bool),
     /// Array of values
     Array(Vec<MetadataValue>),
+}
+
+impl MetadataValue {
+    /// Returns the inner string if this is a [`MetadataValue::String`].
+    #[must_use]
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            MetadataValue::String(s) => Some(s),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for MetadataValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MetadataValue::String(v) => write!(f, "{v}"),
+            MetadataValue::U32(v) => write!(f, "{v}"),
+            MetadataValue::U64(v) => write!(f, "{v}"),
+            MetadataValue::I32(v) => write!(f, "{v}"),
+            MetadataValue::I64(v) => write!(f, "{v}"),
+            MetadataValue::F32(v) => write!(f, "{v}"),
+            MetadataValue::F64(v) => write!(f, "{v}"),
+            MetadataValue::Bool(v) => write!(f, "{v}"),
+            MetadataValue::Array(values) => {
+                let rendered = values
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(f, "[{rendered}]")
+            }
+        }
+    }
 }
 
 impl GGUFModelInfo {
