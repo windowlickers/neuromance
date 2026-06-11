@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO conversations (id, title, description, status, metadata, created_at, updated_at)\n            VALUES ($1, $2, $3, $4, $5, $6, $7)\n            ON CONFLICT (id) DO UPDATE SET\n                title       = EXCLUDED.title,\n                description = EXCLUDED.description,\n                status      = EXCLUDED.status,\n                metadata    = EXCLUDED.metadata,\n                updated_at  = EXCLUDED.updated_at\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Jsonb",
+        "Timestamptz",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0e2a8fb3739df4b39b5ad90d74ad6772261b88da08ab18601882c354de4c33eb"
+}
