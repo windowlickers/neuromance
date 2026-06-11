@@ -39,7 +39,11 @@ pub enum TokenCounterError {
     #[error("Token range error: {0}")]
     TokenRange(String),
 
-    /// Compaction failed (LLM call or conversation rebuild)
+    /// Compaction failed (LLM call or summary generation)
     #[error("Compaction failed: {0}")]
     Compaction(String),
+
+    /// Rebuilding the compacted conversation violated a conversation invariant
+    #[error("Failed to rebuild compacted conversation: {0}")]
+    ConversationRebuild(String),
 }
