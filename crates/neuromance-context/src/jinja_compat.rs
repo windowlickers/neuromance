@@ -306,8 +306,12 @@ fn dict_fn(kwargs: Kwargs) -> Result<Value, Error> {
 ///
 /// Supports `tojson(ensure_ascii=False)` kwarg for compatibility.
 fn tojson_filter(value: Value, kwargs: Kwargs) -> Result<String, Error> {
-    // Note: we ignore ensure_ascii since Rust's serde_json always produces valid UTF-8
-    let _ = kwargs.get::<bool>("ensure_ascii");
+    // serde_json emits UTF-8, so ensure_ascii=false is already our behavior and is
+    // a silent no-op. ensure_ascii=true (escape non-ASCII) is not supported; warn
+    // rather than silently ignore it so template authors aren't misled.
+    if let Ok(true) = kwargs.get::<bool>("ensure_ascii") {
+        tracing::warn!("tojson(ensure_ascii=true) is not supported; emitting UTF-8 unescaped");
+    }
 
     serde_json::to_string(&value).map_err(|e| {
         Error::new(
