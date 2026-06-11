@@ -57,6 +57,7 @@ env_logger = { workspace = true }
 log = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 futures = { workspace = true }
+proptest = "1.4"
 
 [[example]]
 name = "gguf_metadata"
