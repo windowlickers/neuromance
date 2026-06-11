@@ -46,11 +46,6 @@ pub struct FilterCriteria {
 }
 
 impl FilterCriteria {
-    /// Creates a new filter criteria builder.
-    pub fn builder() -> FilterCriteriaBuilder {
-        FilterCriteriaBuilder::default()
-    }
-
     /// Filters by specific message roles.
     pub fn with_roles(mut self, roles: Vec<MessageRole>) -> Self {
         self.roles = Some(roles);
@@ -79,59 +74,6 @@ impl FilterCriteria {
     pub fn offset(mut self, offset: usize) -> Self {
         self.offset = Some(offset);
         self
-    }
-}
-
-/// Builder for creating filter criteria.
-#[derive(Debug, Default)]
-pub struct FilterCriteriaBuilder {
-    roles: Option<Vec<MessageRole>>,
-    after: Option<DateTime<Utc>>,
-    before: Option<DateTime<Utc>>,
-    limit: Option<usize>,
-    offset: Option<usize>,
-}
-
-impl FilterCriteriaBuilder {
-    /// Filters by specific message roles.
-    pub fn roles(mut self, roles: Vec<MessageRole>) -> Self {
-        self.roles = Some(roles);
-        self
-    }
-
-    /// Filters messages after a specific timestamp.
-    pub fn after(mut self, timestamp: DateTime<Utc>) -> Self {
-        self.after = Some(timestamp);
-        self
-    }
-
-    /// Filters messages before a specific timestamp.
-    pub fn before(mut self, timestamp: DateTime<Utc>) -> Self {
-        self.before = Some(timestamp);
-        self
-    }
-
-    /// Limits the number of messages (keeps most recent).
-    pub fn limit(mut self, limit: usize) -> Self {
-        self.limit = Some(limit);
-        self
-    }
-
-    /// Skips the first N messages.
-    pub fn offset(mut self, offset: usize) -> Self {
-        self.offset = Some(offset);
-        self
-    }
-
-    /// Builds the filter criteria.
-    pub fn build(self) -> FilterCriteria {
-        FilterCriteria {
-            roles: self.roles,
-            after: self.after,
-            before: self.before,
-            limit: self.limit,
-            offset: self.offset,
-        }
     }
 }
 
@@ -406,11 +348,10 @@ mod tests {
     use neuromance_common::chat::{Conversation, Message};
 
     #[test]
-    fn test_filter_criteria_builder() {
-        let criteria = FilterCriteria::builder()
-            .roles(vec![MessageRole::User, MessageRole::Assistant])
-            .limit(10)
-            .build();
+    fn test_filter_criteria_fluent() {
+        let criteria = FilterCriteria::default()
+            .with_roles(vec![MessageRole::User, MessageRole::Assistant])
+            .limit(10);
 
         assert!(criteria.roles.is_some());
         assert_eq!(criteria.limit, Some(10));
