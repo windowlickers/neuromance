@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use neuromance::context::compaction::CompactionStrategy;
 use neuromance_tools::ToolConfig;
 
 use crate::error::RuntimeError;
@@ -63,6 +64,11 @@ pub struct RuntimeConfig {
     /// tasks run. In-memory state stays authoritative for serving.
     #[serde(default)]
     pub database: Option<DatabaseSettings>,
+    /// When set, the agent compacts conversation history once it grows past
+    /// a ratio of the model's context window. Compaction triggers on
+    /// provider-reported usage, so no tokenizer is downloaded at startup.
+    #[serde(default)]
+    pub context: Option<ContextSettings>,
     /// Leaf subagents the main agent can delegate to. Each is exposed as a
     /// delegate tool (named by its `id`) and, when an `execute_python` tool is
     /// configured, through the Python REPL's `run_subagent`/`spawn_agents`
@@ -158,6 +164,42 @@ pub struct ProviderConfig {
     /// Tokenizer proxy for this provider. Mutually exclusive with `api_key_env`.
     #[serde(default)]
     pub proxy: Option<ProviderProxyConfig>,
+}
+
+/// Automatic context-compaction settings.
+///
+/// Conversation size is measured from the provider-reported `Usage` of the
+/// most recent response. One known lag: the first request of a resumed
+/// conversation is sent uncompacted, because no usage exists yet in that run —
+/// compaction at the end of the previous run keeps stored histories under
+/// target, so the residual exposure is a single user message on a
+/// near-threshold conversation.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ContextSettings {
+    /// Model context window in tokens (e.g. `128000`).
+    pub context_window_size: usize,
+    /// Ratio of the window at which compaction triggers.
+    #[serde(default = "default_compaction_threshold_ratio")]
+    pub compaction_threshold_ratio: f64,
+    /// Target ratio of the window after compaction.
+    #[serde(default = "default_target_ratio")]
+    pub target_ratio: f64,
+    /// Number of recent user+assistant turns preserved verbatim.
+    #[serde(default = "default_preserve_recent_turns")]
+    pub preserve_recent_turns: usize,
+    /// Compaction strategy: `one_shot`, `hierarchical`, or `truncate`.
+    #[serde(default)]
+    pub strategy: CompactionStrategy,
+}
+
+const fn default_compaction_threshold_ratio() -> f64 {
+    0.8
+}
+const fn default_target_ratio() -> f64 {
+    0.5
+}
+const fn default_preserve_recent_turns() -> usize {
+    3
 }
 
 /// A subagent: a named in-process agent the main agent can delegate to.
@@ -573,6 +615,10 @@ impl RuntimeConfig {
                 ));
             }
         }
+
+        if let Some(context) = &self.context {
+            context.validate()?;
+        }
         Ok(())
     }
 
@@ -634,6 +680,50 @@ impl RuntimeConfig {
                     )));
                 }
             }
+        }
+        Ok(())
+    }
+}
+
+impl ContextSettings {
+    /// Cross-field validation for the `[context]` section.
+    ///
+    /// # Errors
+    /// Returns [`RuntimeError::Config`] when `context_window_size` is zero,
+    /// either ratio is outside `(0, 1]`, the target ratio is not below the
+    /// threshold ratio, or `preserve_recent_turns` is zero.
+    fn validate(&self) -> Result<(), RuntimeError> {
+        if self.context_window_size == 0 {
+            return Err(RuntimeError::Config(
+                "context.context_window_size must be at least 1".to_string(),
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.compaction_threshold_ratio)
+            || self.compaction_threshold_ratio == 0.0
+        {
+            return Err(RuntimeError::Config(format!(
+                "context.compaction_threshold_ratio must be in (0, 1], got {}",
+                self.compaction_threshold_ratio
+            )));
+        }
+        if self.target_ratio <= 0.0 || self.target_ratio >= 1.0 {
+            return Err(RuntimeError::Config(format!(
+                "context.target_ratio must be in (0, 1), got {}",
+                self.target_ratio
+            )));
+        }
+        if self.target_ratio >= self.compaction_threshold_ratio {
+            return Err(RuntimeError::Config(format!(
+                "context.target_ratio ({}) must be below context.compaction_threshold_ratio ({})",
+                self.target_ratio, self.compaction_threshold_ratio
+            )));
+        }
+        if self.preserve_recent_turns == 0 {
+            return Err(RuntimeError::Config(
+                "context.preserve_recent_turns must be at least 1: \
+                 0 would summarize the in-flight tool exchange"
+                    .to_string(),
+            ));
         }
         Ok(())
     }
@@ -1198,6 +1288,123 @@ mod tests {
         let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
         let err = config.validate().err().unwrap();
         assert!(format!("{err}").contains("token_header"));
+    }
+
+    fn serve_toml_with_context(context_section: &str) -> String {
+        format!("{SERVE_PREAMBLE}{context_section}")
+    }
+
+    #[test]
+    fn test_context_absent_is_none() {
+        let config: RuntimeConfig = toml::from_str(minimal_oneshot_toml()).unwrap();
+        config.validate().unwrap();
+        assert!(config.context.is_none());
+    }
+
+    #[test]
+    fn test_context_section_parses_with_defaults() {
+        let toml_str = serve_toml_with_context(
+            r"
+            [context]
+            context_window_size = 128000
+        ",
+        );
+        let config: RuntimeConfig = toml::from_str(&toml_str).unwrap();
+        config.validate().unwrap();
+        let context = config.context.expect("context section");
+        assert_eq!(context.context_window_size, 128_000);
+        assert!((context.compaction_threshold_ratio - 0.8).abs() < f64::EPSILON);
+        assert!((context.target_ratio - 0.5).abs() < f64::EPSILON);
+        assert_eq!(context.preserve_recent_turns, 3);
+        assert_eq!(context.strategy, CompactionStrategy::OneShot);
+    }
+
+    #[test]
+    fn test_context_strategy_parses_snake_case() {
+        let toml_str = serve_toml_with_context(
+            r#"
+            [context]
+            context_window_size = 128000
+            strategy = "truncate"
+        "#,
+        );
+        let config: RuntimeConfig = toml::from_str(&toml_str).unwrap();
+        config.validate().unwrap();
+        assert_eq!(
+            config.context.expect("context").strategy,
+            CompactionStrategy::Truncate
+        );
+    }
+
+    #[test]
+    fn test_context_strategy_rejects_pascal_case() {
+        let toml_str = serve_toml_with_context(
+            r#"
+            [context]
+            context_window_size = 128000
+            strategy = "OneShot"
+        "#,
+        );
+        assert!(toml::from_str::<RuntimeConfig>(&toml_str).is_err());
+    }
+
+    #[test]
+    fn test_context_zero_window_fails_validation() {
+        let toml_str = serve_toml_with_context(
+            r"
+            [context]
+            context_window_size = 0
+        ",
+        );
+        let config: RuntimeConfig = toml::from_str(&toml_str).unwrap();
+        let err = config.validate().err().unwrap();
+        assert!(format!("{err}").contains("context_window_size"));
+    }
+
+    #[test]
+    fn test_context_threshold_ratio_above_one_fails_validation() {
+        let toml_str = serve_toml_with_context(
+            r"
+            [context]
+            context_window_size = 128000
+            compaction_threshold_ratio = 1.5
+        ",
+        );
+        let config: RuntimeConfig = toml::from_str(&toml_str).unwrap();
+        let err = config.validate().err().unwrap();
+        assert!(format!("{err}").contains("compaction_threshold_ratio"));
+    }
+
+    #[test]
+    fn test_context_target_at_or_above_threshold_fails_validation() {
+        let toml_str = serve_toml_with_context(
+            r"
+            [context]
+            context_window_size = 128000
+            compaction_threshold_ratio = 0.8
+            target_ratio = 0.9
+        ",
+        );
+        let config: RuntimeConfig = toml::from_str(&toml_str).unwrap();
+        let err = config.validate().err().unwrap();
+        assert!(
+            format!("{err}").contains("must be below"),
+            "expected ordering error, got: {err}",
+        );
+    }
+
+    #[test]
+    fn test_context_zero_preserve_recent_turns_fails_validation() {
+        let toml_str = serve_toml_with_context(
+            r"
+            [context]
+            context_window_size = 128000
+            preserve_recent_turns = 0
+        ",
+        );
+        let config: RuntimeConfig = toml::from_str(&toml_str).unwrap();
+        let err = config.validate().err().unwrap();
+        assert!(format!("{err}").contains("preserve_recent_turns"));
     }
 
     #[test]

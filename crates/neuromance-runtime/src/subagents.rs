@@ -434,6 +434,7 @@ mod tests {
             oneshot: None,
             providers,
             database: None,
+            context: None,
             subagents,
             bootstrap: Vec::new(),
             sandbox: None,

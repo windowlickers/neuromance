@@ -27,6 +27,10 @@ pub struct RunStats {
     pub successful_tool_calls: u64,
     /// Number of tool calls that failed during execution.
     pub failed_tool_calls: u64,
+    /// Number of context compactions performed.
+    pub compactions: u64,
+    /// Total tokens removed by compaction across the run.
+    pub compaction_tokens_saved: u64,
 }
 
 impl RunStats {
@@ -36,6 +40,16 @@ impl RunStats {
             CoreEvent::Usage(usage) => self.cache_metrics.record(usage),
             CoreEvent::ToolResult { success: true, .. } => self.successful_tool_calls += 1,
             CoreEvent::ToolResult { success: false, .. } => self.failed_tool_calls += 1,
+            CoreEvent::Compaction {
+                original_tokens,
+                compacted_tokens,
+                was_compacted: true,
+                ..
+            } => {
+                self.compactions += 1;
+                let saved = original_tokens.saturating_sub(*compacted_tokens);
+                self.compaction_tokens_saved += u64::try_from(saved).unwrap_or(u64::MAX);
+            }
             CoreEvent::Delta(_)
             | CoreEvent::ApprovalRequest { .. }
             | CoreEvent::Completed(_)
@@ -96,6 +110,27 @@ mod tests {
 
         assert_eq!(stats.successful_tool_calls, 2);
         assert_eq!(stats.failed_tool_calls, 1);
+    }
+
+    #[test]
+    fn observe_records_compaction() {
+        let mut stats = RunStats::default();
+        stats.observe(&CoreEvent::Compaction {
+            original_tokens: 10_000,
+            compacted_tokens: 4_000,
+            messages_summarized: 12,
+            was_compacted: true,
+        });
+        // Attempted-but-skipped compactions don't count.
+        stats.observe(&CoreEvent::Compaction {
+            original_tokens: 3_000,
+            compacted_tokens: 3_000,
+            messages_summarized: 0,
+            was_compacted: false,
+        });
+
+        assert_eq!(stats.compactions, 1);
+        assert_eq!(stats.compaction_tokens_saved, 6_000);
     }
 
     #[test]

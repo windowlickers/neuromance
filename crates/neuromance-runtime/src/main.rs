@@ -8,6 +8,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
+use neuromance::context_management::ContextConfig;
 use neuromance::{Core, build_client};
 use neuromance_agent::Agent;
 use neuromance_client::LLMClient;
@@ -271,6 +272,36 @@ async fn init_store(config: &RuntimeConfig) -> Result<Option<Arc<PgConversationS
     Ok(Some(Arc::new(store)))
 }
 
+/// Wire usage-driven context compaction onto `core` when `[context]` is set.
+///
+/// Builds a separate summarization client from the same provider config so it
+/// inherits the proxy / sealed-token setup. Returns `core` unchanged when no
+/// `[context]` section is present.
+fn apply_context_compaction(
+    core: Core<Box<dyn LLMClient>>,
+    config: &RuntimeConfig,
+    llm_config: neuromance::Config,
+) -> Result<Core<Box<dyn LLMClient>>, RuntimeError> {
+    let Some(ctx) = &config.context else {
+        return Ok(core);
+    };
+    let compaction_client = build_client(llm_config)
+        .map_err(|e| RuntimeError::Config(format!("build compaction client: {e}")))?;
+    let context_config = ContextConfig::new(ctx.context_window_size)
+        .with_compaction_threshold_ratio(ctx.compaction_threshold_ratio)
+        .with_target_ratio(ctx.target_ratio)
+        .with_preserve_recent_turns(ctx.preserve_recent_turns)
+        .with_strategy(ctx.strategy);
+    let core = core.with_context_management_client(compaction_client, context_config);
+    info!(
+        window = ctx.context_window_size,
+        threshold_ratio = ctx.compaction_threshold_ratio,
+        target_ratio = ctx.target_ratio,
+        "context compaction enabled (usage-driven)"
+    );
+    Ok(core)
+}
+
 async fn build_agent(
     config: &RuntimeConfig,
     store: Option<&Arc<PgConversationStore>>,
@@ -290,8 +321,8 @@ async fn build_agent(
         ))
     })?;
     let llm_config = build_provider_config(provider, model)?;
-    let client =
-        build_client(llm_config).map_err(|e| RuntimeError::Config(format!("build client: {e}")))?;
+    let client = build_client(llm_config.clone())
+        .map_err(|e| RuntimeError::Config(format!("build client: {e}")))?;
 
     let mut core = Core::new(client);
     if config.agent.streaming {
@@ -368,6 +399,8 @@ async fn build_agent(
             core = core.with_tool_approval_callback(move |tc| approver.approve(tc));
         }
     }
+
+    core = apply_context_compaction(core, config, llm_config)?;
 
     Ok((Agent::new(config.agent.id.clone(), core), local_python))
 }

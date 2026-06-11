@@ -2571,6 +2571,7 @@ version = "0.1.0"
 dependencies = [
  "ahash",
  "anyhow",
+ "async-trait",
  "candle-core",
  "chrono",
  "clap",

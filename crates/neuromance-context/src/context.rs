@@ -98,6 +98,8 @@ impl Context<Filtered> {
     /// # Example
     ///
     /// ```no_run
+    /// use std::sync::Arc;
+    ///
     /// use neuromance_context::context::Context;
     /// use neuromance_context::transforms::FilterCriteria;
     /// use neuromance_context::{Compactor, CompactionConfig, ModelConfig, TokenCounter};
@@ -113,7 +115,8 @@ impl Context<Filtered> {
     ///
     /// let context = Context::new(Conversation::new()).filter(FilterCriteria::default());
     ///
-    /// let compactor = Compactor::new(client, token_counter)
+    /// let compactor = Compactor::new(client)
+    ///     .with_token_counter(Arc::new(token_counter))
     ///     .with_config(CompactionConfig::new(4000));
     ///
     /// let (_context, _result) = context.compact(&compactor).await?;

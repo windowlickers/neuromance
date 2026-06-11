@@ -182,37 +182,51 @@ impl<C: LLMClient> Core<C> {
 
     /// Enable automatic context compaction between conversation turns.
     ///
-    /// When configured, compaction runs before each turn callback, keeping the
-    /// conversation within the configured token budget.
+    /// When configured, compaction runs inside the conversation loop, keeping
+    /// the conversation within the configured token budget.
     ///
-    /// Requires the `context` feature and `C: Clone` (all built-in clients implement `Clone`).
+    /// Requires the `context` feature and `C: Clone` (all built-in clients
+    /// implement `Clone`). For non-`Clone` clients such as `Box<dyn LLMClient>`,
+    /// use [`with_context_management_client`](Self::with_context_management_client).
     ///
     /// # Example
     ///
     /// ```rust,no_run
-    /// # use std::sync::Arc;
     /// # use neuromance::Core;
     /// # use neuromance::context_management::ContextConfig;
-    /// # use neuromance_context::TokenCounter;
     /// # use neuromance_client::ChatCompletionsClient;
     /// # let client: ChatCompletionsClient = unimplemented!();
-    /// # let token_counter: Arc<TokenCounter> = unimplemented!();
-    /// let config = ContextConfig::new(128_000, token_counter);
+    /// let config = ContextConfig::new(128_000);
     /// let core = Core::new(client)
     ///     .with_context_management(config);
     /// ```
     #[cfg(feature = "context")]
     #[must_use]
-    #[allow(clippy::needless_pass_by_value)]
-    pub fn with_context_management(
-        mut self,
-        config: crate::context_management::ContextConfig,
-    ) -> Self
+    pub fn with_context_management(self, config: crate::context_management::ContextConfig) -> Self
     where
         C: Clone,
     {
+        let compaction_client = self.client.clone();
+        self.with_context_management_client(compaction_client, config)
+    }
+
+    /// Enable automatic context compaction using a separate client for
+    /// summarization calls.
+    ///
+    /// Like [`with_context_management`](Self::with_context_management), but
+    /// without a `Clone` bound on `C` — the caller supplies the client used
+    /// for compaction summaries (typically built from the same config as the
+    /// main client).
+    #[cfg(feature = "context")]
+    #[must_use]
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn with_context_management_client(
+        mut self,
+        compaction_client: C,
+        config: crate::context_management::ContextConfig,
+    ) -> Self {
         self.context_manager = Some(crate::context_management::ContextManager::new(
-            self.client.clone(),
+            compaction_client,
             &config,
         ));
         self
@@ -540,6 +554,15 @@ impl<C: LLMClient> Core<C> {
                 // context plus the assistant reply that joins it. Not a sum across
                 // turns — `prompt_tokens` already accumulates the history.
                 let conv_total_tokens = prompt_tokens.saturating_add(completion_tokens);
+                // Provider-reported size of the context after this turn:
+                // prompt covers everything sent, completion the new assistant
+                // output. Tool results appended below aren't counted — the
+                // compaction threshold ratio absorbs that lag.
+                #[cfg(feature = "context")]
+                let reported_tokens: Option<usize> = response
+                    .usage
+                    .as_ref()
+                    .map(|u| u.prompt_tokens as usize + u.completion_tokens as usize);
                 turn_span.record("model", tracing::field::display(&response.model));
                 turn_span.record("finish_reason", tracing::field::display(&finish_label));
                 info!(
@@ -592,6 +615,31 @@ impl<C: LLMClient> Core<C> {
                 }
 
                 if tool_calls.is_empty() {
+                    // Compact before yielding so the stored history handed
+                    // back to the caller is already within budget.
+                    #[cfg(feature = "context")]
+                    if let Some(ref ctx) = self.context_manager {
+                        let (compacted, result) = ctx.maybe_compact(messages, reported_tokens).await;
+                        messages = compacted;
+                        if let Some(r) = result {
+                            if r.was_compacted {
+                                info!(
+                                    original_tokens = r.original_tokens,
+                                    compacted_tokens = r.compacted_tokens,
+                                    messages_summarized = r.messages_summarized,
+                                    "context compacted",
+                                );
+                                counter!("neuromance_compactions_total").increment(1);
+                            }
+                            yield CoreEvent::Compaction {
+                                original_tokens: r.original_tokens,
+                                compacted_tokens: r.compacted_tokens,
+                                messages_summarized: r.messages_summarized,
+                                was_compacted: r.was_compacted,
+                            };
+                        }
+                    }
+
                     let total_ms =
                         u64::try_from(start_time.elapsed().as_millis()).unwrap_or(u64::MAX);
                     info!(
@@ -755,9 +803,18 @@ impl<C: LLMClient> Core<C> {
                 // Run context compaction (if configured) before the turn callback.
                 #[cfg(feature = "context")]
                 if let Some(ref ctx) = self.context_manager {
-                    let (compacted, result) = ctx.maybe_compact(messages).await;
+                    let (compacted, result) = ctx.maybe_compact(messages, reported_tokens).await;
                     messages = compacted;
                     if let Some(r) = result {
+                        if r.was_compacted {
+                            info!(
+                                original_tokens = r.original_tokens,
+                                compacted_tokens = r.compacted_tokens,
+                                messages_summarized = r.messages_summarized,
+                                "context compacted",
+                            );
+                            counter!("neuromance_compactions_total").increment(1);
+                        }
                         yield CoreEvent::Compaction {
                             original_tokens: r.original_tokens,
                             compacted_tokens: r.compacted_tokens,
@@ -875,6 +932,138 @@ mod tests {
     use super::*;
     use neuromance_client::chat_completions::ChatCompletionsClient;
     use neuromance_common::client::Config;
+
+    /// Returns a plain assistant reply (no tool calls) with a huge reported
+    /// prompt size, so compaction must trigger before `Completed`.
+    #[cfg(feature = "context")]
+    struct HugeUsageClient {
+        config: Config,
+    }
+
+    #[cfg(feature = "context")]
+    #[async_trait::async_trait]
+    impl LLMClient for HugeUsageClient {
+        fn config(&self) -> &Config {
+            &self.config
+        }
+
+        async fn chat(
+            &self,
+            request: &ChatRequest,
+        ) -> Result<ChatResponse, neuromance_client::ClientError> {
+            let conv_id = request
+                .messages
+                .first()
+                .map_or_else(uuid::Uuid::new_v4, |m| m.conversation_id);
+            Ok(ChatResponse {
+                message: Message::assistant(conv_id, "summary or reply"),
+                model: "mock-model".to_string(),
+                usage: Some(neuromance_common::client::Usage {
+                    prompt_tokens: 200_000,
+                    completion_tokens: 10,
+                    total_tokens: 200_010,
+                    cost: None,
+                    input_tokens_details: None,
+                    output_tokens_details: None,
+                }),
+                finish_reason: None,
+                created_at: chrono::Utc::now(),
+                response_id: None,
+                metadata: std::collections::HashMap::new(),
+            })
+        }
+
+        async fn chat_stream(
+            &self,
+            _request: &ChatRequest,
+        ) -> Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<
+                            Item = Result<
+                                neuromance_common::client::ChatChunk,
+                                neuromance_client::ClientError,
+                            >,
+                        > + Send,
+                >,
+            >,
+            neuromance_client::ClientError,
+        > {
+            Ok(Box::pin(futures::stream::pending()))
+        }
+
+        fn supports_tools(&self) -> bool {
+            false
+        }
+
+        fn supports_streaming(&self) -> bool {
+            false
+        }
+    }
+
+    /// Compaction runs on the no-tool-call completion path, so the final
+    /// history handed back to callers is already within budget.
+    #[cfg(feature = "context")]
+    #[tokio::test]
+    async fn test_run_emits_compaction_event_on_completion_path() {
+        use crate::context_management::ContextConfig;
+
+        let mock_config = Config::new("mock", "mock-model");
+        let client = HugeUsageClient {
+            config: mock_config.clone(),
+        };
+        let compaction_client = HugeUsageClient {
+            config: mock_config,
+        };
+
+        let context_config = ContextConfig::new(1000).with_preserve_recent_turns(1);
+        let mut core =
+            Core::new(client).with_context_management_client(compaction_client, context_config);
+
+        let conv_id = uuid::Uuid::new_v4();
+        let messages: Vec<Message> = (0..4)
+            .flat_map(|i| {
+                vec![
+                    Message::user(conv_id, format!("question {i}")),
+                    Message::assistant(conv_id, format!("answer {i}")),
+                ]
+            })
+            .collect();
+
+        let cancel = CancellationToken::new();
+        let mut stream = Box::pin(core.run(messages, cancel));
+
+        let mut saw_compaction = false;
+        let mut completed: Option<Vec<Message>> = None;
+        while let Some(event) = stream.next().await {
+            match event.expect("run should not error") {
+                CoreEvent::Compaction { was_compacted, .. } => {
+                    assert!(
+                        completed.is_none(),
+                        "compaction must precede the completed event"
+                    );
+                    saw_compaction |= was_compacted;
+                }
+                CoreEvent::Completed(msgs) => completed = Some(msgs),
+                _ => {}
+            }
+        }
+
+        assert!(saw_compaction, "expected a was_compacted=true event");
+        let completed = completed.expect("stream must complete");
+        assert!(
+            completed.len() < 9,
+            "history should shrink below input+reply length, got {}",
+            completed.len()
+        );
+        assert!(
+            completed
+                .iter()
+                .any(|m| m.content.contains("summarized")
+                    || m.content.contains("summary or reply")),
+            "compacted history should contain the summary message"
+        );
+    }
 
     /// `with_tool_approval_callback` stores the callback.
     #[tokio::test]
