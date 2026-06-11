@@ -44,10 +44,12 @@ fn enum_to_db_string<T: Serialize>(
     }
 }
 
+/// Maps a [`MessageRole`] to its stored `role` column string.
 pub fn role_to_string(role: MessageRole, message_id: Uuid) -> Result<String, DbError> {
     enum_to_db_string(&role, "messages", "role", message_id)
 }
 
+/// Parses a stored `role` column string back into a [`MessageRole`].
 pub fn role_from_str(value: &str, message_id: Uuid) -> Result<MessageRole, DbError> {
     match value {
         "system" => Ok(MessageRole::System),
@@ -61,6 +63,7 @@ pub fn role_from_str(value: &str, message_id: Uuid) -> Result<MessageRole, DbErr
     }
 }
 
+/// Maps a [`ConversationStatus`] to its stored `status` column string.
 pub fn status_to_string(
     status: &ConversationStatus,
     conversation_id: Uuid,
@@ -68,6 +71,7 @@ pub fn status_to_string(
     enum_to_db_string(status, "conversations", "status", conversation_id)
 }
 
+/// Parses a stored `status` column string back into a [`ConversationStatus`].
 pub fn status_from_str(value: &str, conversation_id: Uuid) -> Result<ConversationStatus, DbError> {
     match value {
         "active" => Ok(ConversationStatus::Active),
@@ -89,6 +93,7 @@ pub struct MessageColumns {
     pub metadata: Value,
 }
 
+/// Derives the encoded column values for inserting a [`Message`].
 pub fn message_to_columns(message: &Message) -> Result<MessageColumns, DbError> {
     let encode = |column: &'static str, source: serde_json::Error| DbError::Encode {
         table: "messages",
@@ -125,6 +130,7 @@ pub struct MessageRow {
 }
 
 impl MessageRow {
+    /// Decodes this row into a [`Message`], parsing its JSON columns.
     pub fn into_message(self) -> Result<Message, DbError> {
         let id = self.id;
         let decode = move |column: &'static str, source: serde_json::Error| DbError::Decode {

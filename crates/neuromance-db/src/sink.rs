@@ -24,6 +24,7 @@ pub trait ConversationSink: Send + Sync {
     ///
     /// Returns [`DbError`] if the transaction fails or a message cannot be
     /// serialized for storage.
+    #[must_use = "the inserted-message count drives the persistence metrics counter"]
     async fn append_messages(
         &self,
         conversation_id: Uuid,

@@ -3,6 +3,10 @@
 use uuid::Uuid;
 
 /// Errors returned by conversation persistence operations.
+///
+/// No `PartialEq`: the `Sqlx` and `Migrate` variants carry `sqlx` source
+/// errors that are not themselves `PartialEq`, so the trait cannot be derived.
+/// Tests match on variants with `matches!` instead.
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
     /// A query or connection-level failure from sqlx.
