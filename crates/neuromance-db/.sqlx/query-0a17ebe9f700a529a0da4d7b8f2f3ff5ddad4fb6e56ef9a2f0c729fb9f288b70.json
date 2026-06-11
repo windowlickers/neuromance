@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT COALESCE(MAX(seq) + 1, 0) AS \"base!\" FROM messages WHERE conversation_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "base!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "0a17ebe9f700a529a0da4d7b8f2f3ff5ddad4fb6e56ef9a2f0c729fb9f288b70"
+}
