@@ -72,7 +72,18 @@ pub enum TokenCounterError {
     #[error("Token range error: {0}")]
     TokenRange(String),
 
-    /// Compaction failed (LLM call or conversation rebuild).
+    /// An LLM call made during compaction failed. Typically retryable
+    /// (network, rate limit, transient provider error).
+    #[error("{context}")]
+    CompactionLlm {
+        /// Which compaction step issued the call.
+        context: String,
+        /// The underlying client error (boxed to keep the error type small).
+        #[source]
+        source: Box<neuromance_client::ClientError>,
+    },
+
+    /// Compaction failed for a permanent reason (logic or invariant violation).
     #[error("Compaction failed: {0}")]
     Compaction(String),
 

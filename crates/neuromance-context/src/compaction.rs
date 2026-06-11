@@ -502,7 +502,10 @@ impl<C: LLMClient> Compactor<C> {
             .with_temperature(0.3);
 
         let response = self.client.chat(&summary_request).await.map_err(|e| {
-            TokenCounterError::Compaction(format!("Failed to generate summary: {e}"))
+            TokenCounterError::CompactionLlm {
+                context: "Failed to generate summary".to_string(),
+                source: Box::new(e),
+            }
         })?;
 
         Ok(response.message.content.clone())
@@ -525,9 +528,14 @@ impl<C: LLMClient> Compactor<C> {
             .with_model(self.client.config().model.clone())
             .with_temperature(0.3);
 
-        let response = self.client.chat(&request).await.map_err(|e| {
-            TokenCounterError::Compaction(format!("Failed to consolidate summaries: {e}"))
-        })?;
+        let response =
+            self.client
+                .chat(&request)
+                .await
+                .map_err(|e| TokenCounterError::CompactionLlm {
+                    context: "Failed to consolidate summaries".to_string(),
+                    source: Box::new(e),
+                })?;
 
         Ok(response.message.content.clone())
     }
