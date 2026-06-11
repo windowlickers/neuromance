@@ -172,6 +172,16 @@ pub struct Compactor<C: LLMClient> {
     config: CompactionConfig,
 }
 
+impl<C: LLMClient> std::fmt::Debug for Compactor<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Compactor")
+            .field("client", &"<LLMClient>")
+            .field("token_counter", &self.token_counter)
+            .field("config", &self.config)
+            .finish()
+    }
+}
+
 impl<C: LLMClient> Compactor<C> {
     /// Creates a new compactor with the given LLM client and token counter.
     #[must_use]
