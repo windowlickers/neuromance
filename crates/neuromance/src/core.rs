@@ -49,6 +49,10 @@ pub struct Core<C: LLMClient> {
     pub turn_callback: Option<TurnCallback>,
     /// Thinking/reasoning mode configuration.
     pub thinking: ThinkingMode,
+    /// Optional sink that persists conversation history as the run progresses.
+    /// Write failures are logged and never abort the run.
+    #[cfg(feature = "db")]
+    pub persistence: Option<Arc<dyn neuromance_db::ConversationSink>>,
 }
 
 impl<C: LLMClient> Core<C> {
@@ -63,7 +67,23 @@ impl<C: LLMClient> Core<C> {
             tool_approval_callback: None,
             turn_callback: None,
             thinking: ThinkingMode::Default,
+            #[cfg(feature = "db")]
+            persistence: None,
         }
+    }
+
+    /// Set a sink that durably records conversation history.
+    ///
+    /// Messages are persisted incrementally during [`Core::run`]: the seed
+    /// snapshot at run start, the assistant message after each turn, and tool
+    /// results after each turn's tool calls complete — so a crashed run still
+    /// has its prefix recorded. Persistence is best-effort: write failures are
+    /// logged and retried at the next persist point, never aborting the run.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_persistence(mut self, sink: Arc<dyn neuromance_db::ConversationSink>) -> Self {
+        self.persistence = Some(sink);
+        self
     }
 
     /// Set callback for tool approval decisions.
@@ -211,6 +231,15 @@ impl<C: LLMClient> Core<C> {
             let mut turn_count: u32 = 0;
             let start_time = Instant::now();
             let mut messages_arc: Arc<[Message]> = messages.clone().into();
+
+            // Persist the seed snapshot (system + user messages) up front so
+            // the input is durable even if the first LLM call fails.
+            #[cfg(feature = "db")]
+            let mut persisted_ids = std::collections::HashSet::new();
+            #[cfg(feature = "db")]
+            if let Some(ref sink) = self.persistence {
+                persist_new_messages(sink.as_ref(), &messages, &mut persisted_ids).await;
+            }
 
             loop {
                 if cancel.is_cancelled() {
@@ -451,6 +480,13 @@ impl<C: LLMClient> Core<C> {
                 .increment(u64::from(completion_tokens));
                 messages.push(response.message);
 
+                // Persist the assistant message before tool execution so a
+                // crashed run still has its prefix recorded.
+                #[cfg(feature = "db")]
+                if let Some(ref sink) = self.persistence {
+                    persist_new_messages(sink.as_ref(), &messages, &mut persisted_ids).await;
+                }
+
                 if tool_calls.is_empty() {
                     let total_ms =
                         u64::try_from(start_time.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -604,6 +640,14 @@ impl<C: LLMClient> Core<C> {
 
                 debug!(tool_calls = tool_calls_count, "completed tool calls; continuing");
 
+                // Persist this turn's tool results (and retry any backlog from
+                // earlier failed writes) before the turn callback can rewrite
+                // the history.
+                #[cfg(feature = "db")]
+                if let Some(ref sink) = self.persistence {
+                    persist_new_messages(sink.as_ref(), &messages, &mut persisted_ids).await;
+                }
+
                 if let Some(ref callback) = self.turn_callback {
                     let outcome: Result<Result<Vec<Message>, anyhow::Error>, CoreError> = tokio::select! {
                         biased;
@@ -662,6 +706,40 @@ impl<C: LLMClient> Core<C> {
         Err(CoreError::NoResponse(
             "Stream ended without Completed event".to_string(),
         ))
+    }
+}
+
+/// Persists messages not yet recorded this run, tolerating failures.
+///
+/// This is the single place implementing the log-and-continue policy: on
+/// success the message ids are marked persisted; on failure they are left
+/// unmarked so the next persist point retries the backlog (the sink's
+/// per-id idempotency makes the retry safe).
+#[cfg(feature = "db")]
+async fn persist_new_messages(
+    sink: &dyn neuromance_db::ConversationSink,
+    messages: &[Message],
+    persisted: &mut std::collections::HashSet<uuid::Uuid>,
+) {
+    let pending: Vec<Message> = messages
+        .iter()
+        .filter(|m| !persisted.contains(&m.id))
+        .cloned()
+        .collect();
+    let Some(first) = pending.first() else { return };
+    match sink.append_messages(first.conversation_id, &pending).await {
+        Ok(inserted) => {
+            persisted.extend(pending.iter().map(|m| m.id));
+            counter!("neuromance_db_messages_persisted_total").increment(inserted);
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                pending = pending.len(),
+                "conversation persistence failed; continuing without it"
+            );
+            counter!("neuromance_db_persist_failures_total").increment(1);
+        }
     }
 }
 
@@ -775,6 +853,99 @@ mod tests {
             matches!(result, Err(CoreError::Cancelled(_))),
             "unexpected: {result:?}"
         );
+    }
+
+    /// A mock sink that records every batch it receives and can be told to fail.
+    #[cfg(feature = "db")]
+    mod persistence {
+        use std::collections::HashSet;
+        use std::sync::Mutex;
+
+        use neuromance_db::{ConversationSink, DbError};
+        use uuid::Uuid;
+
+        use super::*;
+
+        #[derive(Default)]
+        struct MockSink {
+            fail: bool,
+            batches: Mutex<Vec<Vec<Uuid>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl ConversationSink for MockSink {
+            async fn append_messages(
+                &self,
+                conversation_id: Uuid,
+                messages: &[Message],
+            ) -> Result<u64, DbError> {
+                if self.fail {
+                    return Err(DbError::UnknownRole {
+                        value: "mock failure".to_string(),
+                        message_id: conversation_id,
+                    });
+                }
+                let ids: Vec<Uuid> = messages.iter().map(|m| m.id).collect();
+                let count = ids.len() as u64;
+                self.batches.lock().unwrap().push(ids);
+                Ok(count)
+            }
+        }
+
+        /// `with_persistence` stores the sink.
+        #[tokio::test]
+        async fn test_with_persistence_stores_sink() {
+            let config = Config::new("test", "test-model").with_api_key("test-key");
+            let client = ChatCompletionsClient::new(config).expect("Failed to create client");
+            let core = Core::new(client).with_persistence(Arc::new(MockSink::default()));
+            assert!(core.persistence.is_some());
+        }
+
+        /// Already-persisted ids are filtered out of subsequent batches.
+        #[tokio::test]
+        async fn test_persist_new_messages_skips_persisted_ids() {
+            let sink = MockSink::default();
+            let conv_id = uuid::Uuid::new_v4();
+            let first = Message::user(conv_id, "one");
+            let mut persisted = HashSet::new();
+
+            persist_new_messages(&sink, std::slice::from_ref(&first), &mut persisted).await;
+            assert!(persisted.contains(&first.id));
+
+            let second = Message::assistant(conv_id, "two");
+            persist_new_messages(&sink, &[first.clone(), second.clone()], &mut persisted).await;
+
+            let batches = sink.batches.lock().unwrap().clone();
+            assert_eq!(batches, vec![vec![first.id], vec![second.id]]);
+        }
+
+        /// Nothing pending means the sink is never called.
+        #[tokio::test]
+        async fn test_persist_new_messages_noop_when_all_persisted() {
+            let sink = MockSink::default();
+            let message = Message::user(uuid::Uuid::new_v4(), "one");
+            let mut persisted = HashSet::from([message.id]);
+
+            persist_new_messages(&sink, &[message], &mut persisted).await;
+            assert!(sink.batches.lock().unwrap().is_empty());
+        }
+
+        /// A failed write leaves ids unmarked so the next call retries them.
+        #[tokio::test]
+        async fn test_persist_failure_leaves_ids_unpersisted() {
+            let sink = MockSink {
+                fail: true,
+                ..MockSink::default()
+            };
+            let message = Message::user(uuid::Uuid::new_v4(), "one");
+            let mut persisted = HashSet::new();
+
+            persist_new_messages(&sink, std::slice::from_ref(&message), &mut persisted).await;
+            assert!(
+                !persisted.contains(&message.id),
+                "failed writes must be retried at the next persist point"
+            );
+        }
     }
 
     /// Errors from turn callback propagate as `anyhow::Error`.
