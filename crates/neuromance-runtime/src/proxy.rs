@@ -135,6 +135,7 @@ mod tests {
             tools: Vec::new(),
             oneshot: None,
             proxy,
+            database: None,
         }
     }
 
