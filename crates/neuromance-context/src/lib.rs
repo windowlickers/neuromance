@@ -55,6 +55,7 @@ pub mod state;
 pub mod transforms;
 
 pub use compaction::{CompactionConfig, CompactionResult, CompactionStrategy, Compactor};
+pub use context::Context;
 
 /// Configuration for a specific model's tokenizer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
