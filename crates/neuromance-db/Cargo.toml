@@ -29,4 +29,5 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+proptest = "1.4"
 tokio = { workspace = true }

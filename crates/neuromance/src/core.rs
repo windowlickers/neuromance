@@ -894,13 +894,25 @@ mod tests {
             }
         }
 
-        /// `with_persistence` stores the sink.
+        /// `with_persistence` stores the sink that `Core` later drives: writing
+        /// through the stored handle reaches our `MockSink` and records the batch.
         #[tokio::test]
-        async fn test_with_persistence_stores_sink() {
+        async fn test_with_persistence_drives_the_stored_sink() {
             let config = Config::new("test", "test-model").with_api_key("test-key");
             let client = ChatCompletionsClient::new(config).expect("Failed to create client");
-            let core = Core::new(client).with_persistence(Arc::new(MockSink::default()));
-            assert!(core.persistence.is_some());
+            let sink = Arc::new(MockSink::default());
+            let core = Core::new(client).with_persistence(sink.clone());
+
+            let conv_id = uuid::Uuid::new_v4();
+            let message = Message::user(conv_id, "hello");
+            let stored = core.persistence.as_ref().expect("sink should be stored");
+            let count = stored
+                .append_messages(conv_id, std::slice::from_ref(&message))
+                .await
+                .unwrap();
+
+            assert_eq!(count, 1);
+            assert_eq!(*sink.batches.lock().unwrap(), vec![vec![message.id]]);
         }
 
         /// Already-persisted ids are filtered out of subsequent batches.

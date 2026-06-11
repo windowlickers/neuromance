@@ -165,6 +165,8 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     #![allow(clippy::expect_used)]
 
+    use proptest::prelude::*;
+
     use super::*;
 
     fn row_from(message: &Message, columns: MessageColumns) -> MessageRow {
@@ -305,5 +307,116 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn test_corrupt_metadata_json_is_a_decode_error() {
+        let message = Message::user(Uuid::new_v4(), "hi");
+        let columns = message_to_columns(&message).unwrap();
+        let mut row = row_from(&message, columns);
+        row.metadata = serde_json::json!("not a map");
+        let err = row.into_message().unwrap_err();
+        assert!(matches!(
+            err,
+            DbError::Decode {
+                column: "metadata",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_corrupt_reasoning_json_is_a_decode_error() {
+        let message = Message::user(Uuid::new_v4(), "hi");
+        let columns = message_to_columns(&message).unwrap();
+        let mut row = row_from(&message, columns);
+        row.reasoning = Some(serde_json::json!("not a reasoning object"));
+        let err = row.into_message().unwrap_err();
+        assert!(matches!(
+            err,
+            DbError::Decode {
+                column: "reasoning",
+                ..
+            }
+        ));
+    }
+
+    /// Anchors the encoded role spellings to literal DB strings. Unlike
+    /// [`test_all_roles_round_trip_through_strings`], which runs the live
+    /// encoder on both sides, this catches a drift in the stored spelling.
+    #[test]
+    fn test_role_strings_match_stored_spelling() {
+        let id = Uuid::new_v4();
+        for (stored, role) in [
+            ("system", MessageRole::System),
+            ("user", MessageRole::User),
+            ("assistant", MessageRole::Assistant),
+            ("tool", MessageRole::Tool),
+        ] {
+            assert_eq!(role_from_str(stored, id).unwrap(), role);
+            assert_eq!(role_to_string(role, id).unwrap(), stored);
+        }
+    }
+
+    /// Anchors the encoded status spellings to literal DB strings, for the
+    /// same reason as [`test_role_strings_match_stored_spelling`].
+    #[test]
+    fn test_status_strings_match_stored_spelling() {
+        let id = Uuid::new_v4();
+        for (stored, status) in [
+            ("active", ConversationStatus::Active),
+            ("paused", ConversationStatus::Paused),
+            ("archived", ConversationStatus::Archived),
+            ("deleted", ConversationStatus::Deleted),
+        ] {
+            assert_eq!(status_from_str(stored, id).unwrap(), status);
+            assert_eq!(status_to_string(&status, id).unwrap(), stored);
+        }
+    }
+
+    proptest! {
+        /// A message built from arbitrary JSON-backed fields survives the
+        /// column encode → row decode round-trip unchanged.
+        #[test]
+        fn prop_message_round_trips(
+            content in ".*",
+            role_idx in 0usize..4,
+            metadata in proptest::collection::hash_map(
+                "[a-z]{1,8}",
+                "[a-zA-Z0-9 ]{0,16}",
+                0..4,
+            ),
+            reasoning in proptest::option::of((
+                "[ -~]{0,32}",
+                proptest::option::of("[a-z0-9]{1,16}"),
+            )),
+            tool_calls in proptest::collection::vec(
+                ("[a-z_]{1,12}", "[ -~]{0,24}"),
+                0..3,
+            ),
+        ) {
+            let role = [
+                MessageRole::System,
+                MessageRole::User,
+                MessageRole::Assistant,
+                MessageRole::Tool,
+            ][role_idx];
+
+            let mut message = Message::new(Uuid::new_v4(), role, content);
+            message.metadata = metadata
+                .into_iter()
+                .map(|(k, v)| (k, Value::String(v)))
+                .collect();
+            message.reasoning = reasoning.map(|(content, signature)| ReasoningContent {
+                content,
+                signature,
+            });
+            message.tool_calls = tool_calls
+                .into_iter()
+                .map(|(name, args)| ToolCall::new(name, args))
+                .collect();
+
+            assert_round_trip(&message);
+        }
     }
 }

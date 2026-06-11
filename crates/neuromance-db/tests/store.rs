@@ -210,6 +210,33 @@ async fn test_mismatched_conversation_id_is_skipped(pool: PgPool) {
 
 #[sqlx::test(migrations = "./migrations")]
 #[ignore = "requires postgres via DATABASE_URL"]
+async fn test_all_mismatched_batch_touches_nothing(pool: PgPool) {
+    let store = PgConversationStore::new(pool.clone());
+    let conversation_id = Uuid::new_v4();
+    let stray = Message::user(Uuid::new_v4(), "wrong conversation");
+
+    let inserted = store
+        .append_messages(conversation_id, &[stray])
+        .await
+        .unwrap();
+    assert_eq!(
+        inserted, 0,
+        "a batch with no matching messages inserts nothing"
+    );
+
+    // The early return must short-circuit before opening a transaction, so the
+    // conversation FK row is never created.
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM conversations WHERE id = $1)")
+            .bind(conversation_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(!exists, "early return must not create the conversation row");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires postgres via DATABASE_URL"]
 async fn test_concurrent_appends_do_not_collide(pool: PgPool) {
     let store = PgConversationStore::new(pool.clone());
     let conversation_id = Uuid::new_v4();
