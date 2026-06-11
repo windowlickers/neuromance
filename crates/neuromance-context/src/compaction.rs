@@ -6,23 +6,22 @@
 //!
 //! ## Example
 //!
-//! ```rust,ignore
-//! use neuromance_context::{Compactor, CompactionConfig, CompactionStrategy, TokenCounter, ModelConfig};
-//! use neuromance_client::OpenAIClient;
+//! ```no_run
+//! use neuromance_context::{Compactor, CompactionConfig, TokenCounter, ModelConfig};
+//! use neuromance_client::ChatCompletionsClient;
 //! use neuromance_common::Conversation;
+//! use neuromance_common::client::Config;
 //!
 //! # async fn example() -> anyhow::Result<()> {
-//! let client = OpenAIClient::new(config)?;
+//! let client = ChatCompletionsClient::new(
+//!     Config::new("openai", "gpt-4o").with_api_key("sk-..."),
+//! )?;
 //! let token_counter = TokenCounter::new(ModelConfig::gpt_oss_20b()).await?;
 //!
 //! let compactor = Compactor::new(client, token_counter)
-//!     .with_config(CompactionConfig {
-//!         target_tokens: 4000,
-//!         preserve_system_prompt: true,
-//!         preserve_recent_turns: 3,
-//!         strategy: CompactionStrategy::OneShot,
-//!     });
+//!     .with_config(CompactionConfig::new(4000).with_preserve_recent_turns(3));
 //!
+//! let conversation = Conversation::new();
 //! let compacted = compactor.compact(&conversation).await?;
 //! # Ok(())
 //! # }
