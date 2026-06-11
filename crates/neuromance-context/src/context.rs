@@ -211,6 +211,8 @@ impl Context<Ready> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
+
     use super::*;
     use neuromance_common::chat::Conversation;
 
@@ -238,14 +240,23 @@ mod tests {
 
     #[test]
     fn test_skip_transform() {
-        let conv = Conversation::new();
-        let context = Context::new(conv);
+        use neuromance_common::chat::{Message, MessageRole};
 
-        let context = context
-            .filter(FilterCriteria::default())
+        let mut conv = Conversation::new();
+        conv.add_message(Message::user(conv.id, "hi")).unwrap();
+        conv.add_message(Message::system(conv.id, "sys")).unwrap();
+        conv.add_message(Message::assistant(conv.id, "yo")).unwrap();
+
+        let context = Context::new(conv)
+            .filter(FilterCriteria::default().with_roles(vec![MessageRole::User]))
             .skip_transform()
             .ready();
 
+        // The filter kept only the user message, and skip_transform left it untouched.
+        let messages = context.conversation().get_messages();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, MessageRole::User);
+        assert_eq!(messages[0].content, "hi");
         assert_eq!(context.metadata().transformation_count(), 3);
     }
 
