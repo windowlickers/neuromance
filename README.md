@@ -85,6 +85,7 @@ neuromance/
 │   ├── neuromance-agent/     # Agent framework
 │   ├── neuromance-tools/     # Tool execution framework
 │   ├── neuromance-repl/      # Embedded Python REPL
+│   ├── neuromance-db/        # Postgres persistence for conversations
 │   └── neuromance-runtime/   # Container runtime binary
 ├── Cargo.toml                # Workspace configuration
 └── README.md
@@ -120,6 +121,21 @@ token_file = "/var/run/neuromance/tokens/llm"
 # Header carrying the sealed token. Defaults to X-Tokenizer-Token.
 token_header = "X-Tokenizer-Token"
 ```
+
+## Conversation persistence
+
+With an optional `[database]` section, the runtime writes conversation history through to postgres as tasks run — a shared durable record any number of agents can write into. Messages are stored as an append-only log (idempotent per message id, ordered by a per-conversation sequence), so the full history including tool calls and tool results survives restarts and context compaction. In-memory state stays authoritative for serving; persistence is best-effort and never blocks a running task, while a failed connection at startup fails fast.
+
+```toml
+[database]
+# Environment variable holding the postgres URL — the URL embeds a
+# credential, so it never lives in this file (same policy as api_key_env).
+url_env = "DATABASE_URL"
+max_connections = 5            # optional, default 5
+acquire_timeout_seconds = 5    # optional, default 5
+```
+
+Migrations are embedded in `neuromance-db` and applied automatically at startup. See the `neuromance-db` crate docs for the schema and the `cargo sqlx prepare` workflow when changing queries.
 
 ## Model Context Protocol (MCP) Support
 

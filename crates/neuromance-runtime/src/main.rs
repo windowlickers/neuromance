@@ -9,6 +9,7 @@ use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt, util::S
 use neuromance::{Core, build_client};
 use neuromance_agent::Agent;
 use neuromance_client::LLMClient;
+use neuromance_db::PgConversationStore;
 use neuromance_runtime::{
     ApprovalMode, Mode, RuntimeConfig, RuntimeError,
     approval::WebhookApprover,
@@ -57,12 +58,13 @@ async fn main() -> Result<()> {
     .await
     .context("start health server")?;
 
-    let agent = build_agent(&config).map_err(anyhow::Error::from)?;
+    let store = init_store(&config).await?;
+    let agent = build_agent(&config, store.clone()).map_err(anyhow::Error::from)?;
     readiness.set_ready(true);
 
     let result = match config.mode {
         Mode::Oneshot => run_oneshot(&config, agent, cancel.clone()).await,
-        Mode::Serve => run_serve(&config, agent, cancel.clone()).await,
+        Mode::Serve => run_serve(&config, agent, store, cancel.clone()).await,
     };
 
     readiness.set_ready(false);
@@ -135,7 +137,40 @@ async fn spawn_health_server(
     Ok(handle)
 }
 
-fn build_agent(config: &RuntimeConfig) -> Result<Agent<Box<dyn LLMClient>>, RuntimeError> {
+/// Connect to postgres and run migrations when `[database]` is configured.
+///
+/// Failures here abort startup: the readiness gate stays unready and the
+/// orchestrator restarts the pod. A silently-disabled database would record
+/// nothing while looking healthy — worse than a crash loop.
+async fn init_store(config: &RuntimeConfig) -> Result<Option<Arc<PgConversationStore>>> {
+    let Some(database) = &config.database else {
+        return Ok(None);
+    };
+    let url = std::env::var(&database.url_env).with_context(|| {
+        format!(
+            "database.url_env: environment variable '{}' is not set",
+            database.url_env
+        )
+    })?;
+    let store = PgConversationStore::connect(
+        &url,
+        database.max_connections,
+        Duration::from_secs(database.acquire_timeout_seconds),
+    )
+    .await
+    .context("connect to postgres (database.url_env)")?;
+    store.migrate().await.context("run database migrations")?;
+    info!(
+        max_connections = database.max_connections,
+        "database persistence enabled"
+    );
+    Ok(Some(Arc::new(store)))
+}
+
+fn build_agent(
+    config: &RuntimeConfig,
+    store: Option<Arc<PgConversationStore>>,
+) -> Result<Agent<Box<dyn LLMClient>>, RuntimeError> {
     let llm_config = build_llm_config(config)?;
     let client =
         build_client(llm_config).map_err(|e| RuntimeError::Config(format!("build client: {e}")))?;
@@ -146,6 +181,9 @@ fn build_agent(config: &RuntimeConfig) -> Result<Agent<Box<dyn LLMClient>>, Runt
     }
     if let Some(max) = config.agent.max_turns {
         core.max_turns = Some(max);
+    }
+    if let Some(store) = store {
+        core = core.with_persistence(store);
     }
 
     #[cfg_attr(not(feature = "python-repl"), allow(unused_mut))]
@@ -219,7 +257,8 @@ async fn run_oneshot(
 async fn run_serve(
     config: &RuntimeConfig,
     agent: Agent<Box<dyn LLMClient>>,
+    store: Option<Arc<PgConversationStore>>,
     cancel: CancellationToken,
 ) -> Result<()> {
-    serve::run(config, agent, cancel).await
+    serve::run(config, agent, store, cancel).await
 }

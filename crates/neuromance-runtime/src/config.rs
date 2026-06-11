@@ -53,6 +53,10 @@ pub struct RuntimeConfig {
     /// of from `agent.api_key_env`.
     #[serde(default)]
     pub proxy: Option<ProxyTomlConfig>,
+    /// When set, conversation history is written through to postgres as
+    /// tasks run. In-memory state stays authoritative for serving.
+    #[serde(default)]
+    pub database: Option<DatabaseSettings>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -108,6 +112,32 @@ pub struct ProxyTomlConfig {
 
 fn default_token_header() -> String {
     "X-Tokenizer-Token".to_string()
+}
+
+/// Postgres persistence settings.
+///
+/// The connection URL is a credential (it usually embeds a password), so it
+/// is never written in the TOML file — `url_env` names the environment
+/// variable that holds it, the same policy as `agent.api_key_env`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DatabaseSettings {
+    /// Environment variable holding the postgres connection URL
+    /// (e.g. `postgres://user:pass@host:5432/neuromance`).
+    pub url_env: String,
+    /// Maximum connections in the pool.
+    #[serde(default = "default_db_max_connections")]
+    pub max_connections: u32,
+    /// Cap on how long a persistence call may wait for a pool connection.
+    /// Bounds the stall a sick database can add to an agent turn.
+    #[serde(default = "default_db_acquire_timeout")]
+    pub acquire_timeout_seconds: u64,
+}
+
+const fn default_db_max_connections() -> u32 {
+    5
+}
+const fn default_db_acquire_timeout() -> u64 {
+    5
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -267,6 +297,19 @@ impl RuntimeConfig {
             return Err(RuntimeError::Config(
                 "runtime.max_queue_depth must be at least 1".to_string(),
             ));
+        }
+
+        if let Some(database) = &self.database {
+            if database.url_env.trim().is_empty() {
+                return Err(RuntimeError::Config(
+                    "database.url_env must not be empty".to_string(),
+                ));
+            }
+            if database.max_connections == 0 {
+                return Err(RuntimeError::Config(
+                    "database.max_connections must be at least 1".to_string(),
+                ));
+            }
         }
         Ok(())
     }
@@ -634,6 +677,90 @@ mod tests {
         let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
         let err = config.validate().err().unwrap();
         assert!(format!("{err}").contains("token_header"));
+    }
+
+    #[test]
+    fn test_database_section_absent_means_none() {
+        let config: RuntimeConfig = toml::from_str(minimal_oneshot_toml()).unwrap();
+        config.validate().unwrap();
+        assert!(config.database.is_none());
+    }
+
+    #[test]
+    fn test_database_section_applies_defaults() {
+        let toml_str = r#"
+            mode = "serve"
+            [agent]
+            id = "x"
+            model = "openai:gpt-4o"
+            api_key_env = "K"
+            system_prompt = "x"
+            [database]
+            url_env = "DATABASE_URL"
+        "#;
+        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        config.validate().unwrap();
+        let database = config.database.expect("database section");
+        assert_eq!(database.url_env, "DATABASE_URL");
+        assert_eq!(database.max_connections, 5);
+        assert_eq!(database.acquire_timeout_seconds, 5);
+    }
+
+    #[test]
+    fn test_database_section_round_trips_custom_values() {
+        let toml_str = r#"
+            mode = "serve"
+            [agent]
+            id = "x"
+            model = "openai:gpt-4o"
+            api_key_env = "K"
+            system_prompt = "x"
+            [database]
+            url_env = "PG_URL"
+            max_connections = 12
+            acquire_timeout_seconds = 30
+        "#;
+        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        config.validate().unwrap();
+        let database = config.database.expect("database section");
+        assert_eq!(database.url_env, "PG_URL");
+        assert_eq!(database.max_connections, 12);
+        assert_eq!(database.acquire_timeout_seconds, 30);
+    }
+
+    #[test]
+    fn test_database_empty_url_env_fails_validation() {
+        let toml_str = r#"
+            mode = "serve"
+            [agent]
+            id = "x"
+            model = "openai:gpt-4o"
+            api_key_env = "K"
+            system_prompt = "x"
+            [database]
+            url_env = "  "
+        "#;
+        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        let err = config.validate().err().unwrap();
+        assert!(format!("{err}").contains("database.url_env"));
+    }
+
+    #[test]
+    fn test_database_zero_max_connections_fails_validation() {
+        let toml_str = r#"
+            mode = "serve"
+            [agent]
+            id = "x"
+            model = "openai:gpt-4o"
+            api_key_env = "K"
+            system_prompt = "x"
+            [database]
+            url_env = "DATABASE_URL"
+            max_connections = 0
+        "#;
+        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        let err = config.validate().err().unwrap();
+        assert!(format!("{err}").contains("database.max_connections"));
     }
 
     #[test]

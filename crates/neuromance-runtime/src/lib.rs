@@ -14,8 +14,10 @@
 //! decision).
 //!
 //! Tools are constructed at startup from `[[tools]]` entries via
-//! [`neuromance_tools::ToolFactoryRegistry::with_builtin`]. State is in-memory
-//! only; persistence (postgres) is future work.
+//! [`neuromance_tools::ToolFactoryRegistry::with_builtin`]. Serving state is
+//! in-memory; an optional `[database]` section additionally writes
+//! conversation history through to postgres as tasks run (see
+//! `neuromance-db`).
 
 pub mod approval;
 pub mod config;
@@ -29,7 +31,7 @@ pub mod serve;
 pub mod telemetry;
 
 pub use config::{
-    AgentConfig, ApprovalConfig, ApprovalMode, Mode, OneshotConfig, ProxyTomlConfig, RuntimeConfig,
-    RuntimeSettings,
+    AgentConfig, ApprovalConfig, ApprovalMode, DatabaseSettings, Mode, OneshotConfig,
+    ProxyTomlConfig, RuntimeConfig, RuntimeSettings,
 };
 pub use error::RuntimeError;

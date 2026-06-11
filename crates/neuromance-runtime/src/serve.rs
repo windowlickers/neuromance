@@ -11,8 +11,13 @@
 //! probes at the task port.
 //!
 //! Tasks are processed sequentially by a single worker that owns the
-//! agent. State is in-memory only; restarts lose pending and completed
-//! tasks. Postgres-backed persistence is future work.
+//! agent. In-memory state is authoritative for serving; restarts lose
+//! pending and completed tasks. When `[database]` is configured,
+//! conversation history is additionally written through to postgres as a
+//! durable record: Core persists messages incrementally during each run,
+//! and this module records conversation metadata on creation and soft
+//! deletes (the database keeps the history when a conversation is
+//! `DELETE`d here).
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -38,7 +43,8 @@ use uuid::Uuid;
 use neuromance::error::CoreError;
 use neuromance_agent::Agent;
 use neuromance_client::LLMClient;
-use neuromance_common::chat::Message;
+use neuromance_common::chat::{Conversation, ConversationStatus, Message};
+use neuromance_db::PgConversationStore;
 
 use crate::config::RuntimeConfig;
 
@@ -201,6 +207,9 @@ pub struct ServeState {
     conversations: Arc<DashMap<Uuid, ConversationRecord>>,
     work_tx: mpsc::Sender<WorkerJob>,
     system_prompt: Arc<str>,
+    agent_id: Arc<str>,
+    /// Durable conversation record; `None` when `[database]` is not configured.
+    store: Option<Arc<PgConversationStore>>,
 }
 
 /// Cap on `POST /tasks` request bodies. Task input is a single user prompt;
@@ -274,6 +283,22 @@ fn seed_new_conversation(state: &ServeState, system_prompt: Option<&str>) -> Uui
             messages: vec![Message::system(id, prompt)],
         },
     );
+    // Record the conversation row up front so it carries the agent identity;
+    // the messages themselves are persisted by Core during the run.
+    if let Some(store) = &state.store {
+        let store = Arc::clone(store);
+        let mut conversation = Conversation::new();
+        conversation.id = id;
+        conversation.metadata.insert(
+            "agent_id".to_string(),
+            serde_json::json!(state.agent_id.as_ref()),
+        );
+        tokio::spawn(async move {
+            if let Err(e) = store.upsert_conversation(&conversation).await {
+                warn!(error = %e, conversation_id = %id, "failed to record conversation row");
+            }
+        });
+    }
     id
 }
 
@@ -456,6 +481,19 @@ async fn delete_conversation(
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
     if state.conversations.remove(&id).is_some() {
+        // Soft delete in the durable record: the history stays queryable,
+        // only the lifecycle status changes.
+        if let Some(store) = &state.store {
+            let store = Arc::clone(store);
+            tokio::spawn(async move {
+                if let Err(e) = store
+                    .set_conversation_status(id, ConversationStatus::Deleted)
+                    .await
+                {
+                    warn!(error = %e, conversation_id = %id, "failed to soft-delete conversation");
+                }
+            });
+        }
         StatusCode::NO_CONTENT.into_response()
     } else {
         (
@@ -616,6 +654,7 @@ async fn process_job<C: LLMClient + Send + Sync>(
 pub async fn run<C: LLMClient + Send + Sync + 'static>(
     config: &RuntimeConfig,
     agent: Agent<C>,
+    store: Option<Arc<PgConversationStore>>,
     cancel: CancellationToken,
 ) -> Result<()> {
     let tasks: Arc<DashMap<Uuid, TaskRecord>> = Arc::new(DashMap::new());
@@ -637,6 +676,8 @@ pub async fn run<C: LLMClient + Send + Sync + 'static>(
         conversations: Arc::clone(&conversations),
         work_tx,
         system_prompt,
+        agent_id: Arc::from(config.agent.id.as_str()),
+        store,
     };
     let app = router(state);
     let addr: std::net::SocketAddr = config
@@ -914,6 +955,8 @@ mod tests {
                 conversations,
                 work_tx,
                 system_prompt: Arc::from("system"),
+                agent_id: Arc::from("test-agent"),
+                store: None,
             },
             work_rx,
         )
