@@ -83,3 +83,9 @@ pub mod mcp {
 pub mod proxy {
     pub use neuromance_tools::proxy::{ProxyAwareClient, ToolProxyConfig};
 }
+
+// --- Postgres conversation persistence ---
+#[cfg(feature = "db")]
+pub mod db {
+    pub use neuromance_db::{ConversationSink, ConversationSummary, DbError, PgConversationStore};
+}

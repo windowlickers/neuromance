@@ -1822,6 +1822,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-stream",
+ "async-trait",
  "chrono",
  "clap",
  "colored",
@@ -1829,6 +1830,7 @@ dependencies = [
  "metrics",
  "neuromance-client",
  "neuromance-common",
+ "neuromance-db",
  "neuromance-tools",
  "regex",
  "secrecy",
