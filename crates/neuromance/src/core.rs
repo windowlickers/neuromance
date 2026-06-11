@@ -56,6 +56,7 @@ pub struct Core<C: LLMClient> {
 }
 
 impl<C: LLMClient> Core<C> {
+    #[must_use]
     pub fn new(client: C) -> Self {
         Self {
             client,

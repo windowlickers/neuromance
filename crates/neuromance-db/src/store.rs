@@ -30,7 +30,7 @@ pub struct ConversationSummary {
     /// When the conversation was last written to.
     pub updated_at: DateTime<Utc>,
     /// Number of persisted messages.
-    pub message_count: i64,
+    pub message_count: u64,
 }
 
 /// Postgres-backed store for conversations and messages.
@@ -217,8 +217,8 @@ impl PgConversationStore {
     /// Returns [`DbError`] if the query fails or a stored status is unknown.
     pub async fn list_conversations(
         &self,
-        limit: i64,
-        offset: i64,
+        limit: u32,
+        offset: u32,
     ) -> Result<Vec<ConversationSummary>, DbError> {
         let rows = sqlx::query!(
             r#"
@@ -230,8 +230,8 @@ impl PgConversationStore {
             ORDER BY c.updated_at DESC
             LIMIT $1 OFFSET $2
             "#,
-            limit,
-            offset,
+            i64::from(limit),
+            i64::from(offset),
         )
         .fetch_all(&self.pool)
         .await
@@ -245,7 +245,7 @@ impl PgConversationStore {
                     status: status_from_str(&row.status, row.id)?,
                     created_at: row.created_at,
                     updated_at: row.updated_at,
-                    message_count: row.message_count,
+                    message_count: u64::try_from(row.message_count).unwrap_or(0),
                 })
             })
             .collect()
