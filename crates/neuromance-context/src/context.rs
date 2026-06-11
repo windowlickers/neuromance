@@ -97,16 +97,28 @@ impl Context<Filtered> {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// use neuromance_context::{Context, Compactor, CompactionConfig};
+    /// ```no_run
+    /// use neuromance_context::context::Context;
+    /// use neuromance_context::transforms::FilterCriteria;
+    /// use neuromance_context::{Compactor, CompactionConfig, ModelConfig, TokenCounter};
+    /// use neuromance_client::ChatCompletionsClient;
+    /// use neuromance_common::Conversation;
+    /// use neuromance_common::client::Config;
     ///
-    /// let context = Context::new(conversation)
-    ///     .filter(FilterCriteria::default());
+    /// # async fn example() -> anyhow::Result<()> {
+    /// let client = ChatCompletionsClient::new(
+    ///     Config::new("openai", "gpt-4o").with_api_key("sk-..."),
+    /// )?;
+    /// let token_counter = TokenCounter::new(ModelConfig::gpt_oss_20b()).await?;
+    ///
+    /// let context = Context::new(Conversation::new()).filter(FilterCriteria::default());
     ///
     /// let compactor = Compactor::new(client, token_counter)
     ///     .with_config(CompactionConfig::new(4000));
     ///
-    /// let compacted = context.compact(&compactor).await?;
+    /// let (_context, _result) = context.compact(&compactor).await?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn compact<C: LLMClient>(
         mut self,
