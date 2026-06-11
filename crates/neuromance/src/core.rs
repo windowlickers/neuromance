@@ -734,6 +734,7 @@ async fn persist_new_messages(
         }
         Err(e) => {
             tracing::warn!(
+                conversation_id = %first.conversation_id,
                 error = %e,
                 pending = pending.len(),
                 "conversation persistence failed; continuing without it"
