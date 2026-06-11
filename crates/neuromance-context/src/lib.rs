@@ -576,13 +576,11 @@ impl TokenCounter {
         &self,
         conversation: &Conversation,
     ) -> Result<usize, TokenCounterError> {
-        let mut total = 0;
-
-        for message in conversation.get_messages() {
-            total += self.count_message_tokens(message)?;
-        }
-
-        Ok(total)
+        conversation
+            .get_messages()
+            .iter()
+            .map(|message| self.count_message_tokens(message))
+            .sum()
     }
 
     /// Counts the number of tokens in a single message.
@@ -680,35 +678,35 @@ impl TokenCounter {
         let tokenized = self.tokenize_with_positions(text)?;
         let regex = Regex::new(pattern)?;
 
-        let mut matches = Vec::new();
+        let matches = regex
+            .find_iter(text)
+            .map(|match_result| {
+                let char_start = match_result.start();
+                let char_end = match_result.end();
 
-        for match_result in regex.find_iter(text) {
-            let char_start = match_result.start();
-            let char_end = match_result.end();
-            let matched_text = match_result.as_str().to_string();
+                // Find token range that covers this match
+                let token_start = tokenized
+                    .tokens
+                    .iter()
+                    .find(|t| t.char_start <= char_start && char_start < t.char_end)
+                    .map(|t| t.index);
 
-            // Find token range that covers this match
-            let token_start = tokenized
-                .tokens
-                .iter()
-                .find(|t| t.char_start <= char_start && char_start < t.char_end)
-                .map(|t| t.index);
+                let token_end = tokenized
+                    .tokens
+                    .iter()
+                    .rev()
+                    .find(|t| t.char_start < char_end && char_end <= t.char_end)
+                    .map(|t| t.index);
 
-            let token_end = tokenized
-                .tokens
-                .iter()
-                .rev()
-                .find(|t| t.char_start < char_end && char_end <= t.char_end)
-                .map(|t| t.index);
-
-            matches.push(SearchMatch {
-                matched_text,
-                char_start,
-                char_end,
-                token_start,
-                token_end,
-            });
-        }
+                SearchMatch {
+                    matched_text: match_result.as_str().to_string(),
+                    char_start,
+                    char_end,
+                    token_start,
+                    token_end,
+                }
+            })
+            .collect();
 
         Ok(matches)
     }
