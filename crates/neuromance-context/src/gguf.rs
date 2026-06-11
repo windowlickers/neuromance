@@ -99,8 +99,9 @@ impl GGUFModelInfo {
             TokenCounterError::GGUFRead(format!("Failed to open {:?}: {e}", path.as_ref()))
         })?;
 
-        let content = gguf_file::Content::read(&mut file)
-            .map_err(|e| TokenCounterError::GGUFRead(e.to_string()))?;
+        let content = gguf_file::Content::read(&mut file).map_err(|e| {
+            TokenCounterError::GGUFRead(format!("Failed to parse {:?}: {e}", path.as_ref()))
+        })?;
 
         debug!(
             "Loaded GGUF metadata with {} entries",
@@ -169,8 +170,9 @@ impl GGUFModelInfo {
             TokenCounterError::GGUFRead(format!("Failed to open {:?}: {e}", path.as_ref()))
         })?;
 
-        let content = gguf_file::Content::read(&mut file)
-            .map_err(|e| TokenCounterError::GGUFRead(e.to_string()))?;
+        let content = gguf_file::Content::read(&mut file).map_err(|e| {
+            TokenCounterError::GGUFRead(format!("Failed to parse {:?}: {e}", path.as_ref()))
+        })?;
 
         // Extract vocabulary tokens
         let tokens = Self::extract_vocab_tokens(&content)?;
