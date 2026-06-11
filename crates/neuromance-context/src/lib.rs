@@ -758,9 +758,11 @@ impl TokenCounter {
             now.format(&format).to_string()
         });
 
-        env.add_template("chat", template_str).map_err(|e| {
-            TokenCounterError::Template(format!("Failed to add chat template: {e}"))
-        })?;
+        env.add_template("chat", template_str)
+            .map_err(|e| TokenCounterError::TemplateRender {
+                model: self.config.model_repo.clone(),
+                source: e,
+            })?;
 
         let messages: Vec<serde_json::Value> = conversation
             .get_messages()
@@ -810,7 +812,10 @@ impl TokenCounter {
 
         let tmpl = env
             .get_template("chat")
-            .map_err(|e| TokenCounterError::Template(e.to_string()))?;
+            .map_err(|e| TokenCounterError::TemplateRender {
+                model: self.config.model_repo.clone(),
+                source: e,
+            })?;
 
         let bos_token = self.get_special_token("bos_token").unwrap_or_default();
         let eos_token = self.get_special_token("eos_token").unwrap_or_default();
@@ -824,9 +829,12 @@ impl TokenCounter {
             "eos_token": eos_token,
         });
 
-        let rendered = tmpl.render(&context).map_err(|e| {
-            TokenCounterError::Template(format!("Failed to render chat template: {e}"))
-        })?;
+        let rendered = tmpl
+            .render(&context)
+            .map_err(|e| TokenCounterError::TemplateRender {
+                model: self.config.model_repo.clone(),
+                source: e,
+            })?;
 
         Ok(rendered)
     }
