@@ -1924,6 +1924,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "neuromance-common",
+ "proptest",
  "serde",
  "serde_json",
  "smallvec",

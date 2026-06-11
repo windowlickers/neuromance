@@ -310,6 +310,11 @@ impl RuntimeConfig {
                     "database.max_connections must be at least 1".to_string(),
                 ));
             }
+            if database.acquire_timeout_seconds == 0 {
+                return Err(RuntimeError::Config(
+                    "database.acquire_timeout_seconds must be at least 1".to_string(),
+                ));
+            }
         }
         Ok(())
     }
@@ -722,10 +727,34 @@ mod tests {
         "#;
         let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
         config.validate().unwrap();
+
+        // Serialize back out and reparse to exercise the Serialize impl.
+        let reserialized = toml::to_string(&config).unwrap();
+        let config: RuntimeConfig = toml::from_str(&reserialized).unwrap();
+        config.validate().unwrap();
+
         let database = config.database.expect("database section");
         assert_eq!(database.url_env, "PG_URL");
         assert_eq!(database.max_connections, 12);
         assert_eq!(database.acquire_timeout_seconds, 30);
+    }
+
+    #[test]
+    fn test_database_zero_acquire_timeout_fails_validation() {
+        let toml_str = r#"
+            mode = "serve"
+            [agent]
+            id = "x"
+            model = "openai:gpt-4o"
+            api_key_env = "K"
+            system_prompt = "x"
+            [database]
+            url_env = "DATABASE_URL"
+            acquire_timeout_seconds = 0
+        "#;
+        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        let err = config.validate().err().unwrap();
+        assert!(format!("{err}").contains("database.acquire_timeout_seconds"));
     }
 
     #[test]
