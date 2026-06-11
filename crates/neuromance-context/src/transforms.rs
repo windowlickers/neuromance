@@ -18,11 +18,11 @@
 //! ```
 
 use chrono::{DateTime, Utc};
-use tracing::debug;
 use neuromance_common::chat::{Conversation, Message, MessageRole};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
+use tracing::debug;
 
 /// Criteria for filtering messages in a conversation.
 ///
@@ -402,6 +402,7 @@ pub fn apply_transform_pipeline(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use neuromance_common::chat::{Conversation, Message};
 
     #[test]
@@ -583,6 +584,69 @@ mod tests {
 
         let transformed = apply_transform(conv);
         assert_eq!(transformed.get_messages().len(), 2);
+    }
+
+    #[test]
+    fn test_merge_consecutive_empty_unchanged() {
+        let conv = Conversation::new();
+        let merged = merge_consecutive_messages(conv);
+        assert!(merged.get_messages().is_empty());
+    }
+
+    #[test]
+    fn test_merge_consecutive_single_message_unchanged() {
+        let mut conv = Conversation::new();
+        conv.add_message(Message::user(conv.id, "only one"))
+            .unwrap();
+
+        let merged = merge_consecutive_messages(conv);
+        assert_eq!(merged.get_messages().len(), 1);
+        assert_eq!(merged.get_messages()[0].content, "only one");
+    }
+
+    #[test]
+    fn test_filter_removes_all_when_no_role_matches() {
+        let mut conv = Conversation::new();
+        conv.add_message(Message::user(conv.id, "hi")).unwrap();
+        conv.add_message(Message::user(conv.id, "there")).unwrap();
+
+        let criteria = FilterCriteria::default().with_roles(vec![MessageRole::Assistant]);
+        let filtered = apply_filter(conv, criteria);
+        assert!(filtered.get_messages().is_empty());
+    }
+
+    #[test]
+    fn test_filter_by_after_timestamp() {
+        let mut conv = Conversation::new();
+        let mut old = Message::user(conv.id, "old");
+        old.timestamp = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let mut new = Message::user(conv.id, "new");
+        new.timestamp = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        conv.add_message(old).unwrap();
+        conv.add_message(new).unwrap();
+
+        let cutoff = Utc.with_ymd_and_hms(2022, 1, 1, 0, 0, 0).unwrap();
+        let filtered = apply_filter(conv, FilterCriteria::default().after(cutoff));
+
+        assert_eq!(filtered.get_messages().len(), 1);
+        assert_eq!(filtered.get_messages()[0].content, "new");
+    }
+
+    #[test]
+    fn test_filter_by_before_timestamp() {
+        let mut conv = Conversation::new();
+        let mut old = Message::user(conv.id, "old");
+        old.timestamp = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let mut new = Message::user(conv.id, "new");
+        new.timestamp = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        conv.add_message(old).unwrap();
+        conv.add_message(new).unwrap();
+
+        let cutoff = Utc.with_ymd_and_hms(2022, 1, 1, 0, 0, 0).unwrap();
+        let filtered = apply_filter(conv, FilterCriteria::default().before(cutoff));
+
+        assert_eq!(filtered.get_messages().len(), 1);
+        assert_eq!(filtered.get_messages()[0].content, "old");
     }
 
     #[test]

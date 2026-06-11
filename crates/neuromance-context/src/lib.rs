@@ -32,7 +32,6 @@
 //! ```
 
 use hf_hub::{Repo, RepoType, api::tokio::ApiBuilder};
-use tracing::{debug, error};
 use minijinja::Environment;
 use neuromance_common::{Conversation, Message, MessageRole};
 use regex::Regex;
@@ -41,6 +40,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
+use tracing::{debug, error};
 
 mod error;
 pub use error::TokenCounterError;
@@ -407,31 +407,19 @@ impl TokenCounter {
     /// 2. Embedded in tokenizer.json
     /// 3. Separate chat_template.jinja file from HuggingFace
     async fn load_chat_template(config: &ModelConfig, tokenizer: &Tokenizer) -> Option<String> {
-        // First try to extract from GGUF if using a GGUF file
         #[cfg(feature = "gguf")]
-        if let Some(path) = &config.local_tokenizer_path
-            && path.extension().and_then(|s| s.to_str()) == Some("gguf")
-            && let Ok(info) = gguf::GGUFModelInfo::from_file(path)
-            && let Some(template) = info.chat_template
-        {
-            debug!("Found chat template in GGUF metadata");
+        if let Some(template) = Self::extract_gguf_template(config) {
             return Some(template);
         }
 
-        // Then try to get template from tokenizer.json
-        if let Ok(tokenizer_json) = serde_json::to_value(tokenizer)
-            && let Some(template) = tokenizer_json.get("chat_template")
-            && let Some(template_str) = template.as_str()
-        {
-            debug!("Found chat template embedded in tokenizer.json");
-            return Some(template_str.to_string());
+        if let Some(template) = Self::extract_tokenizer_template(tokenizer) {
+            return Some(template);
         }
 
         debug!(
             "No chat template found in tokenizer.json, attempting to download chat_template.jinja"
         );
 
-        // If not in tokenizer, try to download separate file
         let template_path = match config.get_cached_chat_template_path() {
             Ok(path) => path,
             Err(e) => {
@@ -442,26 +430,49 @@ impl TokenCounter {
 
         debug!("Chat template cache path: {:?}", template_path);
 
-        // Check if already cached
         if template_path.exists() {
             debug!("Loading chat template from cache");
             return fs::read_to_string(&template_path).ok();
         }
 
-        // Try to download from HuggingFace using direct HTTP request
-        // We use the /raw/ endpoint which serves the file directly without redirects
-        debug!(
-            "Downloading chat_template.jinja from HuggingFace repo: {}",
-            config.model_repo
-        );
+        Self::download_chat_template(config, &template_path).await
+    }
 
+    /// Extracts a chat template embedded in a GGUF file's metadata, if any.
+    #[cfg(feature = "gguf")]
+    fn extract_gguf_template(config: &ModelConfig) -> Option<String> {
+        let path = config.local_tokenizer_path.as_ref()?;
+        if path.extension().and_then(|s| s.to_str()) != Some("gguf") {
+            return None;
+        }
+
+        let info = gguf::GGUFModelInfo::from_file(path).ok()?;
+        let template = info.chat_template?;
+        debug!("Found chat template in GGUF metadata");
+        Some(template)
+    }
+
+    /// Extracts a chat template embedded in a tokenizer.json, if any.
+    fn extract_tokenizer_template(tokenizer: &Tokenizer) -> Option<String> {
+        let tokenizer_json = serde_json::to_value(tokenizer).ok()?;
+        let template_str = tokenizer_json.get("chat_template")?.as_str()?;
+        debug!("Found chat template embedded in tokenizer.json");
+        Some(template_str.to_string())
+    }
+
+    /// Downloads `chat_template.jinja` from HuggingFace and caches it locally.
+    ///
+    /// Returns the template content on success, or `None` if the file is
+    /// absent or the request fails. Caching failures are logged but do not
+    /// prevent the content from being returned.
+    async fn download_chat_template(config: &ModelConfig, template_path: &Path) -> Option<String> {
+        // Use the /raw/ endpoint which serves the file directly without redirects.
         let url = format!(
             "https://huggingface.co/{}/raw/main/chat_template.jinja",
             config.model_repo
         );
-        debug!("Attempting to download from: {}", url);
+        debug!("Attempting to download chat template from: {}", url);
 
-        // Build HTTP client
         let client = match reqwest::Client::builder()
             .user_agent(concat!("neuromance-context/", env!("CARGO_PKG_VERSION")))
             .build()
@@ -473,68 +484,63 @@ impl TokenCounter {
             }
         };
 
-        // Build request with optional HF token
         let mut request = client.get(&url);
         if let Some(token) = &config.hf_token {
-            request = request.header(
-                "Authorization",
-                format!("Bearer {}", token.expose_secret()),
-            );
+            request = request.header("Authorization", format!("Bearer {}", token.expose_secret()));
         }
 
-        // Download the file
-        match request.send().await {
-            Ok(response) => {
-                if response.status().is_success() {
-                    match response.text().await {
-                        Ok(content) => {
-                            debug!(
-                                "Successfully downloaded chat_template.jinja ({} bytes)",
-                                content.len()
-                            );
-
-                            // Create cache directory
-                            if let Some(parent) = template_path.parent()
-                                && let Err(e) = fs::create_dir_all(parent)
-                            {
-                                error!("Failed to create cache directory: {}", e);
-                                return Some(content); // Return content even if caching fails
-                            }
-
-                            // Cache the file
-                            if let Err(e) = fs::write(&template_path, &content) {
-                                error!("Failed to cache chat template: {}", e);
-                            } else {
-                                debug!("Cached chat template to: {:?}", template_path);
-                            }
-
-                            Some(content)
-                        }
-                        Err(e) => {
-                            error!("Failed to read response body: {}", e);
-                            None
-                        }
-                    }
-                } else if response.status().as_u16() == 404 {
-                    debug!(
-                        "Chat template file not found in repository (this is normal for some models)"
-                    );
-                    None
-                } else {
-                    debug!(
-                        "Failed to download chat template: HTTP {}",
-                        response.status()
-                    );
-                    None
-                }
-            }
+        let response = match request.send().await {
+            Ok(response) => response,
             Err(e) => {
                 debug!(
                     "Could not download chat template: {} (file may not exist in this model)",
                     e
                 );
-                None
+                return None;
             }
+        };
+
+        if response.status().as_u16() == 404 {
+            debug!("Chat template file not found in repository (this is normal for some models)");
+            return None;
+        }
+        if !response.status().is_success() {
+            debug!(
+                "Failed to download chat template: HTTP {}",
+                response.status()
+            );
+            return None;
+        }
+
+        let content = match response.text().await {
+            Ok(content) => content,
+            Err(e) => {
+                error!("Failed to read response body: {}", e);
+                return None;
+            }
+        };
+        debug!(
+            "Successfully downloaded chat_template.jinja ({} bytes)",
+            content.len()
+        );
+
+        Self::cache_chat_template(template_path, &content);
+        Some(content)
+    }
+
+    /// Writes a downloaded chat template to the cache, logging any failure.
+    fn cache_chat_template(template_path: &Path, content: &str) {
+        if let Some(parent) = template_path.parent()
+            && let Err(e) = fs::create_dir_all(parent)
+        {
+            error!("Failed to create cache directory: {}", e);
+            return;
+        }
+
+        if let Err(e) = fs::write(template_path, content) {
+            error!("Failed to cache chat template: {}", e);
+        } else {
+            debug!("Cached chat template to: {:?}", template_path);
         }
     }
 
@@ -1019,6 +1025,85 @@ mod tests {
         // Test get_token
         assert!(result.get_token(0).is_some());
         assert!(result.get_token(999).is_none());
+    }
+
+    #[test]
+    fn test_token_at_char_position_boundaries() {
+        let counter = TokenCounter::from_tokenizer(create_test_tokenizer());
+        let tokenized = counter.tokenize_with_positions("hello world").unwrap();
+
+        // A position inside the first token resolves to that token.
+        let first_start = tokenized.tokens[0].char_start;
+        assert!(tokenized.token_at_char_position(first_start).is_some());
+
+        // A position past the end of the text maps to no token.
+        assert!(
+            tokenized
+                .token_at_char_position("hello world".len())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_char_range_for_tokens_invalid() {
+        let counter = TokenCounter::from_tokenizer(create_test_tokenizer());
+        let tokenized = counter.tokenize_with_positions("hello world").unwrap();
+        let n = tokenized.token_count();
+
+        assert!(
+            tokenized.char_range_for_tokens(1, 1).is_none(),
+            "start == end"
+        );
+        assert!(
+            tokenized.char_range_for_tokens(0, n + 1).is_none(),
+            "end past len"
+        );
+        assert!(
+            tokenized.char_range_for_tokens(n, n).is_none(),
+            "start at len"
+        );
+        assert!(
+            tokenized.char_range_for_tokens(0, n).is_some(),
+            "valid range"
+        );
+    }
+
+    #[test]
+    fn test_search_with_invalid_regex() {
+        let counter = TokenCounter::from_tokenizer(create_test_tokenizer());
+        let err = counter
+            .search_with_token_positions("hello world", "[invalid")
+            .unwrap_err();
+        assert!(matches!(err, TokenCounterError::Regex(_)));
+    }
+
+    #[test]
+    fn test_format_conversation_without_template_errors() {
+        let counter = TokenCounter::from_tokenizer(create_test_tokenizer());
+        let mut conv = Conversation::new();
+        conv.add_message(conv.user_message("hello")).unwrap();
+
+        let err = counter
+            .format_conversation_with_template(&conv)
+            .unwrap_err();
+        assert!(matches!(err, TokenCounterError::Template(_)));
+    }
+
+    #[test]
+    fn test_extract_token_range_errors() {
+        let counter = TokenCounter::from_tokenizer(create_test_tokenizer());
+        let text = "hello world";
+        let n = counter.tokenize_with_positions(text).unwrap().token_count();
+
+        let out_of_bounds = counter.extract_token_range(text, 0, n + 1).unwrap_err();
+        assert!(matches!(out_of_bounds, TokenCounterError::TokenRange(_)));
+
+        let inverted = counter.extract_token_range(text, 1, 1).unwrap_err();
+        assert!(matches!(inverted, TokenCounterError::TokenRange(_)));
+
+        // A valid range round-trips back to the original text.
+        let extracted = counter.extract_token_range(text, 0, n).unwrap();
+        assert_eq!(extracted, text);
     }
 
     #[cfg(feature = "online-tests")]

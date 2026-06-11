@@ -28,12 +28,12 @@
 //! # }
 //! ```
 
-use tracing::{debug, info};
 use neuromance_client::LLMClient;
 use neuromance_common::chat::{Conversation, Message, MessageRole};
 use neuromance_common::client::ChatRequest;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tracing::{debug, info};
 
 use crate::TokenCounter;
 use crate::error::TokenCounterError;
@@ -805,5 +805,43 @@ mod tests {
         // conversation_ids should be preserved
         assert_eq!(result[0].conversation_id, conv_id);
         assert_eq!(result[1].conversation_id, conv_id);
+    }
+
+    #[test]
+    fn test_split_conversation_clamps_preserve_to_available() {
+        use neuromance_client::ChatCompletionsClient;
+        use neuromance_common::client::Config;
+
+        let config = Config::new("test", "test-model").with_api_key("test-key");
+        let client = ChatCompletionsClient::new(config).expect("Failed to create client");
+
+        let tokenizer_json = serde_json::json!({
+            "version": "1.0",
+            "model": {
+                "type": "WordLevel",
+                "vocab": { "[UNK]": 0, "hello": 1, "world": 2 },
+                "unk_token": "[UNK]"
+            },
+            "pre_tokenizer": { "type": "Whitespace" }
+        });
+        let tokenizer =
+            tokenizers::Tokenizer::from_bytes(tokenizer_json.to_string()).expect("tokenizer");
+        let counter = crate::TokenCounter::from_tokenizer(tokenizer);
+
+        // preserve_recent_turns=5 wants to keep 10 messages, but only 2 exist,
+        // so the preserve count clamps and nothing is left in the middle.
+        let compactor = Compactor::new(client, counter)
+            .with_config(CompactionConfig::new(4000).with_preserve_recent_turns(5));
+
+        let conv_id = uuid::Uuid::new_v4();
+        let messages = vec![
+            Message::user(conv_id, "hello"),
+            Message::assistant(conv_id, "world"),
+        ];
+
+        let (system, middle, recent) = compactor.split_conversation(&messages);
+        assert!(system.is_none());
+        assert!(middle.is_empty());
+        assert_eq!(recent.len(), 2);
     }
 }
