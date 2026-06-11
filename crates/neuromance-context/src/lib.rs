@@ -78,6 +78,7 @@ pub struct ModelConfig {
 
 impl ModelConfig {
     /// Creates a configuration for the GPT-OSS-20B model.
+    #[must_use]
     pub fn gpt_oss_20b() -> Self {
         Self {
             model_repo: "openai/gpt-oss-20b".to_string(),
@@ -88,6 +89,7 @@ impl ModelConfig {
     }
 
     /// Creates a configuration for the GPT-OSS-120B model.
+    #[must_use]
     pub fn gpt_oss_120b() -> Self {
         Self {
             model_repo: "openai/gpt-oss-120b".to_string(),
@@ -98,6 +100,7 @@ impl ModelConfig {
     }
 
     /// Creates a configuration for Qwen/Qwen3-30B-A3B-Instruct-2507
+    #[must_use]
     pub fn qwen3_30b_a3b_instruct() -> Self {
         Self {
             model_repo: "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
@@ -108,6 +111,7 @@ impl ModelConfig {
     }
 
     /// Creates a configuration for a custom model repository.
+    #[must_use]
     pub fn custom(model_repo: impl Into<String>) -> Self {
         Self {
             model_repo: model_repo.into(),
@@ -142,18 +146,21 @@ impl ModelConfig {
     }
 
     /// Sets the Hugging Face API token.
+    #[must_use]
     pub fn with_hf_token(mut self, token: impl Into<String>) -> Self {
         self.hf_token = Some(SecretString::new(token.into().into()));
         self
     }
 
     /// Sets a local path to a tokenizer.json file.
+    #[must_use]
     pub fn with_local_tokenizer(mut self, path: impl Into<PathBuf>) -> Self {
         self.local_tokenizer_path = Some(path.into());
         self
     }
 
     /// Sets a custom cache directory for downloaded tokenizers.
+    #[must_use]
     pub fn with_cache_dir(mut self, path: impl Into<PathBuf>) -> Self {
         self.cache_dir = Some(path.into());
         self

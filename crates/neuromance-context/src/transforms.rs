@@ -47,30 +47,35 @@ pub struct FilterCriteria {
 
 impl FilterCriteria {
     /// Filters by specific message roles.
+    #[must_use]
     pub fn with_roles(mut self, roles: Vec<MessageRole>) -> Self {
         self.roles = Some(roles);
         self
     }
 
     /// Filters messages after a specific timestamp.
+    #[must_use]
     pub fn after(mut self, timestamp: DateTime<Utc>) -> Self {
         self.after = Some(timestamp);
         self
     }
 
     /// Filters messages before a specific timestamp.
+    #[must_use]
     pub fn before(mut self, timestamp: DateTime<Utc>) -> Self {
         self.before = Some(timestamp);
         self
     }
 
     /// Limits the number of messages (keeps most recent).
+    #[must_use]
     pub fn limit(mut self, limit: usize) -> Self {
         self.limit = Some(limit);
         self
     }
 
     /// Skips the first N messages.
+    #[must_use]
     pub fn offset(mut self, offset: usize) -> Self {
         self.offset = Some(offset);
         self
@@ -111,6 +116,7 @@ pub struct TransformPipeline {
 
 impl TransformPipeline {
     /// Creates a new empty transform pipeline.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             operations: Vec::new(),
@@ -118,6 +124,7 @@ impl TransformPipeline {
     }
 
     /// Adds an operation to the pipeline.
+    #[must_use]
     #[allow(clippy::should_implement_trait)]
     pub fn add(mut self, operation: TransformOperation) -> Self {
         self.operations.push(operation);
