@@ -363,7 +363,11 @@ impl<C: LLMClient> Compactor<C> {
         let final_summary = if chunk_summaries.len() > 1 {
             self.summarize_summaries(&chunk_summaries).await?
         } else {
-            chunk_summaries.into_iter().next().unwrap_or_default()
+            chunk_summaries.into_iter().next().ok_or_else(|| {
+                TokenCounterError::Compaction(
+                    "no chunk summaries were produced for a non-empty message history".to_string(),
+                )
+            })?
         };
 
         let compacted_conversation =
