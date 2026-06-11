@@ -212,7 +212,7 @@ fn calculate_message_hash(msg: &Message) -> u64 {
     use std::hash::{Hash, Hasher};
 
     let mut hasher = DefaultHasher::new();
-    format!("{:?}", msg.role).hash(&mut hasher);
+    msg.role.hash(&mut hasher);
     msg.content.hash(&mut hasher);
     hasher.finish()
 }

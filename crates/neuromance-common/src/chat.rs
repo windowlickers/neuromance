@@ -93,7 +93,7 @@ impl ReasoningContent {
 /// Represents the role of a message sender in a conversation.
 ///
 /// Roles are serialized to lowercase strings matching the Chat Completions API format.
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum MessageRole {
     /// System-level instructions or context for the LLM.
