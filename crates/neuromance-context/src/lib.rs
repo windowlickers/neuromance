@@ -174,7 +174,7 @@ impl ModelConfig {
         }
 
         let cache_home = dirs::cache_dir().ok_or_else(|| {
-            TokenCounterError::TokenizerLoad("Failed to determine cache directory".to_string())
+            TokenCounterError::CacheDir("Failed to determine cache directory".to_string())
         })?;
 
         Ok(cache_home.join("neuromance").join("tokenizers"))
@@ -362,7 +362,10 @@ impl TokenCounter {
         }
 
         debug!("Loading standard tokenizer.json");
-        Tokenizer::from_file(path).map_err(|e| TokenCounterError::TokenizerLoad(e.to_string()))
+        Tokenizer::from_file(path).map_err(|e| TokenCounterError::Tokenizer {
+            context: format!("Failed to load tokenizer from {}", path.display()),
+            source: e,
+        })
     }
 
     /// Downloads and loads a tokenizer from Hugging Face.
@@ -374,38 +377,41 @@ impl TokenCounter {
         let cached_path = config.get_cached_tokenizer_path()?;
 
         if cached_path.exists() {
-            return Tokenizer::from_file(&cached_path)
-                .map_err(|e| TokenCounterError::TokenizerLoad(e.to_string()));
+            return Tokenizer::from_file(&cached_path).map_err(|e| TokenCounterError::Tokenizer {
+                context: format!("Failed to load cached tokenizer {}", cached_path.display()),
+                source: e,
+            });
         }
 
         let mut api_builder = ApiBuilder::new();
         if let Some(token) = &config.hf_token {
             api_builder = api_builder.with_token(Some(token.expose_secret().to_string()));
         }
-        let api = api_builder.build().map_err(|e| {
-            TokenCounterError::HuggingFaceDownload(format!("Failed to build HF API client: {e}"))
-        })?;
+        let api = api_builder.build()?;
 
         let repo = api.repo(Repo::new(config.model_repo.clone(), RepoType::Model));
 
-        let tokenizer_path = repo.get("tokenizer.json").await.map_err(|e| {
-            TokenCounterError::HuggingFaceDownload(format!(
-                "Failed to download tokenizer.json: {e}"
-            ))
-        })?;
+        let tokenizer_path = repo.get("tokenizer.json").await?;
 
         if let Some(parent) = cached_path.parent() {
-            fs::create_dir_all(parent).map_err(|e| {
-                TokenCounterError::TokenizerLoad(format!("Failed to create cache directory: {e}"))
+            fs::create_dir_all(parent).map_err(|e| TokenCounterError::Io {
+                context: format!("Failed to create cache directory {}", parent.display()),
+                source: e,
             })?;
         }
 
-        fs::copy(&tokenizer_path, &cached_path).map_err(|e| {
-            TokenCounterError::TokenizerLoad(format!("Failed to cache tokenizer file: {e}"))
+        fs::copy(&tokenizer_path, &cached_path).map_err(|e| TokenCounterError::Io {
+            context: format!(
+                "Failed to cache tokenizer file to {}",
+                cached_path.display()
+            ),
+            source: e,
         })?;
 
-        Tokenizer::from_file(&cached_path)
-            .map_err(|e| TokenCounterError::TokenizerLoad(e.to_string()))
+        Tokenizer::from_file(&cached_path).map_err(|e| TokenCounterError::Tokenizer {
+            context: format!("Failed to load cached tokenizer {}", cached_path.display()),
+            source: e,
+        })
     }
 
     /// Loads the chat template for a model.
@@ -558,10 +564,13 @@ impl TokenCounter {
     ///
     /// Returns an error if tokenization fails.
     pub fn count_tokens(&self, text: &str) -> Result<usize, TokenCounterError> {
-        let encoding = self
-            .tokenizer
-            .encode(text, false)
-            .map_err(|e| TokenCounterError::Tokenization(e.to_string()))?;
+        let encoding =
+            self.tokenizer
+                .encode(text, false)
+                .map_err(|e| TokenCounterError::Tokenizer {
+                    context: "Failed to tokenize text".to_string(),
+                    source: e,
+                })?;
 
         Ok(encoding.get_ids().len())
     }
@@ -639,10 +648,13 @@ impl TokenCounter {
     ///
     /// Returns an error if tokenization fails.
     pub fn tokenize_with_positions(&self, text: &str) -> Result<TokenizedText, TokenCounterError> {
-        let encoding = self
-            .tokenizer
-            .encode(text, false)
-            .map_err(|e| TokenCounterError::Tokenization(e.to_string()))?;
+        let encoding =
+            self.tokenizer
+                .encode(text, false)
+                .map_err(|e| TokenCounterError::Tokenizer {
+                    context: "Failed to tokenize text".to_string(),
+                    source: e,
+                })?;
 
         let tokens = encoding
             .get_tokens()

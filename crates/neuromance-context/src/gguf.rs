@@ -129,13 +129,16 @@ impl GGUFModelInfo {
     ///
     /// Returns an error if the file cannot be opened or is not a valid GGUF file.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, TokenCounterError> {
-        let mut file = File::open(path.as_ref()).map_err(|e| {
-            TokenCounterError::GGUFRead(format!("Failed to open {:?}: {e}", path.as_ref()))
+        let mut file = File::open(path.as_ref()).map_err(|e| TokenCounterError::GgufReadIo {
+            path: format!("{:?}", path.as_ref()),
+            source: e,
         })?;
 
-        let content = gguf_file::Content::read(&mut file).map_err(|e| {
-            TokenCounterError::GGUFRead(format!("Failed to parse {:?}: {e}", path.as_ref()))
-        })?;
+        let content =
+            gguf_file::Content::read(&mut file).map_err(|e| TokenCounterError::GgufParse {
+                path: format!("{:?}", path.as_ref()),
+                source: e,
+            })?;
 
         debug!(
             "Loaded GGUF metadata with {} entries",
@@ -200,13 +203,16 @@ impl GGUFModelInfo {
     /// Returns an error if the GGUF file doesn't contain tokenizer vocabulary data
     /// or if the tokenizer cannot be constructed.
     pub fn extract_tokenizer(path: impl AsRef<Path>) -> Result<Tokenizer, TokenCounterError> {
-        let mut file = File::open(path.as_ref()).map_err(|e| {
-            TokenCounterError::GGUFRead(format!("Failed to open {:?}: {e}", path.as_ref()))
+        let mut file = File::open(path.as_ref()).map_err(|e| TokenCounterError::GgufReadIo {
+            path: format!("{:?}", path.as_ref()),
+            source: e,
         })?;
 
-        let content = gguf_file::Content::read(&mut file).map_err(|e| {
-            TokenCounterError::GGUFRead(format!("Failed to parse {:?}: {e}", path.as_ref()))
-        })?;
+        let content =
+            gguf_file::Content::read(&mut file).map_err(|e| TokenCounterError::GgufParse {
+                path: format!("{:?}", path.as_ref()),
+                source: e,
+            })?;
 
         // Extract vocabulary tokens
         let tokens = Self::extract_vocab_tokens(&content)?;
@@ -323,7 +329,7 @@ impl GGUFModelInfo {
             .metadata
             .get("tokenizer.ggml.tokens")
             .ok_or_else(|| {
-                TokenCounterError::GGUFTokenizerExtraction(
+                TokenCounterError::GgufTokenizerExtraction(
                     "No tokenizer.ggml.tokens in GGUF metadata".to_string(),
                 )
             })?;
@@ -334,7 +340,7 @@ impl GGUFModelInfo {
                     if let gguf_file::Value::String(s) = v {
                         Ok(s.to_string())
                     } else {
-                        Err(TokenCounterError::GGUFTokenizerExtraction(format!(
+                        Err(TokenCounterError::GgufTokenizerExtraction(format!(
                             "Expected string in tokens array, \
                                  got {:?}",
                             v
@@ -343,7 +349,7 @@ impl GGUFModelInfo {
                 })
                 .collect()
         } else {
-            Err(TokenCounterError::GGUFTokenizerExtraction(
+            Err(TokenCounterError::GgufTokenizerExtraction(
                 "tokenizer.ggml.tokens is not an array".to_string(),
             ))
         }
@@ -384,11 +390,9 @@ impl GGUFModelInfo {
         let bpe = BpeBuilder::new()
             .vocab_and_merges(vocab, merges)
             .build()
-            .map_err(|e| {
-                TokenCounterError::GGUFTokenizerExtraction(format!(
-                    "Failed to build BPE tokenizer from GGUF \
-                     vocabulary: {e}"
-                ))
+            .map_err(|e| TokenCounterError::Tokenizer {
+                context: "Failed to build BPE tokenizer from GGUF vocabulary".to_string(),
+                source: e,
             })?;
 
         Ok(Tokenizer::new(bpe))
