@@ -96,6 +96,7 @@ impl Default for CompactionConfig {
 
 impl CompactionConfig {
     /// Creates a new compaction config with the specified target token budget.
+    #[must_use]
     pub fn new(target_tokens: usize) -> Self {
         Self {
             target_tokens,
@@ -104,30 +105,35 @@ impl CompactionConfig {
     }
 
     /// Sets whether to preserve the system prompt.
+    #[must_use]
     pub fn with_preserve_system_prompt(mut self, preserve: bool) -> Self {
         self.preserve_system_prompt = preserve;
         self
     }
 
     /// Sets the number of recent turns to preserve.
+    #[must_use]
     pub fn with_preserve_recent_turns(mut self, turns: usize) -> Self {
         self.preserve_recent_turns = turns;
         self
     }
 
     /// Sets the compaction strategy.
+    #[must_use]
     pub fn with_strategy(mut self, strategy: CompactionStrategy) -> Self {
         self.strategy = strategy;
         self
     }
 
     /// Sets a custom summarization prompt.
+    #[must_use]
     pub fn with_custom_prompt(mut self, prompt: impl Into<String>) -> Self {
         self.custom_prompt = Some(prompt.into());
         self
     }
 
     /// Sets the minimum token threshold before compaction is triggered.
+    #[must_use]
     pub fn with_compaction_threshold(mut self, threshold: usize) -> Self {
         self.compaction_threshold = Some(threshold);
         self
@@ -168,6 +174,7 @@ pub struct Compactor<C: LLMClient> {
 
 impl<C: LLMClient> Compactor<C> {
     /// Creates a new compactor with the given LLM client and token counter.
+    #[must_use]
     pub fn new(client: C, token_counter: TokenCounter) -> Self {
         Self {
             client,
@@ -177,6 +184,7 @@ impl<C: LLMClient> Compactor<C> {
     }
 
     /// Creates a new compactor with a shared token counter.
+    #[must_use]
     pub fn with_shared_counter(client: C, token_counter: Arc<TokenCounter>) -> Self {
         Self {
             client,
@@ -186,6 +194,7 @@ impl<C: LLMClient> Compactor<C> {
     }
 
     /// Sets the compaction configuration.
+    #[must_use]
     pub fn with_config(mut self, config: CompactionConfig) -> Self {
         self.config = config;
         self
