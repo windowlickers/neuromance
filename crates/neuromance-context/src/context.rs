@@ -114,7 +114,6 @@ impl Context<Filtered> {
     ) -> Result<(Context<Transformed>, CompactionResult), TokenCounterError> {
         let result = compactor.compact(&self.conversation).await?;
 
-        // Record the compaction in metadata
         self.metadata.add_transformation(
             Operation::Compact,
             &serde_json::json!({
