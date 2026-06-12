@@ -122,6 +122,12 @@ pub struct CreateTaskRequest {
     /// already exist — unknown ids return 404 rather than auto-creating.
     #[serde(default)]
     pub conversation_id: Option<Uuid>,
+    /// Override the configured system prompt for a freshly-seeded
+    /// conversation. Falls back to the runtime's configured prompt when
+    /// omitted. Supplying it alongside `conversation_id` is rejected with
+    /// 400, since the existing conversation already holds its system message.
+    #[serde(default)]
+    pub system_prompt: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -137,6 +143,7 @@ enum EnqueueError {
     QueueFull { depth: usize, max: usize },
     WorkerShutdown,
     ConversationNotFound(Uuid),
+    SystemPromptOnExisting(Uuid),
 }
 
 struct WorkerJob {
@@ -208,10 +215,12 @@ fn queue_depth(tx: &mpsc::Sender<WorkerJob>) -> usize {
     tx.max_capacity().saturating_sub(tx.capacity())
 }
 
-/// Mint a fresh conversation seeded with the configured system prompt.
-fn seed_new_conversation(state: &ServeState) -> Uuid {
+/// Mint a fresh conversation seeded with a system prompt, preferring the
+/// caller's override and falling back to the configured prompt.
+fn seed_new_conversation(state: &ServeState, system_prompt: Option<&str>) -> Uuid {
     let id = Uuid::new_v4();
     let now = Utc::now();
+    let prompt = system_prompt.unwrap_or_else(|| state.system_prompt.as_ref());
     state.conversations.insert(
         id,
         ConversationRecord {
@@ -219,7 +228,7 @@ fn seed_new_conversation(state: &ServeState) -> Uuid {
             created_at: now,
             updated_at: now,
             turn_count: 0,
-            messages: vec![Message::system(id, state.system_prompt.as_ref())],
+            messages: vec![Message::system(id, prompt)],
         },
     );
     id
@@ -233,14 +242,17 @@ fn seed_new_conversation(state: &ServeState) -> Uuid {
 fn resolve_conversation(
     state: &ServeState,
     requested: Option<Uuid>,
+    system_prompt: Option<&str>,
 ) -> Result<(Uuid, bool), EnqueueError> {
     requested.map_or_else(
-        || Ok((seed_new_conversation(state), true)),
+        || Ok((seed_new_conversation(state, system_prompt), true)),
         |id| {
-            if state.conversations.contains_key(&id) {
-                Ok((id, false))
-            } else {
+            if !state.conversations.contains_key(&id) {
                 Err(EnqueueError::ConversationNotFound(id))
+            } else if system_prompt.is_some() {
+                Err(EnqueueError::SystemPromptOnExisting(id))
+            } else {
+                Ok((id, false))
             }
         },
     )
@@ -250,8 +262,9 @@ fn try_enqueue(
     state: &ServeState,
     user: String,
     conversation_id: Option<Uuid>,
+    system_prompt: Option<&str>,
 ) -> Result<TaskRecord, EnqueueError> {
-    let (conversation_id, seeded) = resolve_conversation(state, conversation_id)?;
+    let (conversation_id, seeded) = resolve_conversation(state, conversation_id, system_prompt)?;
     let task_id = Uuid::new_v4();
     let now = Utc::now();
     let depth = queue_depth(&state.work_tx);
@@ -308,7 +321,12 @@ async fn create_task(
     State(state): State<ServeState>,
     Json(req): Json<CreateTaskRequest>,
 ) -> impl IntoResponse {
-    match try_enqueue(&state, req.user, req.conversation_id) {
+    match try_enqueue(
+        &state,
+        req.user,
+        req.conversation_id,
+        req.system_prompt.as_deref(),
+    ) {
         Ok(record) => (
             StatusCode::ACCEPTED,
             Json(CreateTaskResponse {
@@ -337,6 +355,14 @@ async fn create_task(
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
                 "error": "conversation not found",
+                "conversation_id": id,
+            })),
+        )
+            .into_response(),
+        Err(EnqueueError::SystemPromptOnExisting(id)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "system_prompt cannot be set when continuing an existing conversation",
                 "conversation_id": id,
             })),
         )
@@ -890,7 +916,8 @@ mod tests {
     #[test]
     fn test_try_enqueue_records_queue_depth_zero_when_empty() {
         let (state, _rx) = fresh_state(4);
-        let record = try_enqueue(&state, "hi".to_string(), None).expect("enqueue should succeed");
+        let record =
+            try_enqueue(&state, "hi".to_string(), None, None).expect("enqueue should succeed");
         assert_eq!(record.queue_depth_at_enqueue, 0);
         assert_eq!(record.status, TaskStatus::Pending);
         assert!(state.tasks.contains_key(&record.id));
@@ -901,7 +928,7 @@ mod tests {
         let (state, _rx) = fresh_state(4);
         let depths: Vec<usize> = (0..3)
             .map(|_| {
-                try_enqueue(&state, "hi".to_string(), None)
+                try_enqueue(&state, "hi".to_string(), None, None)
                     .expect("enqueue should succeed")
                     .queue_depth_at_enqueue
             })
@@ -912,10 +939,11 @@ mod tests {
     #[test]
     fn test_try_enqueue_returns_queue_full_at_capacity() {
         let (state, _rx) = fresh_state(2);
-        let first = try_enqueue(&state, "a".to_string(), None).expect("first should fit");
-        let second = try_enqueue(&state, "b".to_string(), None).expect("second should fit");
+        let first = try_enqueue(&state, "a".to_string(), None, None).expect("first should fit");
+        let second = try_enqueue(&state, "b".to_string(), None, None).expect("second should fit");
 
-        let err = try_enqueue(&state, "c".to_string(), None).expect_err("third should reject");
+        let err =
+            try_enqueue(&state, "c".to_string(), None, None).expect_err("third should reject");
         assert!(
             matches!(err, EnqueueError::QueueFull { depth: 2, max: 2 }),
             "got {err:?}"
@@ -936,7 +964,7 @@ mod tests {
         let (state, rx) = fresh_state(4);
         drop(rx);
 
-        let err = try_enqueue(&state, "hi".to_string(), None).expect_err("send should fail");
+        let err = try_enqueue(&state, "hi".to_string(), None, None).expect_err("send should fail");
         assert!(matches!(err, EnqueueError::WorkerShutdown), "got {err:?}");
 
         let task_id = state
@@ -960,7 +988,8 @@ mod tests {
     #[test]
     fn test_try_enqueue_seeds_fresh_conversation_with_system_prompt() {
         let (state, _rx) = fresh_state(4);
-        let record = try_enqueue(&state, "hi".to_string(), None).expect("enqueue should succeed");
+        let record =
+            try_enqueue(&state, "hi".to_string(), None, None).expect("enqueue should succeed");
 
         let (turn_count, messages) = {
             let conv = state
@@ -977,11 +1006,81 @@ mod tests {
     }
 
     #[test]
+    fn test_try_enqueue_override_seeds_custom_system_prompt() {
+        let (state, _rx) = fresh_state(4);
+        let record = try_enqueue(&state, "hi".to_string(), None, Some("be terse"))
+            .expect("enqueue should succeed");
+
+        let messages = {
+            let conv = state
+                .conversations
+                .get(&record.conversation_id)
+                .expect("conversation should exist");
+            conv.messages.clone()
+        };
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, MessageRole::System);
+        assert_eq!(messages[0].content, "be terse");
+    }
+
+    #[test]
+    fn test_try_enqueue_falls_back_to_configured_prompt_when_override_omitted() {
+        let (state, _rx) = fresh_state(4);
+        let record =
+            try_enqueue(&state, "hi".to_string(), None, None).expect("enqueue should succeed");
+
+        let content = {
+            let conv = state
+                .conversations
+                .get(&record.conversation_id)
+                .expect("conversation should exist");
+            conv.messages[0].content.clone()
+        };
+        assert_eq!(content, "system");
+    }
+
+    #[test]
+    fn test_try_enqueue_override_on_existing_conversation_is_rejected() {
+        let (state, _rx) = fresh_state(4);
+        let first =
+            try_enqueue(&state, "hi".to_string(), None, None).expect("first should succeed");
+
+        let err = try_enqueue(
+            &state,
+            "again".to_string(),
+            Some(first.conversation_id),
+            Some("be terse"),
+        )
+        .expect_err("override on existing conversation should be rejected");
+        assert!(
+            matches!(err, EnqueueError::SystemPromptOnExisting(id) if id == first.conversation_id)
+        );
+
+        let content = {
+            let conv = state
+                .conversations
+                .get(&first.conversation_id)
+                .expect("conversation should exist");
+            conv.messages[0].content.clone()
+        };
+        assert_eq!(
+            content, "system",
+            "rejected override must not mutate the prompt"
+        );
+    }
+
+    #[test]
     fn test_try_enqueue_reuses_existing_conversation() {
         let (state, _rx) = fresh_state(4);
-        let first = try_enqueue(&state, "hi".to_string(), None).expect("first should succeed");
-        let second = try_enqueue(&state, "again".to_string(), Some(first.conversation_id))
-            .expect("continuation should succeed");
+        let first =
+            try_enqueue(&state, "hi".to_string(), None, None).expect("first should succeed");
+        let second = try_enqueue(
+            &state,
+            "again".to_string(),
+            Some(first.conversation_id),
+            None,
+        )
+        .expect("continuation should succeed");
 
         assert_eq!(first.conversation_id, second.conversation_id);
         assert_eq!(state.conversations.len(), 1);
@@ -991,7 +1090,7 @@ mod tests {
     fn test_try_enqueue_unknown_conversation_returns_not_found() {
         let (state, _rx) = fresh_state(4);
         let bogus = Uuid::new_v4();
-        let err = try_enqueue(&state, "hi".to_string(), Some(bogus))
+        let err = try_enqueue(&state, "hi".to_string(), Some(bogus), None)
             .expect_err("unknown conv id should be rejected");
         assert!(matches!(err, EnqueueError::ConversationNotFound(id) if id == bogus));
         assert!(state.tasks.is_empty(), "rejected task must not be recorded");
@@ -1004,8 +1103,8 @@ mod tests {
     #[tokio::test]
     async fn process_job_continues_existing_conversation() {
         let (state, _rx) = fresh_state(4);
-        let first =
-            try_enqueue(&state, "hello".to_string(), None).expect("first enqueue should succeed");
+        let first = try_enqueue(&state, "hello".to_string(), None, None)
+            .expect("first enqueue should succeed");
         let conv_id = first.conversation_id;
 
         let core = Core::new(EchoClient::new("hi-1"));
@@ -1046,7 +1145,7 @@ mod tests {
             1
         );
 
-        let second = try_enqueue(&state, "again".to_string(), Some(conv_id))
+        let second = try_enqueue(&state, "again".to_string(), Some(conv_id), None)
             .expect("second enqueue should succeed");
         let core2 = Core::new(EchoClient::new("hi-2"));
         let agent2 = Arc::new(Mutex::new(Agent::new("test".into(), core2)));
@@ -1091,7 +1190,8 @@ mod tests {
     #[tokio::test]
     async fn process_job_fails_cleanly_when_conversation_deleted() {
         let (state, _rx) = fresh_state(4);
-        let task = try_enqueue(&state, "hi".to_string(), None).expect("enqueue should succeed");
+        let task =
+            try_enqueue(&state, "hi".to_string(), None, None).expect("enqueue should succeed");
         let conv_id = task.conversation_id;
 
         // DELETE before the worker runs.
