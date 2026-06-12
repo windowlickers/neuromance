@@ -46,6 +46,19 @@ async fn stored_seqs(pool: &PgPool, conversation_id: Uuid) -> Vec<(i64, Uuid)> {
         .unwrap()
 }
 
+/// Message ids attributed to a task via the `[start_seq, end_seq]` join — the
+/// reconstruction path callers use to ask "what did this task produce?".
+async fn task_message_ids(pool: &PgPool, task_id: Uuid) -> Vec<Uuid> {
+    sqlx::query_scalar(
+        "SELECT m.id FROM messages m JOIN tasks t ON t.conversation_id = m.conversation_id \
+         WHERE t.id = $1 AND m.seq BETWEEN t.start_seq AND t.end_seq ORDER BY m.seq",
+    )
+    .bind(task_id)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
 #[sqlx::test(migrations = "./migrations")]
 #[ignore = "requires postgres via DATABASE_URL"]
 async fn test_append_is_idempotent_and_seq_is_dense(pool: PgPool) {
@@ -258,4 +271,65 @@ async fn test_concurrent_appends_do_not_collide(pool: PgPool) {
     let expected: Vec<i64> = (0..20).collect();
     let actual: Vec<i64> = seqs.iter().map(|(seq, _)| *seq).collect();
     assert_eq!(actual, expected, "seqs must be dense with no collisions");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires postgres via DATABASE_URL"]
+async fn test_task_provenance_brackets_each_run_by_seq_range(pool: PgPool) {
+    let store = PgConversationStore::new(pool.clone());
+    let conversation_id = Uuid::new_v4();
+
+    // An empty conversation has no high-water seq — the bracket starts at 0.
+    assert_eq!(store.max_seq(conversation_id).await.unwrap(), None);
+
+    // First task contributes the whole initial history (seq 0..=3).
+    let history = sample_history(conversation_id);
+    store
+        .append_messages(conversation_id, &history)
+        .await
+        .unwrap();
+    assert_eq!(store.max_seq(conversation_id).await.unwrap(), Some(3));
+    let task_one = Uuid::new_v4();
+    store
+        .record_task(task_one, conversation_id, 0, 3)
+        .await
+        .unwrap();
+
+    // Second task appends two more messages (seq 4..=5).
+    let follow_up = vec![
+        Message::user(conversation_id, "thanks"),
+        Message::assistant(conversation_id, "you're welcome"),
+    ];
+    store
+        .append_messages(conversation_id, &follow_up)
+        .await
+        .unwrap();
+    assert_eq!(store.max_seq(conversation_id).await.unwrap(), Some(5));
+    let task_two = Uuid::new_v4();
+    store
+        .record_task(task_two, conversation_id, 4, 5)
+        .await
+        .unwrap();
+
+    // Each task maps to exactly the messages it produced, in order.
+    assert_eq!(
+        task_message_ids(&pool, task_one).await,
+        history.iter().map(|m| m.id).collect::<Vec<_>>(),
+    );
+    assert_eq!(
+        task_message_ids(&pool, task_two).await,
+        follow_up.iter().map(|m| m.id).collect::<Vec<_>>(),
+    );
+
+    // Re-recording a task updates its range rather than duplicating the row.
+    store
+        .record_task(task_two, conversation_id, 4, 5)
+        .await
+        .unwrap();
+    let task_two_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE id = $1")
+        .bind(task_two)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(task_two_rows, 1);
 }

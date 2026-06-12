@@ -250,6 +250,60 @@ impl PgConversationStore {
             })
             .collect()
     }
+
+    /// Highest `seq` currently stored for a conversation, or `None` when it has
+    /// no messages yet.
+    ///
+    /// Callers bracket a unit of work by reading this before and after to learn
+    /// the `seq` range that work contributed (see [`Self::record_task`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::Sqlx`] if the query fails.
+    pub async fn max_seq(&self, conversation_id: Uuid) -> Result<Option<i64>, DbError> {
+        let max = sqlx::query_scalar!(
+            "SELECT MAX(seq) FROM messages WHERE conversation_id = $1",
+            conversation_id,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .op("select max message seq")?;
+        Ok(max)
+    }
+
+    /// Records the `seq` range a task contributed to a conversation.
+    ///
+    /// Idempotent per `task_id`: re-recording updates the stored range, so a
+    /// retried task converges on its final span rather than duplicating.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::Sqlx`] if the insert fails.
+    pub async fn record_task(
+        &self,
+        task_id: Uuid,
+        conversation_id: Uuid,
+        start_seq: i64,
+        end_seq: i64,
+    ) -> Result<(), DbError> {
+        sqlx::query!(
+            r#"
+            INSERT INTO tasks (id, conversation_id, start_seq, end_seq)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (id) DO UPDATE
+                SET start_seq = EXCLUDED.start_seq,
+                    end_seq = EXCLUDED.end_seq
+            "#,
+            task_id,
+            conversation_id,
+            start_seq,
+            end_seq,
+        )
+        .execute(&self.pool)
+        .await
+        .op("insert task provenance")?;
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
