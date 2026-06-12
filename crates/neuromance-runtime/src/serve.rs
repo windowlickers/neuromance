@@ -22,7 +22,7 @@ use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Path, State},
     http::StatusCode,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use chrono::{DateTime, Utc};
@@ -147,6 +147,46 @@ enum EnqueueError {
     ConversationNotFound(Uuid),
     SystemPromptOnExisting(Uuid),
     EmptySystemPrompt,
+}
+
+impl IntoResponse for EnqueueError {
+    fn into_response(self) -> Response {
+        let (status, body) = match self {
+            Self::QueueFull { depth, max } => (
+                StatusCode::TOO_MANY_REQUESTS,
+                serde_json::json!({
+                    "error": "queue full",
+                    "queue_depth": depth,
+                    "max_queue_depth": max,
+                }),
+            ),
+            Self::WorkerShutdown => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                serde_json::json!({"error": "worker shutting down"}),
+            ),
+            Self::ConversationNotFound(id) => (
+                StatusCode::NOT_FOUND,
+                serde_json::json!({
+                    "error": "conversation not found",
+                    "conversation_id": id,
+                }),
+            ),
+            Self::SystemPromptOnExisting(id) => (
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({
+                    "error": "system_prompt cannot be set when continuing an existing conversation",
+                    "conversation_id": id,
+                }),
+            ),
+            Self::EmptySystemPrompt => (
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({
+                    "error": "system_prompt must not be empty or whitespace-only",
+                }),
+            ),
+        };
+        (status, Json(body)).into_response()
+    }
 }
 
 struct WorkerJob {
@@ -345,43 +385,7 @@ async fn create_task(
             }),
         )
             .into_response(),
-        Err(EnqueueError::QueueFull { depth, max }) => (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(serde_json::json!({
-                "error": "queue full",
-                "queue_depth": depth,
-                "max_queue_depth": max,
-            })),
-        )
-            .into_response(),
-        Err(EnqueueError::WorkerShutdown) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "worker shutting down"})),
-        )
-            .into_response(),
-        Err(EnqueueError::ConversationNotFound(id)) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": "conversation not found",
-                "conversation_id": id,
-            })),
-        )
-            .into_response(),
-        Err(EnqueueError::SystemPromptOnExisting(id)) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "system_prompt cannot be set when continuing an existing conversation",
-                "conversation_id": id,
-            })),
-        )
-            .into_response(),
-        Err(EnqueueError::EmptySystemPrompt) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "system_prompt must not be empty or whitespace-only",
-            })),
-        )
-            .into_response(),
+        Err(err) => err.into_response(),
     }
 }
 
@@ -1091,7 +1095,10 @@ mod tests {
         for prompt in ["", "   \n\t"] {
             let err = try_enqueue(&state, "hi".to_string(), None, Some(prompt))
                 .expect_err("blank override should be rejected");
-            assert!(matches!(err, EnqueueError::EmptySystemPrompt), "got {err:?}");
+            assert!(
+                matches!(err, EnqueueError::EmptySystemPrompt),
+                "got {err:?}"
+            );
         }
 
         assert!(
