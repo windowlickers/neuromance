@@ -124,8 +124,9 @@ pub struct CreateTaskRequest {
     pub conversation_id: Option<Uuid>,
     /// Override the configured system prompt for a freshly-seeded
     /// conversation. Falls back to the runtime's configured prompt when
-    /// omitted. Supplying it alongside `conversation_id` is rejected with
-    /// 400, since the existing conversation already holds its system message.
+    /// omitted. Supplying it alongside an existing `conversation_id` is
+    /// rejected with 400, since that conversation already holds its system
+    /// message; an unknown `conversation_id` still returns 404.
     #[serde(default)]
     pub system_prompt: Option<String>,
 }
@@ -235,7 +236,9 @@ fn seed_new_conversation(state: &ServeState, system_prompt: Option<&str>) -> Uui
 }
 
 /// Resolve a request's `conversation_id`: reuse if it exists, mint and seed
-/// a fresh record if omitted, reject unknown ids.
+/// a fresh record (honoring the `system_prompt` override) if omitted, reject
+/// unknown ids. A `system_prompt` supplied for an existing conversation is
+/// rejected, since that conversation already holds its system message.
 ///
 /// Returns the id and whether a fresh conversation was seeded in this call, so
 /// the caller can roll the seed back if the task ultimately fails to enqueue.
