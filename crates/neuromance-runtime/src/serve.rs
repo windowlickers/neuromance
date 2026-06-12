@@ -124,7 +124,8 @@ pub struct CreateTaskRequest {
     pub conversation_id: Option<Uuid>,
     /// Override the configured system prompt for a freshly-seeded
     /// conversation. Falls back to the runtime's configured prompt when
-    /// omitted. Supplying it alongside an existing `conversation_id` is
+    /// omitted. Must be non-empty; an empty or whitespace-only value is
+    /// rejected with 400. Supplying it alongside an existing `conversation_id` is
     /// rejected with 400, since that conversation already holds its system
     /// message; an unknown `conversation_id` still returns 404.
     #[serde(default)]
@@ -145,6 +146,7 @@ enum EnqueueError {
     WorkerShutdown,
     ConversationNotFound(Uuid),
     SystemPromptOnExisting(Uuid),
+    EmptySystemPrompt,
 }
 
 struct WorkerJob {
@@ -247,6 +249,9 @@ fn resolve_conversation(
     requested: Option<Uuid>,
     system_prompt: Option<&str>,
 ) -> Result<(Uuid, bool), EnqueueError> {
+    if system_prompt.is_some_and(|p| p.trim().is_empty()) {
+        return Err(EnqueueError::EmptySystemPrompt);
+    }
     requested.map_or_else(
         || Ok((seed_new_conversation(state, system_prompt), true)),
         |id| {
@@ -367,6 +372,13 @@ async fn create_task(
             Json(serde_json::json!({
                 "error": "system_prompt cannot be set when continuing an existing conversation",
                 "conversation_id": id,
+            })),
+        )
+            .into_response(),
+        Err(EnqueueError::EmptySystemPrompt) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "system_prompt must not be empty or whitespace-only",
             })),
         )
             .into_response(),
@@ -1070,6 +1082,23 @@ mod tests {
             content, "system",
             "rejected override must not mutate the prompt"
         );
+    }
+
+    #[test]
+    fn test_try_enqueue_rejects_empty_system_prompt() {
+        let (state, _rx) = fresh_state(4);
+
+        for prompt in ["", "   \n\t"] {
+            let err = try_enqueue(&state, "hi".to_string(), None, Some(prompt))
+                .expect_err("blank override should be rejected");
+            assert!(matches!(err, EnqueueError::EmptySystemPrompt), "got {err:?}");
+        }
+
+        assert!(
+            state.conversations.is_empty(),
+            "rejected request must not seed a conversation"
+        );
+        assert!(state.tasks.is_empty(), "rejected task must not be recorded");
     }
 
     #[test]
