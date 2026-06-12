@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO tasks (id, conversation_id, start_seq, end_seq)\n            VALUES ($1, $2, $3, $4)\n            ON CONFLICT (id) DO UPDATE\n                SET start_seq = EXCLUDED.start_seq,\n                    end_seq = EXCLUDED.end_seq\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ae1e676d8bc30190b31f89f2fae3bc76149d3a2340b9464ad892d75b953eb602"
+}

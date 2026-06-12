@@ -504,11 +504,20 @@ async fn delete_conversation(
     }
 }
 
-async fn worker_loop<C: LLMClient + Send + Sync + 'static>(
-    mut rx: mpsc::Receiver<WorkerJob>,
+/// Shared handles the worker needs to run a job and record its provenance.
+/// Bundled so [`worker_loop`] and [`run`] stay within the positional-argument
+/// budget as fields accrue.
+struct WorkerCtx<C: LLMClient + Send + Sync> {
     tasks: Arc<DashMap<Uuid, TaskRecord>>,
     conversations: Arc<DashMap<Uuid, ConversationRecord>>,
     agent: Arc<Mutex<Agent<C>>>,
+    /// Durable conversation store; `None` when `[database]` is not configured.
+    store: Option<Arc<PgConversationStore>>,
+}
+
+async fn worker_loop<C: LLMClient + Send + Sync + 'static>(
+    mut rx: mpsc::Receiver<WorkerJob>,
+    ctx: WorkerCtx<C>,
     cancel: CancellationToken,
 ) {
     loop {
@@ -524,9 +533,72 @@ async fn worker_loop<C: LLMClient + Send + Sync + 'static>(
                 };
                 #[allow(clippy::cast_precision_loss)]
                 gauge!("neuromance_queue_depth").set(rx.len() as f64);
-                let _ = process_job(&tasks, &conversations, &agent, job, cancel.clone()).await;
+                // Bracket the run by the conversation's seq high-water mark so we
+                // can record which messages this task contributed. Core persists
+                // the messages themselves during the run; this only reads the
+                // boundaries. Best-effort, matching the log-and-continue policy.
+                let (task_id, conversation_id) = (job.task_id, job.conversation_id);
+                let start_seq = next_seq_before_run(ctx.store.as_ref(), conversation_id).await;
+                let _ = process_job(
+                    &ctx.tasks,
+                    &ctx.conversations,
+                    &ctx.agent,
+                    job,
+                    cancel.clone(),
+                )
+                .await;
+                record_task_provenance(ctx.store.as_ref(), task_id, conversation_id, start_seq)
+                    .await;
             }
         }
+    }
+}
+
+/// Reads the `seq` a task's first message will occupy, or `None` when
+/// persistence is off or the read fails. A failed read drops this task's
+/// provenance without failing the task.
+async fn next_seq_before_run(
+    store: Option<&Arc<PgConversationStore>>,
+    conversation_id: Uuid,
+) -> Option<i64> {
+    let store = store?;
+    match store.max_seq(conversation_id).await {
+        Ok(max) => Some(max.map_or(0, |m| m + 1)),
+        Err(e) => {
+            warn!(%conversation_id, error = %e, "max_seq before run failed; task provenance skipped");
+            None
+        }
+    }
+}
+
+/// Records the `[start_seq, end_seq]` range a task contributed. Skips silently
+/// when persistence is off, the boundary read fails, or the run persisted no
+/// new messages (`end < start`).
+async fn record_task_provenance(
+    store: Option<&Arc<PgConversationStore>>,
+    task_id: Uuid,
+    conversation_id: Uuid,
+    start_seq: Option<i64>,
+) {
+    let (Some(store), Some(start)) = (store, start_seq) else {
+        return;
+    };
+    let end = match store.max_seq(conversation_id).await {
+        Ok(Some(end)) => end,
+        Ok(None) => return,
+        Err(e) => {
+            warn!(%conversation_id, error = %e, "max_seq after run failed; task provenance skipped");
+            return;
+        }
+    };
+    if end < start {
+        return;
+    }
+    if let Err(e) = store
+        .record_task(task_id, conversation_id, start, end)
+        .await
+    {
+        warn!(%task_id, error = %e, "record task provenance failed");
     }
 }
 
@@ -665,9 +737,12 @@ pub async fn run<C: LLMClient + Send + Sync + 'static>(
 
     let worker = tokio::spawn(worker_loop(
         work_rx,
-        Arc::clone(&tasks),
-        Arc::clone(&conversations),
-        Arc::clone(&agent),
+        WorkerCtx {
+            tasks: Arc::clone(&tasks),
+            conversations: Arc::clone(&conversations),
+            agent: Arc::clone(&agent),
+            store: store.clone(),
+        },
         cancel.clone(),
     ));
 
@@ -913,9 +988,12 @@ mod tests {
 
         let worker = tokio::spawn(worker_loop(
             work_rx,
-            Arc::clone(&tasks),
-            Arc::clone(&conversations),
-            Arc::clone(&agent),
+            WorkerCtx {
+                tasks: Arc::clone(&tasks),
+                conversations: Arc::clone(&conversations),
+                agent: Arc::clone(&agent),
+                store: None,
+            },
             cancel.clone(),
         ));
 
