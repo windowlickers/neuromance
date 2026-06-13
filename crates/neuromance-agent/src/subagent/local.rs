@@ -16,12 +16,19 @@ use crate::Agent;
 /// `[system, user]` message pair derived from the [`Task`]. Constructing per
 /// run (rather than reusing one agent behind a lock) keeps concurrent runs of
 /// the *same* subagent genuinely parallel — fan-outs like `spawn_agents` would
-/// otherwise serialize on a shared agent. Nothing persists across runs; agents
-/// are cheap to build because clients share their connection pools via `Arc`.
+/// otherwise serialize on a shared agent. Nothing persists across runs,
+/// including any stateful tools (e.g. a Python interpreter): the factory builds
+/// the agent's whole toolset fresh, so concurrent runs never share interpreter
+/// state. Agents are cheap to build because clients share their connection
+/// pools via `Arc`.
+///
+/// The factory is fallible so it can perform per-run work that may fail (such
+/// as constructing a fresh interpreter); a build error surfaces as a
+/// [`SubagentError`] from [`run`](LocalSubagent::run).
 pub struct LocalSubagent<C: LLMClient> {
     id: String,
     system_prompt: String,
-    build_agent: Box<dyn Fn() -> Agent<C> + Send + Sync>,
+    build_agent: Box<dyn Fn() -> Result<Agent<C>, SubagentError> + Send + Sync>,
 }
 
 impl<C: LLMClient> LocalSubagent<C> {
@@ -31,7 +38,7 @@ impl<C: LLMClient> LocalSubagent<C> {
     pub fn new(
         id: impl Into<String>,
         system_prompt: impl Into<String>,
-        build_agent: impl Fn() -> Agent<C> + Send + Sync + 'static,
+        build_agent: impl Fn() -> Result<Agent<C>, SubagentError> + Send + Sync + 'static,
     ) -> Self {
         Self {
             id: id.into(),
@@ -53,7 +60,7 @@ impl<C: LLMClient> Subagent for LocalSubagent<C> {
             None => task.instructions.clone(),
         };
 
-        let mut agent = (self.build_agent)();
+        let mut agent = (self.build_agent)()?;
         let conv_id = agent.conversation_id;
         let messages = vec![
             Message::system(conv_id, self.system_prompt.as_str()),
@@ -195,7 +202,7 @@ mod tests {
 
     fn echo_subagent() -> LocalSubagent<EchoClient> {
         LocalSubagent::new("echo", "You echo input.", || {
-            Agent::new("echo".to_string(), Core::new(EchoClient))
+            Ok(Agent::new("echo".to_string(), Core::new(EchoClient)))
         })
     }
 
@@ -235,12 +242,12 @@ mod tests {
         let subagent = LocalSubagent::new("blocking", "sys", {
             let barrier = Arc::clone(&barrier);
             move || {
-                Agent::new(
+                Ok(Agent::new(
                     "blocking".to_string(),
                     Core::new(BlockingClient {
                         barrier: Arc::clone(&barrier),
                     }),
-                )
+                ))
             }
         });
 
@@ -256,5 +263,23 @@ mod tests {
 
         assert_eq!(a.expect("run a succeeds").content, "echo: a");
         assert_eq!(b.expect("run b succeeds").content, "echo: b");
+    }
+
+    #[tokio::test]
+    async fn test_builder_failure_surfaces_as_run_error() {
+        // A factory that fails (e.g. constructing a per-run interpreter) must
+        // surface from `run` rather than being swallowed.
+        let subagent: LocalSubagent<EchoClient> =
+            LocalSubagent::new("failing", "sys", || Err(SubagentError::execution("boom")));
+
+        let err = subagent
+            .run(Task::new("x"), CancellationToken::new())
+            .await
+            .expect_err("a failing builder must make the run fail");
+
+        assert!(
+            matches!(err, SubagentError::Execution(ref e) if e.to_string() == "boom"),
+            "unexpected error: {err}",
+        );
     }
 }

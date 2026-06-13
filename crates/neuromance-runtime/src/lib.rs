@@ -36,4 +36,4 @@ pub use config::{
     ProviderConfig, ProviderProxyConfig, RuntimeConfig, RuntimeSettings, SubagentConfig,
 };
 pub use error::RuntimeError;
-pub use subagents::build_subagent_registry;
+pub use subagents::build_parent_toolset;

@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,13 +7,13 @@ use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use neuromance::{Core, build_client};
-use neuromance_agent::{Agent, Subagent, SubagentTool};
+use neuromance_agent::Agent;
 use neuromance_client::LLMClient;
 use neuromance_db::PgConversationStore;
 use neuromance_runtime::{
     ApprovalMode, Mode, RuntimeConfig, RuntimeError,
     approval::WebhookApprover,
-    build_subagent_registry,
+    build_parent_toolset,
     health::{ReadinessGate, router as health_router},
     lifecycle::shutdown_handler,
     metrics as runtime_metrics, oneshot,
@@ -22,10 +21,6 @@ use neuromance_runtime::{
     serve,
     telemetry::{self, BoxedLayer},
 };
-use neuromance_tools::{ToolConfig, ToolFactoryRegistry, ToolRegistry};
-
-/// Tool name the runtime takes over to expose subagents in Python.
-const EXECUTE_PYTHON: &str = "execute_python";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -207,40 +202,16 @@ fn build_agent(
         core = core.with_persistence(store);
     }
 
-    let subagents = build_subagent_registry(config)?;
-
-    // When subagents exist and an execute_python tool is configured, the runtime
-    // builds the REPL itself (with the subagents bridged in) so the factory must
-    // not also build a plain one under the same name.
-    let bridge_python = bridge_python_repl(config, &subagents);
-    let factory_configs: Vec<ToolConfig> = if bridge_python {
-        config
-            .tools
-            .iter()
-            .filter(|t| t.name != EXECUTE_PYTHON)
-            .cloned()
-            .collect()
-    } else {
-        config.tools.clone()
-    };
-
-    #[cfg_attr(not(feature = "python-repl"), allow(unused_mut))]
-    let mut factories = ToolFactoryRegistry::with_builtin();
-    #[cfg(feature = "python-repl")]
-    factories.register(neuromance_repl::python::PythonReplToolFactory);
-    let staged = factories.build_all(&factory_configs)?;
-
-    register_subagent_tools(config, &subagents, &staged, cancel)?;
-    #[cfg(feature = "python-repl")]
-    if bridge_python {
-        register_subagent_repl(config, &subagents, &staged, cancel)?;
-    }
+    // The main agent's toolset, including delegate tools for every configured
+    // subagent and the delegation tower beneath them (bounded by
+    // runtime.max_delegation_depth).
+    let tools = build_parent_toolset(config, cancel)?;
 
     if matches!(config.approval.mode, ApprovalMode::Auto) {
-        let mut needs_approval: Vec<String> = staged
-            .tool_names()
-            .into_iter()
-            .filter(|name| !staged.is_tool_auto_approved(name))
+        let mut needs_approval: Vec<String> = tools
+            .iter()
+            .filter(|tool| !tool.is_auto_approved())
+            .map(|tool| tool.get_definition().function.name)
             .collect();
         if !needs_approval.is_empty() {
             needs_approval.sort();
@@ -262,10 +233,8 @@ fn build_agent(
         }
     }
 
-    for name in staged.tool_names() {
-        if let Some(tool) = staged.get(&name) {
-            core.tool_executor.add_tool_arc(tool);
-        }
+    for tool in tools {
+        core.tool_executor.add_tool_arc(tool);
     }
 
     match config.approval.mode {
@@ -288,98 +257,6 @@ fn build_agent(
     }
 
     Ok(Agent::new(config.agent.id.clone(), core))
-}
-
-/// Whether the runtime should take over `execute_python` to bridge subagents
-/// into Python. True only when subagents are configured, the python-repl
-/// feature is built in, and an `execute_python` tool entry is present.
-#[cfg(feature = "python-repl")]
-fn bridge_python_repl(
-    config: &RuntimeConfig,
-    subagents: &HashMap<String, Arc<dyn Subagent>>,
-) -> bool {
-    !subagents.is_empty() && config.tools.iter().any(|t| t.name == EXECUTE_PYTHON)
-}
-
-#[cfg(not(feature = "python-repl"))]
-fn bridge_python_repl(
-    _config: &RuntimeConfig,
-    _subagents: &HashMap<String, Arc<dyn Subagent>>,
-) -> bool {
-    false
-}
-
-/// Register one [`SubagentTool`] per configured subagent into `staged`, so the
-/// main agent can delegate to each by its id. Registering into `staged` (rather
-/// than directly onto the executor) means the same startup approval gate that
-/// covers factory tools also covers delegate tools.
-///
-/// # Errors
-/// Returns [`RuntimeError::Config`] if a subagent id collides with an
-/// already-registered tool name.
-fn register_subagent_tools(
-    config: &RuntimeConfig,
-    subagents: &HashMap<String, Arc<dyn Subagent>>,
-    staged: &ToolRegistry,
-    cancel: &CancellationToken,
-) -> Result<(), RuntimeError> {
-    for sub in &config.subagents {
-        if staged.contains(&sub.id) {
-            return Err(RuntimeError::Config(format!(
-                "subagent id '{}' collides with a configured tool of the same name",
-                sub.id
-            )));
-        }
-        let Some(inner) = subagents.get(&sub.id).map(Arc::clone) else {
-            continue;
-        };
-        let description = sub
-            .description
-            .clone()
-            .unwrap_or_else(|| format!("Delegate a task to the '{}' subagent.", sub.id));
-        let tool = SubagentTool::new(inner, sub.id.clone(), description, cancel.clone());
-        staged.register(Arc::new(tool));
-    }
-    Ok(())
-}
-
-/// Build the subagent-enabled Python REPL and register it as the
-/// `execute_python` tool. The bridge exposes `run_subagent`/`spawn_agents` over
-/// the same subagent registry the delegate tools use.
-///
-/// # Errors
-/// Returns [`RuntimeError::Config`] if the `execute_python` entry requests
-/// unrestricted mode (the bridge supports restricted mode only) or if building
-/// the REPL or bridge fails.
-#[cfg(feature = "python-repl")]
-fn register_subagent_repl(
-    config: &RuntimeConfig,
-    subagents: &HashMap<String, Arc<dyn Subagent>>,
-    staged: &ToolRegistry,
-    cancel: &CancellationToken,
-) -> Result<(), RuntimeError> {
-    use neuromance_repl::python::{PythonRepl, SubagentRepl};
-
-    let entry = config
-        .tools
-        .iter()
-        .find(|t| t.name == EXECUTE_PYTHON)
-        .ok_or_else(|| RuntimeError::Config("execute_python tool entry missing".to_string()))?;
-    if entry.config.get("restricted") == Some(&serde_json::Value::Bool(false)) {
-        return Err(RuntimeError::Config(
-            "the subagent Python REPL bridge supports restricted mode only; remove \
-             restricted = false from the execute_python tool config"
-                .to_string(),
-        ));
-    }
-
-    let repl = Arc::new(
-        PythonRepl::new().map_err(|e| RuntimeError::Config(format!("build python repl: {e}")))?,
-    );
-    let bridge = SubagentRepl::new(repl, subagents.clone(), cancel.clone())
-        .map_err(|e| RuntimeError::Config(format!("build subagent repl bridge: {e}")))?;
-    staged.register(Arc::new(bridge.into_tool()));
-    Ok(())
 }
 
 async fn run_oneshot(

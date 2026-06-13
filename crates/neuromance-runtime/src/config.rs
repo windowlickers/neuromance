@@ -103,11 +103,13 @@ pub struct ProviderConfig {
     pub proxy: Option<ProviderProxyConfig>,
 }
 
-/// A leaf subagent: a named in-process agent the main agent can delegate to.
+/// A subagent: a named in-process agent the main agent can delegate to.
 ///
 /// Subagents inherit the parent agent's provider unless they name their own; a
-/// subagent may also override just the model. They carry no tools of their own
-/// — they are pure LLM workers.
+/// subagent may also override just the model. Each subagent is provisioned with
+/// the same toolset as the main agent — capability tools, the `execute_python`
+/// bridge, and the delegate tools — so it can both use tools and delegate
+/// further, bounded by `runtime.max_delegation_depth`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SubagentConfig {
     /// Stable identifier. Used as the delegate tool name and the
@@ -215,6 +217,15 @@ pub struct RuntimeSettings {
     /// what the runtime can actually do.
     #[serde(default = "default_max_queue_depth")]
     pub max_queue_depth: usize,
+    /// Maximum length of a delegation chain, counting subagent hops from the
+    /// main agent (which is depth 0). At `1` the main agent reaches subagents
+    /// but those subagents hold no delegate tools; at `2` a subagent may
+    /// delegate one further hop, and so on. The deepest subagents are still
+    /// fully tool-capable — they just cannot delegate. Bounds both startup cost
+    /// and runaway delegation fan-out. Ignored when no `[[subagents]]` are
+    /// configured.
+    #[serde(default = "default_max_delegation_depth")]
+    pub max_delegation_depth: u32,
 }
 
 impl Default for RuntimeSettings {
@@ -224,6 +235,7 @@ impl Default for RuntimeSettings {
             health_addr: default_health_addr(),
             shutdown_grace_seconds: default_shutdown_grace(),
             max_queue_depth: default_max_queue_depth(),
+            max_delegation_depth: default_max_delegation_depth(),
         }
     }
 }
@@ -240,6 +252,14 @@ const fn default_shutdown_grace() -> u64 {
 const fn default_max_queue_depth() -> usize {
     8
 }
+const fn default_max_delegation_depth() -> u32 {
+    2
+}
+
+/// Upper bound on `runtime.max_delegation_depth`. Each level multiplies the
+/// number of subagent instances built at startup and widens the delegation
+/// fan-out; deeper towers buy little and cost a lot.
+const MAX_DELEGATION_DEPTH_CEILING: u32 = 5;
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct ApprovalConfig {
@@ -379,6 +399,16 @@ impl RuntimeConfig {
                 return Err(RuntimeError::Config(
                     "database.acquire_timeout_seconds must be at least 1".to_string(),
                 ));
+            }
+        }
+
+        if !self.subagents.is_empty() {
+            let depth = self.runtime.max_delegation_depth;
+            if !(1..=MAX_DELEGATION_DEPTH_CEILING).contains(&depth) {
+                return Err(RuntimeError::Config(format!(
+                    "runtime.max_delegation_depth must be between 1 and \
+                     {MAX_DELEGATION_DEPTH_CEILING} when [[subagents]] are configured (got {depth})"
+                )));
             }
         }
 
@@ -590,6 +620,56 @@ mod tests {
         );
         let err = config.validate().err().unwrap();
         assert!(format!("{err}").contains("max_queue_depth"));
+    }
+
+    const ONE_SUBAGENT: &str = r#"
+            [[subagents]]
+            id = "worker"
+            system_prompt = "you work"
+    "#;
+
+    #[test]
+    fn test_max_delegation_depth_defaults_to_two() {
+        let config = serve_config(ONE_SUBAGENT);
+        config.validate().unwrap();
+        assert_eq!(config.runtime.max_delegation_depth, 2);
+    }
+
+    #[test]
+    fn test_zero_max_delegation_depth_with_subagents_fails() {
+        let config = serve_config(&format!(
+            "{ONE_SUBAGENT}
+            [runtime]
+            max_delegation_depth = 0
+        "
+        ));
+        let err = config.validate().err().unwrap();
+        assert!(format!("{err}").contains("max_delegation_depth"));
+    }
+
+    #[test]
+    fn test_excessive_max_delegation_depth_fails() {
+        let config = serve_config(&format!(
+            "{ONE_SUBAGENT}
+            [runtime]
+            max_delegation_depth = 99
+        "
+        ));
+        let err = config.validate().err().unwrap();
+        assert!(format!("{err}").contains("max_delegation_depth"));
+    }
+
+    /// Without subagents the depth bound is irrelevant, so an out-of-range value
+    /// does not block startup.
+    #[test]
+    fn test_max_delegation_depth_ignored_without_subagents() {
+        let config = serve_config(
+            r"
+            [runtime]
+            max_delegation_depth = 0
+        ",
+        );
+        config.validate().unwrap();
     }
 
     #[test]

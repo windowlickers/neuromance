@@ -158,14 +158,22 @@ Migrations are embedded in `neuromance-db` and applied automatically at startup.
 
 ## Subagents
 
-A `[[subagents]]` section declares leaf subagents the main agent can delegate to. Each is a pure LLM worker — its own prompt and turn cap, but no tools of its own. A subagent inherits the parent agent's provider (and so its endpoint, credential, and effective model) automatically; it only needs an `id` and `system_prompt`. It may optionally set its own `provider` and/or `model`: the effective model is the subagent's `model`, then the chosen provider's default `model`, then the agent's effective model.
+A `[[subagents]]` section declares subagents the main agent can delegate to. A subagent inherits the parent agent's provider (and so its endpoint, credential, and effective model) automatically; it only needs an `id` and `system_prompt`. It may optionally set its own `provider` and/or `model`: the effective model is the subagent's `model`, then the chosen provider's default `model`, then the agent's effective model.
+
+A subagent is provisioned with the **same toolset as the main agent** — the capability tools from `[[tools]]`, the `execute_python` bridge, and the delegate tools — so it can both use tools and delegate further. Subagent tool calls auto-approve inside the pod: they run autonomously within a single parent delegation, with no interactive approver in the loop, so the pod boundary (e.g. kata containers) is the isolation, the same way the whole agent pod is already sandboxed.
+
+Nested delegation is bounded by `runtime.max_delegation_depth`, which counts subagent hops from the main agent (depth 0). At `1` the main agent reaches subagents but those subagents carry no delegate tools; at `2` (the default) a subagent may delegate one further hop, and so on. The deepest subagents are still fully tool-capable — they simply cannot delegate. The bound is enforced structurally (a finite tower of subagent instances built at startup), so it cannot run away; it is capped at 5.
 
 Every configured subagent is reachable two ways:
 
-- **As a delegate tool** — the main agent gets a tool named after the subagent's `id`, taking `instructions` and optional `context`. Like other tools, a delegate tool is not auto-approved, so under `approval.mode = "auto"` it is subject to the same startup safety gate (set `approval.allow_unsafe_tools = true` or use async approval).
-- **From the Python REPL** — when an `execute_python` tool is also configured (requires the `python-repl` build feature), the runtime builds the REPL with the subagents bridged in as `run_subagent(name, instructions, context=None)` and `spawn_agents([Agent(name, instructions), ...])`, so the agent can write its own orchestration in Python. The bridge runs in restricted mode; an `execute_python` entry with `restricted = false` alongside subagents is rejected.
+- **As a delegate tool** — an agent gets a tool named after the subagent's `id`, taking `instructions` and optional `context`. Like other tools, a delegate tool is not auto-approved, so the main agent's tool calls under `approval.mode = "auto"` are subject to the same startup safety gate (set `approval.allow_unsafe_tools = true` or use async approval).
+- **From the Python REPL** — when an `execute_python` tool is also configured (requires the `python-repl` build feature), the runtime builds the REPL with the subagents bridged in as `run_subagent(name, instructions, context=None)` and `spawn_agents([Agent(name, instructions), ...])`, so the agent can write its own orchestration in Python. The bridge runs in restricted mode; an `execute_python` entry with `restricted = false` alongside subagents is rejected. The deepest subagents, having no children to delegate to, get a plain `execute_python` (no `run_subagent`/`spawn_agents`). Each subagent run gets its own fresh interpreter — including each concurrent run in a `spawn_agents` fan-out — so interpreter state never bleeds across runs.
 
 ```toml
+[runtime]
+# Max subagent hops in a delegation chain. Optional; defaults to 2.
+max_delegation_depth = 2
+
 [[subagents]]
 id = "researcher"
 system_prompt = "You research a question and report findings."
@@ -179,7 +187,8 @@ description = "Delegate a draft to the critic for review."
 model = "anthropic:claude-opus-4-8"
 max_turns = 4
 
-# Bridge the subagents into Python (run_subagent / spawn_agents):
+# Capability tools and the Python bridge are shared by the main agent and every
+# subagent. Bridge the subagents into Python (run_subagent / spawn_agents):
 [[tools]]
 name = "execute_python"
 ```

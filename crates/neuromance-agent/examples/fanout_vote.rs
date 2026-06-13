@@ -42,10 +42,10 @@ fn build_local_subagent(
     let client = ChatCompletionsClient::new(config.clone())?;
     let agent_id = id.to_string();
     Ok(Arc::new(LocalSubagent::new(id, system_prompt, move || {
-        Agent::builder(agent_id.clone(), client.clone())
+        Ok(Agent::builder(agent_id.clone(), client.clone())
             .max_turns(3)
             .auto_approve_tools(true)
-            .build()
+            .build())
     })))
 }
 

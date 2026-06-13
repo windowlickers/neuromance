@@ -1,44 +1,96 @@
-//! Build leaf subagents from `[[subagents]]` config.
+//! Build the main agent's toolset and the subagent delegation tower from
+//! `[[subagents]]` config.
 //!
-//! Each entry becomes a [`LocalSubagent`] over an `Arc`-shared LLM client: the
-//! client (and its connection pool) is built once at startup, and every
-//! delegated run constructs a fresh [`Agent`] around a clone of that `Arc`.
-//! Fresh-agent-per-run keeps concurrent runs of one subagent parallel (see
-//! [`LocalSubagent`]); the shared client avoids rebuilding a reqwest pool on
-//! every run.
+//! A subagent is provisioned with the *same* toolset as the main agent:
+//! capability tools (the built-in factories plus anything in `[[tools]]`), the
+//! `execute_python` bridge, and the delegate tools that let it hand work to
+//! other subagents. Delegation is bounded by `runtime.max_delegation_depth`,
+//! and that bound is enforced *structurally* by building a finite tower of
+//! subagent instances rather than threading a runtime counter:
 //!
-//! The returned registry is shared by both delegation surfaces: the
-//! [`SubagentTool`](neuromance_agent::SubagentTool) wrappers exposed on the main
-//! agent, and the Python REPL bridge (`run_subagent`/`spawn_agents`). Because it
-//! is keyed by id and holds `Arc<dyn Subagent>`, both surfaces see the same set.
+//! - Every configured subagent exists at each depth level.
+//! - A subagent at depth *k* gets delegate tools wired to the subagents at
+//!   depth *k+1*.
+//! - The deepest level holds no delegate tools, which terminates the recursion
+//!   and breaks the otherwise-circular wiring (a subagent's toolset would
+//!   otherwise contain delegate tools that wrap that same subagent).
+//!
+//! Each [`LocalSubagent`] holds an `Arc`-shared LLM client (built once at
+//! startup) and a factory that constructs a fresh [`Agent`] per run, so
+//! concurrent runs of one subagent stay parallel. The factory reassembles the
+//! whole toolset on every run rather than cloning a shared template, so each
+//! run — including each concurrent sibling run in a `spawn_agents` fan-out —
+//! gets its own Python interpreter. No interpreter state bleeds across runs.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use tokio_util::sync::CancellationToken;
+
 use neuromance::Core;
-use neuromance_agent::{Agent, LocalSubagent, Subagent};
+use neuromance_agent::{Agent, LocalSubagent, Subagent, SubagentError, SubagentTool};
 use neuromance_client::{LLMClient, build_client};
+use neuromance_tools::{ToolConfig, ToolFactoryRegistry, ToolImplementation, ToolRegistry};
 
 use crate::config::RuntimeConfig;
 use crate::error::RuntimeError;
 use crate::proxy::build_provider_config;
 
-/// Build the named subagent registry from `config.subagents`.
+/// Tool name the runtime takes over to expose subagents in Python.
+const EXECUTE_PYTHON: &str = "execute_python";
+
+/// Build the main agent's toolset, including delegate tools for every
+/// configured subagent and (when `execute_python` is configured) the Python
+/// delegation bridge.
 ///
-/// Each subagent inherits the parent agent's provider unless it names its own.
-/// The effective model is the subagent's `model` override, then the chosen
-/// provider's default `model`, then the agent's effective model.
+/// When no subagents are configured this is just the capability toolset built
+/// from `[[tools]]`. Otherwise it also builds the delegation tower down to
+/// `runtime.max_delegation_depth` and wires the main agent's delegate tools to
+/// the top of that tower.
 ///
 /// # Errors
-/// Returns [`RuntimeError::Config`] (or the credential errors surfaced by
-/// [`build_provider_config`]) if a subagent's provider, model, or credentials
-/// fail to resolve into an LLM client.
-pub fn build_subagent_registry(
+/// Returns [`RuntimeError`] if a subagent's provider/model/credentials fail to
+/// resolve, a tool factory fails, or a subagent id collides with a configured
+/// tool name.
+pub fn build_parent_toolset(
     config: &RuntimeConfig,
+    cancel: &CancellationToken,
+) -> Result<Vec<Arc<dyn ToolImplementation>>, RuntimeError> {
+    let children = if config.subagents.is_empty() {
+        HashMap::new()
+    } else {
+        // The main agent is depth 0; its children may delegate `depth - 1`
+        // further hops.
+        let remaining = config.runtime.max_delegation_depth.saturating_sub(1);
+        build_subagents_at_depth(config, remaining, cancel)?
+    };
+    assemble_toolset(config, &children, cancel)
+}
+
+/// Build the subagent registry for one tower level.
+///
+/// `remaining` is the number of delegation hops still allowed *below* this
+/// level: at `0` the level is a leaf (its subagents get no delegate tools); above
+/// `0` each subagent can delegate to the level built with `remaining - 1`.
+fn build_subagents_at_depth(
+    config: &RuntimeConfig,
+    remaining: u32,
+    cancel: &CancellationToken,
 ) -> Result<HashMap<String, Arc<dyn Subagent>>, RuntimeError> {
-    let mut registry: HashMap<String, Arc<dyn Subagent>> = HashMap::new();
+    let children = if remaining == 0 {
+        HashMap::new()
+    } else {
+        build_subagents_at_depth(config, remaining - 1, cancel)?
+    };
+    // Shared across every subagent at this level and captured by each run's
+    // builder. The toolset itself is *not* built here: each run reassembles it
+    // (see the builder closure) so stateful tools like the Python interpreter
+    // never bleed across concurrent sibling runs.
+    let children = Arc::new(children);
+    let config = Arc::new(config.clone());
     let agent_model = config.agent_model();
 
+    let mut registry: HashMap<String, Arc<dyn Subagent>> = HashMap::new();
     for sub in &config.subagents {
         let provider_name = sub.provider.as_deref().unwrap_or(&config.agent.provider);
         let provider = config.provider(provider_name).ok_or_else(|| {
@@ -67,15 +119,27 @@ pub fn build_subagent_registry(
 
         let id = sub.id.clone();
         let max_turns = sub.max_turns;
+        let config = Arc::clone(&config);
+        let children = Arc::clone(&children);
+        let cancel = cancel.clone();
         let build_agent = move || {
+            // Reassemble the toolset per run so a fresh Python interpreter is
+            // built each time; nothing persists across runs of one subagent or
+            // across concurrent sibling runs.
+            let tools =
+                assemble_toolset(&config, &children, &cancel).map_err(SubagentError::execution)?;
             let mut core = Core::new(Arc::clone(&client));
             if let Some(max) = max_turns {
                 core.max_turns = Some(max);
             }
-            // Subagents carry no tools, so there is nothing to gate; the loop
-            // only ever calls the model.
+            // Subagent tool calls run autonomously inside one parent delegation,
+            // with no interactive approver in the loop; the pod boundary (kata)
+            // is the isolation. See the README Subagents section.
             core.auto_approve_tools = true;
-            Agent::new(id.clone(), core)
+            for tool in tools {
+                core.tool_executor.add_tool_arc(tool);
+            }
+            Ok(Agent::new(id.clone(), core))
         };
 
         let subagent = LocalSubagent::new(sub.id.clone(), sub.system_prompt.clone(), build_agent);
@@ -85,10 +149,142 @@ pub fn build_subagent_registry(
     Ok(registry)
 }
 
+/// Assemble the toolset for one agent level: the capability tools built from
+/// `[[tools]]`, a delegate tool per `child`, and (when `execute_python` is
+/// configured and `children` is non-empty) the Python delegation bridge over
+/// `children`.
+///
+/// With empty `children` this is the capability toolset only, and any
+/// configured `execute_python` is built as a plain REPL (no bridge).
+fn assemble_toolset(
+    config: &RuntimeConfig,
+    children: &HashMap<String, Arc<dyn Subagent>>,
+    cancel: &CancellationToken,
+) -> Result<Vec<Arc<dyn ToolImplementation>>, RuntimeError> {
+    let bridge = bridge_python(config, children);
+    // When bridging, the runtime builds `execute_python` itself (over the child
+    // subagents), so the factory must not also build a plain one under that name.
+    let factory_configs: Vec<ToolConfig> = if bridge {
+        config
+            .tools
+            .iter()
+            .filter(|t| t.name != EXECUTE_PYTHON)
+            .cloned()
+            .collect()
+    } else {
+        config.tools.clone()
+    };
+
+    #[cfg_attr(not(feature = "python-repl"), allow(unused_mut))]
+    let mut factories = ToolFactoryRegistry::with_builtin();
+    #[cfg(feature = "python-repl")]
+    factories.register(neuromance_repl::python::PythonReplToolFactory);
+    let staged = factories.build_all(&factory_configs)?;
+
+    register_child_delegates(config, children, &staged, cancel)?;
+    #[cfg(feature = "python-repl")]
+    if bridge {
+        register_child_repl(config, children, &staged, cancel)?;
+    }
+
+    Ok(staged
+        .tool_names()
+        .into_iter()
+        .filter_map(|name| staged.get(&name))
+        .collect())
+}
+
+/// Register one [`SubagentTool`] per child subagent into `staged`, so an agent
+/// at this level can delegate to each child by its id.
+///
+/// # Errors
+/// Returns [`RuntimeError::Config`] if a subagent id collides with a configured
+/// tool name.
+fn register_child_delegates(
+    config: &RuntimeConfig,
+    children: &HashMap<String, Arc<dyn Subagent>>,
+    staged: &ToolRegistry,
+    cancel: &CancellationToken,
+) -> Result<(), RuntimeError> {
+    for sub in &config.subagents {
+        let Some(inner) = children.get(&sub.id).map(Arc::clone) else {
+            continue;
+        };
+        if staged.contains(&sub.id) {
+            return Err(RuntimeError::Config(format!(
+                "subagent id '{}' collides with a configured tool of the same name",
+                sub.id
+            )));
+        }
+        let description = sub
+            .description
+            .clone()
+            .unwrap_or_else(|| format!("Delegate a task to the '{}' subagent.", sub.id));
+        let tool = SubagentTool::new(inner, sub.id.clone(), description, cancel.clone());
+        staged.register(Arc::new(tool));
+    }
+    Ok(())
+}
+
+/// Build the subagent-enabled Python REPL over `children` and register it as the
+/// `execute_python` tool, exposing `run_subagent`/`spawn_agents`.
+///
+/// # Errors
+/// Returns [`RuntimeError::Config`] if the `execute_python` entry requests
+/// unrestricted mode (the bridge supports restricted mode only) or if building
+/// the REPL or bridge fails.
+#[cfg(feature = "python-repl")]
+fn register_child_repl(
+    config: &RuntimeConfig,
+    children: &HashMap<String, Arc<dyn Subagent>>,
+    staged: &ToolRegistry,
+    cancel: &CancellationToken,
+) -> Result<(), RuntimeError> {
+    use neuromance_repl::python::{PythonRepl, SubagentRepl};
+
+    let entry = config
+        .tools
+        .iter()
+        .find(|t| t.name == EXECUTE_PYTHON)
+        .ok_or_else(|| RuntimeError::Config("execute_python tool entry missing".to_string()))?;
+    if entry.config.get("restricted") == Some(&serde_json::Value::Bool(false)) {
+        return Err(RuntimeError::Config(
+            "the subagent Python REPL bridge supports restricted mode only; remove \
+             restricted = false from the execute_python tool config"
+                .to_string(),
+        ));
+    }
+
+    let repl = Arc::new(
+        PythonRepl::new().map_err(|e| RuntimeError::Config(format!("build python repl: {e}")))?,
+    );
+    let bridge = SubagentRepl::new(repl, children.clone(), cancel.clone())
+        .map_err(|e| RuntimeError::Config(format!("build subagent repl bridge: {e}")))?;
+    staged.register(Arc::new(bridge.into_tool()));
+    Ok(())
+}
+
+/// Whether `execute_python` should be bridged over `children` rather than built
+/// as a plain REPL: true only with the python-repl feature, a non-empty child
+/// set, and an `execute_python` entry in `[[tools]]`. The restricted-mode
+/// requirement is enforced when the bridge is built (see [`register_child_repl`]).
+#[cfg(feature = "python-repl")]
+fn bridge_python(config: &RuntimeConfig, children: &HashMap<String, Arc<dyn Subagent>>) -> bool {
+    !children.is_empty() && config.tools.iter().any(|t| t.name == EXECUTE_PYTHON)
+}
+
+#[cfg(not(feature = "python-repl"))]
+fn bridge_python(_config: &RuntimeConfig, _children: &HashMap<String, Arc<dyn Subagent>>) -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
     #![allow(clippy::expect_used)]
+
+    use async_trait::async_trait;
+    use neuromance_common::task::{Outcome, Task};
 
     use super::*;
     use crate::config::{ProviderConfig, SubagentConfig};
@@ -150,6 +346,125 @@ mod tests {
         }
     }
 
+    fn read_tool() -> ToolConfig {
+        ToolConfig {
+            name: "read".to_string(),
+            config: serde_json::Value::Null,
+        }
+    }
+
+    /// A stand-in child subagent so toolset assembly can be exercised without
+    /// building an LLM client.
+    struct MockSubagent(&'static str);
+
+    #[async_trait]
+    impl Subagent for MockSubagent {
+        fn id(&self) -> &str {
+            self.0
+        }
+
+        async fn run(
+            &self,
+            task: Task,
+            _cancel: CancellationToken,
+        ) -> Result<Outcome, neuromance_agent::SubagentError> {
+            Ok(Outcome::new(task.id, "ok".to_string()))
+        }
+    }
+
+    fn mock_children(ids: &[&'static str]) -> HashMap<String, Arc<dyn Subagent>> {
+        ids.iter()
+            .map(|id| {
+                let sub: Arc<dyn Subagent> = Arc::new(MockSubagent(id));
+                ((*id).to_string(), sub)
+            })
+            .collect()
+    }
+
+    fn tool_names(tools: &[Arc<dyn ToolImplementation>]) -> Vec<String> {
+        tools
+            .iter()
+            .map(|t| t.get_definition().function.name)
+            .collect()
+    }
+
+    /// With no children, the toolset is exactly the configured capability tools
+    /// — no delegate tools appear.
+    #[test]
+    fn test_assemble_toolset_capability_only_without_children() {
+        let mut config = config_with_subagents(vec![subagent("worker")]);
+        config.tools = vec![read_tool()];
+
+        let tools = assemble_toolset(&config, &HashMap::new(), &CancellationToken::new()).unwrap();
+        let names = tool_names(&tools);
+
+        assert_eq!(names, vec!["read".to_string()]);
+        assert!(!names.contains(&"worker".to_string()));
+    }
+
+    /// A non-empty child set adds one delegate tool per configured subagent,
+    /// named by its id, alongside the capability tools.
+    #[test]
+    fn test_assemble_toolset_adds_delegate_per_child() {
+        let mut config = config_with_subagents(vec![subagent("worker"), subagent("critic")]);
+        config.tools = vec![read_tool()];
+
+        let children = mock_children(&["worker", "critic"]);
+        let tools = assemble_toolset(&config, &children, &CancellationToken::new()).unwrap();
+        let mut names = tool_names(&tools);
+        names.sort();
+
+        assert_eq!(
+            names,
+            vec![
+                "critic".to_string(),
+                "read".to_string(),
+                "worker".to_string()
+            ]
+        );
+    }
+
+    /// With children present and an `execute_python` entry configured, the
+    /// toolset carries a single bridged `execute_python` alongside the delegate
+    /// tools — the plain factory REPL is not also built under that name.
+    #[cfg(feature = "python-repl")]
+    #[test]
+    fn test_assemble_toolset_bridges_python_over_children() {
+        let mut config = config_with_subagents(vec![subagent("worker")]);
+        config.tools = vec![ToolConfig {
+            name: "execute_python".to_string(),
+            config: serde_json::Value::Null,
+        }];
+
+        let children = mock_children(&["worker"]);
+        let tools = assemble_toolset(&config, &children, &CancellationToken::new()).unwrap();
+        let names = tool_names(&tools);
+
+        assert_eq!(
+            names.iter().filter(|n| *n == "execute_python").count(),
+            1,
+            "exactly one execute_python tool expected, got: {names:?}"
+        );
+        assert!(names.contains(&"worker".to_string()));
+    }
+
+    /// A subagent id that collides with a configured tool name is rejected when
+    /// delegate tools are wired in.
+    #[test]
+    fn test_assemble_toolset_rejects_id_tool_collision() {
+        let mut config = config_with_subagents(vec![subagent("read")]);
+        config.tools = vec![read_tool()];
+
+        let children = mock_children(&["read"]);
+        let err = assemble_toolset(&config, &children, &CancellationToken::new())
+            .err()
+            .expect("colliding subagent id must be rejected");
+        assert!(
+            matches!(err, RuntimeError::Config(ref msg) if msg.contains("collides")),
+            "unexpected error: {err}",
+        );
+    }
+
     /// The build path resolves credentials through the inherited provider's
     /// `api_key_env`. With that variable unset, the build fails naming it
     /// rather than silently dropping a subagent. (Env mutation is forbidden by
@@ -158,7 +473,7 @@ mod tests {
     #[test]
     fn test_build_surfaces_missing_credential_env() {
         let config = config_with_subagents(vec![subagent("alpha"), subagent("beta")]);
-        let err = build_subagent_registry(&config)
+        let err = build_parent_toolset(&config, &CancellationToken::new())
             .err()
             .expect("build should fail without the credential env var set");
         assert!(
@@ -167,11 +482,15 @@ mod tests {
         );
     }
 
+    /// With no subagents configured, the toolset is the capability tools only
+    /// and no client is built.
     #[test]
-    fn test_empty_subagents_yields_empty_registry() {
-        let config = config_with_subagents(vec![]);
-        let registry = build_subagent_registry(&config).unwrap();
-        assert!(registry.is_empty());
+    fn test_no_subagents_yields_capability_tools_only() {
+        let mut config = config_with_subagents(vec![]);
+        config.tools = vec![read_tool()];
+
+        let tools = build_parent_toolset(&config, &CancellationToken::new()).unwrap();
+        assert_eq!(tool_names(&tools), vec!["read".to_string()]);
     }
 
     /// A subagent with no `provider` inherits the agent's provider, so its
@@ -179,7 +498,7 @@ mod tests {
     #[test]
     fn test_subagent_inherits_parent_provider_credential() {
         let config = config_with_subagents(vec![subagent("worker")]);
-        let err = build_subagent_registry(&config)
+        let err = build_parent_toolset(&config, &CancellationToken::new())
             .err()
             .expect("build should fail on the inherited provider's unset env var");
         assert!(
@@ -204,7 +523,7 @@ mod tests {
                 ..subagent("worker")
             }],
         );
-        let err = build_subagent_registry(&config)
+        let err = build_parent_toolset(&config, &CancellationToken::new())
             .err()
             .expect("build should fail on the overridden provider's unset env var");
         assert!(
@@ -221,7 +540,7 @@ mod tests {
             provider: Some("ghost".to_string()),
             ..subagent("worker")
         }]);
-        let err = build_subagent_registry(&config)
+        let err = build_parent_toolset(&config, &CancellationToken::new())
             .err()
             .expect("build should fail for an unknown provider");
         assert!(
