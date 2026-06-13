@@ -137,6 +137,33 @@ acquire_timeout_seconds = 5    # optional, default 5
 
 Migrations are embedded in `neuromance-db` and applied automatically at startup. See the `neuromance-db` crate docs for the schema and the `cargo sqlx prepare` workflow when changing queries.
 
+## Subagents
+
+A `[[subagents]]` section declares leaf subagents the main agent can delegate to. Each is a pure LLM worker — its own model, prompt, and turn cap, but no tools of its own. Subagents inherit the main agent's credential path (`[proxy]` or `agent.api_key_env`); only `model`, `base_url`, and `max_turns` may differ, all optional and defaulting to the main agent's values.
+
+Every configured subagent is reachable two ways:
+
+- **As a delegate tool** — the main agent gets a tool named after the subagent's `id`, taking `instructions` and optional `context`. Like other tools, a delegate tool is not auto-approved, so under `approval.mode = "auto"` it is subject to the same startup safety gate (set `approval.allow_unsafe_tools = true` or use async approval).
+- **From the Python REPL** — when an `execute_python` tool is also configured (requires the `python-repl` build feature), the runtime builds the REPL with the subagents bridged in as `run_subagent(name, instructions, context=None)` and `spawn_agents([Agent(name, instructions), ...])`, so the agent can write its own orchestration in Python. The bridge runs in restricted mode; an `execute_python` entry with `restricted = false` alongside subagents is rejected.
+
+```toml
+[[subagents]]
+id = "researcher"
+system_prompt = "You research a question and report findings."
+# model, base_url, max_turns all optional; default to the [agent] values.
+
+[[subagents]]
+id = "critic"
+system_prompt = "You critique a draft and list concrete fixes."
+description = "Delegate a draft to the critic for review."
+model = "anthropic:claude-opus-4-8"
+max_turns = 4
+
+# Bridge the subagents into Python (run_subagent / spawn_agents):
+[[tools]]
+name = "execute_python"
+```
+
 ## Model Context Protocol (MCP) Support
 
 Neuromance supports the [Model Context Protocol](https://modelcontextprotocol.io/) for connecting to external tool servers via the `neuromance-tools` crate.

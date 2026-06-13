@@ -58,7 +58,7 @@ tools = ["neuromance-common", "neuromance-tools"]
 # subagent contract (via `tools`), so the repl crate never depends on the agent
 # crate — keeping `agent -> repl` (repl-as-a-tool) cycle-free.
 subagent = ["python", "tools", "dep:tokio-util"]
-full = ["python", "tools"]
+full = ["python", "tools", "subagent"]
 
 [[example]]
 name = "python_subagent"

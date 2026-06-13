@@ -328,6 +328,36 @@ impl<T: LLMClient + ?Sized> LLMClient for Box<T> {
     }
 }
 
+/// Blanket impl mirroring the [`Box`] one, but for `Arc`. Lets a single client
+/// be shared across cheaply-built `Core`/`Agent` instances — e.g. a subagent
+/// that builds a fresh agent per run while reusing one connection pool.
+#[async_trait]
+impl<T: LLMClient + ?Sized> LLMClient for std::sync::Arc<T> {
+    fn config(&self) -> &Config {
+        (**self).config()
+    }
+
+    async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, ClientError> {
+        (**self).chat(request).await
+    }
+
+    async fn chat_stream(
+        &self,
+        request: &ChatRequest,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatChunk, ClientError>> + Send>>, ClientError>
+    {
+        (**self).chat_stream(request).await
+    }
+
+    fn supports_tools(&self) -> bool {
+        (**self).supports_tools()
+    }
+
+    fn supports_streaming(&self) -> bool {
+        (**self).supports_streaming()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]

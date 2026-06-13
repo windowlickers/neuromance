@@ -57,6 +57,39 @@ pub struct RuntimeConfig {
     /// tasks run. In-memory state stays authoritative for serving.
     #[serde(default)]
     pub database: Option<DatabaseSettings>,
+    /// Leaf subagents the main agent can delegate to. Each is exposed as a
+    /// delegate tool (named by its `id`) and, when an `execute_python` tool is
+    /// configured, through the Python REPL's `run_subagent`/`spawn_agents`
+    /// bridge.
+    #[serde(default)]
+    pub subagents: Vec<SubagentConfig>,
+}
+
+/// A leaf subagent: a named in-process agent the main agent can delegate to.
+///
+/// Subagents inherit the main agent's credential path (`[proxy]` or
+/// `agent.api_key_env`); only the model, upstream endpoint, turn cap, and
+/// prompt differ. They carry no tools of their own — they are pure LLM workers.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SubagentConfig {
+    /// Stable identifier. Used as the delegate tool name and the
+    /// `run_subagent`/`spawn_agents` registry key; must be unique.
+    pub id: String,
+    /// System prompt prepended to every delegated task.
+    pub system_prompt: String,
+    /// Description shown in the delegate tool schema. Defaults to
+    /// "Delegate a task to the '<id>' subagent." when omitted.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Model override; defaults to `agent.model`.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Upstream LLM endpoint override; defaults to `agent.base_url`.
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// Maximum chat-loop turns; defaults to the `Core` default when unset.
+    #[serde(default)]
+    pub max_turns: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -314,6 +347,30 @@ impl RuntimeConfig {
                 return Err(RuntimeError::Config(
                     "database.acquire_timeout_seconds must be at least 1".to_string(),
                 ));
+            }
+        }
+
+        let mut seen_ids = std::collections::HashSet::new();
+        for sub in &self.subagents {
+            if sub.id.trim().is_empty() {
+                return Err(RuntimeError::Config(
+                    "subagent id must not be empty".to_string(),
+                ));
+            }
+            if !seen_ids.insert(sub.id.as_str()) {
+                return Err(RuntimeError::Config(format!(
+                    "duplicate subagent id '{}'",
+                    sub.id
+                )));
+            }
+            if sub.system_prompt.trim().is_empty() {
+                return Err(RuntimeError::Config(format!(
+                    "subagent '{}' system_prompt must not be empty",
+                    sub.id
+                )));
+            }
+            if let Some(url) = &sub.base_url {
+                validate_http_url(url, &format!("subagent '{}' base_url", sub.id))?;
             }
         }
         Ok(())
@@ -790,6 +847,109 @@ mod tests {
         let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
         let err = config.validate().err().unwrap();
         assert!(format!("{err}").contains("database.max_connections"));
+    }
+
+    #[test]
+    fn test_subagents_absent_means_empty() {
+        let config: RuntimeConfig = toml::from_str(minimal_oneshot_toml()).unwrap();
+        config.validate().unwrap();
+        assert!(config.subagents.is_empty());
+    }
+
+    #[test]
+    fn test_subagents_section_parses_with_defaults() {
+        let toml_str = r#"
+            mode = "serve"
+            [agent]
+            id = "manager"
+            model = "openai:gpt-4o"
+            api_key_env = "K"
+            system_prompt = "be helpful"
+
+            [[subagents]]
+            id = "researcher"
+            system_prompt = "You research."
+
+            [[subagents]]
+            id = "critic"
+            system_prompt = "You critique."
+            model = "anthropic:claude-opus-4-8"
+            description = "Critique a draft."
+            max_turns = 4
+        "#;
+        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.subagents.len(), 2);
+        assert_eq!(config.subagents[0].id, "researcher");
+        assert!(config.subagents[0].model.is_none());
+        assert!(config.subagents[0].description.is_none());
+        assert_eq!(
+            config.subagents[1].model.as_deref(),
+            Some("anthropic:claude-opus-4-8")
+        );
+        assert_eq!(config.subagents[1].max_turns, Some(4));
+    }
+
+    #[test]
+    fn test_duplicate_subagent_id_fails_validation() {
+        let toml_str = r#"
+            mode = "serve"
+            [agent]
+            id = "manager"
+            model = "openai:gpt-4o"
+            api_key_env = "K"
+            system_prompt = "be helpful"
+
+            [[subagents]]
+            id = "worker"
+            system_prompt = "a"
+
+            [[subagents]]
+            id = "worker"
+            system_prompt = "b"
+        "#;
+        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        let err = config.validate().err().unwrap();
+        assert!(format!("{err}").contains("duplicate subagent id 'worker'"));
+    }
+
+    #[test]
+    fn test_subagent_empty_system_prompt_fails_validation() {
+        let toml_str = r#"
+            mode = "serve"
+            [agent]
+            id = "manager"
+            model = "openai:gpt-4o"
+            api_key_env = "K"
+            system_prompt = "be helpful"
+
+            [[subagents]]
+            id = "worker"
+            system_prompt = "   "
+        "#;
+        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        let err = config.validate().err().unwrap();
+        assert!(format!("{err}").contains("system_prompt must not be empty"));
+    }
+
+    #[test]
+    fn test_subagent_base_url_must_be_http() {
+        let toml_str = r#"
+            mode = "serve"
+            [agent]
+            id = "manager"
+            model = "openai:gpt-4o"
+            api_key_env = "K"
+            system_prompt = "be helpful"
+
+            [[subagents]]
+            id = "worker"
+            system_prompt = "a"
+            base_url = "file:///etc/passwd"
+        "#;
+        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        let err = config.validate().err().unwrap();
+        assert!(format!("{err}").contains("http or https"));
     }
 
     #[test]

@@ -28,10 +28,12 @@ pub mod metrics;
 pub mod oneshot;
 pub mod proxy;
 pub mod serve;
+pub mod subagents;
 pub mod telemetry;
 
 pub use config::{
     AgentConfig, ApprovalConfig, ApprovalMode, DatabaseSettings, Mode, OneshotConfig,
-    ProxyTomlConfig, RuntimeConfig, RuntimeSettings,
+    ProxyTomlConfig, RuntimeConfig, RuntimeSettings, SubagentConfig,
 };
 pub use error::RuntimeError;
+pub use subagents::build_subagent_registry;

@@ -42,8 +42,28 @@ use crate::{RuntimeConfig, error::RuntimeError};
 /// - [`RuntimeError::ProxyTokenRead`] when the proxy branch cannot read the
 ///   sealed-token file.
 pub fn build_llm_config(config: &RuntimeConfig) -> Result<Config, RuntimeError> {
-    let mut llm_config = Config::from_model(&config.agent.model)
-        .map_err(|e| RuntimeError::Config(format!("model '{}': {e}", config.agent.model)))?;
+    build_llm_config_for(
+        config,
+        &config.agent.model,
+        config.agent.base_url.as_deref(),
+    )
+}
+
+/// Like [`build_llm_config`], but with `model` and `base_url` supplied by the
+/// caller rather than taken from `[agent]`.
+///
+/// Subagents reuse this to inherit the main agent's credential path (`[proxy]`
+/// or `agent.api_key_env`) while overriding the model and upstream endpoint.
+///
+/// # Errors
+/// Same conditions as [`build_llm_config`].
+pub fn build_llm_config_for(
+    config: &RuntimeConfig,
+    model: &str,
+    base_url: Option<&str>,
+) -> Result<Config, RuntimeError> {
+    let mut llm_config = Config::from_model(model)
+        .map_err(|e| RuntimeError::Config(format!("model '{model}': {e}")))?;
 
     if let Some(proxy) = &config.proxy {
         let token = read_token_file(&proxy.token_file)?;
@@ -51,7 +71,7 @@ pub fn build_llm_config(config: &RuntimeConfig) -> Result<Config, RuntimeError> 
             ProxyConfig::with_token_header(proxy.base_url.clone(), proxy.token_header.clone())
                 .map_err(|e| RuntimeError::Config(format!("proxy: {e}")))?;
 
-        if let Some(agent_url) = config.agent.base_url.as_deref()
+        if let Some(agent_url) = base_url
             && agent_url == proxy.base_url
         {
             warn!(
@@ -74,7 +94,7 @@ pub fn build_llm_config(config: &RuntimeConfig) -> Result<Config, RuntimeError> 
         // installed as the reqwest forward proxy in `build_client_resources`.
         llm_config.api_key = Some(token);
         llm_config = llm_config.with_proxy(proxy_config);
-        if let Some(url) = &config.agent.base_url {
+        if let Some(url) = base_url {
             llm_config = llm_config.with_base_url(url);
         }
     } else {
@@ -86,7 +106,7 @@ pub fn build_llm_config(config: &RuntimeConfig) -> Result<Config, RuntimeError> 
         let api_key =
             std::env::var(env_var).map_err(|_| RuntimeError::MissingEnv(env_var.to_string()))?;
         llm_config = llm_config.with_api_key(api_key);
-        if let Some(url) = &config.agent.base_url {
+        if let Some(url) = base_url {
             llm_config = llm_config.with_base_url(url);
         }
     }
@@ -136,6 +156,7 @@ mod tests {
             oneshot: None,
             proxy,
             database: None,
+            subagents: Vec::new(),
         }
     }
 
