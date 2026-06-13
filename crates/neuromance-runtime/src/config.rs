@@ -1,17 +1,21 @@
 //! Runtime configuration parsed from a TOML file.
 //!
 //! The runtime loads `$NEUROMANCE_CONFIG` (default `/etc/neuromance/config.toml`)
-//! at startup. API keys are *not* embedded in this file. Credentials reach the
-//! runtime via one of two paths:
+//! at startup. API keys are *not* embedded in this file.
 //!
-//! - **Env var (legacy)** — `agent.api_key_env` names an environment variable
-//!   whose value is the raw provider API key, read at startup.
-//! - **Tokenizer proxy** — `[proxy]` points at a sealed-token file on disk
-//!   (typically a projected k8s `Secret` volume). The runtime forwards LLM
+//! Endpoints, credentials, and default models are grouped into named
+//! `[[providers]]` entries. The `[agent]` references one by name; each subagent
+//! inherits the agent's provider unless it names its own. A provider supplies
+//! credentials via exactly one of two paths:
+//!
+//! - **Env var** — `api_key_env` names an environment variable whose value is
+//!   the raw provider API key, read at startup.
+//! - **Tokenizer proxy** — `[providers.proxy]` points at a sealed-token file on
+//!   disk (typically a projected k8s `Secret` volume). The runtime forwards LLM
 //!   requests through the tokenizer proxy, which injects the real credential
 //!   server-side. The agent pod never holds the plaintext.
 //!
-//! Exactly one of these paths must be configured.
+//! Exactly one of these paths must be configured per provider.
 
 use std::path::{Path, PathBuf};
 
@@ -48,11 +52,11 @@ pub struct RuntimeConfig {
     pub tools: Vec<ToolConfig>,
     #[serde(default)]
     pub oneshot: Option<OneshotConfig>,
-    /// When set, the runtime routes outbound LLM requests through a tokenizer
-    /// proxy and reads its sealed token from `proxy.token_file` instead
-    /// of from `agent.api_key_env`.
+    /// Named providers: each bundles an endpoint, a credential, and a default
+    /// model. The `[agent]` and each subagent reference one by name. At least
+    /// one entry is required.
     #[serde(default)]
-    pub proxy: Option<ProxyTomlConfig>,
+    pub providers: Vec<ProviderConfig>,
     /// When set, conversation history is written through to postgres as
     /// tasks run. In-memory state stays authoritative for serving.
     #[serde(default)]
@@ -65,11 +69,45 @@ pub struct RuntimeConfig {
     pub subagents: Vec<SubagentConfig>,
 }
 
+/// A named provider: an endpoint, a credential, and a default model bundled
+/// under a name that `[agent]` and `[[subagents]]` reference.
+///
+/// Exactly one credential path must be set: either `api_key_env` (raw key from
+/// the environment) or an inline `[providers.proxy]` table (sealed token routed
+/// through a tokenizer proxy). The two are mutually exclusive.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ProviderConfig {
+    /// Unique name, referenced by `agent.provider` and `subagent.provider`.
+    pub name: String,
+    /// Default model string, e.g. `openai:gpt-4o`. The `provider:` prefix
+    /// selects the client type and default endpoint (see `Config::from_model`).
+    /// An agent or subagent may override it with its own `model`.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Upstream LLM endpoint, e.g. `http://llama-server.windowlickers.svc:8080/v1`
+    /// for an in-cluster `OpenAI`-compatible server. Falls back to the default
+    /// for the model prefix; required when `model` uses the generic
+    /// `chat_completions:` or `responses:` prefixes, which have no default.
+    ///
+    /// When `proxy` is set, this is still the *upstream* the proxy routes to —
+    /// `proxy.base_url` is the forward proxy itself. The upstream URL travels in
+    /// the absolute-form request URI sent through the proxy.
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// Environment variable holding the raw provider API key. Mutually exclusive
+    /// with `proxy`.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    /// Tokenizer proxy for this provider. Mutually exclusive with `api_key_env`.
+    #[serde(default)]
+    pub proxy: Option<ProviderProxyConfig>,
+}
+
 /// A leaf subagent: a named in-process agent the main agent can delegate to.
 ///
-/// Subagents inherit the main agent's credential path (`[proxy]` or
-/// `agent.api_key_env`); only the model, upstream endpoint, turn cap, and
-/// prompt differ. They carry no tools of their own — they are pure LLM workers.
+/// Subagents inherit the parent agent's provider unless they name their own; a
+/// subagent may also override just the model. They carry no tools of their own
+/// — they are pure LLM workers.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SubagentConfig {
     /// Stable identifier. Used as the delegate tool name and the
@@ -81,12 +119,13 @@ pub struct SubagentConfig {
     /// "Delegate a task to the '<id>' subagent." when omitted.
     #[serde(default)]
     pub description: Option<String>,
-    /// Model override; defaults to `agent.model`.
+    /// Provider override; defaults to the parent agent's provider.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Model override. Defaults to the chosen provider's `model`, then the
+    /// parent agent's effective model.
     #[serde(default)]
     pub model: Option<String>,
-    /// Upstream LLM endpoint override; defaults to `agent.base_url`.
-    #[serde(default)]
-    pub base_url: Option<String>,
     /// Maximum chat-loop turns; defaults to the `Core` default when unset.
     #[serde(default)]
     pub max_turns: Option<u32>,
@@ -95,39 +134,28 @@ pub struct SubagentConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AgentConfig {
     pub id: String,
-    pub model: String,
-    /// Environment variable holding the raw provider API key. Required unless
-    /// `[proxy]` is set, in which case the sealed token from the proxy section
-    /// replaces it and this field should be omitted.
+    /// Name of a `[[providers]]` entry supplying the endpoint, credential, and
+    /// default model.
+    pub provider: String,
+    /// Model override. The effective model is this when set, otherwise the
+    /// referenced provider's `model`; one of the two must be present.
     #[serde(default)]
-    pub api_key_env: Option<String>,
+    pub model: Option<String>,
     pub system_prompt: String,
-    /// Override the upstream LLM endpoint, e.g. `http://llama-server.windowlickers.svc:8080/v1`
-    /// for an in-cluster `OpenAI`-compatible server. Required when `model` uses the
-    /// generic `chat_completions:` or `responses:` prefixes, which have no default
-    /// base URL.
-    ///
-    /// When `[proxy]` is set, this field is still the *upstream* the proxy
-    /// routes to — `proxy.base_url` is the forward proxy itself,
-    /// not the upstream. The upstream URL travels in the absolute-form
-    /// request URI sent through the proxy. The two fields have distinct roles
-    /// and can both be set.
-    #[serde(default)]
-    pub base_url: Option<String>,
     #[serde(default)]
     pub max_turns: Option<u32>,
     #[serde(default)]
     pub streaming: bool,
 }
 
-/// Tokenizer-proxy settings.
+/// Per-provider tokenizer-proxy settings.
 ///
-/// When present, the runtime sends every outbound LLM request to `base_url`
-/// with the sealed token from `token_file` carried in the `token_header`. The
-/// proxy decrypts the sealed token server-side and injects the real provider
-/// credential. The agent pod never sees the plaintext.
+/// When present on a provider, the runtime sends that provider's outbound LLM
+/// requests to `base_url` with the sealed token from `token_file` carried in
+/// the `token_header`. The proxy decrypts the sealed token server-side and
+/// injects the real provider credential. The agent pod never sees the plaintext.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ProxyTomlConfig {
+pub struct ProviderProxyConfig {
     /// URL of the tokenizer-proxy Service (e.g.
     /// `http://tokenizer-proxy.windowlickers.svc.cluster.local:8080`). The
     /// runtime installs this as the HTTP forward proxy on the reqwest
@@ -151,7 +179,7 @@ fn default_token_header() -> String {
 ///
 /// The connection URL is a credential (it usually embeds a password), so it
 /// is never written in the TOML file — `url_env` names the environment
-/// variable that holds it, the same policy as `agent.api_key_env`.
+/// variable that holds it, the same policy as a provider's `api_key_env`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DatabaseSettings {
     /// Environment variable holding the postgres connection URL
@@ -266,6 +294,25 @@ impl RuntimeConfig {
         Ok(config)
     }
 
+    /// Look up a provider by name.
+    #[must_use]
+    pub fn provider(&self, name: &str) -> Option<&ProviderConfig> {
+        self.providers.iter().find(|p| p.name == name)
+    }
+
+    /// The agent's effective model: `agent.model` if set, otherwise the
+    /// referenced provider's `model`.
+    ///
+    /// Returns `None` when neither is set or the agent's provider is unknown —
+    /// both rejected by [`Self::validate`].
+    #[must_use]
+    pub fn agent_model(&self) -> Option<&str> {
+        if let Some(model) = self.agent.model.as_deref() {
+            return Some(model);
+        }
+        self.provider(&self.agent.provider)?.model.as_deref()
+    }
+
     /// Cross-field validation that serde alone cannot express.
     ///
     /// # Errors
@@ -274,9 +321,12 @@ impl RuntimeConfig {
     /// - `approval.mode = "async"` but `approval.webhook_url` is unset
     /// - `approval.webhook_url` is set to a URL whose scheme is not
     ///   `http` or `https`
-    /// - neither `agent.api_key_env` nor `[proxy]` is set, or both are set
-    /// - `[proxy].base_url` is not an `http(s)` URL or `[proxy].token_file`
-    ///   is not an absolute path
+    /// - no `[[providers]]` entry is present
+    /// - a provider has a duplicate name, both or neither credential path, or
+    ///   an invalid `base_url`/proxy
+    /// - `agent.provider` (or a `subagent.provider`) names no provider
+    /// - the agent has no effective model (`agent.model` and the provider's
+    ///   `model` are both unset)
     pub fn validate(&self) -> Result<(), RuntimeError> {
         if matches!(self.mode, Mode::Oneshot) && self.oneshot.is_none() {
             return Err(RuntimeError::Config(
@@ -292,38 +342,20 @@ impl RuntimeConfig {
         if let Some(url) = &self.approval.webhook_url {
             validate_http_url(url, "approval.webhook_url")?;
         }
-        if let Some(url) = &self.agent.base_url {
-            validate_http_url(url, "agent.base_url")?;
-        }
 
-        match (&self.agent.api_key_env, &self.proxy) {
-            (Some(_), Some(_)) => {
-                return Err(RuntimeError::Config(
-                    "agent.api_key_env and [proxy] are mutually exclusive: set one or the other"
-                        .to_string(),
-                ));
-            }
-            (None, None) => {
-                return Err(RuntimeError::Config(
-                    "credentials must come from either agent.api_key_env or [proxy]".to_string(),
-                ));
-            }
-            _ => {}
-        }
+        self.validate_providers()?;
 
-        if let Some(proxy) = &self.proxy {
-            validate_http_url(&proxy.base_url, "proxy.base_url")?;
-            if !proxy.token_file.is_absolute() {
-                return Err(RuntimeError::Config(format!(
-                    "proxy.token_file must be an absolute path, got '{}'",
-                    proxy.token_file.display()
-                )));
-            }
-            if proxy.token_header.trim().is_empty() {
-                return Err(RuntimeError::Config(
-                    "proxy.token_header must not be empty".to_string(),
-                ));
-            }
+        if self.provider(&self.agent.provider).is_none() {
+            return Err(RuntimeError::Config(format!(
+                "agent.provider '{}' does not match any [[providers]] entry",
+                self.agent.provider
+            )));
+        }
+        if self.agent_model().is_none() {
+            return Err(RuntimeError::Config(format!(
+                "agent has no model: set agent.model or provider '{}' model",
+                self.agent.provider
+            )));
         }
 
         if self.runtime.max_queue_depth == 0 {
@@ -369,8 +401,75 @@ impl RuntimeConfig {
                     sub.id
                 )));
             }
-            if let Some(url) = &sub.base_url {
-                validate_http_url(url, &format!("subagent '{}' base_url", sub.id))?;
+            if let Some(provider) = &sub.provider
+                && self.provider(provider).is_none()
+            {
+                return Err(RuntimeError::Config(format!(
+                    "subagent '{}' provider '{provider}' does not match any [[providers]] entry",
+                    sub.id
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate `[[providers]]`: at least one entry, unique names, exactly one
+    /// credential path each, and well-formed URLs/proxy fields.
+    fn validate_providers(&self) -> Result<(), RuntimeError> {
+        if self.providers.is_empty() {
+            return Err(RuntimeError::Config(
+                "at least one [[providers]] entry is required".to_string(),
+            ));
+        }
+        let mut seen_names = std::collections::HashSet::new();
+        for provider in &self.providers {
+            if provider.name.trim().is_empty() {
+                return Err(RuntimeError::Config(
+                    "provider name must not be empty".to_string(),
+                ));
+            }
+            if !seen_names.insert(provider.name.as_str()) {
+                return Err(RuntimeError::Config(format!(
+                    "duplicate provider name '{}'",
+                    provider.name
+                )));
+            }
+            match (&provider.api_key_env, &provider.proxy) {
+                (Some(_), Some(_)) => {
+                    return Err(RuntimeError::Config(format!(
+                        "provider '{}': api_key_env and proxy are mutually exclusive",
+                        provider.name
+                    )));
+                }
+                (None, None) => {
+                    return Err(RuntimeError::Config(format!(
+                        "provider '{}': must set either api_key_env or proxy",
+                        provider.name
+                    )));
+                }
+                _ => {}
+            }
+            if let Some(url) = &provider.base_url {
+                validate_http_url(url, &format!("provider '{}' base_url", provider.name))?;
+            }
+            if let Some(proxy) = &provider.proxy {
+                validate_http_url(
+                    &proxy.base_url,
+                    &format!("provider '{}' proxy.base_url", provider.name),
+                )?;
+                if !proxy.token_file.is_absolute() {
+                    return Err(RuntimeError::Config(format!(
+                        "provider '{}' proxy.token_file must be an absolute path, got '{}'",
+                        provider.name,
+                        proxy.token_file.display()
+                    )));
+                }
+                if proxy.token_header.trim().is_empty() {
+                    return Err(RuntimeError::Config(format!(
+                        "provider '{}' proxy.token_header must not be empty",
+                        provider.name
+                    )));
+                }
             }
         }
         Ok(())
@@ -400,15 +499,39 @@ mod tests {
         r#"
             mode = "oneshot"
 
-            [agent]
-            id = "research"
+            [[providers]]
+            name = "default"
             model = "openai:gpt-4o"
             api_key_env = "OPENAI_API_KEY"
+
+            [agent]
+            id = "research"
+            provider = "default"
             system_prompt = "Be helpful."
 
             [oneshot]
             input = "Hello, world."
         "#
+    }
+
+    /// A `[[providers]]` + `[agent]` preamble for `serve`-mode tests, leaving the
+    /// caller to append the section under test.
+    const SERVE_PREAMBLE: &str = r#"
+            mode = "serve"
+
+            [[providers]]
+            name = "default"
+            model = "openai:gpt-4o"
+            api_key_env = "K"
+
+            [agent]
+            id = "manager"
+            provider = "default"
+            system_prompt = "be helpful"
+    "#;
+
+    fn serve_config(extra: &str) -> RuntimeConfig {
+        toml::from_str(&format!("{SERVE_PREAMBLE}{extra}")).unwrap()
     }
 
     #[test]
@@ -417,6 +540,8 @@ mod tests {
         config.validate().unwrap();
         assert_eq!(config.mode, Mode::Oneshot);
         assert_eq!(config.agent.id, "research");
+        assert_eq!(config.agent.provider, "default");
+        assert_eq!(config.agent_model(), Some("openai:gpt-4o"));
         assert_eq!(config.runtime.listen_addr, "127.0.0.1:8080");
         assert_eq!(config.runtime.shutdown_grace_seconds, 30);
         assert_eq!(config.runtime.max_queue_depth, 8);
@@ -427,17 +552,12 @@ mod tests {
 
     #[test]
     fn test_max_queue_depth_round_trips_when_set() {
-        let toml_str = r#"
-            mode = "serve"
-            [agent]
-            id = "manager"
-            model = "openai:gpt-4o"
-            api_key_env = "K"
-            system_prompt = "be helpful"
+        let config = serve_config(
+            r"
             [runtime]
             max_queue_depth = 64
-        "#;
-        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        ",
+        );
         config.validate().unwrap();
         assert_eq!(config.runtime.max_queue_depth, 64);
     }
@@ -446,10 +566,13 @@ mod tests {
     fn test_oneshot_without_section_fails_validation() {
         let toml_str = r#"
             mode = "oneshot"
-            [agent]
-            id = "x"
+            [[providers]]
+            name = "default"
             model = "openai:gpt-4o"
             api_key_env = "K"
+            [agent]
+            id = "x"
+            provider = "default"
             system_prompt = "be helpful"
         "#;
         let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
@@ -459,52 +582,37 @@ mod tests {
 
     #[test]
     fn test_zero_max_queue_depth_fails_validation() {
-        let toml_str = r#"
-            mode = "serve"
-            [agent]
-            id = "x"
-            model = "openai:gpt-4o"
-            api_key_env = "K"
-            system_prompt = "be helpful"
+        let config = serve_config(
+            r"
             [runtime]
             max_queue_depth = 0
-        "#;
-        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        ",
+        );
         let err = config.validate().err().unwrap();
         assert!(format!("{err}").contains("max_queue_depth"));
     }
 
     #[test]
     fn test_async_approval_without_webhook_fails_validation() {
-        let toml_str = r#"
-            mode = "serve"
-            [agent]
-            id = "x"
-            model = "openai:gpt-4o"
-            api_key_env = "K"
-            system_prompt = "be helpful"
+        let config = serve_config(
+            r#"
             [approval]
             mode = "async"
-        "#;
-        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        "#,
+        );
         let err = config.validate().err().unwrap();
         assert!(format!("{err}").contains("webhook_url"));
     }
 
     #[test]
     fn test_webhook_url_must_be_http_or_https() {
-        let toml_str = r#"
-            mode = "serve"
-            [agent]
-            id = "x"
-            model = "openai:gpt-4o"
-            api_key_env = "K"
-            system_prompt = "be helpful"
+        let config = serve_config(
+            r#"
             [approval]
             mode = "async"
             webhook_url = "file:///etc/passwd"
-        "#;
-        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        "#,
+        );
         let err = config.validate().err().unwrap();
         let msg = format!("{err}");
         assert!(
@@ -515,18 +623,13 @@ mod tests {
 
     #[test]
     fn test_webhook_url_https_validates() {
-        let toml_str = r#"
-            mode = "serve"
-            [agent]
-            id = "x"
-            model = "openai:gpt-4o"
-            api_key_env = "K"
-            system_prompt = "be helpful"
+        let config = serve_config(
+            r#"
             [approval]
             mode = "async"
             webhook_url = "https://approve.example.com/decide"
-        "#;
-        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        "#,
+        );
         config.validate().unwrap();
     }
 
@@ -538,66 +641,163 @@ mod tests {
 
     #[test]
     fn test_allow_unsafe_tools_round_trips_when_set() {
-        let toml_str = r#"
-            mode = "serve"
-            [agent]
-            id = "manager"
-            model = "openai:gpt-4o"
-            api_key_env = "K"
-            system_prompt = "be helpful"
+        let config = serve_config(
+            r#"
             [approval]
             mode = "auto"
             allow_unsafe_tools = true
-        "#;
-        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        "#,
+        );
         config.validate().unwrap();
         assert!(config.approval.allow_unsafe_tools);
     }
 
     #[test]
     fn test_serve_mode_does_not_require_oneshot() {
-        let toml_str = r#"
-            mode = "serve"
-            [agent]
-            id = "x"
-            model = "openai:gpt-4o"
-            api_key_env = "K"
-            system_prompt = "be helpful"
-        "#;
-        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        let config = serve_config("");
         config.validate().unwrap();
         assert_eq!(config.mode, Mode::Serve);
     }
 
     #[test]
-    fn test_base_url_round_trips_from_toml() {
+    fn test_no_providers_fails_validation() {
         let toml_str = r#"
             mode = "serve"
             [agent]
-            id = "manager"
-            model = "chat_completions:qwen"
-            api_key_env = "OPENAI_API_KEY"
+            id = "x"
+            provider = "default"
             system_prompt = "be helpful"
+        "#;
+        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        let err = config.validate().err().unwrap();
+        assert!(format!("{err}").contains("at least one [[providers]]"));
+    }
+
+    #[test]
+    fn test_duplicate_provider_name_fails_validation() {
+        let toml_str = r#"
+            mode = "serve"
+            [[providers]]
+            name = "dup"
+            model = "openai:gpt-4o"
+            api_key_env = "A"
+            [[providers]]
+            name = "dup"
+            model = "openai:gpt-4o"
+            api_key_env = "B"
+            [agent]
+            id = "x"
+            provider = "dup"
+            system_prompt = "be helpful"
+        "#;
+        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        let err = config.validate().err().unwrap();
+        assert!(format!("{err}").contains("duplicate provider name 'dup'"));
+    }
+
+    #[test]
+    fn test_agent_provider_unknown_fails_validation() {
+        let toml_str = r#"
+            mode = "serve"
+            [[providers]]
+            name = "default"
+            model = "openai:gpt-4o"
+            api_key_env = "K"
+            [agent]
+            id = "x"
+            provider = "nope"
+            system_prompt = "be helpful"
+        "#;
+        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        let err = config.validate().err().unwrap();
+        assert!(
+            format!("{err}").contains("agent.provider 'nope' does not match"),
+            "got: {err}",
+        );
+    }
+
+    #[test]
+    fn test_agent_no_model_anywhere_fails_validation() {
+        let toml_str = r#"
+            mode = "serve"
+            [[providers]]
+            name = "default"
+            api_key_env = "K"
+            [agent]
+            id = "x"
+            provider = "default"
+            system_prompt = "be helpful"
+        "#;
+        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        let err = config.validate().err().unwrap();
+        assert!(
+            format!("{err}").contains("agent has no model"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_agent_model_falls_back_to_provider_model() {
+        let config: RuntimeConfig = toml::from_str(minimal_oneshot_toml()).unwrap();
+        config.validate().unwrap();
+        assert!(config.agent.model.is_none());
+        assert_eq!(config.agent_model(), Some("openai:gpt-4o"));
+    }
+
+    #[test]
+    fn test_agent_model_overrides_provider_model() {
+        let toml_str = r#"
+            mode = "serve"
+            [[providers]]
+            name = "default"
+            model = "openai:gpt-4o"
+            api_key_env = "K"
+            [agent]
+            id = "x"
+            provider = "default"
+            model = "openai:gpt-4o-mini"
+            system_prompt = "be helpful"
+        "#;
+        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.agent_model(), Some("openai:gpt-4o-mini"));
+    }
+
+    #[test]
+    fn test_provider_base_url_round_trips_from_toml() {
+        let toml_str = r#"
+            mode = "serve"
+            [[providers]]
+            name = "local"
+            model = "chat_completions:qwen"
             base_url = "http://llama-server.windowlickers.svc.cluster.local:8080/v1"
+            api_key_env = "OPENAI_API_KEY"
+            [agent]
+            id = "manager"
+            provider = "local"
+            system_prompt = "be helpful"
         "#;
         let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
         config.validate().unwrap();
         assert_eq!(
-            config.agent.base_url.as_deref(),
+            config.provider("local").unwrap().base_url.as_deref(),
             Some("http://llama-server.windowlickers.svc.cluster.local:8080/v1"),
         );
     }
 
     #[test]
-    fn test_base_url_rejects_non_http_scheme() {
+    fn test_provider_base_url_rejects_non_http_scheme() {
         let toml_str = r#"
             mode = "serve"
+            [[providers]]
+            name = "default"
+            model = "openai:gpt-4o"
+            base_url = "file:///etc/passwd"
+            api_key_env = "K"
             [agent]
             id = "x"
-            model = "openai:gpt-4o"
-            api_key_env = "K"
+            provider = "default"
             system_prompt = "x"
-            base_url = "file:///etc/passwd"
         "#;
         let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
         let err = config.validate().err().unwrap();
@@ -605,20 +805,23 @@ mod tests {
     }
 
     #[test]
-    fn test_proxy_section_parses_with_required_fields() {
+    fn test_provider_proxy_parses_with_required_fields() {
         let toml_str = r#"
             mode = "serve"
-            [agent]
-            id = "x"
+            [[providers]]
+            name = "default"
             model = "openai:gpt-4o"
-            system_prompt = "x"
-            [proxy]
+            [providers.proxy]
             base_url = "http://tokenizer-proxy.svc:8080"
             token_file = "/var/run/neuromance/tokens/llm"
+            [agent]
+            id = "x"
+            provider = "default"
+            system_prompt = "x"
         "#;
         let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
         config.validate().unwrap();
-        let proxy = config.proxy.expect("proxy section");
+        let proxy = config.provider("default").unwrap().proxy.as_ref().unwrap();
         assert_eq!(proxy.base_url, "http://tokenizer-proxy.svc:8080");
         assert_eq!(
             proxy.token_file,
@@ -626,40 +829,46 @@ mod tests {
         );
         // Default applied.
         assert_eq!(proxy.token_header, "X-Tokenizer-Token");
-        assert!(config.agent.api_key_env.is_none());
+        assert!(config.provider("default").unwrap().api_key_env.is_none());
     }
 
     #[test]
-    fn test_proxy_section_round_trips_custom_token_header() {
+    fn test_provider_proxy_round_trips_custom_token_header() {
         let toml_str = r#"
             mode = "serve"
-            [agent]
-            id = "x"
+            [[providers]]
+            name = "default"
             model = "openai:gpt-4o"
-            system_prompt = "x"
-            [proxy]
+            [providers.proxy]
             base_url = "https://tokenizer-proxy.example.com"
             token_file = "/var/run/tokens/llm"
             token_header = "X-Token"
+            [agent]
+            id = "x"
+            provider = "default"
+            system_prompt = "x"
         "#;
         let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
         config.validate().unwrap();
-        let proxy = config.proxy.expect("proxy section");
+        let proxy = config.provider("default").unwrap().proxy.as_ref().unwrap();
         assert_eq!(proxy.token_header, "X-Token");
     }
 
     #[test]
-    fn test_proxy_and_api_key_env_are_mutually_exclusive() {
+    fn test_provider_proxy_and_api_key_env_are_mutually_exclusive() {
         let toml_str = r#"
             mode = "serve"
-            [agent]
-            id = "x"
+            [[providers]]
+            name = "default"
             model = "openai:gpt-4o"
             api_key_env = "K"
-            system_prompt = "x"
-            [proxy]
+            [providers.proxy]
             base_url = "http://tokenizer-proxy.svc:8080"
             token_file = "/var/run/tokens/llm"
+            [agent]
+            id = "x"
+            provider = "default"
+            system_prompt = "x"
         "#;
         let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
         let err = config.validate().err().unwrap();
@@ -670,33 +879,64 @@ mod tests {
     }
 
     #[test]
-    fn test_missing_both_api_key_env_and_proxy_fails() {
+    fn test_provider_without_credential_fails() {
         let toml_str = r#"
             mode = "serve"
+            [[providers]]
+            name = "default"
+            model = "openai:gpt-4o"
             [agent]
             id = "x"
-            model = "openai:gpt-4o"
+            provider = "default"
             system_prompt = "x"
         "#;
         let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
         let err = config.validate().err().unwrap();
         assert!(
-            format!("{err}").contains("credentials must come from"),
-            "expected missing-credentials error, got: {err}",
+            format!("{err}").contains("must set either api_key_env or proxy"),
+            "expected missing-credential error, got: {err}",
         );
     }
 
     #[test]
-    fn test_proxy_token_file_must_be_absolute() {
+    fn test_two_providers_with_distinct_credential_paths_coexist() {
         let toml_str = r#"
             mode = "serve"
+            [[providers]]
+            name = "keyed"
+            model = "openai:gpt-4o"
+            api_key_env = "OPENAI_API_KEY"
+            [[providers]]
+            name = "proxied"
+            model = "openai:gpt-4o"
+            [providers.proxy]
+            base_url = "http://tokenizer-proxy.svc:8080"
+            token_file = "/var/run/tokens/llm"
             [agent]
             id = "x"
-            model = "openai:gpt-4o"
+            provider = "keyed"
             system_prompt = "x"
-            [proxy]
+        "#;
+        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        config.validate().unwrap();
+        assert!(config.provider("keyed").unwrap().api_key_env.is_some());
+        assert!(config.provider("proxied").unwrap().proxy.is_some());
+    }
+
+    #[test]
+    fn test_provider_proxy_token_file_must_be_absolute() {
+        let toml_str = r#"
+            mode = "serve"
+            [[providers]]
+            name = "default"
+            model = "openai:gpt-4o"
+            [providers.proxy]
             base_url = "http://tokenizer-proxy.svc:8080"
             token_file = "relative/path/token"
+            [agent]
+            id = "x"
+            provider = "default"
+            system_prompt = "x"
         "#;
         let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
         let err = config.validate().err().unwrap();
@@ -707,16 +947,19 @@ mod tests {
     }
 
     #[test]
-    fn test_proxy_base_url_rejects_non_http_scheme() {
+    fn test_provider_proxy_base_url_rejects_non_http_scheme() {
         let toml_str = r#"
             mode = "serve"
-            [agent]
-            id = "x"
+            [[providers]]
+            name = "default"
             model = "openai:gpt-4o"
-            system_prompt = "x"
-            [proxy]
+            [providers.proxy]
             base_url = "file:///etc/passwd"
             token_file = "/var/run/tokens/llm"
+            [agent]
+            id = "x"
+            provider = "default"
+            system_prompt = "x"
         "#;
         let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
         let err = config.validate().err().unwrap();
@@ -724,17 +967,20 @@ mod tests {
     }
 
     #[test]
-    fn test_proxy_token_header_must_not_be_empty() {
+    fn test_provider_proxy_token_header_must_not_be_empty() {
         let toml_str = r#"
             mode = "serve"
-            [agent]
-            id = "x"
+            [[providers]]
+            name = "default"
             model = "openai:gpt-4o"
-            system_prompt = "x"
-            [proxy]
+            [providers.proxy]
             base_url = "http://tokenizer-proxy.svc:8080"
             token_file = "/var/run/tokens/llm"
             token_header = "   "
+            [agent]
+            id = "x"
+            provider = "default"
+            system_prompt = "x"
         "#;
         let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
         let err = config.validate().err().unwrap();
@@ -750,17 +996,12 @@ mod tests {
 
     #[test]
     fn test_database_section_applies_defaults() {
-        let toml_str = r#"
-            mode = "serve"
-            [agent]
-            id = "x"
-            model = "openai:gpt-4o"
-            api_key_env = "K"
-            system_prompt = "x"
+        let config = serve_config(
+            r#"
             [database]
             url_env = "DATABASE_URL"
-        "#;
-        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        "#,
+        );
         config.validate().unwrap();
         let database = config.database.expect("database section");
         assert_eq!(database.url_env, "DATABASE_URL");
@@ -770,19 +1011,14 @@ mod tests {
 
     #[test]
     fn test_database_section_round_trips_custom_values() {
-        let toml_str = r#"
-            mode = "serve"
-            [agent]
-            id = "x"
-            model = "openai:gpt-4o"
-            api_key_env = "K"
-            system_prompt = "x"
+        let config = serve_config(
+            r#"
             [database]
             url_env = "PG_URL"
             max_connections = 12
             acquire_timeout_seconds = 30
-        "#;
-        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        "#,
+        );
         config.validate().unwrap();
 
         // Serialize back out and reparse to exercise the Serialize impl.
@@ -798,53 +1034,38 @@ mod tests {
 
     #[test]
     fn test_database_zero_acquire_timeout_fails_validation() {
-        let toml_str = r#"
-            mode = "serve"
-            [agent]
-            id = "x"
-            model = "openai:gpt-4o"
-            api_key_env = "K"
-            system_prompt = "x"
+        let config = serve_config(
+            r#"
             [database]
             url_env = "DATABASE_URL"
             acquire_timeout_seconds = 0
-        "#;
-        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        "#,
+        );
         let err = config.validate().err().unwrap();
         assert!(format!("{err}").contains("database.acquire_timeout_seconds"));
     }
 
     #[test]
     fn test_database_empty_url_env_fails_validation() {
-        let toml_str = r#"
-            mode = "serve"
-            [agent]
-            id = "x"
-            model = "openai:gpt-4o"
-            api_key_env = "K"
-            system_prompt = "x"
+        let config = serve_config(
+            r#"
             [database]
             url_env = "  "
-        "#;
-        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        "#,
+        );
         let err = config.validate().err().unwrap();
         assert!(format!("{err}").contains("database.url_env"));
     }
 
     #[test]
     fn test_database_zero_max_connections_fails_validation() {
-        let toml_str = r#"
-            mode = "serve"
-            [agent]
-            id = "x"
-            model = "openai:gpt-4o"
-            api_key_env = "K"
-            system_prompt = "x"
+        let config = serve_config(
+            r#"
             [database]
             url_env = "DATABASE_URL"
             max_connections = 0
-        "#;
-        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        "#,
+        );
         let err = config.validate().err().unwrap();
         assert!(format!("{err}").contains("database.max_connections"));
     }
@@ -858,14 +1079,8 @@ mod tests {
 
     #[test]
     fn test_subagents_section_parses_with_defaults() {
-        let toml_str = r#"
-            mode = "serve"
-            [agent]
-            id = "manager"
-            model = "openai:gpt-4o"
-            api_key_env = "K"
-            system_prompt = "be helpful"
-
+        let config = serve_config(
+            r#"
             [[subagents]]
             id = "researcher"
             system_prompt = "You research."
@@ -876,11 +1091,12 @@ mod tests {
             model = "anthropic:claude-opus-4-8"
             description = "Critique a draft."
             max_turns = 4
-        "#;
-        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        "#,
+        );
         config.validate().unwrap();
         assert_eq!(config.subagents.len(), 2);
         assert_eq!(config.subagents[0].id, "researcher");
+        assert!(config.subagents[0].provider.is_none());
         assert!(config.subagents[0].model.is_none());
         assert!(config.subagents[0].description.is_none());
         assert_eq!(
@@ -892,14 +1108,8 @@ mod tests {
 
     #[test]
     fn test_duplicate_subagent_id_fails_validation() {
-        let toml_str = r#"
-            mode = "serve"
-            [agent]
-            id = "manager"
-            model = "openai:gpt-4o"
-            api_key_env = "K"
-            system_prompt = "be helpful"
-
+        let config = serve_config(
+            r#"
             [[subagents]]
             id = "worker"
             system_prompt = "a"
@@ -907,68 +1117,79 @@ mod tests {
             [[subagents]]
             id = "worker"
             system_prompt = "b"
-        "#;
-        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        "#,
+        );
         let err = config.validate().err().unwrap();
         assert!(format!("{err}").contains("duplicate subagent id 'worker'"));
     }
 
     #[test]
     fn test_subagent_empty_system_prompt_fails_validation() {
-        let toml_str = r#"
-            mode = "serve"
-            [agent]
-            id = "manager"
-            model = "openai:gpt-4o"
-            api_key_env = "K"
-            system_prompt = "be helpful"
-
+        let config = serve_config(
+            r#"
             [[subagents]]
             id = "worker"
             system_prompt = "   "
-        "#;
-        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        "#,
+        );
         let err = config.validate().err().unwrap();
         assert!(format!("{err}").contains("system_prompt must not be empty"));
     }
 
     #[test]
-    fn test_subagent_base_url_must_be_http() {
-        let toml_str = r#"
-            mode = "serve"
-            [agent]
-            id = "manager"
-            model = "openai:gpt-4o"
-            api_key_env = "K"
-            system_prompt = "be helpful"
-
+    fn test_subagent_provider_must_reference_existing_provider() {
+        let config = serve_config(
+            r#"
             [[subagents]]
             id = "worker"
             system_prompt = "a"
-            base_url = "file:///etc/passwd"
+            provider = "ghost"
+        "#,
+        );
+        let err = config.validate().err().unwrap();
+        assert!(
+            format!("{err}").contains("provider 'ghost' does not match"),
+            "got: {err}",
+        );
+    }
+
+    #[test]
+    fn test_subagent_can_reference_a_second_provider() {
+        let toml_str = r#"
+            mode = "serve"
+            [[providers]]
+            name = "primary"
+            model = "openai:gpt-4o"
+            api_key_env = "A"
+            [[providers]]
+            name = "secondary"
+            model = "anthropic:claude-opus-4-8"
+            api_key_env = "B"
+            [agent]
+            id = "manager"
+            provider = "primary"
+            system_prompt = "be helpful"
+            [[subagents]]
+            id = "worker"
+            system_prompt = "a"
+            provider = "secondary"
         "#;
         let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
-        let err = config.validate().err().unwrap();
-        assert!(format!("{err}").contains("http or https"));
+        config.validate().unwrap();
+        assert_eq!(config.subagents[0].provider.as_deref(), Some("secondary"));
     }
 
     #[test]
     fn test_tools_section_parses() {
-        let toml_str = r#"
-            mode = "serve"
-            [agent]
-            id = "x"
-            model = "openai:gpt-4o"
-            api_key_env = "K"
-            system_prompt = "x"
-
+        let config = serve_config(
+            r#"
             [[tools]]
             name = "read"
 
             [[tools]]
             name = "bash"
-        "#;
-        let config: RuntimeConfig = toml::from_str(toml_str).unwrap();
+        "#,
+        );
         config.validate().unwrap();
         assert_eq!(config.tools.len(), 2);
         assert_eq!(config.tools[0].name, "read");

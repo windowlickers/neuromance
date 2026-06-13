@@ -91,29 +91,47 @@ neuromance/
 └── README.md
 ```
 
-## Tokenizer proxy
+## Providers
 
-When the runtime is deployed behind a tokenizer proxy, the agent pod never holds the plaintext provider credential. The pod reads a sealed token from a projected secret, sends it to the proxy under `X-Tokenizer-Token`, and the proxy decrypts the token and injects the real provider key server-side before forwarding to the upstream.
-
-`agent.base_url` and `[proxy].base_url` carry distinct URLs:
-
-- `agent.base_url` is the **upstream** LLM endpoint. Falls back to the provider default from the `model` prefix (e.g. `openai:gpt-4o` → `https://api.openai.com/v1`).
-- `[proxy].base_url` is the **tokenizer proxy** itself. The client attaches it as an HTTP forward proxy so requests leave the pod in absolute-form (RFC 7230 §5.3.2) with the upstream authority in the request URL — no side-band routing header is needed.
+Endpoints, credentials, and default models are grouped into named `[[providers]]` entries. The `[agent]` references one by name; each subagent inherits the agent's provider unless it names its own. A provider supplies credentials via exactly one of two paths — `api_key_env` (a raw key read from the environment) or an inline `[providers.proxy]` table (a sealed token routed through a tokenizer proxy). At least one provider is required.
 
 ```toml
 mode = "serve"
 
+[[providers]]
+name = "primary"
+model = "openai:gpt-4o"          # default model; an agent/subagent may override it
+api_key_env = "OPENAI_API_KEY"   # raw key from the environment
+
 [agent]
 id = "research-agent"
+provider = "primary"             # references a [[providers]] entry
+# model omitted — inherits the provider's "openai:gpt-4o"
+system_prompt = "..."
+```
+
+The `provider:` prefix on a `model` string (`openai:`, `anthropic:`, `chat_completions:`, …) selects the client type and the default endpoint; the provider's `base_url` overrides that endpoint. A model with a generic prefix (`chat_completions:`, `responses:`) has no default endpoint, so its provider must set `base_url`.
+
+### Tokenizer proxy
+
+When a provider is deployed behind a tokenizer proxy, the agent pod never holds the plaintext credential. The pod reads a sealed token from a projected secret, sends it to the proxy under `X-Tokenizer-Token`, and the proxy decrypts the token and injects the real provider key server-side before forwarding to the upstream.
+
+The provider's `base_url` and `[providers.proxy].base_url` carry distinct URLs:
+
+- `base_url` is the **upstream** LLM endpoint. Falls back to the provider default from the `model` prefix (e.g. `openai:gpt-4o` → `https://api.openai.com/v1`).
+- `[providers.proxy].base_url` is the **tokenizer proxy** itself. The client attaches it as an HTTP forward proxy so requests leave the pod in absolute-form (RFC 7230 §5.3.2) with the upstream authority in the request URL — no side-band routing header is needed.
+
+```toml
+[[providers]]
+name = "primary"
 model = "openai:gpt-4o"
 # Upstream provider URL. Optional when the model prefix has a default
 # (here, openai → api.openai.com). Set this to pin a different upstream,
 # e.g. https://openrouter.ai/api/v1.
 base_url = "https://openrouter.ai/api/v1"
-system_prompt = "..."
-# api_key_env is omitted — [proxy] is the credential source.
+# api_key_env is omitted — the proxy is the credential source.
 
-[proxy]
+[providers.proxy]
 # Tokenizer proxy Service inside the cluster. Attached as the HTTP forward proxy.
 base_url = "http://tokenizer-proxy.windowlickers.svc.cluster.local:8080"
 # Projected Secret volume holding the sealed token.
@@ -129,7 +147,8 @@ With an optional `[database]` section, the runtime writes conversation history t
 ```toml
 [database]
 # Environment variable holding the postgres URL — the URL embeds a
-# credential, so it never lives in this file (same policy as api_key_env).
+# credential, so it never lives in this file (same policy as a provider's
+# api_key_env).
 url_env = "DATABASE_URL"
 max_connections = 5            # optional, default 5
 acquire_timeout_seconds = 5    # optional, default 5
@@ -139,7 +158,7 @@ Migrations are embedded in `neuromance-db` and applied automatically at startup.
 
 ## Subagents
 
-A `[[subagents]]` section declares leaf subagents the main agent can delegate to. Each is a pure LLM worker — its own model, prompt, and turn cap, but no tools of its own. Subagents inherit the main agent's credential path (`[proxy]` or `agent.api_key_env`); only `model`, `base_url`, and `max_turns` may differ, all optional and defaulting to the main agent's values.
+A `[[subagents]]` section declares leaf subagents the main agent can delegate to. Each is a pure LLM worker — its own prompt and turn cap, but no tools of its own. A subagent inherits the parent agent's provider (and so its endpoint, credential, and effective model) automatically; it only needs an `id` and `system_prompt`. It may optionally set its own `provider` and/or `model`: the effective model is the subagent's `model`, then the chosen provider's default `model`, then the agent's effective model.
 
 Every configured subagent is reachable two ways:
 
@@ -150,7 +169,8 @@ Every configured subagent is reachable two ways:
 [[subagents]]
 id = "researcher"
 system_prompt = "You research a question and report findings."
-# model, base_url, max_turns all optional; default to the [agent] values.
+# provider, model, max_turns all optional; provider defaults to the agent's,
+# model defaults to the provider's default then the agent's effective model.
 
 [[subagents]]
 id = "critic"

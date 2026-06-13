@@ -94,10 +94,10 @@ Neuromance is a Rust library for LLM orchestration, organized as a Cargo workspa
 
 When the runtime is deployed behind a tokenizer proxy, the agent pod never holds the plaintext provider credential — it sends a sealed token under `X-Tokenizer-Token` and the proxy injects the real provider key server-side.
 
-Two distinct URLs are involved:
+The proxy is configured per-provider via an inline `[providers.proxy]` table. Two distinct URLs are involved:
 
-- `agent.base_url` — the **upstream** LLM endpoint. Falls back to the provider default from the `model` prefix (e.g. `openai:gpt-4o` → `https://api.openai.com/v1`).
-- `[proxy].base_url` — the **tokenizer proxy** itself. The client attaches it as an HTTP forward proxy, so requests leave the pod in absolute-form with the upstream authority in the request URL; no side-band routing header is needed.
+- the provider's `base_url` — the **upstream** LLM endpoint. Falls back to the provider default from the `model` prefix (e.g. `openai:gpt-4o` → `https://api.openai.com/v1`).
+- `[providers.proxy].base_url` — the **tokenizer proxy** itself. The client attaches it as an HTTP forward proxy, so requests leave the pod in absolute-form with the upstream authority in the request URL; no side-band routing header is needed.
 
 See `README.md` for the full TOML config example.
 

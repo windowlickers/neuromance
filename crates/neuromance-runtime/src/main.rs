@@ -18,7 +18,7 @@ use neuromance_runtime::{
     health::{ReadinessGate, router as health_router},
     lifecycle::shutdown_handler,
     metrics as runtime_metrics, oneshot,
-    proxy::build_llm_config,
+    proxy::build_provider_config,
     serve,
     telemetry::{self, BoxedLayer},
 };
@@ -46,7 +46,8 @@ async fn main() -> Result<()> {
     info!(
         mode = ?config.mode,
         agent_id = %config.agent.id,
-        model = %config.agent.model,
+        provider = %config.agent.provider,
+        model = config.agent_model().unwrap_or("<unset>"),
         "neuromance-runtime starting"
     );
 
@@ -179,7 +180,19 @@ fn build_agent(
     store: Option<Arc<PgConversationStore>>,
     cancel: &CancellationToken,
 ) -> Result<Agent<Box<dyn LLMClient>>, RuntimeError> {
-    let llm_config = build_llm_config(config)?;
+    let provider = config.provider(&config.agent.provider).ok_or_else(|| {
+        RuntimeError::Config(format!(
+            "agent.provider '{}' does not match any [[providers]] entry",
+            config.agent.provider
+        ))
+    })?;
+    let model = config.agent_model().ok_or_else(|| {
+        RuntimeError::Config(format!(
+            "agent has no model: set agent.model or provider '{}' model",
+            config.agent.provider
+        ))
+    })?;
+    let llm_config = build_provider_config(provider, model)?;
     let client =
         build_client(llm_config).map_err(|e| RuntimeError::Config(format!("build client: {e}")))?;
 
