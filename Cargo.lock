@@ -1914,6 +1914,7 @@ dependencies = [
  "serde_json",
  "smallvec",
  "thiserror 2.0.18",
+ "tokio",
  "tokio-util",
  "tracing",
  "typed-builder",
@@ -1964,6 +1965,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

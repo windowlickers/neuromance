@@ -139,59 +139,77 @@ impl PythonRepl {
         let state = Arc::clone(&self.state);
         let timeout = self.config.timeout;
 
+        // A task-local delegation context does not survive the `spawn_blocking`
+        // hop, so capture it here and re-establish it on the blocking thread
+        // (see `run_block` below). Without this, a subagent the executing code
+        // spawns via `run_subagent`/`spawn_agents` would lose its parent link.
+        #[cfg(feature = "subagent")]
+        let delegation = neuromance_common::delegation::current();
+
         let result = tokio::time::timeout(
             timeout,
             tokio::task::spawn_blocking(move || {
-                let start = Instant::now();
+                let run_block = move || {
+                    let start = Instant::now();
 
-                Python::attach(|py| {
-                    let s = &mut *state
-                        .lock()
-                        .map_err(|e| ReplError::StatePoisoned(e.to_string()))?;
+                    Python::attach(|py| {
+                        let s = &mut *state
+                            .lock()
+                            .map_err(|e| ReplError::StatePoisoned(e.to_string()))?;
 
-                    let globals_ref = s.globals.bind(py);
-                    let locals_ref = s.shared.locals.bind(py);
+                        let globals_ref = s.globals.bind(py);
+                        let locals_ref = s.shared.locals.bind(py);
 
-                    callback::inject_callbacks_if_needed(
-                        py,
-                        globals_ref,
-                        &s.shared.callbacks,
-                        &mut s.shared.injected_callbacks,
-                    )?;
+                        callback::inject_callbacks_if_needed(
+                            py,
+                            globals_ref,
+                            &s.shared.callbacks,
+                            &mut s.shared.injected_callbacks,
+                        )?;
 
-                    let c_code = CString::new(code.as_str()).map_err(|e| {
-                        ReplError::InvalidInput(format!(
-                            "code contains an interior NUL byte at position {}",
-                            e.nul_position()
-                        ))
-                    })?;
+                        let c_code = CString::new(code.as_str()).map_err(|e| {
+                            ReplError::InvalidInput(format!(
+                                "code contains an interior NUL byte at position {}",
+                                e.nul_position()
+                            ))
+                        })?;
 
-                    let streams = redirect_streams(py)?;
+                        let streams = redirect_streams(py)?;
 
-                    let exec_result = py
-                        .run(c_code.as_c_str(), Some(globals_ref), Some(locals_ref))
-                        .map_err(ReplError::PythonExec);
+                        let exec_result = py
+                            .run(c_code.as_c_str(), Some(globals_ref), Some(locals_ref))
+                            .map_err(ReplError::PythonExec);
 
-                    let (stdout, stderr) = streams.restore(py)?;
-                    let elapsed_ms = start.elapsed().as_millis() as u64;
+                        let (stdout, stderr) = streams.restore(py)?;
+                        let elapsed_ms = start.elapsed().as_millis() as u64;
 
-                    match exec_result {
-                        Ok(()) => Ok(ReplResult {
-                            stdout,
-                            stderr,
-                            success: true,
-                            return_value: None,
-                            execution_time_ms: elapsed_ms,
-                        }),
-                        Err(e) => Ok(ReplResult {
-                            stdout: String::new(),
-                            stderr: e.to_string(),
-                            success: false,
-                            return_value: None,
-                            execution_time_ms: elapsed_ms,
-                        }),
-                    }
-                })
+                        match exec_result {
+                            Ok(()) => Ok(ReplResult {
+                                stdout,
+                                stderr,
+                                success: true,
+                                return_value: None,
+                                execution_time_ms: elapsed_ms,
+                            }),
+                            Err(e) => Ok(ReplResult {
+                                stdout: String::new(),
+                                stderr: e.to_string(),
+                                success: false,
+                                return_value: None,
+                                execution_time_ms: elapsed_ms,
+                            }),
+                        }
+                    })
+                };
+
+                #[cfg(feature = "subagent")]
+                {
+                    neuromance_common::delegation::with_thread_local(delegation, run_block)
+                }
+                #[cfg(not(feature = "subagent"))]
+                {
+                    run_block()
+                }
             }),
         )
         .await;

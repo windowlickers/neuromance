@@ -50,45 +50,26 @@ pub use builder::AgentBuilder;
 // --- Subagents ---
 pub use subagent::{FanoutVote, LocalSubagent, Subagent, SubagentError, SubagentTool};
 
-/// Delegation context threaded through a tokio task so a spawned subagent can
-/// learn which conversation and runtime task it descends from.
-///
-/// `ToolImplementation::execute` carries no calling context, so this travels
-/// out-of-band: [`Agent::execute_with_history`] scopes it around the run, and
-/// because the subagent fan-out paths poll children on the same task (via
-/// `futures::join_all`, not `tokio::spawn`), a child's run observes its
-/// parent's value.
-#[derive(Clone, Copy, Default)]
-struct AgentCtx {
-    /// Conversation of the enclosing agent, or `None` at a root scope (e.g. one
-    /// seeded by the runtime solely to carry [`AgentCtx::task_id`]).
-    conversation_id: Option<Uuid>,
-    /// Runtime task this delegation tree belongs to, when known.
-    task_id: Option<Uuid>,
-}
-
-tokio::task_local! {
-    static AGENT_CTX: AgentCtx;
-}
+use neuromance_common::delegation::{self, DelegationContext};
 
 /// Run `fut` as the root of a delegation tree belonging to `task_id`.
 ///
 /// The runtime wraps a top-level agent run in this so descendant subagent
 /// conversations inherit the task id. The root conversation itself has no
-/// parent, so no conversation id is seeded here.
+/// parent, so no conversation id is seeded here. The propagation mechanism
+/// lives in [`neuromance_common::delegation`].
 pub async fn scope_task<F>(task_id: Option<Uuid>, fut: F) -> F::Output
 where
     F: std::future::Future,
 {
-    AGENT_CTX
-        .scope(
-            AgentCtx {
-                conversation_id: None,
-                task_id,
-            },
-            fut,
-        )
-        .await
+    delegation::scope(
+        DelegationContext {
+            conversation_id: None,
+            task_id,
+        },
+        fut,
+    )
+    .await
 }
 
 // --- Agent state types (live in neuromance-common so they can be shared,
@@ -203,7 +184,7 @@ impl<C: LLMClient + Send + Sync> Agent<C> {
 
         // Read the enclosing delegation context (set by a parent agent's scope,
         // or the runtime's `scope_task`). A root run sees no parent.
-        let enclosing = AGENT_CTX.try_with(|ctx| *ctx).ok().unwrap_or_default();
+        let enclosing = delegation::current();
         let parent_conversation_id = enclosing.conversation_id;
         let task_id = enclosing.task_id;
         {
@@ -252,13 +233,12 @@ impl<C: LLMClient + Send + Sync> Agent<C> {
 
         // Scope this agent's conversation as the parent for any subagent it
         // delegates to during the run, inheriting the same runtime task id.
-        let child_ctx = AgentCtx {
+        let child_ctx = DelegationContext {
             conversation_id: Some(self.conversation_id),
             task_id,
         };
-        let (messages, run_stats) = AGENT_CTX
-            .scope(child_ctx, self.core.chat_with_tool_loop(messages, cancel))
-            .await?;
+        let (messages, run_stats) =
+            delegation::scope(child_ctx, self.core.chat_with_tool_loop(messages, cancel)).await?;
 
         self.state.stats.total_messages += messages.len();
         #[allow(clippy::cast_possible_truncation)]

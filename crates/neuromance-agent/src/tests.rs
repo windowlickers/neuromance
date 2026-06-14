@@ -615,6 +615,9 @@ impl LLMClient for ToolCallingMock {
 /// Records the delegation parent it observes from the task-local context when
 /// run. A subagent spawned during the parent's run would read the same value.
 struct CtxProbe {
+    // Outer `None`: the probe never ran. Inner `None`: it ran but observed no
+    // delegation parent. The two cases must stay distinct for the assertion.
+    #[allow(clippy::option_option)]
     seen: Arc<Mutex<Option<Option<Uuid>>>>,
 }
 
@@ -631,7 +634,7 @@ impl ToolImplementation for CtxProbe {
     }
 
     async fn execute(&self, _args: &serde_json::Value) -> Result<String, ToolError> {
-        let observed = crate::AGENT_CTX.try_with(|ctx| ctx.conversation_id).ok().flatten();
+        let observed = neuromance_common::delegation::current().conversation_id;
         *self.seen.lock().expect("probe mutex") = Some(observed);
         Ok("ok".to_string())
     }
@@ -672,7 +675,8 @@ async fn execute_publishes_conversation_id_as_delegation_parent() {
 async fn scope_task_seeds_task_id_without_parent_conversation() {
     let task_id = Uuid::new_v4();
     let observed = crate::scope_task(Some(task_id), async {
-        crate::AGENT_CTX.with(|ctx| (ctx.conversation_id, ctx.task_id))
+        let ctx = neuromance_common::delegation::current();
+        (ctx.conversation_id, ctx.task_id)
     })
     .await;
 

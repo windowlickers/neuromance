@@ -72,6 +72,9 @@ pub mod tools;
 
 pub mod agents;
 
+/// Out-of-band delegation lineage propagation for spawned subagents.
+pub mod delegation;
+
 /// The subagent contract (trait + error) for delegated work.
 pub mod subagent;
 /// Task and outcome types for subagent delegation.
@@ -83,6 +86,7 @@ pub use client::{
     CacheMetrics, ChatRequest, ChatResponse, Config, FinishReason, InputTokensDetails,
     OutputTokensDetails, Provider, ProxyConfig, ReasoningEffort, RetryConfig, ToolChoice, Usage,
 };
+pub use delegation::DelegationContext;
 pub use features::{ReasoningLevel, ThinkingMode};
 pub use subagent::{Subagent, SubagentError};
 pub use task::{Outcome, Task};

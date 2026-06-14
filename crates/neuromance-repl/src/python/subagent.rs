@@ -564,4 +564,65 @@ results = spawn_agents([Agent('a', 'first'), Agent('b', 'second'), Agent('c', 't
             "the sibling should still have run despite the batch failing",
         );
     }
+
+    /// Records the delegation context observed when run, proving whether the
+    /// ambient context survived the relay into the subagent.
+    struct DelegationProbe {
+        seen: Mutex<Option<neuromance_common::delegation::DelegationContext>>,
+    }
+
+    #[async_trait]
+    impl Subagent for DelegationProbe {
+        #[allow(clippy::unnecessary_literal_bound)] // trait fixes the return as `&str`
+        fn id(&self) -> &str {
+            "probe"
+        }
+
+        async fn run(
+            &self,
+            task: Task,
+            _cancel: CancellationToken,
+        ) -> Result<Outcome, SubagentError> {
+            *self.seen.lock().unwrap() = Some(neuromance_common::delegation::current());
+            Ok(Outcome::new(task.id, "ok".to_string()))
+        }
+    }
+
+    /// A subagent runs from inside `execute`'s `spawn_blocking`/`block_on`, which
+    /// a task-local does not cross. The relay must carry the ambient delegation
+    /// context to the subagent run anyway; without it the probe would observe the
+    /// default context.
+    #[tokio::test]
+    #[serial]
+    async fn test_delegation_context_relays_across_spawn_blocking() {
+        use neuromance_common::delegation::{self, DelegationContext};
+
+        let probe = Arc::new(DelegationProbe {
+            seen: Mutex::new(None),
+        });
+        let repl = Arc::new(PythonRepl::new().unwrap());
+        let bridge = SubagentRepl::new(
+            Arc::clone(&repl),
+            registry(vec![("probe", Arc::clone(&probe) as Arc<dyn Subagent>)]),
+            CancellationToken::new(),
+        )
+        .unwrap();
+
+        let parent = DelegationContext {
+            conversation_id: Some(uuid::Uuid::new_v4()),
+            task_id: Some(uuid::Uuid::new_v4()),
+        };
+
+        let result =
+            delegation::scope(parent, bridge.repl().execute("run_subagent('probe', 'go')"))
+                .await
+                .unwrap();
+        assert!(result.success, "stderr: {}", result.stderr);
+        assert_eq!(
+            *probe.seen.lock().unwrap(),
+            Some(parent),
+            "the subagent run should observe the parent delegation context relayed \
+             across the spawn_blocking boundary",
+        );
+    }
 }

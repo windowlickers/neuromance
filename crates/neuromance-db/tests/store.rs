@@ -336,13 +336,11 @@ async fn test_task_provenance_brackets_each_run_by_seq_range(pool: PgPool) {
 
 /// Reads the lineage columns for a conversation row.
 async fn parent_link(pool: &PgPool, id: Uuid) -> (Option<Uuid>, Option<Uuid>) {
-    sqlx::query_as(
-        "SELECT parent_conversation_id, parent_task_id FROM conversations WHERE id = $1",
-    )
-    .bind(id)
-    .fetch_one(pool)
-    .await
-    .unwrap()
+    sqlx::query_as("SELECT parent_conversation_id, parent_task_id FROM conversations WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
 }
 
 /// `set_conversation_parent` links a child to its spawning parent, works whether
@@ -361,7 +359,11 @@ async fn test_set_conversation_parent_links_child(pool: PgPool) {
         .append_messages(parent, &sample_history(parent))
         .await
         .unwrap();
-    assert_eq!(parent_link(&pool, parent).await, (None, None), "root is unlinked");
+    assert_eq!(
+        parent_link(&pool, parent).await,
+        (None, None),
+        "root is unlinked"
+    );
 
     // Link before the child has any messages (the upsert creates the row).
     store
@@ -383,7 +385,10 @@ async fn test_set_conversation_parent_links_child(pool: PgPool) {
         .set_conversation_parent(child, parent, Some(task_retry))
         .await
         .unwrap();
-    assert_eq!(parent_link(&pool, child).await, (Some(parent), Some(task_retry)));
+    assert_eq!(
+        parent_link(&pool, child).await,
+        (Some(parent), Some(task_retry))
+    );
     let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversations WHERE id = $1")
         .bind(child)
         .fetch_one(&pool)
