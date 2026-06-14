@@ -230,6 +230,9 @@ impl<C: LLMClient> Core<C> {
         try_stream! {
             let mut messages = messages;
             let mut turn_count: u32 = 0;
+            // `prompt_tokens` from each turn is the whole context sent that turn,
+            // so the turn-over-turn delta shows how fast the conversation grows.
+            let mut prev_prompt_tokens: u32 = 0;
             let start_time = Instant::now();
             let mut messages_arc: Arc<[Message]> = messages.clone().into();
 
@@ -449,6 +452,20 @@ impl<C: LLMClient> Core<C> {
                     .usage
                     .as_ref()
                     .map_or((0_u32, 0_u32), |u| (u.prompt_tokens, u.completion_tokens));
+                let cached_tokens = response
+                    .usage
+                    .as_ref()
+                    .and_then(|u| u.input_tokens_details.as_ref())
+                    .map_or(0_u32, |d| d.cached_tokens);
+                // Growth in the input context since the previous turn — the cost of
+                // the last assistant message, tool results, and any new input. Goes
+                // negative when a turn shrinks the context (e.g. after compaction).
+                let prompt_delta = i64::from(prompt_tokens) - i64::from(prev_prompt_tokens);
+                prev_prompt_tokens = prompt_tokens;
+                // Current footprint of the stored conversation: the full input
+                // context plus the assistant reply that joins it. Not a sum across
+                // turns — `prompt_tokens` already accumulates the history.
+                let conv_total_tokens = prompt_tokens.saturating_add(completion_tokens);
                 turn_span.record("model", tracing::field::display(&response.model));
                 turn_span.record("finish_reason", tracing::field::display(&finish_label));
                 info!(
@@ -456,7 +473,10 @@ impl<C: LLMClient> Core<C> {
                     duration_ms = turn_duration_ms,
                     finish = %finish_label,
                     prompt_tokens,
+                    prompt_delta,
                     completion_tokens,
+                    cached_tokens,
+                    conv_total_tokens,
                     tool_calls = tool_calls_count,
                     "chat turn completed",
                 );
