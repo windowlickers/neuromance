@@ -12,6 +12,17 @@ keywords.workspace = true
 categories.workspace = true
 description = "Postgres persistence for neuromance conversations and messages"
 
+# Explicit include so the sqlx offline metadata and embedded migrations survive
+# packaging. Without it, a consumer that vendors this crate from a source tree
+# with no `.git` (e.g. Nix `fetchGit` + crane) gets a `cargo package` file list
+# that drops the hidden `.sqlx/` directory, breaking `SQLX_OFFLINE` builds of
+# the `sqlx::query!` macros downstream.
+include = [
+    "src/**/*.rs",
+    "migrations/*.sql",
+    ".sqlx/query-*.json",
+]
+
 [lints]
 workspace = true
 
