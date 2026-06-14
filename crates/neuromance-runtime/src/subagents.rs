@@ -30,6 +30,7 @@ use tokio_util::sync::CancellationToken;
 use neuromance::Core;
 use neuromance_agent::{Agent, LocalSubagent, Subagent, SubagentError, SubagentTool};
 use neuromance_client::{LLMClient, build_client};
+use neuromance_db::PgConversationStore;
 use neuromance_tools::{ToolConfig, ToolFactoryRegistry, ToolImplementation, ToolRegistry};
 
 use crate::config::RuntimeConfig;
@@ -48,12 +49,17 @@ const EXECUTE_PYTHON: &str = "execute_python";
 /// `runtime.max_delegation_depth` and wires the main agent's delegate tools to
 /// the top of that tower.
 ///
+/// `store`, when present, is wired into every subagent's `Core` so child
+/// conversations persist (and record their parent/child lineage) just like the
+/// main agent's.
+///
 /// # Errors
 /// Returns [`RuntimeError`] if a subagent's provider/model/credentials fail to
 /// resolve, a tool factory fails, or a subagent id collides with a configured
 /// tool name.
 pub fn build_parent_toolset(
     config: &RuntimeConfig,
+    store: Option<&Arc<PgConversationStore>>,
     cancel: &CancellationToken,
 ) -> Result<Vec<Arc<dyn ToolImplementation>>, RuntimeError> {
     let children = if config.subagents.is_empty() {
@@ -62,7 +68,7 @@ pub fn build_parent_toolset(
         // The main agent is depth 0; its children may delegate `depth - 1`
         // further hops.
         let remaining = config.runtime.max_delegation_depth.saturating_sub(1);
-        build_subagents_at_depth(config, remaining, cancel)?
+        build_subagents_at_depth(config, remaining, store, cancel)?
     };
     assemble_toolset(config, &children, cancel)
 }
@@ -75,12 +81,13 @@ pub fn build_parent_toolset(
 fn build_subagents_at_depth(
     config: &RuntimeConfig,
     remaining: u32,
+    store: Option<&Arc<PgConversationStore>>,
     cancel: &CancellationToken,
 ) -> Result<HashMap<String, Arc<dyn Subagent>>, RuntimeError> {
     let children = if remaining == 0 {
         HashMap::new()
     } else {
-        build_subagents_at_depth(config, remaining - 1, cancel)?
+        build_subagents_at_depth(config, remaining - 1, store, cancel)?
     };
     // Shared across every subagent at this level and captured by each run's
     // builder. The toolset itself is *not* built here: each run reassembles it
@@ -122,6 +129,7 @@ fn build_subagents_at_depth(
         let config = Arc::clone(&config);
         let children = Arc::clone(&children);
         let cancel = cancel.clone();
+        let store = store.cloned();
         let build_agent = move || {
             // Reassemble the toolset per run so a fresh Python interpreter is
             // built each time; nothing persists across runs of one subagent or
@@ -136,6 +144,12 @@ fn build_subagents_at_depth(
             // with no interactive approver in the loop; the pod boundary (kata)
             // is the isolation. See the README Subagents section.
             core.auto_approve_tools = true;
+            // Persist child conversations (and their parent link) when the
+            // runtime has a store, matching the main agent.
+            if let Some(store) = &store {
+                let sink: Arc<PgConversationStore> = Arc::clone(store);
+                core = core.with_persistence(sink);
+            }
             for tool in tools {
                 core.tool_executor.add_tool_arc(tool);
             }
@@ -473,7 +487,7 @@ mod tests {
     #[test]
     fn test_build_surfaces_missing_credential_env() {
         let config = config_with_subagents(vec![subagent("alpha"), subagent("beta")]);
-        let err = build_parent_toolset(&config, &CancellationToken::new())
+        let err = build_parent_toolset(&config, None, &CancellationToken::new())
             .err()
             .expect("build should fail without the credential env var set");
         assert!(
@@ -489,7 +503,7 @@ mod tests {
         let mut config = config_with_subagents(vec![]);
         config.tools = vec![read_tool()];
 
-        let tools = build_parent_toolset(&config, &CancellationToken::new()).unwrap();
+        let tools = build_parent_toolset(&config, None, &CancellationToken::new()).unwrap();
         assert_eq!(tool_names(&tools), vec!["read".to_string()]);
     }
 
@@ -498,7 +512,7 @@ mod tests {
     #[test]
     fn test_subagent_inherits_parent_provider_credential() {
         let config = config_with_subagents(vec![subagent("worker")]);
-        let err = build_parent_toolset(&config, &CancellationToken::new())
+        let err = build_parent_toolset(&config, None, &CancellationToken::new())
             .err()
             .expect("build should fail on the inherited provider's unset env var");
         assert!(
@@ -523,7 +537,7 @@ mod tests {
                 ..subagent("worker")
             }],
         );
-        let err = build_parent_toolset(&config, &CancellationToken::new())
+        let err = build_parent_toolset(&config, None, &CancellationToken::new())
             .err()
             .expect("build should fail on the overridden provider's unset env var");
         assert!(
@@ -540,7 +554,7 @@ mod tests {
             provider: Some("ghost".to_string()),
             ..subagent("worker")
         }]);
-        let err = build_parent_toolset(&config, &CancellationToken::new())
+        let err = build_parent_toolset(&config, None, &CancellationToken::new())
             .err()
             .expect("build should fail for an unknown provider");
         assert!(

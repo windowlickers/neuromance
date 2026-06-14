@@ -308,6 +308,32 @@ impl PgConversationStore {
 
 #[async_trait::async_trait]
 impl ConversationSink for PgConversationStore {
+    async fn set_conversation_parent(
+        &self,
+        child: Uuid,
+        parent: Uuid,
+        parent_task_id: Option<Uuid>,
+    ) -> Result<(), DbError> {
+        // Upsert so the link records regardless of whether the child row has
+        // been created by the first message append yet.
+        sqlx::query!(
+            r#"
+            INSERT INTO conversations (id, parent_conversation_id, parent_task_id)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (id) DO UPDATE
+                SET parent_conversation_id = EXCLUDED.parent_conversation_id,
+                    parent_task_id = EXCLUDED.parent_task_id
+            "#,
+            child,
+            parent,
+            parent_task_id,
+        )
+        .execute(&self.pool)
+        .await
+        .op("link conversation parent")?;
+        Ok(())
+    }
+
     async fn append_messages(
         &self,
         conversation_id: Uuid,

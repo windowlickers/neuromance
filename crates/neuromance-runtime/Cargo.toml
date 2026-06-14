@@ -22,7 +22,7 @@ path = "src/main.rs"
 
 [dependencies]
 neuromance = { workspace = true, features = ["db"] }
-neuromance-agent = { workspace = true }
+neuromance-agent = { workspace = true, features = ["db"] }
 neuromance-client = { workspace = true }
 neuromance-common = { workspace = true }
 neuromance-db = { workspace = true }

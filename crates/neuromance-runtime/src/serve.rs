@@ -668,10 +668,16 @@ async fn process_job<C: LLMClient + Send + Sync>(
     let span = Span::current();
     span.record("agent_id", field::display(agent.id()));
 
+    // Seed the runtime task id so subagent conversations spawned during this
+    // run inherit it as their `parent_task_id`. The root conversation itself
+    // has no parent, so no conversation id is seeded here.
     let exec_result = tokio::select! {
         biased;
         () = cancel.cancelled() => Err(CoreError::Cancelled("worker shutdown".to_string())),
-        res = agent.execute_with_history(Some(input_messages), cancel.child_token()) => res,
+        res = neuromance_agent::scope_task(
+            Some(job.task_id),
+            agent.execute_with_history(Some(input_messages), cancel.child_token()),
+        ) => res,
     };
 
     let run_ms = u64::try_from(run_start.elapsed().as_millis()).unwrap_or(u64::MAX);

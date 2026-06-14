@@ -4,6 +4,9 @@
 
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use futures::Stream;
@@ -15,6 +18,8 @@ use neuromance_client::{ClientError, LLMClient};
 use neuromance_common::agents::{AgentMessage, AgentState, ContextUpdate};
 use neuromance_common::chat::{Message, MessageRole};
 use neuromance_common::client::{ChatChunk, ChatRequest, ChatResponse, Config, ToolChoice, Usage};
+use neuromance_common::tools::{Function, FunctionCall, Tool, ToolCall};
+use neuromance_tools::{ToolError, ToolImplementation};
 
 use crate::Agent;
 
@@ -533,6 +538,145 @@ fn agent_state_accessors() {
     let mut agent = Agent::new("test".into(), Core::new(client));
     agent.state_mut().stats.total_messages = 42;
     assert_eq!(agent.state().stats.total_messages, 42);
+}
+
+// -- Delegation context propagation --
+
+/// A client that calls `ctx_probe` on its first turn, then finishes. Drives the
+/// tool loop exactly once so a tool runs inside the agent's delegation scope.
+struct ToolCallingMock {
+    config: Config,
+    calls: AtomicUsize,
+}
+
+impl ToolCallingMock {
+    fn new() -> Self {
+        Self {
+            config: Config::new("mock", "mock-model"),
+            calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl LLMClient for ToolCallingMock {
+    fn config(&self) -> &Config {
+        &self.config
+    }
+
+    async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, ClientError> {
+        let conv_id = request
+            .messages
+            .first()
+            .map_or_else(Uuid::new_v4, |m| m.conversation_id);
+        let message = if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            Message::assistant(conv_id, "")
+                .with_tool_calls(vec![ToolCall {
+                    id: "call_1".to_string(),
+                    function: FunctionCall {
+                        name: "ctx_probe".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                    call_type: "function".to_string(),
+                    index: None,
+                }])
+                .expect("assistant message accepts tool calls")
+        } else {
+            Message::assistant(conv_id, "done")
+        };
+        Ok(ChatResponse {
+            message,
+            model: "mock-model".to_string(),
+            usage: None,
+            finish_reason: None,
+            created_at: chrono::Utc::now(),
+            response_id: None,
+            metadata: HashMap::new(),
+        })
+    }
+
+    async fn chat_stream(
+        &self,
+        _request: &ChatRequest,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatChunk, ClientError>> + Send>>, ClientError>
+    {
+        panic!("ToolCallingMock does not stream")
+    }
+
+    fn supports_tools(&self) -> bool {
+        true
+    }
+
+    fn supports_streaming(&self) -> bool {
+        false
+    }
+}
+
+/// Records the delegation parent it observes from the task-local context when
+/// run. A subagent spawned during the parent's run would read the same value.
+struct CtxProbe {
+    seen: Arc<Mutex<Option<Option<Uuid>>>>,
+}
+
+#[async_trait]
+impl ToolImplementation for CtxProbe {
+    fn get_definition(&self) -> Tool {
+        Tool::builder()
+            .function(Function {
+                name: "ctx_probe".to_string(),
+                description: "records the observed delegation context".to_string(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            })
+            .build()
+    }
+
+    async fn execute(&self, _args: &serde_json::Value) -> Result<String, ToolError> {
+        let observed = crate::AGENT_CTX.try_with(|ctx| ctx.conversation_id).ok().flatten();
+        *self.seen.lock().expect("probe mutex") = Some(observed);
+        Ok("ok".to_string())
+    }
+
+    fn is_auto_approved(&self) -> bool {
+        true
+    }
+}
+
+/// While an agent runs, its own conversation id is published to the delegation
+/// context, so a tool (and any subagent it spawns) observes that id as its
+/// parent. Without the scope wiring the probe would observe `None`.
+#[tokio::test]
+async fn execute_publishes_conversation_id_as_delegation_parent() {
+    let seen = Arc::new(Mutex::new(None));
+    let mut agent = Agent::new("parent".into(), Core::new(ToolCallingMock::new()));
+    agent.core.auto_approve_tools = true;
+    agent.core.tool_executor.add_tool(CtxProbe {
+        seen: Arc::clone(&seen),
+    });
+    let conv_id = agent.conversation_id;
+
+    agent
+        .execute(Some(make_messages(conv_id)), CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *seen.lock().unwrap(),
+        Some(Some(conv_id)),
+        "probe should observe the running agent's conversation as its delegation parent"
+    );
+}
+
+/// `scope_task` seeds only the runtime task id; the root conversation it wraps
+/// has no parent conversation of its own.
+#[tokio::test]
+async fn scope_task_seeds_task_id_without_parent_conversation() {
+    let task_id = Uuid::new_v4();
+    let observed = crate::scope_task(Some(task_id), async {
+        crate::AGENT_CTX.with(|ctx| (ctx.conversation_id, ctx.task_id))
+    })
+    .await;
+
+    assert_eq!(observed, (None, Some(task_id)));
 }
 
 // -- CacheMetrics total_output_tokens --

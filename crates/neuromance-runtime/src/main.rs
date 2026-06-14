@@ -62,7 +62,7 @@ async fn main() -> Result<()> {
     let store = init_store(&config)
         .await
         .context("initialize database store")?;
-    let agent = build_agent(&config, store.clone(), &cancel).map_err(anyhow::Error::from)?;
+    let agent = build_agent(&config, store.as_ref(), &cancel).map_err(anyhow::Error::from)?;
     readiness.set_ready(true);
 
     let result = match config.mode {
@@ -180,7 +180,7 @@ async fn init_store(config: &RuntimeConfig) -> Result<Option<Arc<PgConversationS
 
 fn build_agent(
     config: &RuntimeConfig,
-    store: Option<Arc<PgConversationStore>>,
+    store: Option<&Arc<PgConversationStore>>,
     cancel: &CancellationToken,
 ) -> Result<Agent<Box<dyn LLMClient>>, RuntimeError> {
     let provider = config.provider(&config.agent.provider).ok_or_else(|| {
@@ -207,13 +207,15 @@ fn build_agent(
         core.max_turns = Some(max);
     }
     if let Some(store) = store {
-        core = core.with_persistence(store);
+        let sink: Arc<PgConversationStore> = Arc::clone(store);
+        core = core.with_persistence(sink);
     }
 
     // The main agent's toolset, including delegate tools for every configured
     // subagent and the delegation tower beneath them (bounded by
-    // runtime.max_delegation_depth).
-    let tools = build_parent_toolset(config, cancel)?;
+    // runtime.max_delegation_depth). The store is threaded through so subagent
+    // conversations persist and record their parent link too.
+    let tools = build_parent_toolset(config, store, cancel)?;
 
     if matches!(config.approval.mode, ApprovalMode::Auto) {
         let mut needs_approval: Vec<String> = tools

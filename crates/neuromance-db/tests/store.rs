@@ -333,3 +333,61 @@ async fn test_task_provenance_brackets_each_run_by_seq_range(pool: PgPool) {
         .unwrap();
     assert_eq!(task_two_rows, 1);
 }
+
+/// Reads the lineage columns for a conversation row.
+async fn parent_link(pool: &PgPool, id: Uuid) -> (Option<Uuid>, Option<Uuid>) {
+    sqlx::query_as(
+        "SELECT parent_conversation_id, parent_task_id FROM conversations WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// `set_conversation_parent` links a child to its spawning parent, works whether
+/// or not the child row exists yet, survives later message appends, and updates
+/// idempotently on re-link. Roots stay unlinked.
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires postgres via DATABASE_URL"]
+async fn test_set_conversation_parent_links_child(pool: PgPool) {
+    let store = PgConversationStore::new(pool.clone());
+    let parent = Uuid::new_v4();
+    let child = Uuid::new_v4();
+    let task = Uuid::new_v4();
+
+    // Parent must exist for the self-FK to resolve.
+    store
+        .append_messages(parent, &sample_history(parent))
+        .await
+        .unwrap();
+    assert_eq!(parent_link(&pool, parent).await, (None, None), "root is unlinked");
+
+    // Link before the child has any messages (the upsert creates the row).
+    store
+        .set_conversation_parent(child, parent, Some(task))
+        .await
+        .unwrap();
+    assert_eq!(parent_link(&pool, child).await, (Some(parent), Some(task)));
+
+    // Appending the child's messages does not clobber the link.
+    store
+        .append_messages(child, &sample_history(child))
+        .await
+        .unwrap();
+    assert_eq!(parent_link(&pool, child).await, (Some(parent), Some(task)));
+
+    // Re-linking (e.g. a retried run) updates in place rather than duplicating.
+    let task_retry = Uuid::new_v4();
+    store
+        .set_conversation_parent(child, parent, Some(task_retry))
+        .await
+        .unwrap();
+    assert_eq!(parent_link(&pool, child).await, (Some(parent), Some(task_retry)));
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversations WHERE id = $1")
+        .bind(child)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 1);
+}

@@ -131,8 +131,10 @@ where
     // export, the export fails again, and a down or misconfigured collector feeds
     // its own failure stream. The events still reach stderr, so the misconfiguration
     // stays diagnosable.
-    let log_layer = OpenTelemetryTracingBridge::new(&logger_provider)
-        .with_filter(filter_fn(|meta| !meta.target().starts_with("opentelemetry")));
+    let log_layer =
+        OpenTelemetryTracingBridge::new(&logger_provider).with_filter(filter_fn(|meta| {
+            !meta.target().starts_with("opentelemetry")
+        }));
     let combined: BoxedLayer<S> = trace_layer.and_then(log_layer).boxed();
 
     Ok(Some((

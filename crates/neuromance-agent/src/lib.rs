@@ -50,6 +50,47 @@ pub use builder::AgentBuilder;
 // --- Subagents ---
 pub use subagent::{FanoutVote, LocalSubagent, Subagent, SubagentError, SubagentTool};
 
+/// Delegation context threaded through a tokio task so a spawned subagent can
+/// learn which conversation and runtime task it descends from.
+///
+/// `ToolImplementation::execute` carries no calling context, so this travels
+/// out-of-band: [`Agent::execute_with_history`] scopes it around the run, and
+/// because the subagent fan-out paths poll children on the same task (via
+/// `futures::join_all`, not `tokio::spawn`), a child's run observes its
+/// parent's value.
+#[derive(Clone, Copy, Default)]
+struct AgentCtx {
+    /// Conversation of the enclosing agent, or `None` at a root scope (e.g. one
+    /// seeded by the runtime solely to carry [`AgentCtx::task_id`]).
+    conversation_id: Option<Uuid>,
+    /// Runtime task this delegation tree belongs to, when known.
+    task_id: Option<Uuid>,
+}
+
+tokio::task_local! {
+    static AGENT_CTX: AgentCtx;
+}
+
+/// Run `fut` as the root of a delegation tree belonging to `task_id`.
+///
+/// The runtime wraps a top-level agent run in this so descendant subagent
+/// conversations inherit the task id. The root conversation itself has no
+/// parent, so no conversation id is seeded here.
+pub async fn scope_task<F>(task_id: Option<Uuid>, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    AGENT_CTX
+        .scope(
+            AgentCtx {
+                conversation_id: None,
+                task_id,
+            },
+            fut,
+        )
+        .await
+}
+
 // --- Agent state types (live in neuromance-common so they can be shared,
 //     surfaced here so agent consumers only need this crate) ---
 pub use neuromance_common::agents::{
@@ -144,7 +185,12 @@ impl<C: LLMClient + Send + Sync> Agent<C> {
     #[tracing::instrument(
         name = "agent.execute",
         skip_all,
-        fields(agent_id = %self.id, conversation_id = %self.conversation_id),
+        fields(
+            agent_id = %self.id,
+            conversation_id = %self.conversation_id,
+            parent_conversation_id = tracing::field::Empty,
+            task_id = tracing::field::Empty,
+        ),
     )]
     pub async fn execute_with_history(
         &mut self,
@@ -154,6 +200,26 @@ impl<C: LLMClient + Send + Sync> Agent<C> {
         let exec_start = Instant::now();
         info!("agent executing");
         self.core.tool_choice = self.tool_choice.clone();
+
+        // Read the enclosing delegation context (set by a parent agent's scope,
+        // or the runtime's `scope_task`). A root run sees no parent.
+        let enclosing = AGENT_CTX.try_with(|ctx| *ctx).ok().unwrap_or_default();
+        let parent_conversation_id = enclosing.conversation_id;
+        let task_id = enclosing.task_id;
+        {
+            let span = tracing::Span::current();
+            if let Some(parent) = parent_conversation_id {
+                span.record("parent_conversation_id", tracing::field::display(parent));
+            }
+            if let Some(task) = task_id {
+                span.record("task_id", tracing::field::display(task));
+            }
+        }
+        #[cfg(feature = "db")]
+        {
+            self.core.parent_conversation_id = parent_conversation_id;
+            self.core.parent_task_id = task_id;
+        }
 
         let mut messages = messages.unwrap_or_else(|| self.messages.clone());
 
@@ -184,7 +250,15 @@ impl<C: LLMClient + Send + Sync> Agent<C> {
             messages[0].content.push_str(&ctx);
         }
 
-        let (messages, run_stats) = self.core.chat_with_tool_loop(messages, cancel).await?;
+        // Scope this agent's conversation as the parent for any subagent it
+        // delegates to during the run, inheriting the same runtime task id.
+        let child_ctx = AgentCtx {
+            conversation_id: Some(self.conversation_id),
+            task_id,
+        };
+        let (messages, run_stats) = AGENT_CTX
+            .scope(child_ctx, self.core.chat_with_tool_loop(messages, cancel))
+            .await?;
 
         self.state.stats.total_messages += messages.len();
         #[allow(clippy::cast_possible_truncation)]

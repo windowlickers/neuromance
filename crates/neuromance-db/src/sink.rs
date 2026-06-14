@@ -30,4 +30,26 @@ pub trait ConversationSink: Send + Sync {
         conversation_id: Uuid,
         messages: &[Message],
     ) -> Result<u64, DbError>;
+
+    /// Links `child` to the `parent` conversation that spawned it (e.g. a
+    /// subagent delegation), optionally tagging the runtime `parent_task_id` the
+    /// tree belongs to.
+    ///
+    /// Defaults to a no-op so sinks that do not model lineage (test doubles,
+    /// non-relational backends) need not implement it. Implementations must be
+    /// idempotent and tolerate being called before the child's conversation row
+    /// exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the write fails.
+    async fn set_conversation_parent(
+        &self,
+        child: Uuid,
+        parent: Uuid,
+        parent_task_id: Option<Uuid>,
+    ) -> Result<(), DbError> {
+        let _ = (child, parent, parent_task_id);
+        Ok(())
+    }
 }

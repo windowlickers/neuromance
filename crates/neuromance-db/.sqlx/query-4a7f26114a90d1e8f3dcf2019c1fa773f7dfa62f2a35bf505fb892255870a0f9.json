@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO conversations (id, parent_conversation_id, parent_task_id)\n            VALUES ($1, $2, $3)\n            ON CONFLICT (id) DO UPDATE\n                SET parent_conversation_id = EXCLUDED.parent_conversation_id,\n                    parent_task_id = EXCLUDED.parent_task_id\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4a7f26114a90d1e8f3dcf2019c1fa773f7dfa62f2a35bf505fb892255870a0f9"
+}

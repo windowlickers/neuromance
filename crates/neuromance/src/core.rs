@@ -53,6 +53,15 @@ pub struct Core<C: LLMClient> {
     /// Write failures are logged and never abort the run.
     #[cfg(feature = "db")]
     pub persistence: Option<Arc<dyn neuromance_db::ConversationSink>>,
+    /// Conversation that spawned this run (e.g. a delegating parent agent),
+    /// recorded against the persisted conversation so a delegation tree can be
+    /// reconstructed. `None` for a root conversation.
+    #[cfg(feature = "db")]
+    pub parent_conversation_id: Option<uuid::Uuid>,
+    /// Runtime task this run belongs to, persisted alongside
+    /// [`Self::parent_conversation_id`].
+    #[cfg(feature = "db")]
+    pub parent_task_id: Option<uuid::Uuid>,
 }
 
 impl<C: LLMClient> Core<C> {
@@ -70,6 +79,10 @@ impl<C: LLMClient> Core<C> {
             thinking: ThinkingMode::Default,
             #[cfg(feature = "db")]
             persistence: None,
+            #[cfg(feature = "db")]
+            parent_conversation_id: None,
+            #[cfg(feature = "db")]
+            parent_task_id: None,
         }
     }
 
@@ -243,6 +256,21 @@ impl<C: LLMClient> Core<C> {
             #[cfg(feature = "db")]
             if let Some(ref sink) = self.persistence {
                 persist_new_messages(sink.as_ref(), &messages, &mut persisted_ids).await;
+                // Link this conversation to its spawning parent, once the seed
+                // append has created the row. Best-effort, like message writes.
+                if let (Some(parent), Some(first)) =
+                    (self.parent_conversation_id, messages.first())
+                    && let Err(e) = sink
+                        .set_conversation_parent(first.conversation_id, parent, self.parent_task_id)
+                        .await
+                {
+                    tracing::warn!(
+                        conversation_id = %first.conversation_id,
+                        parent_conversation_id = %parent,
+                        error = %e,
+                        "recording conversation parent failed; continuing without it"
+                    );
+                }
             }
 
             loop {

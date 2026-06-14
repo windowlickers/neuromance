@@ -15,6 +15,11 @@ description = "Agent framework for autonomous task execution with LLMs"
 [lints]
 workspace = true
 
+[features]
+# Forward conversation persistence so subagent runs can record parent/child
+# lineage through `neuromance::Core`.
+db = ["neuromance/db"]
+
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
