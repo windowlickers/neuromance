@@ -336,6 +336,7 @@ mod tests {
             providers,
             database: None,
             subagents,
+            bootstrap: Vec::new(),
         }
     }
 

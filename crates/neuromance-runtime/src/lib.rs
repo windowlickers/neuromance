@@ -20,6 +20,7 @@
 //! `neuromance-db`).
 
 pub mod approval;
+pub mod bootstrap;
 pub mod config;
 pub mod error;
 pub mod health;

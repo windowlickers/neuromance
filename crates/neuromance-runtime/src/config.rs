@@ -67,6 +67,32 @@ pub struct RuntimeConfig {
     /// bridge.
     #[serde(default)]
     pub subagents: Vec<SubagentConfig>,
+    /// One-time tool setup run at container start, before tasks. Each entry
+    /// spawns `command` with `args`; if `token_env` is set its value is fed on
+    /// stdin. Best-effort — failures are logged, never fatal.
+    #[serde(default)]
+    pub bootstrap: Vec<BootstrapCommand>,
+}
+
+/// A command run once at container start to set up a tool.
+///
+/// The pod has no persistent storage, so tools that read auth from a config
+/// file rather than the environment must be logged in each boot. Best-effort: a
+/// failure is logged, not fatal.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BootstrapCommand {
+    /// Human-readable label for logs.
+    pub name: String,
+    /// Executable to run; must be on `PATH`.
+    pub command: String,
+    /// Arguments. Must not contain secrets — `config.toml` ships in a
+    /// `ConfigMap`. Sealed tokens go via `token_env` (stdin) instead.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Env var whose value is fed to the command on stdin (e.g. a sealed token).
+    /// Never placed in argv. Skipped if unset or empty at runtime.
+    #[serde(default)]
+    pub token_env: Option<String>,
 }
 
 /// A named provider: an endpoint, a credential, and a default model bundled
@@ -359,6 +385,7 @@ impl RuntimeConfig {
     /// - `agent.provider` (or a `subagent.provider`) names no provider
     /// - the agent has no effective model (`agent.model` and the provider's
     ///   `model` are both unset)
+    /// - a `[[bootstrap]]` entry has an empty `name` or `command`
     pub fn validate(&self) -> Result<(), RuntimeError> {
         if matches!(self.mode, Mode::Oneshot) && self.oneshot.is_none() {
             return Err(RuntimeError::Config(
@@ -449,6 +476,20 @@ impl RuntimeConfig {
                 return Err(RuntimeError::Config(format!(
                     "subagent '{}' provider '{provider}' does not match any [[providers]] entry",
                     sub.id
+                )));
+            }
+        }
+
+        for entry in &self.bootstrap {
+            if entry.name.trim().is_empty() {
+                return Err(RuntimeError::Config(
+                    "bootstrap entry name must not be empty".to_string(),
+                ));
+            }
+            if entry.command.trim().is_empty() {
+                return Err(RuntimeError::Config(format!(
+                    "bootstrap entry '{}' command must not be empty",
+                    entry.name
                 )));
             }
         }
@@ -1306,5 +1347,59 @@ mod tests {
         assert_eq!(config.tools.len(), 2);
         assert_eq!(config.tools[0].name, "read");
         assert_eq!(config.tools[1].name, "bash");
+    }
+
+    #[test]
+    fn test_bootstrap_defaults_to_empty() {
+        let config: RuntimeConfig = toml::from_str(minimal_oneshot_toml()).unwrap();
+        config.validate().unwrap();
+        assert!(config.bootstrap.is_empty());
+    }
+
+    #[test]
+    fn test_bootstrap_entry_parses_and_validates() {
+        let config = serve_config(
+            r#"
+            [[bootstrap]]
+            name = "forgejo"
+            command = "fj"
+            args = ["--host", "git.example", "auth", "add-tokenizer"]
+            token_env = "FORGEJO_TOKEN"
+        "#,
+        );
+        config.validate().unwrap();
+        assert_eq!(config.bootstrap.len(), 1);
+        let entry = &config.bootstrap[0];
+        assert_eq!(entry.command, "fj");
+        assert_eq!(entry.args.len(), 4);
+        assert_eq!(entry.token_env.as_deref(), Some("FORGEJO_TOKEN"));
+    }
+
+    #[test]
+    fn test_bootstrap_token_env_is_optional() {
+        let config = serve_config(
+            r#"
+            [[bootstrap]]
+            name = "noop"
+            command = "true"
+        "#,
+        );
+        config.validate().unwrap();
+        let entry = &config.bootstrap[0];
+        assert!(entry.token_env.is_none());
+        assert!(entry.args.is_empty());
+    }
+
+    #[test]
+    fn test_bootstrap_empty_command_fails_validation() {
+        let config = serve_config(
+            r#"
+            [[bootstrap]]
+            name = "forgejo"
+            command = ""
+        "#,
+        );
+        let err = config.validate().unwrap_err();
+        assert!(matches!(err, RuntimeError::Config(_)));
     }
 }

@@ -194,6 +194,26 @@ max_turns = 4
 name = "execute_python"
 ```
 
+## Tool bootstrap
+
+Some tools cache their credentials to disk rather than reading them from the environment on each call. The agent pod has no persistent storage, so those tools must be logged in at container start. Each `[[bootstrap]]` entry names a command the runtime runs once before tasks begin; failures are logged but never fatal — a tool that can't be set up just isn't available, the same as any other tool error.
+
+The runtime has no per-tool knowledge: the full command and arguments are supplied in config, so the deployer (typically an operator) bakes them in. A secret is **never** placed in `args` — `config.toml` ships in a `ConfigMap`. Instead, set `token_env` to the name of an environment variable (sourced from a `Secret`); the runtime feeds that variable's value to the command on stdin, so the credential never lands in argv.
+
+```toml
+[[bootstrap]]
+name = "forgejo"                 # label for logs only
+command = "fj"                   # executable, must be on PATH
+args = [
+  "--host", "git.example.com",
+  "auth", "add-tokenizer",
+  "--proxy", "http://tokenizer-proxy.windowlickers.svc.cluster.local:8080",
+  "--name", "forgejo",
+]
+# Optional. When set, the value of this env var is fed on stdin, never in args.
+token_env = "FORGEJO_TOKEN"
+```
+
 ## Model Context Protocol (MCP) Support
 
 Neuromance supports the [Model Context Protocol](https://modelcontextprotocol.io/) for connecting to external tool servers via the `neuromance-tools` crate.

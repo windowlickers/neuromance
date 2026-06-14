@@ -35,6 +35,11 @@ let
     pythonEnv != null
   ) "PYTHONPATH=${pythonEnv}/${pythonEnv.sitePackages}";
 
+  contents = [
+    package
+    pkgs.cacert
+  ] ++ pythonContents ++ shellPackages ++ extraTools;
+
   variantSuffix = pkgs.lib.optionalString (variant != null) "-${variant}";
   variantTitleSuffix = pkgs.lib.optionalString (variant != null) " (${variant})";
 in
@@ -42,10 +47,7 @@ pkgs.dockerTools.buildLayeredImage {
   name = imageName;
   tag = "${version}${variantSuffix}";
 
-  contents = [
-    package
-    pkgs.cacert
-  ] ++ pythonContents ++ shellPackages ++ extraTools;
+  inherit contents;
 
   # Make the baked /nix/store usable by nix inside the container: register the
   # image closure in /nix/var/nix/db so baked paths are reused instead of
@@ -94,6 +96,11 @@ pkgs.dockerTools.buildLayeredImage {
     ExposedPorts = exposedPorts;
 
     Env = [
+      # buildLayeredImage only symlinks the first occurrence of each /bin name
+      # into the image, so multi-binary packages (npm/npx beside node, cargo-fmt
+      # beside cargo) can be shadowed. Set PATH explicitly over the full closure
+      # so every tool's bin dir is reachable.
+      "PATH=${pkgs.lib.makeBinPath contents}:/bin"
       "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
       "SSL_CERT_DIR=${pkgs.cacert}/etc/ssl/certs"
       "GIT_SSL_CAINFO=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"

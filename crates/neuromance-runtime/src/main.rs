@@ -13,7 +13,7 @@ use neuromance_db::PgConversationStore;
 use neuromance_runtime::{
     ApprovalMode, Mode, RuntimeConfig, RuntimeError,
     approval::WebhookApprover,
-    build_parent_toolset,
+    bootstrap, build_parent_toolset,
     health::{ReadinessGate, router as health_router},
     lifecycle::shutdown_handler,
     metrics as runtime_metrics, oneshot,
@@ -63,6 +63,11 @@ async fn main() -> Result<()> {
         .await
         .context("initialize database store")?;
     let agent = build_agent(&config, store.as_ref(), &cancel).map_err(anyhow::Error::from)?;
+
+    // Best-effort: run one-time tool setup before tasks, since the pod has no
+    // persistent storage to cache credentials a tool writes to disk.
+    bootstrap::run(&config.bootstrap).await;
+
     readiness.set_ready(true);
 
     let result = match config.mode {
