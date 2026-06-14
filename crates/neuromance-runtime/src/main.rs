@@ -148,7 +148,9 @@ async fn spawn_health_server(
     Ok(handle)
 }
 
-/// Connect to postgres and run migrations when `[database]` is configured.
+/// Connect to postgres when `[database]` is configured, running the embedded
+/// migrations unless `run_migrations = false` hands schema ownership to an
+/// external manager.
 ///
 /// Failures here abort startup: the readiness gate stays unready and the
 /// orchestrator restarts the pod. A silently-disabled database would record
@@ -170,9 +172,16 @@ async fn init_store(config: &RuntimeConfig) -> Result<Option<Arc<PgConversationS
     )
     .await
     .with_context(|| format!("connect to postgres (env: {})", database.url_env))?;
-    store.migrate().await.context("run database migrations")?;
+    if database.run_migrations {
+        store.migrate().await.context("run database migrations")?;
+    } else {
+        warn!(
+            "skipping database migrations (run_migrations = false); schema is externally managed"
+        );
+    }
     info!(
         max_connections = database.max_connections,
+        run_migrations = database.run_migrations,
         "database persistence enabled"
     );
     Ok(Some(Arc::new(store)))

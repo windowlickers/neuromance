@@ -152,9 +152,10 @@ With an optional `[database]` section, the runtime writes conversation history t
 url_env = "DATABASE_URL"
 max_connections = 5            # optional, default 5
 acquire_timeout_seconds = 5    # optional, default 5
+run_migrations = true          # optional, default true
 ```
 
-Migrations are embedded in `neuromance-db` and applied automatically at startup. See the `neuromance-db` crate docs for the schema and the `cargo sqlx prepare` workflow when changing queries.
+Migrations are embedded in `neuromance-db` and applied automatically at startup. Set `run_migrations = false` when an external owner (an operator or a shared schema service) manages the database — the runtime then connects to and uses the existing schema without attempting any DDL. The embedded migrations remain the source of truth for neuromance's tables regardless of who applies them. See the `neuromance-db` crate docs for the schema and the `cargo sqlx prepare` workflow when changing queries.
 
 ## Subagents
 

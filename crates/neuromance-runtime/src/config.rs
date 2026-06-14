@@ -194,6 +194,15 @@ pub struct DatabaseSettings {
     /// Bounds the stall a sick database can add to an agent turn.
     #[serde(default = "default_db_acquire_timeout")]
     pub acquire_timeout_seconds: u64,
+    /// Whether the runtime applies neuromance's embedded schema migrations at
+    /// startup.
+    ///
+    /// Defaults to `true`: the runtime owns and provisions its own tables. Set
+    /// to `false` when an external owner (an operator or a shared schema
+    /// service) manages the database — the runtime then uses the existing
+    /// schema without attempting any DDL.
+    #[serde(default = "default_db_run_migrations")]
+    pub run_migrations: bool,
 }
 
 const fn default_db_max_connections() -> u32 {
@@ -201,6 +210,9 @@ const fn default_db_max_connections() -> u32 {
 }
 const fn default_db_acquire_timeout() -> u64 {
     5
+}
+const fn default_db_run_migrations() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1087,6 +1099,26 @@ mod tests {
         assert_eq!(database.url_env, "DATABASE_URL");
         assert_eq!(database.max_connections, 5);
         assert_eq!(database.acquire_timeout_seconds, 5);
+        assert!(database.run_migrations);
+    }
+
+    #[test]
+    fn test_database_run_migrations_can_be_disabled() {
+        let config = serve_config(
+            r#"
+            [database]
+            url_env = "DATABASE_URL"
+            run_migrations = false
+        "#,
+        );
+        config.validate().unwrap();
+
+        // Round-trip through Serialize to confirm the flag survives.
+        let reserialized = toml::to_string(&config).unwrap();
+        let config: RuntimeConfig = toml::from_str(&reserialized).unwrap();
+
+        let database = config.database.expect("database section");
+        assert!(!database.run_migrations);
     }
 
     #[test]
