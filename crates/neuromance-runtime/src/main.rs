@@ -102,8 +102,16 @@ fn init_tracing(extra_layer: Option<BoxedLayer<Registry>>) {
     // an empty Vec reports Interest::never() and silences every event.
     let base = Registry::default().with(extra_layer);
     if json {
+        // `with_current_span(false)` drops the per-event `span` object, which only
+        // duplicates the leaf of the `spans` stack already on every line. The stack
+        // is kept for task/conversation correlation.
         base.with(filter)
-            .with(fmt::layer().json().flatten_event(true))
+            .with(
+                fmt::layer()
+                    .json()
+                    .flatten_event(true)
+                    .with_current_span(false),
+            )
             .init();
     } else {
         base.with(filter)

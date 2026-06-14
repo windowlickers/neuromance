@@ -230,22 +230,18 @@ pub fn router(state: ServeState) -> Router {
             |res: &axum::http::Response<_>, latency: std::time::Duration, span: &Span| {
                 let status = res.status();
                 span.record("status", status.as_u16());
-                let level = if status.is_server_error() {
-                    Level::ERROR
-                } else if status.is_client_error() {
-                    Level::WARN
-                } else {
-                    Level::INFO
-                };
                 let latency_ms = u64::try_from(latency.as_millis()).unwrap_or(u64::MAX);
-                match level {
-                    Level::ERROR => {
-                        tracing::event!(parent: span, Level::ERROR, latency_ms, "http response");
-                    }
-                    Level::WARN => {
-                        tracing::event!(parent: span, Level::WARN, latency_ms, "http response");
-                    }
-                    _ => tracing::event!(parent: span, Level::INFO, latency_ms, "http response"),
+                // Access logs are high-volume — clients poll /tasks/{id} on a tight
+                // loop — so successful responses log at DEBUG. Task lifecycle events
+                // ("task starting"/"task succeeded") carry the real signal at INFO.
+                // Client and server errors stay at WARN/ERROR so they remain visible
+                // at the default level.
+                if status.is_server_error() {
+                    tracing::event!(parent: span, Level::ERROR, latency_ms, "http response");
+                } else if status.is_client_error() {
+                    tracing::event!(parent: span, Level::WARN, latency_ms, "http response");
+                } else {
+                    tracing::event!(parent: span, Level::DEBUG, latency_ms, "http response");
                 }
             },
         );

@@ -28,7 +28,7 @@ use opentelemetry_sdk::{
 };
 use opentelemetry_semantic_conventions::resource::{SERVICE_NAME, SERVICE_VERSION};
 use tracing::Subscriber;
-use tracing_subscriber::{Layer, registry::LookupSpan};
+use tracing_subscriber::{Layer, filter::filter_fn, registry::LookupSpan};
 
 use crate::error::RuntimeError;
 
@@ -126,7 +126,13 @@ where
 
     let tracer = tracer_provider.tracer("neuromance-runtime");
     let trace_layer = tracing_opentelemetry::layer().with_tracer(tracer);
-    let log_layer = OpenTelemetryTracingBridge::new(&logger_provider);
+    // Keep the OTel SDK's own internal events out of the log bridge. Otherwise an
+    // export failure logs an ERROR via `tracing`, the bridge queues that ERROR for
+    // export, the export fails again, and a down or misconfigured collector feeds
+    // its own failure stream. The events still reach stderr, so the misconfiguration
+    // stays diagnosable.
+    let log_layer = OpenTelemetryTracingBridge::new(&logger_provider)
+        .with_filter(filter_fn(|meta| !meta.target().starts_with("opentelemetry")));
     let combined: BoxedLayer<S> = trace_layer.and_then(log_layer).boxed();
 
     Ok(Some((
