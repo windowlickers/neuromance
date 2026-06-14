@@ -35,7 +35,6 @@ const ENV_ALLOWLIST: &[&str] = &["PATH", "HOME", "LANG", "LC_ALL", "TERM"];
 /// and stderr.
 ///
 /// Not auto-approved: arbitrary command execution requires explicit approval.
-#[derive(Default)]
 pub struct BashTool {
     /// Additional env var names forwarded to the shell beyond [`ENV_ALLOWLIST`].
     ///
@@ -47,14 +46,34 @@ pub struct BashTool {
     /// the runtime's own provider keys and DSN — which are not in this list —
     /// stay stripped.
     env_passthrough: Vec<String>,
+    /// Timeout applied when a call omits `timeout_ms`. Defaults to
+    /// [`DEFAULT_TIMEOUT_MS`].
+    default_timeout_ms: u64,
+    /// Upper bound a per-call `timeout_ms` is clamped to. Defaults to
+    /// [`MAX_TIMEOUT_MS`].
+    max_timeout_ms: u64,
+}
+
+impl Default for BashTool {
+    fn default() -> Self {
+        Self {
+            env_passthrough: Vec::new(),
+            default_timeout_ms: DEFAULT_TIMEOUT_MS,
+            max_timeout_ms: MAX_TIMEOUT_MS,
+        }
+    }
 }
 
 impl BashTool {
     /// Construct a bash tool that forwards `env_passthrough` (in addition to
-    /// [`ENV_ALLOWLIST`]) from the runtime's environment into each command.
+    /// [`ENV_ALLOWLIST`]) from the runtime's environment into each command,
+    /// using the default and maximum timeouts.
     #[must_use]
-    pub const fn new(env_passthrough: Vec<String>) -> Self {
-        Self { env_passthrough }
+    pub fn new(env_passthrough: Vec<String>) -> Self {
+        Self {
+            env_passthrough,
+            ..Self::default()
+        }
     }
 }
 
@@ -69,7 +88,8 @@ impl ToolImplementation for BashTool {
         properties.insert(
             "timeout_ms".to_string(),
             Property::number(format!(
-                "Optional timeout in milliseconds. Defaults to {DEFAULT_TIMEOUT_MS}, max {MAX_TIMEOUT_MS}."
+                "Optional timeout in milliseconds. Defaults to {}, max {}.",
+                self.default_timeout_ms, self.max_timeout_ms
             )),
         );
         properties.insert(
@@ -101,12 +121,12 @@ impl ToolImplementation for BashTool {
             .ok_or_else(|| ToolError::InvalidArguments("missing 'command' parameter".into()))?;
 
         let timeout_ms = match obj.get("timeout_ms") {
-            None | Some(Value::Null) => DEFAULT_TIMEOUT_MS,
+            None | Some(Value::Null) => self.default_timeout_ms,
             Some(v) => v.as_u64().ok_or_else(|| {
                 ToolError::InvalidArguments("'timeout_ms' must be a positive integer".into())
             })?,
         };
-        let timeout_ms = timeout_ms.clamp(1, MAX_TIMEOUT_MS);
+        let timeout_ms = timeout_ms.clamp(1, self.max_timeout_ms);
 
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg(command);
@@ -247,11 +267,16 @@ async fn spill_to_temp(bytes: Vec<u8>) -> Option<PathBuf> {
 
 /// Factory that registers [`BashTool`] under the name `bash`.
 ///
-/// Optional config: `env_passthrough`, an array of env var names forwarded from
-/// the runtime's environment into each shell command on top of
-/// [`ENV_ALLOWLIST`]. Deployments use it to let agent-run tools see the
-/// credentials injected for them (e.g. a tokenizer-proxy token, `GIT_CONFIG_*`)
-/// without exposing the runtime's own secrets.
+/// Optional config:
+/// - `env_passthrough`: an array of env var names forwarded from the runtime's
+///   environment into each shell command on top of [`ENV_ALLOWLIST`].
+///   Deployments use it to let agent-run tools see the credentials injected for
+///   them (e.g. a tokenizer-proxy token, `GIT_CONFIG_*`) without exposing the
+///   runtime's own secrets.
+/// - `default_timeout_ms`: timeout applied when a call omits `timeout_ms`
+///   (defaults to [`DEFAULT_TIMEOUT_MS`]).
+/// - `max_timeout_ms`: upper bound a per-call `timeout_ms` is clamped to
+///   (defaults to [`MAX_TIMEOUT_MS`]). Must be >= `default_timeout_ms`.
 pub struct BashToolFactory;
 
 impl ToolFactory for BashToolFactory {
@@ -278,8 +303,39 @@ impl ToolFactory for BashToolFactory {
                 ));
             }
         };
-        registry.register(Arc::new(BashTool::new(env_passthrough)));
+
+        let default_timeout_ms =
+            parse_positive_ms(config, "default_timeout_ms")?.unwrap_or(DEFAULT_TIMEOUT_MS);
+        let max_timeout_ms = parse_positive_ms(config, "max_timeout_ms")?.unwrap_or(MAX_TIMEOUT_MS);
+        if default_timeout_ms > max_timeout_ms {
+            return Err(ToolError::InvalidArguments(format!(
+                "bash 'default_timeout_ms' ({default_timeout_ms}) must not exceed \
+                 'max_timeout_ms' ({max_timeout_ms})"
+            )));
+        }
+
+        registry.register(Arc::new(BashTool {
+            env_passthrough,
+            default_timeout_ms,
+            max_timeout_ms,
+        }));
         Ok(())
+    }
+}
+
+/// Reads an optional positive-integer millisecond field from a config blob.
+///
+/// Returns `None` when absent or null. Rejects non-integers, negatives, and
+/// zero (a zero timeout would fire immediately).
+fn parse_positive_ms(config: &Value, key: &str) -> Result<Option<u64>, ToolError> {
+    match config.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => match v.as_u64() {
+            Some(0) | None => Err(ToolError::InvalidArguments(format!(
+                "bash '{key}' must be a positive integer"
+            ))),
+            Some(ms) => Ok(Some(ms)),
+        },
     }
 }
 
@@ -493,7 +549,10 @@ mod tests {
     fn test_factory_accepts_env_passthrough_array() {
         let registry = ToolRegistry::new();
         BashToolFactory
-            .build(&json!({ "env_passthrough": ["PLANE_ENDPOINT", "GIT_CONFIG_COUNT"] }), &registry)
+            .build(
+                &json!({ "env_passthrough": ["PLANE_ENDPOINT", "GIT_CONFIG_COUNT"] }),
+                &registry,
+            )
             .unwrap();
         assert!(registry.contains("bash"));
     }
@@ -514,5 +573,83 @@ mod tests {
             .build(&json!({ "env_passthrough": [42] }), &registry)
             .unwrap_err();
         assert!(err.to_string().contains("must be strings"));
+    }
+
+    #[tokio::test]
+    async fn test_bash_uses_configured_default_timeout() {
+        // No per-call timeout_ms, so the configured default (100ms) applies and
+        // a 5s sleep is killed.
+        let tool = BashTool {
+            default_timeout_ms: 100,
+            ..BashTool::default()
+        };
+        let result = tool
+            .execute(&json!({ "command": "sleep 5" }))
+            .await
+            .unwrap();
+        assert!(result.contains("timed out after 100ms"), "{result}");
+    }
+
+    #[tokio::test]
+    async fn test_bash_clamps_per_call_timeout_to_configured_max() {
+        // The call requests 5000ms but the configured max is 100ms, so the
+        // command is clamped and killed at 100ms.
+        let tool = BashTool {
+            max_timeout_ms: 100,
+            ..BashTool::default()
+        };
+        let result = tool
+            .execute(&json!({ "command": "sleep 5", "timeout_ms": 5000 }))
+            .await
+            .unwrap();
+        assert!(result.contains("timed out after 100ms"), "{result}");
+    }
+
+    #[test]
+    fn test_factory_accepts_timeout_overrides() {
+        let registry = ToolRegistry::new();
+        BashToolFactory
+            .build(
+                &json!({ "default_timeout_ms": 30_000, "max_timeout_ms": 300_000 }),
+                &registry,
+            )
+            .unwrap();
+        assert!(registry.contains("bash"));
+    }
+
+    #[test]
+    fn test_factory_rejects_default_timeout_exceeding_max() {
+        let registry = ToolRegistry::new();
+        let err = BashToolFactory
+            .build(
+                &json!({ "default_timeout_ms": 300_000, "max_timeout_ms": 1_000 }),
+                &registry,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("must not exceed"), "{err}");
+    }
+
+    #[test]
+    fn test_factory_rejects_zero_timeout() {
+        let registry = ToolRegistry::new();
+        let err = BashToolFactory
+            .build(&json!({ "default_timeout_ms": 0 }), &registry)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("must be a positive integer"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_factory_rejects_non_integer_timeout() {
+        let registry = ToolRegistry::new();
+        let err = BashToolFactory
+            .build(&json!({ "max_timeout_ms": "soon" }), &registry)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("must be a positive integer"),
+            "{err}"
+        );
     }
 }
