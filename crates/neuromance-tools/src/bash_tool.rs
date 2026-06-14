@@ -22,17 +22,41 @@ const MAX_STREAM_BYTES: usize = 64 * 1024;
 /// Maximum lines retained from each of stdout / stderr before truncation.
 const MAX_STREAM_LINES: usize = 2000;
 
-/// Environment variables forwarded into the shell subprocess. Anything else —
-/// including secrets injected by k8s as env vars (`OPENAI_API_KEY`,
-/// `KUBERNETES_*`, projected service-account paths, etc.) — is stripped via
-/// `env_clear` so it cannot leak into tool output.
+/// Base environment variables always forwarded into the shell subprocess.
+/// Everything else — including the runtime's own secrets injected by k8s as env
+/// vars (`OPENAI_API_KEY`, the database DSN, `KUBERNETES_*`, projected
+/// service-account paths, etc.) — is stripped via `env_clear` so it cannot leak
+/// into tool output. Deployments that inject *tool* credentials as env vars
+/// (e.g. a tokenizer-proxy token or `GIT_CONFIG_*`) name them explicitly via
+/// the bash tool's `env_passthrough` config; see [`BashTool::env_passthrough`].
 const ENV_ALLOWLIST: &[&str] = &["PATH", "HOME", "LANG", "LC_ALL", "TERM"];
 
 /// Executes a shell command via `sh -c` and returns its exit code, stdout,
 /// and stderr.
 ///
 /// Not auto-approved: arbitrary command execution requires explicit approval.
-pub struct BashTool;
+#[derive(Default)]
+pub struct BashTool {
+    /// Additional env var names forwarded to the shell beyond [`ENV_ALLOWLIST`].
+    ///
+    /// `env_clear` strips the whole environment by default so the runtime's
+    /// secrets never reach an agent-run command. Operator-injected *tool*
+    /// credentials (a tokenizer-proxy token, `GIT_CONFIG_*`, a CLI's
+    /// `*_ENDPOINT`) are the exception: the deployment lists exactly those
+    /// names here so the tools the agent shells out to can authenticate, while
+    /// the runtime's own provider keys and DSN — which are not in this list —
+    /// stay stripped.
+    env_passthrough: Vec<String>,
+}
+
+impl BashTool {
+    /// Construct a bash tool that forwards `env_passthrough` (in addition to
+    /// [`ENV_ALLOWLIST`]) from the runtime's environment into each command.
+    #[must_use]
+    pub const fn new(env_passthrough: Vec<String>) -> Self {
+        Self { env_passthrough }
+    }
+}
 
 #[async_trait]
 impl ToolImplementation for BashTool {
@@ -89,7 +113,11 @@ impl ToolImplementation for BashTool {
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         cmd.kill_on_drop(true);
         cmd.env_clear();
-        for key in ENV_ALLOWLIST {
+        for key in ENV_ALLOWLIST
+            .iter()
+            .copied()
+            .chain(self.env_passthrough.iter().map(String::as_str))
+        {
             if let Ok(value) = std::env::var(key) {
                 cmd.env(key, value);
             }
@@ -218,7 +246,12 @@ async fn spill_to_temp(bytes: Vec<u8>) -> Option<PathBuf> {
 }
 
 /// Factory that registers [`BashTool`] under the name `bash`.
-/// Takes no configuration.
+///
+/// Optional config: `env_passthrough`, an array of env var names forwarded from
+/// the runtime's environment into each shell command on top of
+/// [`ENV_ALLOWLIST`]. Deployments use it to let agent-run tools see the
+/// credentials injected for them (e.g. a tokenizer-proxy token, `GIT_CONFIG_*`)
+/// without exposing the runtime's own secrets.
 pub struct BashToolFactory;
 
 impl ToolFactory for BashToolFactory {
@@ -226,8 +259,26 @@ impl ToolFactory for BashToolFactory {
         "bash"
     }
 
-    fn build(&self, _config: &Value, registry: &ToolRegistry) -> Result<(), ToolError> {
-        registry.register(Arc::new(BashTool));
+    fn build(&self, config: &Value, registry: &ToolRegistry) -> Result<(), ToolError> {
+        let env_passthrough = match config.get("env_passthrough") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(items)) => items
+                .iter()
+                .map(|v| {
+                    v.as_str().map(str::to_string).ok_or_else(|| {
+                        ToolError::InvalidArguments(
+                            "bash 'env_passthrough' entries must be strings".into(),
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            Some(_) => {
+                return Err(ToolError::InvalidArguments(
+                    "bash 'env_passthrough' must be an array of strings".into(),
+                ));
+            }
+        };
+        registry.register(Arc::new(BashTool::new(env_passthrough)));
         Ok(())
     }
 }
@@ -243,7 +294,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_bash_echo() {
-        let tool = BashTool;
+        let tool = BashTool::default();
         let result = tool
             .execute(&json!({ "command": "echo hello" }))
             .await
@@ -254,14 +305,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_bash_nonzero_exit() {
-        let tool = BashTool;
+        let tool = BashTool::default();
         let result = tool.execute(&json!({ "command": "false" })).await.unwrap();
         assert!(result.contains("exit_code: 1"));
     }
 
     #[tokio::test]
     async fn test_bash_captures_stderr() {
-        let tool = BashTool;
+        let tool = BashTool::default();
         let result = tool
             .execute(&json!({ "command": "echo oops 1>&2" }))
             .await
@@ -272,7 +323,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_bash_timeout() {
-        let tool = BashTool;
+        let tool = BashTool::default();
         let result = tool
             .execute(&json!({
                 "command": "sleep 5",
@@ -286,7 +337,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_bash_cwd_must_exist() {
-        let tool = BashTool;
+        let tool = BashTool::default();
         let err = tool
             .execute(&json!({
                 "command": "pwd",
@@ -300,7 +351,7 @@ mod tests {
     #[tokio::test]
     async fn test_bash_cwd_used() {
         let dir = tempdir().unwrap();
-        let tool = BashTool;
+        let tool = BashTool::default();
         let result = tool
             .execute(&json!({
                 "command": "pwd",
@@ -313,7 +364,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_bash_relative_cwd_rejected() {
-        let tool = BashTool;
+        let tool = BashTool::default();
         let err = tool
             .execute(&json!({
                 "command": "pwd",
@@ -326,14 +377,14 @@ mod tests {
 
     #[test]
     fn test_is_not_auto_approved() {
-        assert!(!BashTool.is_auto_approved());
+        assert!(!BashTool::default().is_auto_approved());
     }
 
     #[tokio::test]
     async fn test_bash_truncation_keeps_tail() {
         // 5000 lines exceeds MAX_STREAM_LINES (2000); the *last* line must
         // survive (errors live at the end) and the full output is spilled.
-        let tool = BashTool;
+        let tool = BashTool::default();
         let result = tool
             .execute(&json!({ "command": "seq 1 5000" }))
             .await
@@ -346,7 +397,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_bash_spilled_file_has_full_output() {
-        let tool = BashTool;
+        let tool = BashTool::default();
         let result = tool
             .execute(&json!({ "command": "seq 1 5000" }))
             .await
@@ -366,7 +417,7 @@ mod tests {
     #[tokio::test]
     async fn test_bash_forwards_path_env() {
         // PATH is in ENV_ALLOWLIST and is set in any sane test environment.
-        let tool = BashTool;
+        let tool = BashTool::default();
         let result = tool
             .execute(&json!({ "command": "test -n \"$PATH\" && echo PATH_OK" }))
             .await
@@ -382,7 +433,7 @@ mod tests {
         // `cargo test` always sets `CARGO`; it is not in ENV_ALLOWLIST, so
         // `env_clear` followed by the allowlist forwarding should drop it.
         // If $CARGO is empty inside the shell, env_clear is working.
-        let tool = BashTool;
+        let tool = BashTool::default();
         let result = tool
             .execute(&json!({
                 "command": "if [ -z \"$CARGO\" ]; then echo CLEAN; else echo LEAKED; fi"
@@ -394,5 +445,74 @@ mod tests {
             "non-allowlisted env (CARGO) leaked into shell:\n{result}"
         );
         assert!(!result.contains("LEAKED"));
+    }
+
+    #[tokio::test]
+    async fn test_bash_env_passthrough_forwards_named_var() {
+        // `cargo test` always sets `CARGO`; it is not in ENV_ALLOWLIST, so it is
+        // stripped by default (see test above). Naming it in `env_passthrough`
+        // forwards it — the mechanism that lets operator-injected tool
+        // credentials reach the subprocess.
+        let tool = BashTool::new(vec!["CARGO".to_string()]);
+        let result = tool
+            .execute(&json!({
+                "command": "if [ -n \"$CARGO\" ]; then echo FORWARDED; else echo MISSING; fi"
+            }))
+            .await
+            .unwrap();
+        assert!(
+            result.contains("FORWARDED"),
+            "env_passthrough var (CARGO) should reach the shell:\n{result}"
+        );
+        assert!(!result.contains("MISSING"));
+    }
+
+    #[tokio::test]
+    async fn test_bash_env_passthrough_does_not_widen_other_vars() {
+        // Forwarding one name must not forward unrelated names: PWD is set in the
+        // runtime env but absent from both ENV_ALLOWLIST and env_passthrough.
+        let tool = BashTool::new(vec!["CARGO".to_string()]);
+        let result = tool
+            .execute(&json!({
+                "command": "if [ -z \"$CARGO_MANIFEST_DIR\" ]; then echo CLEAN; else echo LEAKED; fi"
+            }))
+            .await
+            .unwrap();
+        assert!(result.contains("CLEAN"), "unexpected env leaked:\n{result}");
+        assert!(!result.contains("LEAKED"));
+    }
+
+    #[test]
+    fn test_factory_registers_bash_with_no_config() {
+        let registry = ToolRegistry::new();
+        BashToolFactory.build(&Value::Null, &registry).unwrap();
+        assert!(registry.contains("bash"));
+    }
+
+    #[test]
+    fn test_factory_accepts_env_passthrough_array() {
+        let registry = ToolRegistry::new();
+        BashToolFactory
+            .build(&json!({ "env_passthrough": ["PLANE_ENDPOINT", "GIT_CONFIG_COUNT"] }), &registry)
+            .unwrap();
+        assert!(registry.contains("bash"));
+    }
+
+    #[test]
+    fn test_factory_rejects_non_array_env_passthrough() {
+        let registry = ToolRegistry::new();
+        let err = BashToolFactory
+            .build(&json!({ "env_passthrough": "PLANE_ENDPOINT" }), &registry)
+            .unwrap_err();
+        assert!(err.to_string().contains("must be an array"));
+    }
+
+    #[test]
+    fn test_factory_rejects_non_string_env_passthrough_entries() {
+        let registry = ToolRegistry::new();
+        let err = BashToolFactory
+            .build(&json!({ "env_passthrough": [42] }), &registry)
+            .unwrap_err();
+        assert!(err.to_string().contains("must be strings"));
     }
 }
