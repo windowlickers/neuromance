@@ -175,6 +175,7 @@
             variant ? "minimal",
             extraTools ? [ ],
             includeShell ? false,
+            extraEnv ? [ ],
           }:
           import ./image.nix {
             inherit
@@ -194,7 +195,7 @@
               "8080/tcp" = { };
               "8081/tcp" = { };
             };
-            extraEnv = [ "NEUROMANCE_CONFIG=/etc/neuromance/config.toml" ];
+            extraEnv = [ "NEUROMANCE_CONFIG=/etc/neuromance/config.toml" ] ++ extraEnv;
             configDir = "etc/neuromance";
           };
 
@@ -206,6 +207,7 @@
             pythonPackages ? defaultPythonPackages,
             extraTools ? [ ],
             includeShell ? false,
+            extraEnv ? [ ],
           }:
           let
             pythonEnv = pkgs.python3.withPackages pythonPackages;
@@ -223,6 +225,7 @@
                 variant
                 extraTools
                 includeShell
+                extraEnv
                 ;
             };
           };
