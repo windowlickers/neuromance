@@ -71,10 +71,15 @@ async fn run_command(cmd: &BootstrapCommand) {
         }
     };
 
-    if let (Some(token), Some(mut stdin)) = (token, child.stdin.take()) {
-        if let Err(e) = stdin
-            .write_all(format!("{}\n", token.trim()).as_bytes())
-            .await
+    // Close the child's stdin: write the token first when present, then drop
+    // the write end so the child sees EOF. This must happen even without a
+    // token — a command that reads stdin (e.g. an auth CLI prompting for input)
+    // would otherwise block forever and wedge startup.
+    if let Some(mut stdin) = child.stdin.take() {
+        if let Some(token) = token
+            && let Err(e) = stdin
+                .write_all(format!("{}\n", token.trim()).as_bytes())
+                .await
         {
             warn!(bootstrap = %cmd.name, error = %e, "could not write token to stdin");
             return;
@@ -101,6 +106,8 @@ async fn run_command(cmd: &BootstrapCommand) {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
+
     use super::*;
 
     #[test]
@@ -120,6 +127,21 @@ mod tests {
         // the value, and the args carry no credential material.
         assert!(!cmd.args.iter().any(|a| a.contains("FORGEJO_TOKEN")));
         assert!(!cmd.args.iter().any(|a| a.contains("Tokenizer ")));
+    }
+
+    #[tokio::test]
+    async fn test_command_reading_stdin_without_token_env_does_not_hang() {
+        // `cat` reads stdin until EOF. If stdin is left open when no token_env
+        // is set, it blocks forever; closing stdin unconditionally lets it exit.
+        let cmd = BootstrapCommand {
+            name: "reads-stdin".to_string(),
+            command: "cat".to_string(),
+            args: vec![],
+            token_env: None,
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), run_command(&cmd))
+            .await
+            .expect("bootstrap without token_env must not block on stdin");
     }
 
     #[test]
