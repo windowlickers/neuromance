@@ -29,6 +29,9 @@ const MAX_STREAM_LINES: usize = 2000;
 /// into tool output. Deployments that inject *tool* credentials as env vars
 /// (e.g. a tokenizer-proxy token or `GIT_CONFIG_*`) name them explicitly via
 /// the bash tool's `env_passthrough` config; see [`BashTool::env_passthrough`].
+///
+/// Setting [`BashTool::inherit_env`] disables this stripping entirely, letting
+/// the shell inherit the full parent environment.
 const ENV_ALLOWLIST: &[&str] = &["PATH", "HOME", "LANG", "LC_ALL", "TERM"];
 
 /// Executes a shell command via `sh -c` and returns its exit code, stdout,
@@ -46,6 +49,12 @@ pub struct BashTool {
     /// the runtime's own provider keys and DSN — which are not in this list —
     /// stay stripped.
     env_passthrough: Vec<String>,
+    /// When `true`, the shell inherits the full parent environment: `env_clear`
+    /// and `env_passthrough` are both bypassed. Intended for deployments where
+    /// secrets are delivered out-of-band (e.g. sealed tokens injected by a
+    /// proxy) so the pod's environment holds nothing worth stripping. Defaults
+    /// to `false`, preserving the allowlist-only behavior.
+    inherit_env: bool,
     /// Timeout applied when a call omits `timeout_ms`. Defaults to
     /// [`DEFAULT_TIMEOUT_MS`].
     default_timeout_ms: u64,
@@ -58,6 +67,7 @@ impl Default for BashTool {
     fn default() -> Self {
         Self {
             env_passthrough: Vec::new(),
+            inherit_env: false,
             default_timeout_ms: DEFAULT_TIMEOUT_MS,
             max_timeout_ms: MAX_TIMEOUT_MS,
         }
@@ -132,14 +142,16 @@ impl ToolImplementation for BashTool {
         cmd.arg("-c").arg(command);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         cmd.kill_on_drop(true);
-        cmd.env_clear();
-        for key in ENV_ALLOWLIST
-            .iter()
-            .copied()
-            .chain(self.env_passthrough.iter().map(String::as_str))
-        {
-            if let Ok(value) = std::env::var(key) {
-                cmd.env(key, value);
+        if !self.inherit_env {
+            cmd.env_clear();
+            for key in ENV_ALLOWLIST
+                .iter()
+                .copied()
+                .chain(self.env_passthrough.iter().map(String::as_str))
+            {
+                if let Ok(value) = std::env::var(key) {
+                    cmd.env(key, value);
+                }
             }
         }
 
@@ -273,6 +285,10 @@ async fn spill_to_temp(bytes: Vec<u8>) -> Option<PathBuf> {
 ///   Deployments use it to let agent-run tools see the credentials injected for
 ///   them (e.g. a tokenizer-proxy token, `GIT_CONFIG_*`) without exposing the
 ///   runtime's own secrets.
+/// - `inherit_env`: a boolean (default `false`). When `true`, the shell inherits
+///   the full parent environment and both `env_clear` and `env_passthrough` are
+///   bypassed. Use only where the pod's environment holds no secrets worth
+///   stripping (e.g. credentials delivered out-of-band by a proxy).
 /// - `default_timeout_ms`: timeout applied when a call omits `timeout_ms`
 ///   (defaults to [`DEFAULT_TIMEOUT_MS`]).
 /// - `max_timeout_ms`: upper bound a per-call `timeout_ms` is clamped to
@@ -304,6 +320,16 @@ impl ToolFactory for BashToolFactory {
             }
         };
 
+        let inherit_env = match config.get("inherit_env") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(b)) => *b,
+            Some(_) => {
+                return Err(ToolError::InvalidArguments(
+                    "bash 'inherit_env' must be a boolean".into(),
+                ));
+            }
+        };
+
         let default_timeout_ms =
             parse_positive_ms(config, "default_timeout_ms")?.unwrap_or(DEFAULT_TIMEOUT_MS);
         let max_timeout_ms = parse_positive_ms(config, "max_timeout_ms")?.unwrap_or(MAX_TIMEOUT_MS);
@@ -316,6 +342,7 @@ impl ToolFactory for BashToolFactory {
 
         registry.register(Arc::new(BashTool {
             env_passthrough,
+            inherit_env,
             default_timeout_ms,
             max_timeout_ms,
         }));
@@ -536,6 +563,46 @@ mod tests {
             .unwrap();
         assert!(result.contains("CLEAN"), "unexpected env leaked:\n{result}");
         assert!(!result.contains("LEAKED"));
+    }
+
+    #[tokio::test]
+    async fn test_bash_inherit_env_forwards_all() {
+        // `cargo test` always sets `CARGO`, which is not in ENV_ALLOWLIST and so
+        // is stripped by default. With `inherit_env`, the full parent
+        // environment is inherited and it reaches the shell unnamed.
+        let tool = BashTool {
+            inherit_env: true,
+            ..BashTool::default()
+        };
+        let result = tool
+            .execute(&json!({
+                "command": "if [ -n \"$CARGO\" ]; then echo INHERITED; else echo MISSING; fi"
+            }))
+            .await
+            .unwrap();
+        assert!(
+            result.contains("INHERITED"),
+            "inherit_env should pass the full parent environment to the shell:\n{result}"
+        );
+        assert!(!result.contains("MISSING"));
+    }
+
+    #[test]
+    fn test_factory_parses_inherit_env() {
+        let registry = ToolRegistry::new();
+        BashToolFactory
+            .build(&json!({ "inherit_env": true }), &registry)
+            .unwrap();
+        assert!(registry.contains("bash"));
+    }
+
+    #[test]
+    fn test_factory_rejects_non_bool_inherit_env() {
+        let registry = ToolRegistry::new();
+        let err = BashToolFactory
+            .build(&json!({ "inherit_env": "yes" }), &registry)
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments(_)));
     }
 
     #[test]
