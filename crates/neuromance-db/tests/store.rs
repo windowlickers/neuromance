@@ -14,15 +14,33 @@
 
 use chrono::SubsecRound;
 use neuromance_common::chat::{Conversation, ConversationStatus, Message, ReasoningContent};
+use neuromance_common::client::{InputTokensDetails, Usage};
 use neuromance_common::tools::ToolCall;
 use neuromance_db::{ConversationSink, PgConversationStore};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+const fn sample_usage() -> Usage {
+    Usage {
+        prompt_tokens: 120,
+        completion_tokens: 34,
+        total_tokens: 154,
+        cost: Some(0.0012),
+        input_tokens_details: Some(InputTokensDetails {
+            cached_tokens: 80,
+            cache_creation_tokens: 0,
+        }),
+        output_tokens_details: None,
+    }
+}
+
 fn sample_history(conversation_id: Uuid) -> Vec<Message> {
-    let assistant = Message::assistant(conversation_id, "checking the weather")
+    let mut assistant = Message::assistant(conversation_id, "checking the weather")
         .with_tool_calls(vec![ToolCall::new("get_weather", r#"{"city":"Berlin"}"#)])
         .unwrap();
+    assistant.model = Some("claude-sonnet-4-5-20250929".to_string());
+    assistant.provider = Some("anthropic".to_string());
+    assistant.usage = Some(sample_usage());
     let tool_call_id = assistant.tool_calls[0].id.clone();
     vec![
         Message::system(conversation_id, "you are helpful"),
@@ -85,6 +103,46 @@ async fn test_append_is_idempotent_and_seq_is_dense(pool: PgPool) {
         .map(|(i, m)| (i64::try_from(i).unwrap(), m.id))
         .collect();
     assert_eq!(seqs, expected, "seq must be dense and follow caller order");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires postgres via DATABASE_URL"]
+async fn test_model_provider_usage_round_trip_through_store(pool: PgPool) {
+    let store = PgConversationStore::new(pool.clone());
+    let conversation_id = Uuid::new_v4();
+    let history = sample_history(conversation_id);
+    store
+        .append_messages(conversation_id, &history)
+        .await
+        .unwrap();
+
+    let conversation = store
+        .get_conversation(conversation_id)
+        .await
+        .unwrap()
+        .expect("conversation should exist after append");
+
+    let assistant = conversation
+        .messages
+        .iter()
+        .find(|m| m.role == neuromance_common::chat::MessageRole::Assistant)
+        .expect("history has an assistant message");
+    assert_eq!(
+        assistant.model.as_deref(),
+        Some("claude-sonnet-4-5-20250929")
+    );
+    assert_eq!(assistant.provider.as_deref(), Some("anthropic"));
+    assert_eq!(assistant.usage, Some(sample_usage()));
+
+    // Non-assistant rows carry no client metadata.
+    let user = conversation
+        .messages
+        .iter()
+        .find(|m| m.role == neuromance_common::chat::MessageRole::User)
+        .expect("history has a user message");
+    assert_eq!(user.model, None);
+    assert_eq!(user.provider, None);
+    assert_eq!(user.usage, None);
 }
 
 #[sqlx::test(migrations = "./migrations")]

@@ -638,6 +638,9 @@ mod tests {
             timestamp: Utc::now(),
             metadata: HashMap::new(),
             reasoning: None,
+            model: None,
+            provider: None,
+            usage: None,
         }
     }
 
@@ -1289,6 +1292,9 @@ mod tests {
             timestamp: Utc::now(),
             metadata: HashMap::new(),
             reasoning: None,
+            model: None,
+            provider: None,
+            usage: None,
         };
 
         let anthropic_msg = AnthropicMessage::from(&tool_message);
@@ -1351,6 +1357,9 @@ mod tests {
             timestamp: Utc::now(),
             metadata: HashMap::new(),
             reasoning: None,
+            model: None,
+            provider: None,
+            usage: None,
         };
 
         let anthropic_msg = AnthropicMessage::from(&assistant_message);
@@ -1429,6 +1438,9 @@ mod tests {
                 timestamp: Utc::now(),
                 metadata: HashMap::new(),
                 reasoning: None,
+                model: None,
+                provider: None,
+                usage: None,
             },
             Message {
                 id: uuid::Uuid::new_v4(),
@@ -1441,6 +1453,9 @@ mod tests {
                 timestamp: Utc::now(),
                 metadata: HashMap::new(),
                 reasoning: None,
+                model: None,
+                provider: None,
+                usage: None,
             },
         ];
         messages.push(create_test_message()); // Add a user message

@@ -179,7 +179,7 @@ impl PgConversationStore {
             MessageRow,
             r#"
             SELECT id, conversation_id, role, content, tool_calls, tool_call_id,
-                   name, reasoning, metadata, timestamp
+                   name, reasoning, metadata, timestamp, model, provider, usage
             FROM messages WHERE conversation_id = $1 ORDER BY seq
             "#,
             id,
@@ -405,8 +405,9 @@ impl ConversationSink for PgConversationStore {
             let result = sqlx::query!(
                 r#"
                 INSERT INTO messages (id, conversation_id, seq, role, content, tool_calls,
-                                      tool_call_id, name, reasoning, metadata, timestamp)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                                      tool_call_id, name, reasoning, metadata, timestamp,
+                                      model, provider, usage)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
                 ON CONFLICT (id) DO NOTHING
                 "#,
                 message.id,
@@ -420,6 +421,9 @@ impl ConversationSink for PgConversationStore {
                 columns.reasoning as Option<Value>,
                 columns.metadata,
                 message.timestamp,
+                columns.model,
+                columns.provider,
+                columns.usage as Option<Value>,
             )
             .execute(&mut *tx)
             .await

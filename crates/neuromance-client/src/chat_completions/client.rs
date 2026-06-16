@@ -764,6 +764,9 @@ mod tests {
             timestamp: Utc::now(),
             metadata: HashMap::new(),
             reasoning: None,
+            model: None,
+            provider: None,
+            usage: None,
         }
     }
 

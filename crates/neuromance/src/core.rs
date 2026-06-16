@@ -437,6 +437,9 @@ impl<C: LLMClient> Core<C> {
                         timestamp: Utc::now(),
                         metadata: last_chunk.metadata,
                         reasoning: None,
+                        model: None,
+                        provider: None,
+                        usage: None,
                     };
 
                     ChatResponse {
@@ -532,7 +535,11 @@ impl<C: LLMClient> Core<C> {
                     "model" => model_label,
                 )
                 .increment(u64::from(completion_tokens));
-                messages.push(response.message);
+                let mut assistant_message = response.message;
+                assistant_message.model = Some(response.model);
+                assistant_message.provider = Some(self.client.config().provider.clone());
+                assistant_message.usage = response.usage;
+                messages.push(assistant_message);
 
                 // Persist the assistant message before tool execution so a
                 // crashed run still has its prefix recorded.

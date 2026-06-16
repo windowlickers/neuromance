@@ -138,6 +138,9 @@ impl MessageBuilder {
             timestamp: Utc::now(),
             metadata: HashMap::new(),
             reasoning,
+            model: None,
+            provider: None,
+            usage: None,
         }
     }
 }

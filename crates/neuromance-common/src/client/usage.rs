@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Different providers may count tokens differently. The `total_tokens`
 /// should always equal `prompt_tokens + completion_tokens`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
     /// Number of tokens in the input prompt.
     #[serde(alias = "input_tokens")]
@@ -39,7 +39,7 @@ pub struct Usage {
 ///
 /// Provides additional information about how input tokens were processed,
 /// including cache utilization.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct InputTokensDetails {
     /// Number of tokens served from cache rather than processed fresh.
     ///
@@ -67,7 +67,7 @@ const fn is_zero(val: &u32) -> bool {
 ///
 /// Provides additional information about token usage in the model's response,
 /// including reasoning tokens for models that support chain-of-thought.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputTokensDetails {
     /// Number of tokens used for internal reasoning (e.g., chain-of-thought).
     ///

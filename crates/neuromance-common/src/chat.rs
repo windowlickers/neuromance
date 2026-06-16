@@ -51,6 +51,7 @@ use smallvec::SmallVec;
 use typed_builder::TypedBuilder;
 use uuid::Uuid;
 
+use crate::client::Usage;
 use crate::tools::ToolCall;
 
 /// Reasoning/thinking content from models that support extended thinking.
@@ -154,6 +155,23 @@ pub struct Message {
     /// Reasoning/thinking content from models that support extended thinking.
     #[builder(default)]
     pub reasoning: Option<ReasoningContent>,
+
+    /// Model identifier that produced this message (assistant messages only).
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+
+    /// Provider/vendor that served this message, e.g. "anthropic", "openai"
+    /// (assistant messages only).
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+
+    /// Token usage reported for the turn that produced this message
+    /// (assistant messages only).
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
 }
 
 impl Message {
@@ -170,6 +188,9 @@ impl Message {
             tool_call_id: None,
             name: None,
             reasoning: None,
+            model: None,
+            provider: None,
+            usage: None,
         }
     }
 

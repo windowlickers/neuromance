@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, conversation_id, role, content, tool_calls, tool_call_id,\n                   name, reasoning, metadata, timestamp\n            FROM messages WHERE conversation_id = $1 ORDER BY seq\n            ",
+  "query": "\n            SELECT id, conversation_id, role, content, tool_calls, tool_call_id,\n                   name, reasoning, metadata, timestamp, model, provider, usage\n            FROM messages WHERE conversation_id = $1 ORDER BY seq\n            ",
   "describe": {
     "columns": [
       {
@@ -52,6 +52,21 @@
         "ordinal": 9,
         "name": "timestamp",
         "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 10,
+        "name": "model",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "provider",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 12,
+        "name": "usage",
+        "type_info": "Jsonb"
       }
     ],
     "parameters": {
@@ -69,8 +84,11 @@
       true,
       true,
       false,
-      false
+      false,
+      true,
+      true,
+      true
     ]
   },
-  "hash": "3149ed0097c79d30b7d194aeec88af51cc36dbf286945cd9eea351b0b180d5a2"
+  "hash": "b2a49de4bc126379f6cd50ab499bf52e11e8b6044aa219ead881c3f5f9c7b865"
 }

@@ -7,6 +7,7 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use neuromance_common::chat::{ConversationStatus, Message, MessageRole, ReasoningContent};
+use neuromance_common::client::Usage;
 use neuromance_common::tools::ToolCall;
 use serde::Serialize;
 use serde_json::Value;
@@ -91,6 +92,9 @@ pub struct MessageColumns {
     pub tool_calls: Value,
     pub reasoning: Option<Value>,
     pub metadata: Value,
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    pub usage: Option<Value>,
 }
 
 /// Derives the encoded column values for inserting a [`Message`].
@@ -112,6 +116,14 @@ pub fn message_to_columns(message: &Message) -> Result<MessageColumns, DbError> 
             .transpose()
             .map_err(|e| encode("reasoning", e))?,
         metadata: serde_json::to_value(&message.metadata).map_err(|e| encode("metadata", e))?,
+        model: message.model.clone(),
+        provider: message.provider.clone(),
+        usage: message
+            .usage
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|e| encode("usage", e))?,
     })
 }
 
@@ -127,6 +139,9 @@ pub struct MessageRow {
     pub reasoning: Option<Value>,
     pub metadata: Value,
     pub timestamp: DateTime<Utc>,
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    pub usage: Option<Value>,
 }
 
 impl MessageRow {
@@ -156,6 +171,13 @@ impl MessageRow {
                 .map(serde_json::from_value::<ReasoningContent>)
                 .transpose()
                 .map_err(|e| decode("reasoning", e))?,
+            model: self.model,
+            provider: self.provider,
+            usage: self
+                .usage
+                .map(serde_json::from_value::<Usage>)
+                .transpose()
+                .map_err(|e| decode("usage", e))?,
         })
     }
 }
@@ -165,6 +187,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     #![allow(clippy::expect_used)]
 
+    use neuromance_common::client::InputTokensDetails;
     use proptest::prelude::*;
 
     use super::*;
@@ -181,6 +204,9 @@ mod tests {
             reasoning: columns.reasoning,
             metadata: columns.metadata,
             timestamp: message.timestamp,
+            model: columns.model,
+            provider: columns.provider,
+            usage: columns.usage,
         }
     }
 
@@ -198,6 +224,9 @@ mod tests {
         assert_eq!(restored.tool_call_id, message.tool_call_id);
         assert_eq!(restored.name, message.name);
         assert_eq!(restored.reasoning, message.reasoning);
+        assert_eq!(restored.model, message.model);
+        assert_eq!(restored.provider, message.provider);
+        assert_eq!(restored.usage, message.usage);
     }
 
     #[test]
@@ -235,6 +264,58 @@ mod tests {
         let mut message = Message::assistant(Uuid::new_v4(), "answer");
         message.reasoning = Some(ReasoningContent::with_signature("thinking...", "sig-abc"));
         assert_round_trip(&message);
+    }
+
+    #[test]
+    fn test_assistant_message_with_model_and_usage_round_trips() {
+        let mut message = Message::assistant(Uuid::new_v4(), "the answer is 42");
+        message.model = Some("claude-sonnet-4-5-20250929".to_string());
+        message.provider = Some("anthropic".to_string());
+        message.usage = Some(Usage {
+            prompt_tokens: 120,
+            completion_tokens: 34,
+            total_tokens: 154,
+            cost: Some(0.0012),
+            input_tokens_details: Some(InputTokensDetails {
+                cached_tokens: 80,
+                cache_creation_tokens: 0,
+            }),
+            output_tokens_details: None,
+        });
+        assert_round_trip(&message);
+    }
+
+    #[test]
+    fn test_model_and_usage_absent_encode_as_null() {
+        let message = Message::user(Uuid::new_v4(), "hi");
+        let columns = message_to_columns(&message).unwrap();
+        assert_eq!(columns.model, None);
+        assert_eq!(columns.provider, None);
+        assert_eq!(columns.usage, None);
+    }
+
+    #[test]
+    fn test_corrupt_usage_json_is_a_decode_error() {
+        let mut message = Message::assistant(Uuid::new_v4(), "answer");
+        message.usage = Some(Usage {
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            total_tokens: 2,
+            cost: None,
+            input_tokens_details: None,
+            output_tokens_details: None,
+        });
+        let columns = message_to_columns(&message).unwrap();
+        let mut row = row_from(&message, columns);
+        row.usage = Some(serde_json::json!("not a usage object"));
+        let err = row.into_message().unwrap_err();
+        assert!(matches!(
+            err,
+            DbError::Decode {
+                column: "usage",
+                ..
+            }
+        ));
     }
 
     #[test]
