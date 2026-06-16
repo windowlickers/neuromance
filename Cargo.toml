@@ -131,7 +131,7 @@ unimplemented = "deny"
 dbg_macro = "deny"
 
 [profile.release]
-lto = true
-codegen-units = 1
+lto = "thin"
+codegen-units = 16
 panic = "abort"
-debug = true
+debug = false

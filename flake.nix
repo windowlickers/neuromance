@@ -65,11 +65,17 @@
           pname = "neuromance";
           inherit version;
           buildInputs = [ pkgs.openssl pythonEnv ];
-          nativeBuildInputs = [ pkgs.pkg-config ];
+          nativeBuildInputs = [
+            pkgs.pkg-config
+            pkgs.mold
+          ];
           PYO3_PYTHON = "${pythonEnv}/bin/python3";
           # Compile sqlx query macros from the committed .sqlx/ metadata —
           # build sandboxes have no database.
           SQLX_OFFLINE = "true";
+          # Link with mold. Must be set here so buildDepsOnly and every check
+          # share one RUSTFLAGS value, or the cached dep artifacts won't match.
+          RUSTFLAGS = "-C link-arg=-fuse-ld=mold";
         };
 
         commonArgs = mkCommonArgs defaultPythonEnv;
@@ -446,6 +452,11 @@
             neuromance-runtime
             neuromance-runtime-toolkit
             ;
+          # The shared cargo dependency artifact, exposed so CI can build and
+          # push it to the binary cache. It is a build-time input of the
+          # clippy/test/build derivations, not part of their runtime closure,
+          # so pushing only the final outputs would never cache it.
+          deps = cargoArtifacts;
           neuromance-image = neuromanceImage;
           neuromance-toolkit-image = neuromanceImageToolkit;
           default = neuromance;
@@ -534,10 +545,12 @@
             dive
             sqlx-cli
             postgresql
+            mold
           ]);
 
           RUST_BACKTRACE = "1";
           PYO3_PYTHON = "${defaultPythonEnv}/bin/python3";
+          RUSTFLAGS = "-C link-arg=-fuse-ld=mold";
         };
 
         formatter = pkgs.nixpkgs-fmt;

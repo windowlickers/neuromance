@@ -11,6 +11,22 @@ env:
   ATTIC_URL: ${{ vars.ATTIC_URL }}
 
 jobs:
+  deps:
+    runs-on: nix-latest
+    container:
+      options: --user root
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup attic
+        run: |
+          attic login ci "$ATTIC_URL" "$ATTIC_TOKEN"
+          attic use ci
+      - name: Build cargo dependency artifact
+        run: nix build .#deps --print-build-logs
+      - name: Push deps to attic
+        run: attic push ci ./result
+
   fmt:
     runs-on: nix-latest
     container:
@@ -28,6 +44,7 @@ jobs:
         run: attic push ci ./result
 
   clippy:
+    needs: deps
     runs-on: nix-latest
     container:
       options: --user root
@@ -44,6 +61,7 @@ jobs:
         run: attic push ci ./result
 
   tests:
+    needs: deps
     runs-on: nix-latest
     container:
       options: --user root
@@ -60,6 +78,7 @@ jobs:
         run: attic push ci ./result
 
   build:
+    needs: deps
     runs-on: nix-latest
     container:
       options: --user root
@@ -80,8 +99,15 @@ jobs:
         run: attic push ci ./result
       - name: Verify runtime binary
         run: test -x result/bin/neuromance-runtime
+      - name: Build neuromance-runtime-toolkit
+        run: nix build .#neuromance-runtime-toolkit --print-build-logs
+      - name: Push neuromance-runtime-toolkit to attic
+        run: attic push ci ./result
+      - name: Verify toolkit runtime binary
+        run: test -x result/bin/neuromance-runtime
 
   image:
+    needs: build
     runs-on: nix-latest
     container:
       options: --user root
