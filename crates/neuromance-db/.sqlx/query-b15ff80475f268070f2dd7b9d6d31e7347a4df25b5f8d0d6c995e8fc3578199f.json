@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, title, description, status, metadata, created_at, updated_at\n            FROM conversations WHERE id = $1\n            ",
+  "query": "\n            SELECT id, title, description, status, metadata, created_at, updated_at,\n                   parent_conversation_id, parent_message_id, parent_tool_call_id\n            FROM conversations WHERE id = $1\n            ",
   "describe": {
     "columns": [
       {
@@ -37,6 +37,21 @@
         "ordinal": 6,
         "name": "updated_at",
         "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "parent_conversation_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 8,
+        "name": "parent_message_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 9,
+        "name": "parent_tool_call_id",
+        "type_info": "Text"
       }
     ],
     "parameters": {
@@ -51,8 +66,11 @@
       false,
       false,
       false,
-      false
+      false,
+      true,
+      true,
+      true
     ]
   },
-  "hash": "9826efd580502e168c7ae6f8ee5e1c703a95810494e5b5e48f9156e252f0df63"
+  "hash": "b15ff80475f268070f2dd7b9d6d31e7347a4df25b5f8d0d6c995e8fc3578199f"
 }

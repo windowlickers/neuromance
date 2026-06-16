@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use neuromance_common::chat::{Conversation, ConversationStatus, Message};
+use serde::Serialize;
 use serde_json::Value;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
@@ -17,7 +18,7 @@ use crate::rows::{MessageRow, message_to_columns, status_from_str, status_to_str
 use crate::sink::ConversationSink;
 
 /// A lightweight listing entry for a stored conversation.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ConversationSummary {
     /// Conversation id.
     pub id: Uuid,
@@ -31,6 +32,12 @@ pub struct ConversationSummary {
     pub updated_at: DateTime<Utc>,
     /// Number of persisted messages.
     pub message_count: u64,
+    /// Conversation that spawned this one, or `None` for a root conversation.
+    pub parent_conversation_id: Option<Uuid>,
+    /// Assistant message in the parent that emitted the spawning tool call.
+    pub parent_message_id: Option<Uuid>,
+    /// Id of the specific tool call within [`Self::parent_message_id`].
+    pub parent_tool_call_id: Option<String>,
 }
 
 /// Postgres-backed store for conversations and messages.
@@ -163,7 +170,8 @@ impl PgConversationStore {
     pub async fn get_conversation(&self, id: Uuid) -> Result<Option<Conversation>, DbError> {
         let Some(row) = sqlx::query!(
             r#"
-            SELECT id, title, description, status, metadata, created_at, updated_at
+            SELECT id, title, description, status, metadata, created_at, updated_at,
+                   parent_conversation_id, parent_message_id, parent_tool_call_id
             FROM conversations WHERE id = $1
             "#,
             id,
@@ -206,6 +214,9 @@ impl PgConversationStore {
             updated_at: row.updated_at,
             metadata,
             status: status_from_str(&row.status, id)?,
+            parent_conversation_id: row.parent_conversation_id,
+            parent_message_id: row.parent_message_id,
+            parent_tool_call_id: row.parent_tool_call_id,
             messages: Arc::new(messages),
         }))
     }
@@ -223,6 +234,7 @@ impl PgConversationStore {
         let rows = sqlx::query!(
             r#"
             SELECT c.id, c.title, c.status, c.created_at, c.updated_at,
+                   c.parent_conversation_id, c.parent_message_id, c.parent_tool_call_id,
                    COUNT(m.id) AS "message_count!"
             FROM conversations c
             LEFT JOIN messages m ON m.conversation_id = c.id
@@ -246,6 +258,60 @@ impl PgConversationStore {
                     created_at: row.created_at,
                     updated_at: row.updated_at,
                     message_count: u64::try_from(row.message_count).unwrap_or(0),
+                    parent_conversation_id: row.parent_conversation_id,
+                    parent_message_id: row.parent_message_id,
+                    parent_tool_call_id: row.parent_tool_call_id,
+                })
+            })
+            .collect()
+    }
+
+    /// Lists the child conversations of `parent_id`, most recently updated first.
+    ///
+    /// Children are conversations a delegating run spawned (e.g. subagents),
+    /// linked via [`ConversationSink::set_conversation_parent`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the query fails or a stored status is unknown.
+    pub async fn list_child_conversations(
+        &self,
+        parent_id: Uuid,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<ConversationSummary>, DbError> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT c.id, c.title, c.status, c.created_at, c.updated_at,
+                   c.parent_conversation_id, c.parent_message_id, c.parent_tool_call_id,
+                   COUNT(m.id) AS "message_count!"
+            FROM conversations c
+            LEFT JOIN messages m ON m.conversation_id = c.id
+            WHERE c.parent_conversation_id = $1
+            GROUP BY c.id
+            ORDER BY c.updated_at DESC
+            LIMIT $2 OFFSET $3
+            "#,
+            parent_id,
+            i64::from(limit),
+            i64::from(offset),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .op("list child conversations")?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(ConversationSummary {
+                    id: row.id,
+                    title: row.title,
+                    status: status_from_str(&row.status, row.id)?,
+                    created_at: row.created_at,
+                    updated_at: row.updated_at,
+                    message_count: u64::try_from(row.message_count).unwrap_or(0),
+                    parent_conversation_id: row.parent_conversation_id,
+                    parent_message_id: row.parent_message_id,
+                    parent_tool_call_id: row.parent_tool_call_id,
                 })
             })
             .collect()
@@ -313,20 +379,28 @@ impl ConversationSink for PgConversationStore {
         child: Uuid,
         parent: Uuid,
         parent_task_id: Option<Uuid>,
+        parent_message_id: Option<Uuid>,
+        parent_tool_call_id: Option<&str>,
     ) -> Result<(), DbError> {
         // Upsert so the link records regardless of whether the child row has
         // been created by the first message append yet.
         sqlx::query!(
             r#"
-            INSERT INTO conversations (id, parent_conversation_id, parent_task_id)
-            VALUES ($1, $2, $3)
+            INSERT INTO conversations
+                (id, parent_conversation_id, parent_task_id,
+                 parent_message_id, parent_tool_call_id)
+            VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT (id) DO UPDATE
                 SET parent_conversation_id = EXCLUDED.parent_conversation_id,
-                    parent_task_id = EXCLUDED.parent_task_id
+                    parent_task_id = EXCLUDED.parent_task_id,
+                    parent_message_id = EXCLUDED.parent_message_id,
+                    parent_tool_call_id = EXCLUDED.parent_tool_call_id
             "#,
             child,
             parent,
             parent_task_id,
+            parent_message_id,
+            parent_tool_call_id,
         )
         .execute(&self.pool)
         .await

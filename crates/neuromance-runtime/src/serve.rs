@@ -222,6 +222,10 @@ pub struct ServeState {
 /// 64 KiB is generous and prevents memory amplification from oversized intake.
 const MAX_TASK_BODY_BYTES: usize = 64 * 1024;
 
+/// Page size for `GET /conversations/{id}/children`. A delegation fan-out is
+/// bounded in practice; this caps a single response without pagination params.
+const CHILDREN_PAGE_LIMIT: u32 = 100;
+
 pub fn router(state: ServeState) -> Router {
     let trace_layer = TraceLayer::new_for_http()
         .make_span_with(|req: &axum::http::Request<_>| {
@@ -260,6 +264,7 @@ pub fn router(state: ServeState) -> Router {
             "/conversations/{id}",
             get(get_conversation).delete(delete_conversation),
         )
+        .route("/conversations/{id}/children", get(list_conversation_children))
         .layer(DefaultBodyLimit::max(MAX_TASK_BODY_BYTES))
         .layer(trace_layer)
         .with_state(state)
@@ -476,6 +481,40 @@ async fn get_conversation(
         },
         |rec| (StatusCode::OK, Json(rec.clone())).into_response(),
     )
+}
+
+/// Lists the child conversations (e.g. subagent delegations) of a conversation.
+///
+/// Lineage is only durable in postgres — subagent conversations never enter the
+/// in-memory serving map — so this returns `503` when no `[database]` is
+/// configured.
+async fn list_conversation_children(
+    State(state): State<ServeState>,
+    Path(id): Path<Uuid>,
+) -> impl IntoResponse {
+    let Some(store) = &state.store else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "conversation lineage requires a configured database",
+            })),
+        )
+            .into_response();
+    };
+    match store
+        .list_child_conversations(id, CHILDREN_PAGE_LIMIT, 0)
+        .await
+    {
+        Ok(children) => (StatusCode::OK, Json(children)).into_response(),
+        Err(e) => {
+            warn!(error = %e, conversation_id = %id, "failed to list conversation children");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "failed to list conversation children"})),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn delete_conversation(

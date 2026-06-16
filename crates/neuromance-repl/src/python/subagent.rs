@@ -611,12 +611,16 @@ results = spawn_agents([Agent('a', 'first'), Agent('b', 'second'), Agent('c', 't
         let parent = DelegationContext {
             conversation_id: Some(uuid::Uuid::new_v4()),
             task_id: Some(uuid::Uuid::new_v4()),
+            parent_message_id: Some(uuid::Uuid::new_v4()),
+            parent_tool_call_id: Some("call_probe".to_string()),
         };
 
-        let result =
-            delegation::scope(parent, bridge.repl().execute("run_subagent('probe', 'go')"))
-                .await
-                .unwrap();
+        let result = delegation::scope(
+            parent.clone(),
+            bridge.repl().execute("run_subagent('probe', 'go')"),
+        )
+        .await
+        .unwrap();
         assert!(result.success, "stderr: {}", result.stderr);
         assert_eq!(
             *probe.seen.lock().unwrap(),
