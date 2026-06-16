@@ -412,11 +412,15 @@ async fn test_set_conversation_parent_links_child(pool: PgPool) {
     let child = Uuid::new_v4();
     let task = Uuid::new_v4();
 
-    // Parent must exist for the self-FK to resolve.
-    store
-        .append_messages(parent, &sample_history(parent))
-        .await
-        .unwrap();
+    // Parent must exist for both self-FKs (conversation + message) to resolve.
+    let parent_history = sample_history(parent);
+    let launching = parent_history
+        .iter()
+        .find(|m| !m.tool_calls.is_empty())
+        .expect("sample history has a tool-calling assistant message");
+    let parent_message_id = launching.id;
+    let parent_tool_call_id = launching.tool_calls[0].id.clone();
+    store.append_messages(parent, &parent_history).await.unwrap();
     assert_eq!(
         parent_link(&pool, parent).await,
         (None, None),
@@ -425,7 +429,13 @@ async fn test_set_conversation_parent_links_child(pool: PgPool) {
 
     // Link before the child has any messages (the upsert creates the row).
     store
-        .set_conversation_parent(child, parent, Some(task))
+        .set_conversation_parent(
+            child,
+            parent,
+            Some(task),
+            Some(parent_message_id),
+            Some(&parent_tool_call_id),
+        )
         .await
         .unwrap();
     assert_eq!(parent_link(&pool, child).await, (Some(parent), Some(task)));
@@ -437,20 +447,69 @@ async fn test_set_conversation_parent_links_child(pool: PgPool) {
         .unwrap();
     assert_eq!(parent_link(&pool, child).await, (Some(parent), Some(task)));
 
+    // The message-level launch site round-trips through get_conversation.
+    let loaded = store.get_conversation(child).await.unwrap().unwrap();
+    assert_eq!(loaded.parent_conversation_id, Some(parent));
+    assert_eq!(loaded.parent_message_id, Some(parent_message_id));
+    assert_eq!(loaded.parent_tool_call_id, Some(parent_tool_call_id));
+
     // Re-linking (e.g. a retried run) updates in place rather than duplicating.
     let task_retry = Uuid::new_v4();
     store
-        .set_conversation_parent(child, parent, Some(task_retry))
+        .set_conversation_parent(child, parent, Some(task_retry), None, None)
         .await
         .unwrap();
     assert_eq!(
         parent_link(&pool, child).await,
         (Some(parent), Some(task_retry))
     );
+    let relinked = store.get_conversation(child).await.unwrap().unwrap();
+    assert_eq!(relinked.parent_message_id, None, "re-link cleared message id");
+    assert_eq!(relinked.parent_tool_call_id, None);
     let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversations WHERE id = $1")
         .bind(child)
         .fetch_one(&pool)
         .await
         .unwrap();
     assert_eq!(rows, 1);
+}
+
+/// `list_child_conversations` returns only the children of a given parent,
+/// carrying their lineage columns, and excludes the parent itself.
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires postgres via DATABASE_URL"]
+async fn test_list_child_conversations(pool: PgPool) {
+    let store = PgConversationStore::new(pool.clone());
+    let parent = Uuid::new_v4();
+    let child_a = Uuid::new_v4();
+    let child_b = Uuid::new_v4();
+    let unrelated = Uuid::new_v4();
+
+    for id in [parent, child_a, child_b, unrelated] {
+        store.append_messages(id, &sample_history(id)).await.unwrap();
+    }
+    for child in [child_a, child_b] {
+        store
+            .set_conversation_parent(child, parent, None, None, None)
+            .await
+            .unwrap();
+    }
+
+    let children = store.list_child_conversations(parent, 10, 0).await.unwrap();
+    let ids: std::collections::HashSet<Uuid> = children.iter().map(|c| c.id).collect();
+    assert_eq!(ids, [child_a, child_b].into_iter().collect());
+    assert!(
+        children
+            .iter()
+            .all(|c| c.parent_conversation_id == Some(parent)),
+        "each child reports its parent"
+    );
+    assert!(
+        store
+            .list_child_conversations(unrelated, 10, 0)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a conversation with no children returns nothing"
+    );
 }

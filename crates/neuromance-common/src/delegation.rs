@@ -16,19 +16,25 @@
 //! [`current`] reads the task-local first and falls back to the thread-local,
 //! so both relays feed the same lookup.
 
-use std::cell::Cell;
+use std::cell::RefCell;
 use std::future::Future;
 
 use uuid::Uuid;
 
 /// Lineage of the enclosing agent run, propagated to any subagent it spawns.
-#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct DelegationContext {
     /// Conversation of the enclosing agent, or `None` at a root scope (e.g. one
     /// seeded by the runtime solely to carry [`DelegationContext::task_id`]).
     pub conversation_id: Option<Uuid>,
     /// Runtime task this delegation tree belongs to, when known.
     pub task_id: Option<Uuid>,
+    /// Assistant message that emitted the tool call spawning the subagent, when
+    /// the enclosing run is delegating from a specific tool call.
+    pub parent_message_id: Option<Uuid>,
+    /// Id of the specific tool call within [`Self::parent_message_id`] that
+    /// spawned the subagent.
+    pub parent_tool_call_id: Option<String>,
 }
 
 tokio::task_local! {
@@ -36,7 +42,7 @@ tokio::task_local! {
 }
 
 thread_local! {
-    static THREAD_CTX: Cell<Option<DelegationContext>> = const { Cell::new(None) };
+    static THREAD_CTX: RefCell<Option<DelegationContext>> = const { RefCell::new(None) };
 }
 
 /// The delegation context in effect, or the default when none is set.
@@ -46,10 +52,12 @@ thread_local! {
 /// [`with_thread_local`].
 #[must_use]
 pub fn current() -> DelegationContext {
-    if let Ok(ctx) = TASK_CTX.try_with(|ctx| *ctx) {
+    if let Ok(ctx) = TASK_CTX.try_with(Clone::clone) {
         return ctx;
     }
-    THREAD_CTX.with(Cell::get).unwrap_or_default()
+    THREAD_CTX
+        .with(|c| c.borrow().clone())
+        .unwrap_or_default()
 }
 
 /// Run `fut` with `ctx` as the ambient delegation context for its task.
@@ -73,11 +81,11 @@ pub fn with_thread_local<R>(ctx: DelegationContext, f: impl FnOnce() -> R) -> R 
     struct Restore(Option<DelegationContext>);
     impl Drop for Restore {
         fn drop(&mut self) {
-            THREAD_CTX.with(|c| c.set(self.0));
+            THREAD_CTX.with(|c| *c.borrow_mut() = self.0.take());
         }
     }
 
-    let _restore = Restore(THREAD_CTX.with(|c| c.replace(Some(ctx))));
+    let _restore = Restore(THREAD_CTX.with(|c| c.borrow_mut().replace(ctx)));
     f()
 }
 
@@ -96,8 +104,10 @@ mod tests {
         let ctx = DelegationContext {
             conversation_id: Some(Uuid::new_v4()),
             task_id: Some(Uuid::new_v4()),
+            parent_message_id: Some(Uuid::new_v4()),
+            parent_tool_call_id: Some("call_abc".to_string()),
         };
-        let observed = scope(ctx, async { current() }).await;
+        let observed = scope(ctx.clone(), async { current() }).await;
         assert_eq!(observed, ctx);
     }
 
@@ -106,8 +116,10 @@ mod tests {
         let ctx = DelegationContext {
             conversation_id: Some(Uuid::new_v4()),
             task_id: None,
+            parent_message_id: None,
+            parent_tool_call_id: None,
         };
-        let observed = with_thread_local(ctx, current);
+        let observed = with_thread_local(ctx.clone(), current);
         assert_eq!(observed, ctx);
         // The relay is cleared once the scope returns.
         assert_eq!(current(), DelegationContext::default());
@@ -118,14 +130,18 @@ mod tests {
         let outer = DelegationContext {
             conversation_id: Some(Uuid::new_v4()),
             task_id: None,
+            parent_message_id: None,
+            parent_tool_call_id: None,
         };
         let inner = DelegationContext {
             conversation_id: Some(Uuid::new_v4()),
             task_id: None,
+            parent_message_id: None,
+            parent_tool_call_id: None,
         };
-        with_thread_local(outer, || {
+        with_thread_local(outer.clone(), || {
             let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                with_thread_local(inner, || panic!("boom"));
+                with_thread_local(inner.clone(), || panic!("boom"));
             }));
             assert!(caught.is_err());
             // The inner scope unwound; the outer context must still be in effect.

@@ -32,8 +32,11 @@ pub trait ConversationSink: Send + Sync {
     ) -> Result<u64, DbError>;
 
     /// Links `child` to the `parent` conversation that spawned it (e.g. a
-    /// subagent delegation), optionally tagging the runtime `parent_task_id` the
-    /// tree belongs to.
+    /// subagent delegation), tagging the runtime `parent_task_id` the tree
+    /// belongs to and, when the delegation came from a specific tool call, the
+    /// `parent_message_id` (the assistant message that emitted it) and
+    /// `parent_tool_call_id` (the call within that message). The message-level
+    /// ids let a child be traced back to the exact launch site.
     ///
     /// Defaults to a no-op so sinks that do not model lineage (test doubles,
     /// non-relational backends) need not implement it. Implementations must be
@@ -48,8 +51,16 @@ pub trait ConversationSink: Send + Sync {
         child: Uuid,
         parent: Uuid,
         parent_task_id: Option<Uuid>,
+        parent_message_id: Option<Uuid>,
+        parent_tool_call_id: Option<&str>,
     ) -> Result<(), DbError> {
-        let _ = (child, parent, parent_task_id);
+        let _ = (
+            child,
+            parent,
+            parent_task_id,
+            parent_message_id,
+            parent_tool_call_id,
+        );
         Ok(())
     }
 }

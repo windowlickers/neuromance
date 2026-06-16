@@ -62,6 +62,15 @@ pub struct Core<C: LLMClient> {
     /// [`Self::parent_conversation_id`].
     #[cfg(feature = "db")]
     pub parent_task_id: Option<uuid::Uuid>,
+    /// Assistant message in the parent conversation that emitted the tool call
+    /// spawning this run, recorded so a delegation can be traced to the exact
+    /// message. `None` for a root conversation.
+    #[cfg(feature = "db")]
+    pub parent_message_id: Option<uuid::Uuid>,
+    /// Id of the specific tool call within [`Self::parent_message_id`] that
+    /// spawned this run.
+    #[cfg(feature = "db")]
+    pub parent_tool_call_id: Option<String>,
     /// Optional context manager for automatic compaction between turns.
     #[cfg(feature = "context")]
     context_manager: Option<crate::context_management::ContextManager<C>>,
@@ -86,6 +95,10 @@ impl<C: LLMClient> Core<C> {
             parent_conversation_id: None,
             #[cfg(feature = "db")]
             parent_task_id: None,
+            #[cfg(feature = "db")]
+            parent_message_id: None,
+            #[cfg(feature = "db")]
+            parent_tool_call_id: None,
             #[cfg(feature = "context")]
             context_manager: None,
         }
@@ -318,7 +331,13 @@ impl<C: LLMClient> Core<C> {
                 if let (Some(parent), Some(first)) =
                     (self.parent_conversation_id, messages.first())
                     && let Err(e) = sink
-                        .set_conversation_parent(first.conversation_id, parent, self.parent_task_id)
+                        .set_conversation_parent(
+                            first.conversation_id,
+                            parent,
+                            self.parent_task_id,
+                            self.parent_message_id,
+                            self.parent_tool_call_id.as_deref(),
+                        )
                         .await
                 {
                     tracing::warn!(
@@ -605,6 +624,9 @@ impl<C: LLMClient> Core<C> {
                 assistant_message.model = Some(response.model);
                 assistant_message.provider = Some(self.client.config().provider.clone());
                 assistant_message.usage = response.usage;
+                // Pins any subagent spawned by this turn's tool calls to the exact
+                // message that launched it (see the per-tool-call delegation scope).
+                let assistant_message_id = assistant_message.id;
                 messages.push(assistant_message);
 
                 // Persist the assistant message before tool execution so a
@@ -698,10 +720,20 @@ impl<C: LLMClient> Core<C> {
                         ToolApproval::Approved => {
                             info!(tool = %tool_name, "executing tool");
                             let tool_start = Instant::now();
+                            // Carry the launch site down to any subagent this tool
+                            // spawns: the assistant message and the specific tool
+                            // call. Conversation/task ids are preserved from the
+                            // enclosing scope.
+                            let mut child_ctx = neuromance_common::delegation::current();
+                            child_ctx.parent_message_id = Some(assistant_message_id);
+                            child_ctx.parent_tool_call_id = Some(tool_call.id.clone());
                             let exec_outcome: Result<Result<String, ToolExecutorError>, CoreError> = tokio::select! {
                                 biased;
                                 () = cancel.cancelled() => Err(CoreError::Cancelled("tool execution".to_string())),
-                                r = self.tool_executor.execute_tool(tool_call) => Ok(r),
+                                r = neuromance_common::delegation::scope(
+                                    child_ctx,
+                                    self.tool_executor.execute_tool(tool_call),
+                                ) => Ok(r),
                             };
                             let tool_elapsed = tool_start.elapsed();
                             let tool_duration_ms =

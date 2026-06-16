@@ -1,0 +1,71 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT c.id, c.title, c.status, c.created_at, c.updated_at,\n                   c.parent_conversation_id, c.parent_message_id, c.parent_tool_call_id,\n                   COUNT(m.id) AS \"message_count!\"\n            FROM conversations c\n            LEFT JOIN messages m ON m.conversation_id = c.id\n            GROUP BY c.id\n            ORDER BY c.updated_at DESC\n            LIMIT $1 OFFSET $2\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "title",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "status",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 4,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 5,
+        "name": "parent_conversation_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 6,
+        "name": "parent_message_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 7,
+        "name": "parent_tool_call_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "message_count!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      null
+    ]
+  },
+  "hash": "24ea9f4b8385bb914c09c36c3669504f87ed24e102afc31838e817397e497c78"
+}

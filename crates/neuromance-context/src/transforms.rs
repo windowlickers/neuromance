@@ -280,6 +280,9 @@ fn rebuild_conversation(original: Conversation, messages: Vec<Message>) -> Conve
     new_conversation.updated_at = Utc::now();
     new_conversation.metadata = original.metadata;
     new_conversation.status = original.status;
+    new_conversation.parent_conversation_id = original.parent_conversation_id;
+    new_conversation.parent_message_id = original.parent_message_id;
+    new_conversation.parent_tool_call_id = original.parent_tool_call_id;
     new_conversation.messages = Arc::new(messages);
     new_conversation
 }

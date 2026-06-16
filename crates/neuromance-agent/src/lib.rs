@@ -67,6 +67,8 @@ where
         DelegationContext {
             conversation_id: None,
             task_id,
+            parent_message_id: None,
+            parent_tool_call_id: None,
         },
         fut,
     )
@@ -240,6 +242,10 @@ impl<C: LLMClient + Send + Sync> Agent<C> {
         {
             self.core.parent_conversation_id = parent_conversation_id;
             self.core.parent_task_id = task_id;
+            self.core.parent_message_id = enclosing.parent_message_id;
+            self.core
+                .parent_tool_call_id
+                .clone_from(&enclosing.parent_tool_call_id);
         }
 
         let mut messages = messages.unwrap_or_else(|| self.messages.clone());
@@ -276,6 +282,10 @@ impl<C: LLMClient + Send + Sync> Agent<C> {
         let child_ctx = DelegationContext {
             conversation_id: Some(self.conversation_id),
             task_id,
+            // Message-level provenance is filled in per tool call by Core when
+            // this agent delegates; a fresh scope starts without it.
+            parent_message_id: None,
+            parent_tool_call_id: None,
         };
         let (messages, run_stats) =
             delegation::scope(child_ctx, self.core.chat_with_tool_loop(messages, cancel)).await?;

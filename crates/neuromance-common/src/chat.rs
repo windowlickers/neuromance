@@ -349,6 +349,19 @@ pub struct Conversation {
     /// Current status of the conversation (defaults to `Active`).
     pub status: ConversationStatus,
 
+    /// Conversation that spawned this one (e.g. a delegating parent agent), or
+    /// `None` for a root conversation. Populated when loaded from storage;
+    /// writes go through the persistence layer's parent-linking call.
+    pub parent_conversation_id: Option<Uuid>,
+
+    /// Assistant message in the parent conversation that emitted the tool call
+    /// which spawned this conversation, when known.
+    pub parent_message_id: Option<Uuid>,
+
+    /// Id of the specific tool call within [`Self::parent_message_id`] that
+    /// spawned this conversation, when known.
+    pub parent_tool_call_id: Option<String>,
+
     /// Messages in this conversation (wrapped in `Arc` for efficient cloning).
     pub messages: Arc<Vec<Message>>,
 }
@@ -366,6 +379,9 @@ impl Conversation {
             updated_at: now,
             metadata: HashMap::new(),
             status: ConversationStatus::Active,
+            parent_conversation_id: None,
+            parent_message_id: None,
+            parent_tool_call_id: None,
             messages: Arc::new(Vec::new()),
         }
     }
