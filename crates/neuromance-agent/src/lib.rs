@@ -36,6 +36,7 @@ use tracing::info;
 use uuid::Uuid;
 
 use neuromance::Core;
+use neuromance::RunStats;
 use neuromance::error::CoreError;
 use neuromance_client::LLMClient;
 use neuromance_common::chat::{Message, MessageRole};
@@ -173,6 +174,45 @@ impl<C: LLMClient + Send + Sync> Agent<C> {
             task_id = tracing::field::Empty,
         ),
     )]
+    /// Fold a completed run's stats into the agent's cumulative state and emit
+    /// the per-run summary log (tokens, prompt-cache usage, tool outcomes).
+    fn record_run_stats(&mut self, run_stats: &RunStats, exec_start: Instant) {
+        let metrics = &run_stats.cache_metrics;
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            let tokens = metrics.total_input_tokens + metrics.total_output_tokens;
+            self.state.stats.tokens_used += tokens as usize;
+            self.state.stats.successful_tool_calls += run_stats.successful_tool_calls as usize;
+            self.state.stats.failed_tool_calls += run_stats.failed_tool_calls as usize;
+        }
+
+        let duration_ms = u64::try_from(exec_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        info!(
+            duration_ms,
+            turns = metrics.total_requests,
+            input_tokens = metrics.total_input_tokens,
+            output_tokens = metrics.total_output_tokens,
+            cached_tokens = metrics.total_cached_tokens,
+            cache_creation_tokens = metrics.total_cache_creation_tokens,
+            cache_hit_ratio = metrics.cache_hit_ratio().unwrap_or(0.0),
+            requests_with_cache_hits = metrics.requests_with_cache_hits,
+            tools_succeeded = run_stats.successful_tool_calls,
+            tools_failed = run_stats.failed_tool_calls,
+            compactions = run_stats.compactions,
+            "agent finished",
+        );
+    }
+
+    /// Run the agent over the given history (or the agent's own messages when
+    /// `None`), driving the tool-execution loop to completion and returning the
+    /// final response alongside the full message transcript.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::InvalidInput`] if the history lacks the required
+    /// leading system and user messages, and propagates any [`CoreError`] from
+    /// the underlying chat/tool loop. Returns [`CoreError::NoResponse`] if the
+    /// loop produces no assistant message.
     pub async fn execute_with_history(
         &mut self,
         messages: Option<Vec<Message>>,
@@ -241,26 +281,7 @@ impl<C: LLMClient + Send + Sync> Agent<C> {
             delegation::scope(child_ctx, self.core.chat_with_tool_loop(messages, cancel)).await?;
 
         self.state.stats.total_messages += messages.len();
-        #[allow(clippy::cast_possible_truncation)]
-        {
-            let tokens = run_stats.cache_metrics.total_input_tokens
-                + run_stats.cache_metrics.total_output_tokens;
-            self.state.stats.tokens_used += tokens as usize;
-            self.state.stats.successful_tool_calls += run_stats.successful_tool_calls as usize;
-            self.state.stats.failed_tool_calls += run_stats.failed_tool_calls as usize;
-        }
-
-        let duration_ms = u64::try_from(exec_start.elapsed().as_millis()).unwrap_or(u64::MAX);
-        info!(
-            duration_ms,
-            turns = run_stats.cache_metrics.total_requests,
-            input_tokens = run_stats.cache_metrics.total_input_tokens,
-            output_tokens = run_stats.cache_metrics.total_output_tokens,
-            tools_succeeded = run_stats.successful_tool_calls,
-            tools_failed = run_stats.failed_tool_calls,
-            compactions = run_stats.compactions,
-            "agent finished",
-        );
+        self.record_run_stats(&run_stats, exec_start);
 
         let content = messages
             .iter()
