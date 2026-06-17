@@ -6,7 +6,9 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
-use neuromance_common::chat::{ConversationStatus, Message, MessageRole, ReasoningContent};
+use neuromance_common::chat::{
+    ConversationStatus, Message, MessageRole, ReasoningContent, TaskStatus,
+};
 use neuromance_common::client::Usage;
 use neuromance_common::tools::ToolCall;
 use serde::Serialize;
@@ -82,6 +84,26 @@ pub fn status_from_str(value: &str, conversation_id: Uuid) -> Result<Conversatio
         _ => Err(DbError::UnknownStatus {
             value: value.to_string(),
             conversation_id,
+        }),
+    }
+}
+
+/// Maps a [`TaskStatus`] to its stored `status` column string.
+pub fn task_status_to_string(status: TaskStatus, task_id: Uuid) -> Result<String, DbError> {
+    enum_to_db_string(&status, "tasks", "status", task_id)
+}
+
+/// Parses a stored task `status` column string back into a [`TaskStatus`].
+pub fn task_status_from_str(value: &str, task_id: Uuid) -> Result<TaskStatus, DbError> {
+    match value {
+        "pending" => Ok(TaskStatus::Pending),
+        "running" => Ok(TaskStatus::Running),
+        "succeeded" => Ok(TaskStatus::Succeeded),
+        "failed" => Ok(TaskStatus::Failed),
+        "cancelled" => Ok(TaskStatus::Cancelled),
+        _ => Err(DbError::UnknownTaskStatus {
+            value: value.to_string(),
+            task_id,
         }),
     }
 }
@@ -375,6 +397,31 @@ mod tests {
     }
 
     #[test]
+    fn test_all_task_statuses_round_trip_through_strings() {
+        let id = Uuid::new_v4();
+        for status in [
+            TaskStatus::Pending,
+            TaskStatus::Running,
+            TaskStatus::Succeeded,
+            TaskStatus::Failed,
+            TaskStatus::Cancelled,
+        ] {
+            let s = task_status_to_string(status, id).unwrap();
+            assert_eq!(task_status_from_str(&s, id).unwrap(), status);
+        }
+    }
+
+    #[test]
+    fn test_unknown_task_status_is_an_error() {
+        let id = Uuid::new_v4();
+        let err = task_status_from_str("queued", id).unwrap_err();
+        assert!(matches!(
+            err,
+            DbError::UnknownTaskStatus { value, task_id } if value == "queued" && task_id == id
+        ));
+    }
+
+    #[test]
     fn test_corrupt_tool_calls_json_is_a_decode_error() {
         let message = Message::user(Uuid::new_v4(), "hi");
         let columns = message_to_columns(&message).unwrap();
@@ -452,6 +499,23 @@ mod tests {
         ] {
             assert_eq!(status_from_str(stored, id).unwrap(), status);
             assert_eq!(status_to_string(&status, id).unwrap(), stored);
+        }
+    }
+
+    /// Anchors the encoded task-status spellings to literal DB strings, for the
+    /// same reason as [`test_status_strings_match_stored_spelling`].
+    #[test]
+    fn test_task_status_strings_match_stored_spelling() {
+        let id = Uuid::new_v4();
+        for (stored, status) in [
+            ("pending", TaskStatus::Pending),
+            ("running", TaskStatus::Running),
+            ("succeeded", TaskStatus::Succeeded),
+            ("failed", TaskStatus::Failed),
+            ("cancelled", TaskStatus::Cancelled),
+        ] {
+            assert_eq!(task_status_from_str(stored, id).unwrap(), status);
+            assert_eq!(task_status_to_string(status, id).unwrap(), stored);
         }
     }
 

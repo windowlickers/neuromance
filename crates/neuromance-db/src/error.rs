@@ -49,6 +49,17 @@ pub enum DbError {
         conversation_id: Uuid,
     },
 
+    /// A `status` column held a value that is not a known [`TaskStatus`].
+    ///
+    /// [`TaskStatus`]: neuromance_common::chat::TaskStatus
+    #[error("unknown task status '{value}' in task row {task_id}")]
+    UnknownTaskStatus {
+        /// The unrecognized status string read from the database.
+        value: String,
+        /// The id of the task row holding it.
+        task_id: Uuid,
+    },
+
     /// Serializing a field to JSON for a JSONB column failed.
     #[error("failed to encode column {column} of {table} row {id} as JSON: {source}")]
     Encode {

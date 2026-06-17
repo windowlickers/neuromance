@@ -86,7 +86,9 @@ pub mod subagent;
 pub mod task;
 
 pub use agents::{AgentContext, AgentMemory, AgentMessage, AgentResponse, AgentState, AgentStats};
-pub use chat::{Conversation, ConversationStatus, Message, MessageRole, ReasoningContent};
+pub use chat::{
+    Conversation, ConversationStatus, Message, MessageRole, ReasoningContent, TaskStatus,
+};
 pub use client::{
     CacheMetrics, ChatRequest, ChatResponse, Config, FinishReason, InputTokensDetails,
     OutputTokensDetails, Provider, ProxyConfig, ReasoningEffort, RetryConfig, ToolChoice, Usage,

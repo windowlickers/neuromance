@@ -294,6 +294,8 @@ mod tests {
             let ctx = DelegationContext {
                 conversation_id: None,
                 task_id: Some(task),
+                parent_message_id: None,
+                parent_tool_call_id: None,
             };
             let out = delegation::scope(ctx, python.execute(&json!({ "code": code })))
                 .await

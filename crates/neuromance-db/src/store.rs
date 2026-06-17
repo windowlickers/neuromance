@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use neuromance_common::chat::{Conversation, ConversationStatus, Message};
+use neuromance_common::chat::{Conversation, ConversationStatus, Message, TaskStatus};
 use serde::Serialize;
 use serde_json::Value;
 use sqlx::PgPool;
@@ -14,7 +14,10 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::error::{DbError, SqlxResultExt};
-use crate::rows::{MessageRow, message_to_columns, status_from_str, status_to_string};
+use crate::rows::{
+    MessageRow, message_to_columns, status_from_str, status_to_string, task_status_from_str,
+    task_status_to_string,
+};
 use crate::sink::ConversationSink;
 
 /// A lightweight listing entry for a stored conversation.
@@ -38,6 +41,51 @@ pub struct ConversationSummary {
     pub parent_message_id: Option<Uuid>,
     /// Id of the specific tool call within [`Self::parent_message_id`].
     pub parent_tool_call_id: Option<String>,
+}
+
+/// A durable task row: lifecycle status plus the fields `GET /tasks/{id}` serializes.
+///
+/// Mirrors the runtime's in-memory task record so a replica that never owned
+/// the task can still answer a poll.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StoredTask {
+    /// Task id.
+    pub id: Uuid,
+    /// Conversation the task ran against.
+    pub conversation_id: Uuid,
+    /// Current lifecycle status.
+    pub status: TaskStatus,
+    /// Final assistant output, present once the task succeeds.
+    pub output: Option<String>,
+    /// Failure or cancellation reason, present on a non-success terminal state.
+    pub error: Option<String>,
+    /// Tasks already buffered when this task was accepted, frozen at submit time.
+    pub queue_depth_at_enqueue: i64,
+    /// When the task was first recorded (at enqueue).
+    pub created_at: DateTime<Utc>,
+    /// When the status was last written.
+    pub updated_at: DateTime<Utc>,
+}
+
+/// The status fields written through to the durable task row at enqueue,
+/// dequeue, and terminal. Bundled so [`PgConversationStore::record_task_status`]
+/// stays within the positional-argument budget.
+#[derive(Debug, Clone)]
+pub struct TaskStatusUpdate {
+    /// Task id (the upsert key).
+    pub id: Uuid,
+    /// Conversation the task runs against (the FK target).
+    pub conversation_id: Uuid,
+    /// Status to write.
+    pub status: TaskStatus,
+    /// Output to write, if any.
+    pub output: Option<String>,
+    /// Error to write, if any.
+    pub error: Option<String>,
+    /// Queue depth at enqueue, frozen at submit time.
+    pub queue_depth_at_enqueue: i64,
+    /// Creation timestamp, preserved across status updates.
+    pub created_at: DateTime<Utc>,
 }
 
 /// Postgres-backed store for conversations and messages.
@@ -369,6 +417,148 @@ impl PgConversationStore {
         .await
         .op("insert task provenance")?;
         Ok(())
+    }
+
+    /// Upserts a task's status, output, error and queue depth, keyed by id.
+    ///
+    /// Idempotent per id and column-scoped: the conflict clause updates only the
+    /// status columns, never the provenance columns (`start_seq`/`end_seq`) that
+    /// [`Self::record_task`] writes, so the two upserts compose regardless of
+    /// order. `created_at` is preserved across updates.
+    ///
+    /// The conversation row is pre-inserted (`ON CONFLICT DO NOTHING`) so this
+    /// write is self-sufficient against the `tasks.conversation_id` foreign key
+    /// even when the conversation row write is still in flight.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the write fails or the status cannot be encoded.
+    pub async fn record_task_status(&self, update: &TaskStatusUpdate) -> Result<(), DbError> {
+        let status = task_status_to_string(update.status, update.id)?;
+        let mut tx = self.pool.begin().await.op("begin transaction")?;
+
+        sqlx::query!(
+            "INSERT INTO conversations (id) VALUES ($1) ON CONFLICT (id) DO NOTHING",
+            update.conversation_id,
+        )
+        .execute(&mut *tx)
+        .await
+        .op("insert conversation row")?;
+
+        sqlx::query!(
+            r#"
+            INSERT INTO tasks
+                (id, conversation_id, status, output, error,
+                 queue_depth_at_enqueue, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+            ON CONFLICT (id) DO UPDATE SET
+                status                 = EXCLUDED.status,
+                output                 = EXCLUDED.output,
+                error                  = EXCLUDED.error,
+                queue_depth_at_enqueue = EXCLUDED.queue_depth_at_enqueue,
+                updated_at             = now()
+            "#,
+            update.id,
+            update.conversation_id,
+            status,
+            update.output,
+            update.error,
+            update.queue_depth_at_enqueue,
+            update.created_at,
+        )
+        .execute(&mut *tx)
+        .await
+        .op("upsert task status")?;
+
+        tx.commit().await.op("commit transaction")?;
+        Ok(())
+    }
+
+    /// Deletes a task's durable row.
+    ///
+    /// Used to roll back an enqueue that persisted a `pending` row but then
+    /// failed to hand the job to the worker, so a rejected task never lingers
+    /// in [`Self::list_active_tasks`]. A missing row is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::Sqlx`] if the delete fails.
+    pub async fn delete_task(&self, task_id: Uuid) -> Result<(), DbError> {
+        sqlx::query!("DELETE FROM tasks WHERE id = $1", task_id)
+            .execute(&self.pool)
+            .await
+            .op("delete task")?;
+        Ok(())
+    }
+
+    /// Loads the durable status row for a task, or `None` if none was recorded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the query fails or the stored status is unknown.
+    pub async fn get_task(&self, task_id: Uuid) -> Result<Option<StoredTask>, DbError> {
+        let Some(row) = sqlx::query!(
+            r#"
+            SELECT id, conversation_id, status, output, error,
+                   queue_depth_at_enqueue, created_at, updated_at
+            FROM tasks WHERE id = $1
+            "#,
+            task_id,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .op("select task")?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(StoredTask {
+            id: row.id,
+            conversation_id: row.conversation_id,
+            status: task_status_from_str(&row.status, row.id)?,
+            output: row.output,
+            error: row.error,
+            queue_depth_at_enqueue: row.queue_depth_at_enqueue,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        }))
+    }
+
+    /// Lists tasks that are still `pending` or `running`, oldest first.
+    ///
+    /// Backs `GET /tasks`: a caller's index in the returned vec is their queue
+    /// position. Reads from postgres so any replica returns the same view.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the query fails or a stored status is unknown.
+    pub async fn list_active_tasks(&self) -> Result<Vec<StoredTask>, DbError> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT id, conversation_id, status, output, error,
+                   queue_depth_at_enqueue, created_at, updated_at
+            FROM tasks
+            WHERE status IN ('pending', 'running')
+            ORDER BY created_at
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .op("list active tasks")?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(StoredTask {
+                    id: row.id,
+                    conversation_id: row.conversation_id,
+                    status: task_status_from_str(&row.status, row.id)?,
+                    output: row.output,
+                    error: row.error,
+                    queue_depth_at_enqueue: row.queue_depth_at_enqueue,
+                    created_at: row.created_at,
+                    updated_at: row.updated_at,
+                })
+            })
+            .collect()
     }
 }
 
