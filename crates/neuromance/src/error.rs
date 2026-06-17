@@ -28,8 +28,14 @@ pub enum CoreError {
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 
-    #[error("Turn callback error: {0}")]
-    TurnCallback(Box<dyn std::error::Error + Send + Sync>),
+    #[error("Hook {hook} failed: {source}")]
+    Hook {
+        /// Name of the hook that failed.
+        hook: String,
+        /// The underlying error returned by the hook.
+        #[source]
+        source: anyhow::Error,
+    },
 
     #[error("Context compaction error: {0}")]
     CompactionError(String),

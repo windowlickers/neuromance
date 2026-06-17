@@ -8,6 +8,7 @@ use neuromance_client::LLMClient;
 use neuromance_common::agents::AgentState;
 use neuromance_common::chat::Message;
 use neuromance_common::client::ToolChoice;
+use neuromance_common::hook::{FnReviewHook, Hook};
 use neuromance_common::tools::{ToolApproval, ToolCall};
 use neuromance_context::skills::SkillCatalog;
 use neuromance_tools::{SkillTool, ToolImplementation};
@@ -118,12 +119,18 @@ impl<C: LLMClient> AgentBuilder<C> {
         self
     }
 
-    /// Set a stored callback that decides tool approval per call.
+    /// Register a lifecycle [`Hook`] on the underlying [`Core`].
+    #[must_use]
+    pub fn with_hook(mut self, hook: Arc<dyn Hook>) -> Self {
+        self.core = self.core.with_hook(hook);
+        self
+    }
+
+    /// Decide tool approval per call via a closure.
     ///
-    /// Mirrors [`Core::with_tool_approval_callback`]. When set, the underlying
-    /// `Core` answers approvals via the callback instead of yielding
-    /// `CoreEvent::ApprovalRequest`. `auto_approve_tools` still short-circuits
-    /// the callback when enabled.
+    /// Wraps `callback` in a [`Hook`] whose `review_tool` answers approvals
+    /// internally instead of yielding `CoreEvent::ApprovalRequest`.
+    /// `auto_approve_tools` still short-circuits it when enabled.
     ///
     /// # Arguments
     /// * `callback` - Async function called for each non-auto-approved tool call
@@ -133,7 +140,7 @@ impl<C: LLMClient> AgentBuilder<C> {
         F: Fn(&ToolCall) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ToolApproval> + Send + 'static,
     {
-        self.core = self.core.with_tool_approval_callback(callback);
+        self.core = self.core.with_hook(Arc::new(FnReviewHook::new(callback)));
         self
     }
 

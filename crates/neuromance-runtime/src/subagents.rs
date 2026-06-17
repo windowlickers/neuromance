@@ -32,7 +32,7 @@ use tokio_util::sync::CancellationToken;
 use neuromance::Core;
 use neuromance_agent::{Agent, LocalSubagent, Subagent, SubagentError, SubagentTool};
 use neuromance_client::{LLMClient, build_client};
-use neuromance_db::PgConversationStore;
+use neuromance_db::{PersistenceHook, PgConversationStore};
 use neuromance_tools::{ToolConfig, ToolFactoryRegistry, ToolImplementation, ToolRegistry};
 
 use crate::config::RuntimeConfig;
@@ -175,7 +175,9 @@ fn build_subagents_at_depth(
             // runtime has a store, matching the main agent.
             if let Some(store) = &store {
                 let sink: Arc<PgConversationStore> = Arc::clone(store);
-                core = core.with_persistence(sink);
+                // Constructed inside the parent's delegation scope, so the hook
+                // captures the lineage that links this child to its parent.
+                core = core.with_hook(Arc::new(PersistenceHook::new(sink)));
             }
             for tool in tools {
                 core.tool_executor.add_tool_arc(tool);
@@ -437,6 +439,7 @@ mod tests {
             context: None,
             subagents,
             skills: None,
+            rules: None,
             bootstrap: Vec::new(),
             sandbox: None,
         }

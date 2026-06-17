@@ -17,13 +17,14 @@ const STREAM_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 
 use neuromance_client::LLMClient;
 use neuromance_common::chat::{Message, MessageRole};
-use neuromance_common::client::{ChatRequest, ChatResponse, ToolChoice};
+use neuromance_common::client::{ChatRequest, ChatResponse, ToolChoice, Usage};
 use neuromance_common::features::ThinkingMode;
+use neuromance_common::hook::{CompactionStats, Hook, HookContext};
 use neuromance_common::tools::{ToolApproval, ToolCall};
 use neuromance_tools::{ToolExecutor, ToolExecutorError};
 
 use crate::error::CoreError;
-use crate::events::{CoreEvent, ToolApprovalCallback, TurnCallback};
+use crate::events::CoreEvent;
 use crate::stats::RunStats;
 
 /// Core orchestration layer for LLM conversations with tool execution.
@@ -42,38 +43,10 @@ pub struct Core<C: LLMClient> {
     pub tool_choice: ToolChoice,
     /// Holds tools in `ToolRegistry` and executes tools.
     pub tool_executor: ToolExecutor,
-    /// Optional stored callback for tool approval. When set, Core answers
-    /// approvals internally and never yields [`CoreEvent::ApprovalRequest`].
-    pub tool_approval_callback: Option<ToolApprovalCallback>,
-    /// Optional turn callback for transforming messages between turns (e.g., compaction).
-    pub turn_callback: Option<TurnCallback>,
+    /// Lifecycle hooks dispatched at each stage of the run, in registration order.
+    pub hooks: Vec<Arc<dyn Hook>>,
     /// Thinking/reasoning mode configuration.
     pub thinking: ThinkingMode,
-    /// Optional sink that persists conversation history as the run progresses.
-    /// Write failures are logged and never abort the run.
-    #[cfg(feature = "db")]
-    pub persistence: Option<Arc<dyn neuromance_db::ConversationSink>>,
-    /// Conversation that spawned this run (e.g. a delegating parent agent),
-    /// recorded against the persisted conversation so a delegation tree can be
-    /// reconstructed. `None` for a root conversation.
-    #[cfg(feature = "db")]
-    pub parent_conversation_id: Option<uuid::Uuid>,
-    /// Runtime task this run belongs to, persisted alongside
-    /// [`Self::parent_conversation_id`].
-    #[cfg(feature = "db")]
-    pub parent_task_id: Option<uuid::Uuid>,
-    /// Assistant message in the parent conversation that emitted the tool call
-    /// spawning this run, recorded so a delegation can be traced to the exact
-    /// message. `None` for a root conversation.
-    #[cfg(feature = "db")]
-    pub parent_message_id: Option<uuid::Uuid>,
-    /// Id of the specific tool call within [`Self::parent_message_id`] that
-    /// spawned this run.
-    #[cfg(feature = "db")]
-    pub parent_tool_call_id: Option<String>,
-    /// Optional context manager for automatic compaction between turns.
-    #[cfg(feature = "context")]
-    context_manager: Option<crate::context_management::ContextManager<C>>,
 }
 
 impl<C: LLMClient> Core<C> {
@@ -86,79 +59,24 @@ impl<C: LLMClient> Core<C> {
             auto_approve_tools: false,
             tool_choice: ToolChoice::Auto,
             tool_executor: ToolExecutor::new(),
-            tool_approval_callback: None,
-            turn_callback: None,
+            hooks: Vec::new(),
             thinking: ThinkingMode::Default,
-            #[cfg(feature = "db")]
-            persistence: None,
-            #[cfg(feature = "db")]
-            parent_conversation_id: None,
-            #[cfg(feature = "db")]
-            parent_task_id: None,
-            #[cfg(feature = "db")]
-            parent_message_id: None,
-            #[cfg(feature = "db")]
-            parent_tool_call_id: None,
-            #[cfg(feature = "context")]
-            context_manager: None,
         }
     }
 
-    /// Set a sink that durably records conversation history.
+    /// Register a lifecycle [`Hook`].
     ///
-    /// Messages are persisted incrementally during [`Core::run`]: the seed
-    /// snapshot at run start, the assistant message after each turn, and tool
-    /// results after each turn's tool calls complete — so a crashed run still
-    /// has its prefix recorded. Persistence is best-effort: write failures are
-    /// logged and retried at the next persist point, never aborting the run.
-    #[cfg(feature = "db")]
+    /// Hooks run in registration order at each stage of [`Core::run`]: they can
+    /// inject context, decide tool approval, and rewrite or compact history.
     #[must_use]
-    pub fn with_persistence(mut self, sink: Arc<dyn neuromance_db::ConversationSink>) -> Self {
-        self.persistence = Some(sink);
+    pub fn with_hook(mut self, hook: Arc<dyn Hook>) -> Self {
+        self.hooks.push(hook);
         self
     }
 
-    /// Set callback for tool approval decisions.
-    ///
-    /// Escape hatch for consumers who prefer stored callbacks over reacting to
-    /// [`CoreEvent::ApprovalRequest`] in the stream. When set, Core answers
-    /// approvals internally and never yields [`CoreEvent::ApprovalRequest`].
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// # use neuromance::{Core, ToolApproval};
-    /// # use neuromance_client::chat_completions::ChatCompletionsClient;
-    /// # let client: ChatCompletionsClient = unimplemented!();
-    /// let core = Core::new(client)
-    ///     .with_tool_approval_callback(|tool_call| {
-    ///         let tool_call = tool_call.clone();
-    ///         async move {
-    ///             println!("Tool requested: {}", tool_call.function.name);
-    ///             ToolApproval::Approved
-    ///         }
-    ///     });
-    /// ```
-    #[must_use]
-    pub fn with_tool_approval_callback<F, Fut>(mut self, callback: F) -> Self
-    where
-        F: Fn(&ToolCall) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = ToolApproval> + Send + 'static,
-    {
-        self.tool_approval_callback =
-            Some(Box::new(move |tool_call| Box::pin(callback(tool_call))));
-        self
-    }
-
-    /// Set callback for transforming messages between turns.
-    #[must_use]
-    pub fn with_turn_callback<F, Fut>(mut self, callback: F) -> Self
-    where
-        F: Fn(Vec<Message>) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<Vec<Message>>> + Send + 'static,
-    {
-        self.turn_callback = Some(Box::new(move |messages| Box::pin(callback(messages))));
-        self
+    /// Register a lifecycle [`Hook`] in place.
+    pub fn add_hook(&mut self, hook: Arc<dyn Hook>) {
+        self.hooks.push(hook);
     }
 
     /// Enable streaming mode.
@@ -193,58 +111,6 @@ impl<C: LLMClient> Core<C> {
         self
     }
 
-    /// Enable automatic context compaction between conversation turns.
-    ///
-    /// When configured, compaction runs inside the conversation loop, keeping
-    /// the conversation within the configured token budget.
-    ///
-    /// Requires the `context` feature and `C: Clone` (all built-in clients
-    /// implement `Clone`). For non-`Clone` clients such as `Box<dyn LLMClient>`,
-    /// use [`with_context_management_client`](Self::with_context_management_client).
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// # use neuromance::Core;
-    /// # use neuromance::context_management::ContextConfig;
-    /// # use neuromance_client::ChatCompletionsClient;
-    /// # let client: ChatCompletionsClient = unimplemented!();
-    /// let config = ContextConfig::new(128_000);
-    /// let core = Core::new(client)
-    ///     .with_context_management(config);
-    /// ```
-    #[cfg(feature = "context")]
-    #[must_use]
-    pub fn with_context_management(self, config: crate::context_management::ContextConfig) -> Self
-    where
-        C: Clone,
-    {
-        let compaction_client = self.client.clone();
-        self.with_context_management_client(compaction_client, config)
-    }
-
-    /// Enable automatic context compaction using a separate client for
-    /// summarization calls.
-    ///
-    /// Like [`with_context_management`](Self::with_context_management), but
-    /// without a `Clone` bound on `C` — the caller supplies the client used
-    /// for compaction summaries (typically built from the same config as the
-    /// main client).
-    #[cfg(feature = "context")]
-    #[must_use]
-    #[allow(clippy::needless_pass_by_value)]
-    pub fn with_context_management_client(
-        mut self,
-        compaction_client: C,
-        config: crate::context_management::ContextConfig,
-    ) -> Self {
-        self.context_manager = Some(crate::context_management::ContextManager::new(
-            compaction_client,
-            &config,
-        ));
-        self
-    }
-
     /// Send a chat request with retry logic for transient failures.
     async fn chat_with_retry(&self, request: &ChatRequest) -> Result<ChatResponse, CoreError> {
         let mut last_error = None;
@@ -275,6 +141,122 @@ impl<C: LLMClient> Core<C> {
             || CoreError::NoResponse("No response received after retries".to_string()),
             CoreError::Client,
         ))
+    }
+
+    /// Run every hook's `on_conversation_start`, appending injected messages.
+    async fn hooks_conversation_start(
+        &self,
+        ctx: &HookContext,
+        messages: &mut Vec<Message>,
+        cancel: &CancellationToken,
+    ) -> Result<(), CoreError> {
+        for hook in &self.hooks {
+            let outcome = run_hook(
+                cancel,
+                hook.name(),
+                hook.on_conversation_start(ctx, messages),
+            )
+            .await?;
+            messages.extend(outcome.messages);
+        }
+        Ok(())
+    }
+
+    /// Run every hook's `on_messages` observer for the current history.
+    async fn hooks_messages(
+        &self,
+        ctx: &HookContext,
+        messages: &[Message],
+        cancel: &CancellationToken,
+    ) -> Result<(), CoreError> {
+        for hook in &self.hooks {
+            run_hook(cancel, hook.name(), hook.on_messages(ctx, messages)).await?;
+        }
+        Ok(())
+    }
+
+    /// Run every hook's `on_usage` observer.
+    async fn hooks_usage(
+        &self,
+        ctx: &HookContext,
+        usage: &Usage,
+        cancel: &CancellationToken,
+    ) -> Result<(), CoreError> {
+        for hook in &self.hooks {
+            run_hook(cancel, hook.name(), hook.on_usage(ctx, usage)).await?;
+        }
+        Ok(())
+    }
+
+    /// Poll hooks for a tool-approval decision; the first non-abstaining hook wins.
+    async fn hooks_review_tool(
+        &self,
+        ctx: &HookContext,
+        call: &ToolCall,
+        cancel: &CancellationToken,
+    ) -> Result<Option<ToolApproval>, CoreError> {
+        for hook in &self.hooks {
+            if let Some(decision) =
+                run_hook(cancel, hook.name(), hook.review_tool(ctx, call)).await?
+            {
+                return Ok(Some(decision));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Run every hook's `after_tool`, collecting injected messages.
+    async fn hooks_after_tool(
+        &self,
+        ctx: &HookContext,
+        call: &ToolCall,
+        result: &str,
+        success: bool,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<Message>, CoreError> {
+        let mut injected = Vec::new();
+        for hook in &self.hooks {
+            let outcome = run_hook(
+                cancel,
+                hook.name(),
+                hook.after_tool(ctx, call, result, success),
+            )
+            .await?;
+            injected.extend(outcome.messages);
+        }
+        Ok(injected)
+    }
+
+    /// Fold the history through every hook's `on_turn_end`, collecting any
+    /// compaction statistics for the caller to emit.
+    async fn hooks_turn_end(
+        &self,
+        ctx: &HookContext,
+        mut messages: Vec<Message>,
+        cancel: &CancellationToken,
+    ) -> Result<(Vec<Message>, Vec<CompactionStats>), CoreError> {
+        let mut stats = Vec::new();
+        for hook in &self.hooks {
+            let end = run_hook(cancel, hook.name(), hook.on_turn_end(ctx, messages)).await?;
+            messages = end.messages;
+            if let Some(s) = end.compaction {
+                stats.push(s);
+            }
+        }
+        Ok((messages, stats))
+    }
+
+    /// Run every hook's `on_completion` observer.
+    async fn hooks_completion(
+        &self,
+        ctx: &HookContext,
+        messages: &[Message],
+        cancel: &CancellationToken,
+    ) -> Result<(), CoreError> {
+        for hook in &self.hooks {
+            run_hook(cancel, hook.name(), hook.on_completion(ctx, messages)).await?;
+        }
+        Ok(())
     }
 
     /// Run the conversation loop as a stream of [`CoreEvent`]s.
@@ -317,42 +299,31 @@ impl<C: LLMClient> Core<C> {
             // so the turn-over-turn delta shows how fast the conversation grows.
             let mut prev_prompt_tokens: u32 = 0;
             let start_time = Instant::now();
+
+            // The conversation id is stable across the run; derive it from the
+            // seed so hooks have it before the first response.
+            let conversation_id = messages
+                .first()
+                .map_or_else(uuid::Uuid::new_v4, |m| m.conversation_id);
+            let start_ctx = HookContext::new(conversation_id, 0);
+
+            // Conversation-start hooks inject always-on context before the
+            // first LLM call (e.g. rule files that always apply).
+            self.hooks_conversation_start(&start_ctx, &mut messages, &cancel)
+                .await?;
             let mut messages_arc: Arc<[Message]> = messages.clone().into();
 
-            // Persist the seed snapshot (system + user messages) up front so
-            // the input is durable even if the first LLM call fails.
-            #[cfg(feature = "db")]
-            let mut persisted_ids = std::collections::HashSet::new();
-            #[cfg(feature = "db")]
-            if let Some(ref sink) = self.persistence {
-                persist_new_messages(sink.as_ref(), &messages, &mut persisted_ids).await;
-                // Link this conversation to its spawning parent, once the seed
-                // append has created the row. Best-effort, like message writes.
-                if let (Some(parent), Some(first)) =
-                    (self.parent_conversation_id, messages.first())
-                    && let Err(e) = sink
-                        .set_conversation_parent(
-                            first.conversation_id,
-                            parent,
-                            self.parent_task_id,
-                            self.parent_message_id,
-                            self.parent_tool_call_id.as_deref(),
-                        )
-                        .await
-                {
-                    tracing::warn!(
-                        conversation_id = %first.conversation_id,
-                        parent_conversation_id = %parent,
-                        error = %e,
-                        "recording conversation parent failed; continuing without it"
-                    );
-                }
-            }
+            // Hooks observe the seed snapshot before the first LLM call (e.g.
+            // persistence records it so the input is durable even if the call
+            // fails, and links the conversation to its spawning parent).
+            self.hooks_messages(&start_ctx, &messages, &cancel).await?;
 
             loop {
                 if cancel.is_cancelled() {
                     Err(CoreError::Cancelled("loop start".to_string()))?;
                 }
+
+                let turn_ctx = HookContext::new(conversation_id, turn_count);
 
                 let mut request = ChatRequest::from((self.client.config(), messages_arc.clone()))
                     .with_tools(self.tool_executor.get_all_tools())
@@ -543,6 +514,7 @@ impl<C: LLMClient> Core<C> {
 
                 if let Some(ref usage) = response.usage {
                     yield CoreEvent::Usage(usage.clone());
+                    self.hooks_usage(&turn_ctx, usage, &cancel).await?;
                 }
 
                 let turn_duration = turn_start.elapsed();
@@ -573,15 +545,6 @@ impl<C: LLMClient> Core<C> {
                 // context plus the assistant reply that joins it. Not a sum across
                 // turns — `prompt_tokens` already accumulates the history.
                 let conv_total_tokens = prompt_tokens.saturating_add(completion_tokens);
-                // Provider-reported size of the context after this turn:
-                // prompt covers everything sent, completion the new assistant
-                // output. Tool results appended below aren't counted — the
-                // compaction threshold ratio absorbs that lag.
-                #[cfg(feature = "context")]
-                let reported_tokens: Option<usize> = response
-                    .usage
-                    .as_ref()
-                    .map(|u| u.prompt_tokens as usize + u.completion_tokens as usize);
                 turn_span.record("model", tracing::field::display(&response.model));
                 turn_span.record("finish_reason", tracing::field::display(&finish_label));
                 info!(
@@ -629,38 +592,29 @@ impl<C: LLMClient> Core<C> {
                 let assistant_message_id = assistant_message.id;
                 messages.push(assistant_message);
 
-                // Persist the assistant message before tool execution so a
-                // crashed run still has its prefix recorded.
-                #[cfg(feature = "db")]
-                if let Some(ref sink) = self.persistence {
-                    persist_new_messages(sink.as_ref(), &messages, &mut persisted_ids).await;
-                }
+                // Hooks observe the assistant message before tool execution
+                // (e.g. persistence records it so a crashed run keeps its prefix).
+                self.hooks_messages(&turn_ctx, &messages, &cancel).await?;
 
                 if tool_calls.is_empty() {
-                    // Compact before yielding so the stored history handed
-                    // back to the caller is already within budget.
-                    #[cfg(feature = "context")]
-                    if let Some(ref ctx) = self.context_manager {
-                        let (compacted, result) = ctx.maybe_compact(messages, reported_tokens).await;
-                        messages = compacted;
-                        if let Some(r) = result {
-                            if r.was_compacted {
-                                info!(
-                                    original_tokens = r.original_tokens,
-                                    compacted_tokens = r.compacted_tokens,
-                                    messages_summarized = r.messages_summarized,
-                                    "context compacted",
-                                );
-                                counter!("neuromance_compactions_total").increment(1);
-                            }
-                            yield CoreEvent::Compaction {
-                                original_tokens: r.original_tokens,
-                                compacted_tokens: r.compacted_tokens,
-                                messages_summarized: r.messages_summarized,
-                                was_compacted: r.was_compacted,
-                            };
+                    // End-of-turn hooks run on the final turn too; they may
+                    // compact or rewrite the history handed back to the caller.
+                    let (turn_messages, turn_stats) =
+                        self.hooks_turn_end(&turn_ctx, messages, &cancel).await?;
+                    messages = turn_messages;
+                    for s in turn_stats {
+                        if s.was_compacted {
+                            counter!("neuromance_compactions_total").increment(1);
                         }
+                        yield CoreEvent::Compaction {
+                            original_tokens: s.original_tokens,
+                            compacted_tokens: s.compacted_tokens,
+                            messages_summarized: s.messages_summarized,
+                            was_compacted: s.was_compacted,
+                        };
                     }
+
+                    self.hooks_completion(&turn_ctx, &messages, &cancel).await?;
 
                     let total_ms =
                         u64::try_from(start_time.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -691,13 +645,10 @@ impl<C: LLMClient> Core<C> {
 
                     let approval = if is_auto_approved {
                         ToolApproval::Approved
-                    } else if let Some(ref callback) = self.tool_approval_callback {
-                        let outcome: Result<ToolApproval, CoreError> = tokio::select! {
-                            biased;
-                            () = cancel.cancelled() => Err(CoreError::Cancelled("approval callback".to_string())),
-                            a = callback(tool_call) => Ok(a),
-                        };
-                        outcome?
+                    } else if let Some(decision) =
+                        self.hooks_review_tool(&turn_ctx, tool_call, &cancel).await?
+                    {
+                        decision
                     } else {
                         let (tx, rx) = oneshot::channel();
                         yield CoreEvent::ApprovalRequest {
@@ -715,6 +666,10 @@ impl<C: LLMClient> Core<C> {
                     };
 
                     debug!(approval = ?approval, "tool approval decided");
+
+                    // Captured from an executed tool so `after_tool` hooks can
+                    // inject follow-on context once the result message is in place.
+                    let mut tool_outcome: Option<(String, bool)> = None;
 
                     match approval {
                         ToolApproval::Approved => {
@@ -765,12 +720,13 @@ impl<C: LLMClient> Core<C> {
                                     };
                                     let tool_message = Message::tool(
                                         conversation_id,
-                                        result,
+                                        result.clone(),
                                         tool_call.id.clone(),
                                         tool_call.function.name.clone(),
                                     )
                                     .map_err(|e| CoreError::ToolError(e.to_string()))?;
                                     messages.push(tool_message);
+                                    tool_outcome = Some((result, true));
                                 }
                                 Err(e) => {
                                     info!(
@@ -793,12 +749,13 @@ impl<C: LLMClient> Core<C> {
                                     };
                                     let error_message = Message::tool(
                                         conversation_id,
-                                        error_msg,
+                                        error_msg.clone(),
                                         tool_call.id.clone(),
                                         tool_call.function.name.clone(),
                                     )
                                     .map_err(|e| CoreError::ToolError(e.to_string()))?;
                                     messages.push(error_message);
+                                    tool_outcome = Some((error_msg, false));
                                 }
                             }
                         }
@@ -820,50 +777,38 @@ impl<C: LLMClient> Core<C> {
                             ))?;
                         }
                     }
+
+                    // After-tool hooks inject follow-on context (e.g. a rule
+                    // file keyed to the touched path) right after the result.
+                    if let Some((result, success)) = tool_outcome {
+                        let injected = self
+                            .hooks_after_tool(&turn_ctx, tool_call, &result, success, &cancel)
+                            .await?;
+                        messages.extend(injected);
+                    }
                 }
 
                 debug!(tool_calls = tool_calls_count, "completed tool calls; continuing");
 
-                // Persist this turn's tool results (and retry any backlog from
-                // earlier failed writes) before the turn callback can rewrite
-                // the history.
-                #[cfg(feature = "db")]
-                if let Some(ref sink) = self.persistence {
-                    persist_new_messages(sink.as_ref(), &messages, &mut persisted_ids).await;
-                }
+                // Hooks observe this turn's tool results (e.g. persistence
+                // records them, retrying any backlog from earlier failed writes).
+                self.hooks_messages(&turn_ctx, &messages, &cancel).await?;
 
-                // Run context compaction (if configured) before the turn callback.
-                #[cfg(feature = "context")]
-                if let Some(ref ctx) = self.context_manager {
-                    let (compacted, result) = ctx.maybe_compact(messages, reported_tokens).await;
-                    messages = compacted;
-                    if let Some(r) = result {
-                        if r.was_compacted {
-                            info!(
-                                original_tokens = r.original_tokens,
-                                compacted_tokens = r.compacted_tokens,
-                                messages_summarized = r.messages_summarized,
-                                "context compacted",
-                            );
-                            counter!("neuromance_compactions_total").increment(1);
-                        }
-                        yield CoreEvent::Compaction {
-                            original_tokens: r.original_tokens,
-                            compacted_tokens: r.compacted_tokens,
-                            messages_summarized: r.messages_summarized,
-                            was_compacted: r.was_compacted,
-                        };
+                // End-of-turn hooks may rewrite or compact the history before
+                // the next turn; emit any compaction they report.
+                let (turn_messages, turn_stats) =
+                    self.hooks_turn_end(&turn_ctx, messages, &cancel).await?;
+                messages = turn_messages;
+                for s in turn_stats {
+                    if s.was_compacted {
+                        counter!("neuromance_compactions_total").increment(1);
                     }
-                }
-
-
-                if let Some(ref callback) = self.turn_callback {
-                    let outcome: Result<Result<Vec<Message>, anyhow::Error>, CoreError> = tokio::select! {
-                        biased;
-                        () = cancel.cancelled() => Err(CoreError::Cancelled("turn callback".to_string())),
-                        r = callback(messages) => Ok(r),
+                    yield CoreEvent::Compaction {
+                        original_tokens: s.original_tokens,
+                        compacted_tokens: s.compacted_tokens,
+                        messages_summarized: s.messages_summarized,
+                        was_compacted: s.was_compacted,
                     };
-                    messages = outcome?.map_err(|e| CoreError::TurnCallback(e.into()))?;
                 }
 
                 messages_arc = messages.clone().into();
@@ -921,38 +866,20 @@ impl<C: LLMClient> Core<C> {
     }
 }
 
-/// Persists messages not yet recorded this run, tolerating failures.
-///
-/// This is the single place implementing the log-and-continue policy: on
-/// success the message ids are marked persisted; on failure they are left
-/// unmarked so the next persist point retries the backlog (the sink's
-/// per-id idempotency makes the retry safe).
-#[cfg(feature = "db")]
-async fn persist_new_messages(
-    sink: &dyn neuromance_db::ConversationSink,
-    messages: &[Message],
-    persisted: &mut std::collections::HashSet<uuid::Uuid>,
-) {
-    let pending: Vec<Message> = messages
-        .iter()
-        .filter(|m| !persisted.contains(&m.id))
-        .cloned()
-        .collect();
-    let Some(first) = pending.first() else { return };
-    match sink.append_messages(first.conversation_id, &pending).await {
-        Ok(inserted) => {
-            persisted.extend(pending.iter().map(|m| m.id));
-            counter!("neuromance_db_messages_persisted_total").increment(inserted);
-        }
-        Err(e) => {
-            tracing::warn!(
-                conversation_id = %first.conversation_id,
-                error = %e,
-                pending = pending.len(),
-                "conversation persistence failed; continuing without it"
-            );
-            counter!("neuromance_db_persist_failures_total").increment(1);
-        }
+/// Await a hook future under cancellation, mapping its error to
+/// [`CoreError::Hook`] with the hook's name for context.
+async fn run_hook<T>(
+    cancel: &CancellationToken,
+    name: &str,
+    fut: impl Future<Output = anyhow::Result<T>>,
+) -> Result<T, CoreError> {
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => Err(CoreError::Cancelled(format!("hook {name}"))),
+        r = fut => r.map_err(|source| CoreError::Hook {
+            hook: name.to_string(),
+            source,
+        }),
     }
 }
 
@@ -962,17 +889,113 @@ mod tests {
     #![allow(clippy::expect_used)]
 
     use super::*;
+    use async_trait::async_trait;
     use neuromance_client::chat_completions::ChatCompletionsClient;
     use neuromance_common::client::Config;
+    use neuromance_common::hook::{HookOutcome, TurnEnd};
 
-    /// Returns a plain assistant reply (no tool calls) with a huge reported
-    /// prompt size, so compaction must trigger before `Completed`.
-    #[cfg(feature = "context")]
+    /// Hook that appends a marker system message in `on_turn_end`.
+    struct AppendTurnEndHook(&'static str);
+
+    #[async_trait]
+    impl Hook for AppendTurnEndHook {
+        async fn on_turn_end(
+            &self,
+            ctx: &HookContext,
+            mut messages: Vec<Message>,
+        ) -> anyhow::Result<TurnEnd> {
+            messages.push(Message::system(ctx.conversation_id, self.0));
+            Ok(TurnEnd::unchanged(messages))
+        }
+    }
+
+    /// Hook whose `on_turn_end` always fails.
+    struct FailingTurnEndHook;
+
+    #[async_trait]
+    impl Hook for FailingTurnEndHook {
+        async fn on_turn_end(
+            &self,
+            _ctx: &HookContext,
+            _messages: Vec<Message>,
+        ) -> anyhow::Result<TurnEnd> {
+            Err(anyhow::anyhow!("boom"))
+        }
+    }
+
+    /// Hook that decides every tool call with a fixed approval.
+    struct FixedReviewHook(ToolApproval);
+
+    #[async_trait]
+    impl Hook for FixedReviewHook {
+        async fn review_tool(
+            &self,
+            _ctx: &HookContext,
+            _call: &ToolCall,
+        ) -> anyhow::Result<Option<ToolApproval>> {
+            Ok(Some(self.0.clone()))
+        }
+    }
+
+    /// Hook that injects a marker message in `on_conversation_start`.
+    struct StartInjectHook(&'static str);
+
+    #[async_trait]
+    impl Hook for StartInjectHook {
+        async fn on_conversation_start(
+            &self,
+            ctx: &HookContext,
+            _messages: &[Message],
+        ) -> anyhow::Result<HookOutcome> {
+            Ok(HookOutcome::inject(vec![Message::system(
+                ctx.conversation_id,
+                self.0,
+            )]))
+        }
+    }
+
+    /// Hook that injects a marker message in `after_tool`.
+    struct AfterToolInjectHook(&'static str);
+
+    #[async_trait]
+    impl Hook for AfterToolInjectHook {
+        async fn after_tool(
+            &self,
+            ctx: &HookContext,
+            _call: &ToolCall,
+            _result: &str,
+            _success: bool,
+        ) -> anyhow::Result<HookOutcome> {
+            Ok(HookOutcome::inject(vec![Message::system(
+                ctx.conversation_id,
+                self.0,
+            )]))
+        }
+    }
+
+    /// Hook that reports compaction stats from `on_turn_end`.
+    struct CompactingHook;
+
+    #[async_trait]
+    impl Hook for CompactingHook {
+        async fn on_turn_end(
+            &self,
+            _ctx: &HookContext,
+            messages: Vec<Message>,
+        ) -> anyhow::Result<TurnEnd> {
+            Ok(TurnEnd::compacted(
+                messages,
+                CompactionStats::new(100, 50, 2, true),
+            ))
+        }
+    }
+
+    /// Returns a plain assistant reply with no tool calls, so a run reaches the
+    /// no-tool completion path in a single turn.
     struct HugeUsageClient {
         config: Config,
     }
 
-    #[cfg(feature = "context")]
     #[async_trait::async_trait]
     impl LLMClient for HugeUsageClient {
         fn config(&self) -> &Config {
@@ -1033,34 +1056,21 @@ mod tests {
         }
     }
 
-    /// Compaction runs on the no-tool-call completion path, so the final
-    /// history handed back to callers is already within budget.
-    #[cfg(feature = "context")]
+    /// A hook reporting compaction surfaces as a `CoreEvent::Compaction` on the
+    /// no-tool completion path, before `Completed`.
     #[tokio::test]
     async fn test_run_emits_compaction_event_on_completion_path() {
-        use crate::context_management::ContextConfig;
-
         let mock_config = Config::new("mock", "mock-model");
-        let client = HugeUsageClient {
-            config: mock_config.clone(),
-        };
-        let compaction_client = HugeUsageClient {
+        let mut core = Core::new(HugeUsageClient {
             config: mock_config,
-        };
-
-        let context_config = ContextConfig::new(1000).with_preserve_recent_turns(1);
-        let mut core =
-            Core::new(client).with_context_management_client(compaction_client, context_config);
+        })
+        .with_hook(Arc::new(CompactingHook));
 
         let conv_id = uuid::Uuid::new_v4();
-        let messages: Vec<Message> = (0..4)
-            .flat_map(|i| {
-                vec![
-                    Message::user(conv_id, format!("question {i}")),
-                    Message::assistant(conv_id, format!("answer {i}")),
-                ]
-            })
-            .collect();
+        let messages = vec![
+            Message::system(conv_id, "sys"),
+            Message::user(conv_id, "hello"),
+        ];
 
         let cancel = CancellationToken::new();
         let mut stream = Box::pin(core.run(messages, cancel));
@@ -1082,83 +1092,154 @@ mod tests {
         }
 
         assert!(saw_compaction, "expected a was_compacted=true event");
-        let completed = completed.expect("stream must complete");
-        assert!(
-            completed.len() < 9,
-            "history should shrink below input+reply length, got {}",
-            completed.len()
-        );
-        assert!(
-            completed
-                .iter()
-                .any(|m| m.content.contains("summarized")
-                    || m.content.contains("summary or reply")),
-            "compacted history should contain the summary message"
-        );
+        assert!(completed.is_some(), "stream must complete");
     }
 
-    /// `with_tool_approval_callback` stores the callback.
+    /// Core without any hooks builds cleanly.
     #[tokio::test]
-    async fn test_tool_approval_callback() {
-        let config = Config::new("test", "test-model").with_api_key("test-key");
-        let client = ChatCompletionsClient::new(config).expect("Failed to create client");
-
-        let core = Core::new(client).with_tool_approval_callback(|tool_call| {
-            let tool_name = tool_call.function.name.clone();
-            async move {
-                if tool_name == "dangerous" {
-                    ToolApproval::Denied("Not allowed".to_string())
-                } else {
-                    ToolApproval::Approved
-                }
-            }
-        });
-
-        assert!(core.tool_approval_callback.is_some());
-    }
-
-    /// Core without any callbacks builds cleanly.
-    #[tokio::test]
-    async fn test_core_without_callbacks() {
+    async fn test_core_without_hooks() {
         let config = Config::new("test", "test-model").with_api_key("test-key");
         let client = ChatCompletionsClient::new(config).expect("Failed to create client");
         let core = Core::new(client);
 
-        assert!(core.tool_approval_callback.is_none());
-        assert!(core.turn_callback.is_none());
+        assert!(core.hooks.is_empty());
     }
 
-    /// `with_turn_callback` stores the callback.
+    /// `with_hook` registers a hook.
     #[tokio::test]
-    async fn test_core_with_turn_callback() {
+    async fn test_with_hook_registers() {
         let config = Config::new("test", "test-model").with_api_key("test-key");
         let client = ChatCompletionsClient::new(config).expect("Failed to create client");
 
-        let core = Core::new(client).with_turn_callback(|messages| async move { Ok(messages) });
+        let core = Core::new(client).with_hook(Arc::new(AppendTurnEndHook("[x]")));
 
-        assert!(core.turn_callback.is_some());
+        assert_eq!(core.hooks.len(), 1);
     }
 
-    /// Turn callback can transform messages.
+    /// `on_turn_end` hooks can transform the history.
     #[tokio::test]
-    async fn test_turn_callback_transforms_messages() {
+    async fn test_on_turn_end_transforms_messages() {
         let config = Config::new("test", "test-model").with_api_key("test-key");
         let client = ChatCompletionsClient::new(config).expect("Failed to create client");
 
-        let core = Core::new(client).with_turn_callback(|mut messages| async move {
-            let conv_id = messages
-                .first()
-                .map_or_else(uuid::Uuid::new_v4, |m| m.conversation_id);
-            messages.push(Message::system(conv_id, "[compacted]"));
-            Ok(messages)
-        });
+        let core = Core::new(client).with_hook(Arc::new(AppendTurnEndHook("[compacted]")));
 
         let conv_id = uuid::Uuid::new_v4();
+        let ctx = HookContext::new(conv_id, 0);
         let input = vec![Message::user(conv_id, "hello")];
-        let output = (core.turn_callback.unwrap())(input).await.unwrap();
+        let (output, stats) = core
+            .hooks_turn_end(&ctx, input, &CancellationToken::new())
+            .await
+            .unwrap();
 
         assert_eq!(output.len(), 2);
         assert_eq!(output[1].content, "[compacted]");
+        assert!(stats.is_empty());
+    }
+
+    fn test_core() -> Core<ChatCompletionsClient> {
+        let config = Config::new("test", "test-model").with_api_key("test-key");
+        Core::new(ChatCompletionsClient::new(config).expect("client"))
+    }
+
+    /// `on_conversation_start` hooks append their injected messages.
+    #[tokio::test]
+    async fn test_on_conversation_start_injects() {
+        let core = test_core().with_hook(Arc::new(StartInjectHook("[rules]")));
+        let conv_id = uuid::Uuid::new_v4();
+        let ctx = HookContext::new(conv_id, 0);
+        let mut messages = vec![Message::user(conv_id, "hi")];
+
+        core.hooks_conversation_start(&ctx, &mut messages, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].content, "[rules]");
+    }
+
+    /// The first hook to return a decision wins the approval.
+    #[tokio::test]
+    async fn test_review_tool_first_decision_wins() {
+        let core = test_core()
+            .with_hook(Arc::new(FixedReviewHook(ToolApproval::Denied("no".into()))))
+            .with_hook(Arc::new(FixedReviewHook(ToolApproval::Approved)));
+        let ctx = HookContext::new(uuid::Uuid::new_v4(), 0);
+        let call = ToolCall::new("t", "");
+
+        let decision = core
+            .hooks_review_tool(&ctx, &call, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(decision, Some(ToolApproval::Denied("no".into())));
+    }
+
+    /// With no deciding hook, approval abstains (caller falls back).
+    #[tokio::test]
+    async fn test_review_tool_all_abstain_returns_none() {
+        let core = test_core().with_hook(Arc::new(AppendTurnEndHook("[x]")));
+        let ctx = HookContext::new(uuid::Uuid::new_v4(), 0);
+        let call = ToolCall::new("t", "");
+
+        let decision = core
+            .hooks_review_tool(&ctx, &call, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert!(decision.is_none());
+    }
+
+    /// `after_tool` collects injected messages across hooks in order.
+    #[tokio::test]
+    async fn test_after_tool_collects_injections() {
+        let core = test_core()
+            .with_hook(Arc::new(AfterToolInjectHook("[a]")))
+            .with_hook(Arc::new(AfterToolInjectHook("[b]")));
+        let ctx = HookContext::new(uuid::Uuid::new_v4(), 0);
+        let call = ToolCall::new("read", "");
+
+        let injected = core
+            .hooks_after_tool(&ctx, &call, "result", true, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        let contents: Vec<&str> = injected.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(contents, vec!["[a]", "[b]"]);
+    }
+
+    /// Multiple `on_turn_end` hooks run in registration order.
+    #[tokio::test]
+    async fn test_multiple_hooks_run_in_registration_order() {
+        let core = test_core()
+            .with_hook(Arc::new(AppendTurnEndHook("[first]")))
+            .with_hook(Arc::new(AppendTurnEndHook("[second]")));
+        let conv_id = uuid::Uuid::new_v4();
+        let ctx = HookContext::new(conv_id, 0);
+
+        let (output, _) = core
+            .hooks_turn_end(&ctx, vec![], &CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(output[0].content, "[first]");
+        assert_eq!(output[1].content, "[second]");
+    }
+
+    /// `on_turn_end` surfaces the compaction stats a hook reports.
+    #[tokio::test]
+    async fn test_on_turn_end_collects_compaction_stats() {
+        let core = test_core().with_hook(Arc::new(CompactingHook));
+        let ctx = HookContext::new(uuid::Uuid::new_v4(), 0);
+
+        let (_, stats) = core
+            .hooks_turn_end(&ctx, vec![], &CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(stats.len(), 1);
+        assert!(stats[0].was_compacted);
+        assert_eq!(stats[0].original_tokens, 100);
     }
 
     /// Pre-cancelling the token surfaces `CoreError::Cancelled` immediately:
@@ -1200,125 +1281,22 @@ mod tests {
         );
     }
 
-    /// A mock sink that records every batch it receives and can be told to fail.
-    #[cfg(feature = "db")]
-    mod persistence {
-        use std::collections::HashSet;
-        use std::sync::Mutex;
-
-        use neuromance_db::{ConversationSink, DbError};
-        use uuid::Uuid;
-
-        use super::*;
-
-        #[derive(Default)]
-        struct MockSink {
-            fail: bool,
-            batches: Mutex<Vec<Vec<Uuid>>>,
-        }
-
-        #[async_trait::async_trait]
-        impl ConversationSink for MockSink {
-            async fn append_messages(
-                &self,
-                conversation_id: Uuid,
-                messages: &[Message],
-            ) -> Result<u64, DbError> {
-                if self.fail {
-                    return Err(DbError::UnknownRole {
-                        value: "mock failure".to_string(),
-                        message_id: conversation_id,
-                    });
-                }
-                let ids: Vec<Uuid> = messages.iter().map(|m| m.id).collect();
-                let count = ids.len() as u64;
-                self.batches.lock().unwrap().push(ids);
-                Ok(count)
-            }
-        }
-
-        /// `with_persistence` stores the sink that `Core` later drives: writing
-        /// through the stored handle reaches our `MockSink` and records the batch.
-        #[tokio::test]
-        async fn test_with_persistence_drives_the_stored_sink() {
-            let config = Config::new("test", "test-model").with_api_key("test-key");
-            let client = ChatCompletionsClient::new(config).expect("Failed to create client");
-            let sink = Arc::new(MockSink::default());
-            let core = Core::new(client).with_persistence(sink.clone());
-
-            let conv_id = uuid::Uuid::new_v4();
-            let message = Message::user(conv_id, "hello");
-            let stored = core.persistence.as_ref().expect("sink should be stored");
-            let count = stored
-                .append_messages(conv_id, std::slice::from_ref(&message))
-                .await
-                .unwrap();
-
-            assert_eq!(count, 1);
-            assert_eq!(*sink.batches.lock().unwrap(), vec![vec![message.id]]);
-        }
-
-        /// Already-persisted ids are filtered out of subsequent batches.
-        #[tokio::test]
-        async fn test_persist_new_messages_skips_persisted_ids() {
-            let sink = MockSink::default();
-            let conv_id = uuid::Uuid::new_v4();
-            let first = Message::user(conv_id, "one");
-            let mut persisted = HashSet::new();
-
-            persist_new_messages(&sink, std::slice::from_ref(&first), &mut persisted).await;
-            assert!(persisted.contains(&first.id));
-
-            let second = Message::assistant(conv_id, "two");
-            persist_new_messages(&sink, &[first.clone(), second.clone()], &mut persisted).await;
-
-            let batches = sink.batches.lock().unwrap().clone();
-            assert_eq!(batches, vec![vec![first.id], vec![second.id]]);
-        }
-
-        /// Nothing pending means the sink is never called.
-        #[tokio::test]
-        async fn test_persist_new_messages_noop_when_all_persisted() {
-            let sink = MockSink::default();
-            let message = Message::user(uuid::Uuid::new_v4(), "one");
-            let mut persisted = HashSet::from([message.id]);
-
-            persist_new_messages(&sink, &[message], &mut persisted).await;
-            assert!(sink.batches.lock().unwrap().is_empty());
-        }
-
-        /// A failed write leaves ids unmarked so the next call retries them.
-        #[tokio::test]
-        async fn test_persist_failure_leaves_ids_unpersisted() {
-            let sink = MockSink {
-                fail: true,
-                ..MockSink::default()
-            };
-            let message = Message::user(uuid::Uuid::new_v4(), "one");
-            let mut persisted = HashSet::new();
-
-            persist_new_messages(&sink, std::slice::from_ref(&message), &mut persisted).await;
-            assert!(
-                !persisted.contains(&message.id),
-                "failed writes must be retried at the next persist point"
-            );
-        }
-    }
-
-    /// Errors from turn callback propagate as `anyhow::Error`.
+    /// A failing hook surfaces as `CoreError::Hook` naming the hook.
     #[tokio::test]
-    async fn test_turn_callback_error_propagation() {
+    async fn test_hook_error_maps_to_core_error_hook() {
         let config = Config::new("test", "test-model").with_api_key("test-key");
         let client = ChatCompletionsClient::new(config).expect("Failed to create client");
 
-        let core = Core::new(client).with_turn_callback(|_messages| async move {
-            Err(anyhow::anyhow!("compaction failed"))
-        });
+        let core = Core::new(client).with_hook(Arc::new(FailingTurnEndHook));
 
-        let input = vec![Message::user(uuid::Uuid::new_v4(), "hello")];
-        let result = (core.turn_callback.unwrap())(input).await;
+        let ctx = HookContext::new(uuid::Uuid::new_v4(), 0);
+        let input = vec![Message::user(ctx.conversation_id, "hello")];
+        let result = core
+            .hooks_turn_end(&ctx, input, &CancellationToken::new())
+            .await;
 
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().to_string(), "compaction failed");
+        let err = result.unwrap_err();
+        assert!(matches!(err, CoreError::Hook { .. }));
+        assert!(err.to_string().contains("boom"));
     }
 }

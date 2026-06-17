@@ -293,6 +293,36 @@ menu_budget_bytes = 8192
 body_budget_bytes = 8192
 ```
 
+## Rules
+
+An optional `[rules]` section gives the agent **rule files** — Markdown files (`.md`/`.mdc`) with optional YAML frontmatter that inject instructions by *location* rather than by intent. Where a skill is summoned when its description matches the task, a rule is pushed in automatically: a rule marked `always_apply` is injected once at the start of every conversation, and a rule with `globs` is injected the first time a tool touches a file whose path matches one of its patterns. Each rule is injected at most once per conversation.
+
+Recognized frontmatter keys are `globs` (a YAML sequence or a comma-separated scalar; `paths` is accepted as an alias), `always_apply` (`alwaysApply` is also accepted), and `description`. A file with no frontmatter is a body-only rule with no globs. Glob patterns follow gitignore-style semantics and are matched workspace-relative, so `*.rs` matches a Rust file in any directory and `src/**/*.rs` matches only under `src/`.
+
+Rules are discovered from on-host directory `roots` (walked recursively; a rule's id is its path relative to the root) and/or a corpus-shaped HTTP `endpoint` (`GET /rules` for the listing, `GET /rules/{id}` for a body). On-host roots take precedence over the endpoint when a rule id appears in both.
+
+```toml
+[rules]
+# On-host rule directories, highest precedence first (searched recursively).
+roots = ["/etc/neuromance/rules", "./rules"]
+# Optional corpus-shaped endpoint serving rules over HTTP.
+endpoint = "https://corpus.internal/api/v1/rules"
+# Optional env var holding a bearer token for the endpoint.
+endpoint_token_env = "CORPUS_TOKEN"
+# Byte budget for each injected rule body (default 8192).
+body_budget_bytes = 8192
+```
+
+A rule file looks like:
+
+```markdown
+---
+globs: "*.rs"
+description: Rust conventions
+---
+Follow the repository's error-handling rules: no unwrap/expect outside tests.
+```
+
 ## Model Context Protocol (MCP) Support
 
 Neuromance supports the [Model Context Protocol](https://modelcontextprotocol.io/) for connecting to external tool servers via the `neuromance-tools` crate.

@@ -1,25 +1,25 @@
-//! First-class context management for Core.
+//! Automatic context compaction as a conversation [`Hook`].
 //!
-//! Provides automatic context compaction as built-in infrastructure in the conversation loop.
-//! Users configure compaction through [`ContextConfig`] and wire it into [`Core`](crate::core::Core)
-//! via [`Core::with_context_management()`](crate::core::Core::with_context_management) or
-//! [`Core::with_context_management_client()`](crate::core::Core::with_context_management_client).
-//!
-//! Compaction runs automatically inside the conversation loop, keeping the
-//! conversation within the configured token budget. Conversation size is
-//! measured according to [`TokenSource`]: by default the provider-reported
-//! `Usage` from the latest response, or a local tokenizer when one is
-//! configured.
+//! [`CompactionHook`] wraps a [`Compactor`] and plugs into the conversation
+//! loop: it records the provider-reported token count on each turn
+//! ([`Hook::on_usage`]) and compacts the history when it grows past the
+//! configured threshold ([`Hook::on_turn_end`]), reporting [`CompactionStats`]
+//! the core surfaces as a compaction event.
 
-use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use tracing::warn;
+use async_trait::async_trait;
+use tracing::{info, warn};
 
 use neuromance_client::LLMClient;
 use neuromance_common::chat::{Conversation, Message};
-use neuromance_context::compaction::{CompactionConfig, CompactionResult, CompactionStrategy};
-use neuromance_context::{Compactor, TokenCounter};
+use neuromance_common::client::Usage;
+use neuromance_common::hook::{CompactionStats, Hook, HookContext, TurnEnd};
+
+use crate::Compactor;
+use crate::TokenCounter;
+use crate::compaction::CompactionStrategy;
 
 /// How conversation size is measured for compaction triggering.
 #[derive(Clone, Default)]
@@ -31,18 +31,19 @@ pub enum TokenSource {
     #[default]
     Reported,
     /// Count locally with a `HuggingFace` tokenizer.
-    Tokenizer(Arc<TokenCounter>),
+    Tokenizer(std::sync::Arc<TokenCounter>),
 }
 
 /// High-level configuration for automatic context management.
 ///
-/// Wraps the lower-level [`CompactionConfig`] with user-friendly ratio-based settings.
-/// Sensible defaults are derived from `context_window_size`.
+/// Wraps the lower-level [`CompactionConfig`](crate::compaction::CompactionConfig)
+/// with user-friendly ratio-based settings. Sensible defaults are derived from
+/// `context_window_size`.
 ///
 /// # Example
 ///
 /// ```rust
-/// use neuromance::context_management::ContextConfig;
+/// use neuromance_context::ContextConfig;
 ///
 /// let config = ContextConfig::new(128_000)
 ///     .with_compaction_threshold_ratio(0.85)
@@ -91,7 +92,7 @@ impl ContextConfig {
     /// Measure conversation size with a local tokenizer instead of
     /// provider-reported `Usage`.
     #[must_use]
-    pub fn with_tokenizer(mut self, token_counter: Arc<TokenCounter>) -> Self {
+    pub fn with_tokenizer(mut self, token_counter: std::sync::Arc<TokenCounter>) -> Self {
         self.token_source = TokenSource::Tokenizer(token_counter);
         self
     }
@@ -131,18 +132,18 @@ impl ContextConfig {
         self
     }
 
-    /// Convert ratios into absolute token counts and build a [`CompactionConfig`].
+    /// Convert ratios into absolute token counts and build a `CompactionConfig`.
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         clippy::cast_precision_loss
     )]
-    fn to_compaction_config(&self) -> CompactionConfig {
+    fn to_compaction_config(&self) -> crate::compaction::CompactionConfig {
         let threshold =
             (self.context_window_size as f64 * self.compaction_threshold_ratio) as usize;
         let target = (self.context_window_size as f64 * self.target_ratio) as usize;
 
-        let mut config = CompactionConfig::new(target)
+        let mut config = crate::compaction::CompactionConfig::new(target)
             .with_compaction_threshold(threshold)
             .with_preserve_recent_turns(self.preserve_recent_turns)
             .with_strategy(self.strategy);
@@ -155,54 +156,57 @@ impl ContextConfig {
     }
 }
 
-/// Internal context manager that owns a [`Compactor`] and handles conversation remapping.
+/// Conversation hook that compacts history when it grows past a token budget.
 ///
-/// This is `pub(crate)` — users interact with [`ContextConfig`] and
-/// [`Core::with_context_management()`](crate::core::Core::with_context_management).
-pub(crate) struct ContextManager<C: LLMClient> {
+/// Generic over the client used for summarization; registered as
+/// `Arc<dyn Hook>` so the client type is erased from the core.
+pub struct CompactionHook<C: LLMClient> {
     compactor: Compactor<C>,
     use_reported: bool,
+    /// Latest provider-reported token count, captured in `on_usage`.
+    reported_tokens: Mutex<Option<usize>>,
     missing_usage_warned: AtomicBool,
 }
 
-impl<C: LLMClient> ContextManager<C> {
-    /// Create a new context manager from a client and user-facing config.
-    pub(crate) fn new(client: C, config: &ContextConfig) -> Self {
+impl<C: LLMClient> CompactionHook<C> {
+    /// Create a compaction hook from a summarization `client` and config.
+    #[must_use]
+    pub fn new(client: C, config: &ContextConfig) -> Self {
         let compaction_config = config.to_compaction_config();
         let mut compactor = Compactor::new(client).with_config(compaction_config);
         let use_reported = match &config.token_source {
             TokenSource::Reported => true,
             TokenSource::Tokenizer(counter) => {
-                compactor = compactor.with_token_counter(Arc::clone(counter));
+                compactor = compactor.with_token_counter(std::sync::Arc::clone(counter));
                 false
             }
         };
         Self {
             compactor,
             use_reported,
+            reported_tokens: Mutex::new(None),
             missing_usage_warned: AtomicBool::new(false),
         }
     }
 
-    /// Check if compaction is needed and perform it if so.
-    ///
-    /// `reported_tokens` is the conversation size from the latest response's
-    /// `Usage` (prompt + completion tokens), consulted when the manager is
-    /// configured with [`TokenSource::Reported`].
-    ///
-    /// Returns the (possibly compacted) messages and an optional [`CompactionResult`]
-    /// if compaction was attempted. On error, logs a warning and returns originals unchanged.
-    pub(crate) async fn maybe_compact(
+    /// Compact `messages` if needed, returning the (possibly compacted) history
+    /// and statistics when compaction was attempted.
+    async fn maybe_compact(
         &self,
         messages: Vec<Message>,
-        reported_tokens: Option<usize>,
-    ) -> (Vec<Message>, Option<CompactionResult>) {
+    ) -> (Vec<Message>, Option<CompactionStats>) {
         if messages.is_empty() {
             return (messages, None);
         }
 
         let reported = if self.use_reported {
-            let Some(tokens) = reported_tokens else {
+            let tokens = {
+                *self
+                    .reported_tokens
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+            };
+            let Some(tokens) = tokens else {
                 if !self.missing_usage_warned.swap(true, Ordering::Relaxed) {
                     warn!(
                         "context management is configured with TokenSource::Reported but \
@@ -219,7 +223,7 @@ impl<C: LLMClient> ContextManager<C> {
             None
         };
 
-        // Build a temporary Conversation from the messages, remapping conversation_ids
+        // Build a temporary Conversation from the messages, remapping conversation_ids.
         let mut temp_conversation = Conversation::new();
         let original_conversation_id = messages.first().map(|m| m.conversation_id);
 
@@ -255,7 +259,6 @@ impl<C: LLMClient> ContextManager<C> {
 
         match outcome {
             Ok(result) => {
-                // Restore original conversation_id on compacted messages
                 let compacted_messages: Vec<Message> = result
                     .conversation
                     .messages
@@ -269,7 +272,22 @@ impl<C: LLMClient> ContextManager<C> {
                     })
                     .collect();
 
-                (compacted_messages, Some(result))
+                if result.was_compacted {
+                    info!(
+                        original_tokens = result.original_tokens,
+                        compacted_tokens = result.compacted_tokens,
+                        messages_summarized = result.messages_summarized,
+                        "context compacted",
+                    );
+                }
+
+                let stats = CompactionStats::new(
+                    result.original_tokens,
+                    result.compacted_tokens,
+                    result.messages_summarized,
+                    result.was_compacted,
+                );
+                (compacted_messages, Some(stats))
             }
             Err(e) => {
                 warn!(
@@ -281,12 +299,43 @@ impl<C: LLMClient> ContextManager<C> {
     }
 }
 
+#[async_trait]
+impl<C: LLMClient> Hook for CompactionHook<C> {
+    fn name(&self) -> &'static str {
+        "compaction"
+    }
+
+    async fn on_usage(&self, _ctx: &HookContext, usage: &Usage) -> anyhow::Result<()> {
+        if self.use_reported {
+            let tokens = usage.prompt_tokens as usize + usage.completion_tokens as usize;
+            *self
+                .reported_tokens
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(tokens);
+        }
+        Ok(())
+    }
+
+    async fn on_turn_end(
+        &self,
+        _ctx: &HookContext,
+        messages: Vec<Message>,
+    ) -> anyhow::Result<TurnEnd> {
+        let (messages, stats) = self.maybe_compact(messages).await;
+        Ok(match stats {
+            Some(stats) => TurnEnd::compacted(messages, stats),
+            None => TurnEnd::unchanged(messages),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
     #![allow(clippy::expect_used)]
 
     use std::pin::Pin;
+    use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
 
     use async_trait::async_trait;
@@ -370,61 +419,78 @@ mod tests {
             .collect()
     }
 
-    fn reported_manager(window: usize) -> (ContextManager<MockSummaryClient>, Arc<AtomicUsize>) {
+    fn reported_hook(window: usize) -> (CompactionHook<MockSummaryClient>, Arc<AtomicUsize>) {
         let client = MockSummaryClient::new("summary of earlier turns");
         let calls = client.call_counter();
         let config = ContextConfig::new(window).with_preserve_recent_turns(1);
-        (ContextManager::new(client, &config), calls)
+        (CompactionHook::new(client, &config), calls)
+    }
+
+    fn usage_with(prompt: u32) -> Usage {
+        Usage {
+            prompt_tokens: prompt,
+            completion_tokens: 0,
+            total_tokens: prompt,
+            cost: None,
+            input_tokens_details: None,
+            output_tokens_details: None,
+        }
     }
 
     #[tokio::test]
-    async fn test_maybe_compact_reported_none_is_noop() {
-        let (manager, calls) = reported_manager(1000);
+    async fn test_no_usage_reported_is_noop() {
+        let (hook, calls) = reported_hook(1000);
         let conv_id = Uuid::new_v4();
+        let ctx = HookContext::new(conv_id, 0);
         let messages = history(conv_id, 4);
 
-        let (out, result) = manager.maybe_compact(messages.clone(), None).await;
+        // No on_usage call -> no reported tokens -> never compacts.
+        let end = hook.on_turn_end(&ctx, messages.clone()).await.unwrap();
 
-        assert_eq!(out.len(), messages.len());
-        assert!(result.is_none());
+        assert_eq!(end.messages.len(), messages.len());
+        assert!(end.compaction.is_none());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
-    async fn test_maybe_compact_reported_below_threshold_is_noop() {
-        // window 1000, threshold ratio 0.8 -> trigger above 800 tokens
-        let (manager, calls) = reported_manager(1000);
+    async fn test_below_threshold_is_noop() {
+        // window 1000, threshold ratio 0.8 -> trigger above 800 tokens.
+        let (hook, calls) = reported_hook(1000);
         let conv_id = Uuid::new_v4();
+        let ctx = HookContext::new(conv_id, 0);
         let messages = history(conv_id, 4);
 
-        let (out, result) = manager.maybe_compact(messages.clone(), Some(800)).await;
+        hook.on_usage(&ctx, &usage_with(800)).await.unwrap();
+        let end = hook.on_turn_end(&ctx, messages.clone()).await.unwrap();
 
-        assert_eq!(out.len(), messages.len());
-        assert!(result.is_none());
+        assert_eq!(end.messages.len(), messages.len());
+        assert!(end.compaction.is_none());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
-    async fn test_maybe_compact_reported_triggers_and_restores_conversation_id() {
-        let (manager, calls) = reported_manager(1000);
+    async fn test_triggers_and_restores_conversation_id() {
+        let (hook, calls) = reported_hook(1000);
         let conv_id = Uuid::new_v4();
+        let ctx = HookContext::new(conv_id, 0);
         let messages = history(conv_id, 4);
 
-        let (out, result) = manager.maybe_compact(messages, Some(5000)).await;
+        hook.on_usage(&ctx, &usage_with(5000)).await.unwrap();
+        let end = hook.on_turn_end(&ctx, messages).await.unwrap();
 
-        let result = result.expect("compaction attempted");
-        assert!(result.was_compacted);
-        assert_eq!(result.original_tokens, 5000);
+        let stats = end.compaction.expect("compaction attempted");
+        assert!(stats.was_compacted);
+        assert_eq!(stats.original_tokens, 5000);
         assert!(
             calls.load(Ordering::SeqCst) >= 1,
             "summary LLM call expected"
         );
 
         // summary message + 2 preserved recent messages
-        assert_eq!(out.len(), 3);
-        assert!(out[0].content.contains("summary of earlier turns"));
+        assert_eq!(end.messages.len(), 3);
+        assert!(end.messages[0].content.contains("summary of earlier turns"));
         assert!(
-            out.iter().all(|m| m.conversation_id == conv_id),
+            end.messages.iter().all(|m| m.conversation_id == conv_id),
             "conversation_id must be restored on compacted messages"
         );
     }

@@ -44,18 +44,21 @@ mod error;
 pub use error::TokenCounterError;
 
 pub mod compaction;
+pub mod compaction_hook;
 pub mod context;
 #[cfg(feature = "gguf")]
 pub mod gguf;
 mod jinja_compat;
 pub mod metadata;
 mod navigation;
+pub mod rules;
 pub mod skills;
 pub mod state;
 mod template;
 pub mod transforms;
 
 pub use compaction::{CompactionConfig, CompactionResult, CompactionStrategy, Compactor};
+pub use compaction_hook::{CompactionHook, ContextConfig, TokenSource};
 pub use context::Context;
 pub use navigation::{SearchMatch, TokenInfo, TokenizedText};
 

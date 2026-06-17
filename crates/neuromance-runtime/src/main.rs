@@ -8,11 +8,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
-use neuromance::context_management::ContextConfig;
 use neuromance::{Core, build_client};
 use neuromance_agent::Agent;
 use neuromance_client::LLMClient;
-use neuromance_db::PgConversationStore;
+use neuromance_common::FnReviewHook;
+use neuromance_context::rules::RulesHook;
+use neuromance_context::{CompactionHook, ContextConfig};
+use neuromance_db::{PersistenceHook, PgConversationStore};
 use neuromance_runtime::{
     ApprovalMode, Mode, RuntimeConfig, RuntimeError, SessionReset, SkillRuntime,
     approval::WebhookApprover,
@@ -21,7 +23,7 @@ use neuromance_runtime::{
     lifecycle::shutdown_handler,
     metrics as runtime_metrics, oneshot,
     proxy::build_provider_config,
-    sandbox, serve, skills,
+    rules, sandbox, serve, skills,
     telemetry::{self, BoxedLayer},
 };
 use neuromance_tools::SkillTool;
@@ -121,11 +123,13 @@ async fn run_orchestrator(config: &RuntimeConfig, cancel: CancellationToken) -> 
 
     let skills = skills::build(config.skills.as_ref()).await;
 
+    let rules = rules::build(config.rules.as_ref()).await;
     let (agent, local_python) = build_agent(
         config,
         store.as_ref(),
         sandbox_client.as_ref(),
         skills.as_ref(),
+        rules.as_ref(),
         &cancel,
     )
     .await
@@ -301,7 +305,10 @@ fn apply_context_compaction(
         .with_target_ratio(ctx.target_ratio)
         .with_preserve_recent_turns(ctx.preserve_recent_turns)
         .with_strategy(ctx.strategy);
-    let core = core.with_context_management_client(compaction_client, context_config);
+    let core = core.with_hook(Arc::new(CompactionHook::new(
+        compaction_client,
+        &context_config,
+    )));
     info!(
         window = ctx.context_window_size,
         threshold_ratio = ctx.compaction_threshold_ratio,
@@ -316,6 +323,7 @@ async fn build_agent(
     store: Option<&Arc<PgConversationStore>>,
     sandbox_client: Option<&sandbox::SandboxClient>,
     skills: Option<&Arc<SkillRuntime>>,
+    rules: Option<&Arc<RulesHook>>,
     cancel: &CancellationToken,
 ) -> Result<(Agent<Box<dyn LLMClient>>, Option<SessionReset>), RuntimeError> {
     let provider = config.provider(&config.agent.provider).ok_or_else(|| {
@@ -343,7 +351,7 @@ async fn build_agent(
     }
     if let Some(store) = store {
         let sink: Arc<PgConversationStore> = Arc::clone(store);
-        core = core.with_persistence(sink);
+        core = core.with_hook(Arc::new(PersistenceHook::new(sink)));
     }
 
     // When a sandbox endpoint is configured, capability tools execute in the
@@ -417,11 +425,17 @@ async fn build_agent(
                 url,
                 Duration::from_secs(config.approval.timeout_seconds),
             )?;
-            core = core.with_tool_approval_callback(move |tc| approver.approve(tc));
+            core = core.with_hook(Arc::new(FnReviewHook::new(move |tc| approver.approve(tc))));
         }
     }
 
     core = apply_context_compaction(core, config, llm_config)?;
+
+    // Rules inject always-apply guidance at conversation start and glob-matched
+    // guidance after a tool touches a matching path, entirely inside the loop.
+    if let Some(rules) = rules {
+        core = core.with_hook(Arc::clone(rules) as Arc<dyn neuromance_common::hook::Hook>);
+    }
 
     Ok((Agent::new(config.agent.id.clone(), core), local_python))
 }

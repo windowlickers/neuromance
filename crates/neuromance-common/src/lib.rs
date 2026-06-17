@@ -65,6 +65,11 @@ pub mod client;
 /// Provides types like `ThinkingMode` and `ReasoningLevel` that abstract
 /// provider-specific features into a common interface.
 pub mod features;
+/// Generic lifecycle hooks for the conversation loop.
+///
+/// Provides the [`hook::Hook`] trait and its support types — the single
+/// extension point the orchestration core dispatches to.
+pub mod hook;
 /// Tool calling and function execution types.
 ///
 /// Provides types for defining and executing functions/tools that LLMs can call.
@@ -88,6 +93,7 @@ pub use client::{
 };
 pub use delegation::DelegationContext;
 pub use features::{ReasoningLevel, ThinkingMode};
+pub use hook::{CompactionStats, FnReviewHook, Hook, HookContext, HookOutcome, TurnEnd};
 pub use subagent::{Subagent, SubagentError};
 pub use task::{Outcome, Task};
 pub use tools::{
