@@ -128,10 +128,38 @@ mod tests {
 
     use std::fs;
 
+    use async_trait::async_trait;
     use tempfile::{TempDir, tempdir};
 
     use super::*;
-    use crate::rules::source::LocalRuleSource;
+    use crate::rules::error::RuleError;
+    use crate::rules::model::RuleLocator;
+    use crate::rules::source::{LocalRuleSource, RuleSource};
+
+    /// A source that lists one always-apply rule but always fails to load its
+    /// body, exercising the inject path that drops a rule on load failure.
+    struct ListsButFailsToLoad;
+
+    #[async_trait]
+    impl RuleSource for ListsButFailsToLoad {
+        async fn list(&self) -> Result<Vec<RuleMetadata>, RuleError> {
+            Ok(vec![RuleMetadata {
+                id: RuleId::new("ghost.md"),
+                globs: Vec::new(),
+                always_apply: true,
+                description: None,
+                locator: RuleLocator::Remote {
+                    endpoint: "mem://rules".to_string(),
+                    id: "ghost.md".to_string(),
+                },
+                extra: serde_yaml::Mapping::new(),
+            }])
+        }
+
+        async fn load_body(&self, id: &RuleId) -> Result<String, RuleError> {
+            Err(RuleError::NotFound(id.to_string()))
+        }
+    }
 
     async fn hook_over(files: &[(&str, &str)]) -> (RulesHook, TempDir) {
         let dir = tempdir().unwrap();
@@ -220,5 +248,20 @@ mod tests {
             .unwrap();
         assert_eq!(a.messages.len(), 1);
         assert_eq!(b.messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_inject_skips_rule_whose_body_fails_to_load() {
+        let catalog = RuleCatalog::build(vec![Box::new(ListsButFailsToLoad)]).await;
+        assert_eq!(
+            catalog.len(),
+            1,
+            "rule is listed but its body load will fail"
+        );
+        let hook = RulesHook::new(Arc::new(catalog), 8192);
+        let ctx = HookContext::new(Uuid::new_v4(), 0);
+
+        let outcome = hook.on_conversation_start(&ctx, &[]).await.unwrap();
+        assert!(outcome.messages.is_empty());
     }
 }

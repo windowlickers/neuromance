@@ -1567,6 +1567,37 @@ mod tests {
     }
 
     #[test]
+    fn test_rules_section_round_trips_custom_values() {
+        let config = serve_config(
+            r#"
+            [rules]
+            roots = ["/etc/rules", "/home/me/rules"]
+            endpoint = "https://corpus/api/v1/rules"
+            endpoint_token_env = "RULES_TOKEN"
+            body_budget_bytes = 4096
+        "#,
+        );
+        config.validate().unwrap();
+
+        // Serialize back out and reparse to exercise the Serialize impl.
+        let reserialized = toml::to_string(&config).unwrap();
+        let config: RuntimeConfig = toml::from_str(&reserialized).unwrap();
+        config.validate().unwrap();
+
+        let rules = config.rules.expect("rules section");
+        assert_eq!(
+            rules.roots,
+            vec![PathBuf::from("/etc/rules"), PathBuf::from("/home/me/rules")]
+        );
+        assert_eq!(
+            rules.endpoint.as_deref(),
+            Some("https://corpus/api/v1/rules")
+        );
+        assert_eq!(rules.endpoint_token_env.as_deref(), Some("RULES_TOKEN"));
+        assert_eq!(rules.body_budget_bytes, 4096);
+    }
+
+    #[test]
     fn test_database_zero_acquire_timeout_fails_validation() {
         let config = serve_config(
             r#"
