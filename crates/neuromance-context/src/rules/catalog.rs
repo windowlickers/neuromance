@@ -38,6 +38,7 @@ impl RuleCatalog {
     ///
     /// A source whose `list` fails, or a rule whose glob fails to compile, is
     /// logged and skipped rather than aborting the build.
+    #[must_use]
     pub async fn build(sources: Vec<Box<dyn RuleSource>>) -> Self {
         let mut entries: Vec<Entry> = Vec::new();
         let mut seen: HashSet<RuleId> = HashSet::new();
