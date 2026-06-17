@@ -30,7 +30,7 @@ struct Entry {
 pub struct RuleCatalog {
     sources: Vec<Box<dyn RuleSource>>,
     entries: Vec<Entry>,
-    by_id: HashMap<String, usize>,
+    by_id: HashMap<RuleId, usize>,
 }
 
 impl RuleCatalog {
@@ -40,12 +40,12 @@ impl RuleCatalog {
     /// logged and skipped rather than aborting the build.
     pub async fn build(sources: Vec<Box<dyn RuleSource>>) -> Self {
         let mut entries: Vec<Entry> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
+        let mut seen: HashSet<RuleId> = HashSet::new();
         for (idx, source) in sources.iter().enumerate() {
             match source.list().await {
                 Ok(metas) => {
                     for meta in metas {
-                        if !seen.insert(meta.id.as_str().to_string()) {
+                        if !seen.insert(meta.id.clone()) {
                             continue;
                         }
                         match compile_globs(&meta) {
@@ -65,7 +65,7 @@ impl RuleCatalog {
         let by_id = entries
             .iter()
             .enumerate()
-            .map(|(i, e)| (e.meta.id.as_str().to_string(), i))
+            .map(|(i, e)| (e.meta.id.clone(), i))
             .collect();
         Self {
             sources,
@@ -117,7 +117,7 @@ impl RuleCatalog {
     pub async fn load(&self, id: &RuleId, budget_bytes: usize) -> Result<String, RuleError> {
         let idx = *self
             .by_id
-            .get(id.as_str())
+            .get(id)
             .ok_or_else(|| RuleError::NotFound(id.to_string()))?;
         let entry = &self.entries[idx];
         let body = self.sources[entry.source].load_body(&entry.meta.id).await?;
