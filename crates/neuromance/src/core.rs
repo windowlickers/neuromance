@@ -1095,27 +1095,6 @@ mod tests {
         assert!(completed.is_some(), "stream must complete");
     }
 
-    /// Core without any hooks builds cleanly.
-    #[tokio::test]
-    async fn test_core_without_hooks() {
-        let config = Config::new("test", "test-model").with_api_key("test-key");
-        let client = ChatCompletionsClient::new(config).expect("Failed to create client");
-        let core = Core::new(client);
-
-        assert!(core.hooks.is_empty());
-    }
-
-    /// `with_hook` registers a hook.
-    #[tokio::test]
-    async fn test_with_hook_registers() {
-        let config = Config::new("test", "test-model").with_api_key("test-key");
-        let client = ChatCompletionsClient::new(config).expect("Failed to create client");
-
-        let core = Core::new(client).with_hook(Arc::new(AppendTurnEndHook("[x]")));
-
-        assert_eq!(core.hooks.len(), 1);
-    }
-
     /// `on_turn_end` hooks can transform the history.
     #[tokio::test]
     async fn test_on_turn_end_transforms_messages() {

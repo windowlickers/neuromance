@@ -466,17 +466,24 @@ fn builder_sets_auto_approve() {
     assert!(agent.core.auto_approve_tools);
 }
 
-#[test]
-fn builder_sets_tool_approval_callback() {
-    use neuromance_common::tools::ToolApproval;
+#[tokio::test]
+async fn builder_sets_tool_approval_callback() {
+    use neuromance_common::hook::HookContext;
+    use neuromance_common::tools::{ToolApproval, ToolCall};
 
     let client = MockLLMClient::new();
     let agent = Agent::builder("agent", client)
         .with_tool_approval_callback(|_tc| async { ToolApproval::Approved })
         .build();
 
-    // The approval closure is registered as a review hook on the core.
-    assert_eq!(agent.core.hooks.len(), 1);
+    // The registered review hook actually decides a tool call, not merely
+    // occupies a slot.
+    let ctx = HookContext::new(uuid::Uuid::new_v4(), 0);
+    let decision = agent.core.hooks[0]
+        .review_tool(&ctx, &ToolCall::new("t", "{}"))
+        .await
+        .unwrap();
+    assert_eq!(decision, Some(ToolApproval::Approved));
 }
 
 #[test]

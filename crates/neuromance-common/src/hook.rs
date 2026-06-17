@@ -300,8 +300,11 @@ mod tests {
     #[test]
     fn test_hook_outcome_inject_carries_messages() {
         let id = Uuid::new_v4();
-        let outcome = HookOutcome::inject(vec![Message::system(id, "x")]);
-        assert!(!outcome.is_empty());
+        let outcome = HookOutcome::inject(vec![Message::system(id, "payload")]);
+        // The exact message passes through unchanged, not a placeholder.
         assert_eq!(outcome.messages.len(), 1);
+        assert_eq!(outcome.messages[0].content, "payload");
+        // An empty injection is a no-op outcome — inject does not fabricate one.
+        assert!(HookOutcome::inject(Vec::new()).is_empty());
     }
 }
