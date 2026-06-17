@@ -39,7 +39,4 @@ pub enum CoreError {
 
     #[error("Context compaction error: {0}")]
     CompactionError(String),
-
-    #[error("Other error: {0}")]
-    Other(#[from] anyhow::Error),
 }
