@@ -56,10 +56,12 @@
 //! [`Message::id`]: neuromance_common::chat::Message
 
 mod error;
+mod hook;
 mod rows;
 mod sink;
 mod store;
 
 pub use error::DbError;
+pub use hook::PersistenceHook;
 pub use sink::ConversationSink;
 pub use store::{ConversationSummary, PgConversationStore};

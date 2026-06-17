@@ -238,16 +238,6 @@ impl<C: LLMClient + Send + Sync> Agent<C> {
                 span.record("task_id", tracing::field::display(task));
             }
         }
-        #[cfg(feature = "db")]
-        {
-            self.core.parent_conversation_id = parent_conversation_id;
-            self.core.parent_task_id = task_id;
-            self.core.parent_message_id = enclosing.parent_message_id;
-            self.core
-                .parent_tool_call_id
-                .clone_from(&enclosing.parent_tool_call_id);
-        }
-
         let mut messages = messages.unwrap_or_else(|| self.messages.clone());
 
         if messages.len() < 2 {

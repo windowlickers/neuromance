@@ -475,7 +475,8 @@ fn builder_sets_tool_approval_callback() {
         .with_tool_approval_callback(|_tc| async { ToolApproval::Approved })
         .build();
 
-    assert!(agent.core.tool_approval_callback.is_some());
+    // The approval closure is registered as a review hook on the core.
+    assert_eq!(agent.core.hooks.len(), 1);
 }
 
 #[test]

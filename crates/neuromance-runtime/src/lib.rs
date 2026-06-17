@@ -28,6 +28,7 @@ pub mod lifecycle;
 pub mod metrics;
 pub mod oneshot;
 pub mod proxy;
+pub mod rules;
 pub mod sandbox;
 pub mod serve;
 pub mod skills;
@@ -36,8 +37,8 @@ pub mod telemetry;
 
 pub use config::{
     AgentConfig, ApprovalConfig, ApprovalMode, ContextSettings, DatabaseSettings, Invocation, Mode,
-    OneshotConfig, ProviderConfig, ProviderProxyConfig, RuntimeConfig, RuntimeSettings,
-    SandboxConfig, SkillsSettings, SubagentConfig,
+    OneshotConfig, ProviderConfig, ProviderProxyConfig, RulesSettings, RuntimeConfig,
+    RuntimeSettings, SandboxConfig, SkillsSettings, SubagentConfig,
 };
 pub use error::RuntimeError;
 pub use skills::SkillRuntime;

@@ -35,13 +35,13 @@
 //! - **Tool Calling**: Define and execute function calls from LLM responses
 //! - **Serialization**: Full serde support for all types
 //!
-//! ## Optional Features
+//! ## Hooks
 //!
-//! - **`context`**: Token counting and context management using Candle tokenizers.
-//!   Enable with `neuromance = { features = ["context"] }`
+//! Cross-cutting concerns plug in through [`Hook`](neuromance_common::hook::Hook):
+//! register persistence (`neuromance-db`), context compaction
+//! (`neuromance-context`), tool approval, or custom behavior via
+//! [`Core::with_hook`](crate::core::Core::with_hook).
 
-#[cfg(feature = "context")]
-pub mod context_management;
 pub mod core;
 pub mod error;
 pub mod events;
@@ -97,12 +97,3 @@ pub mod mcp {
 pub mod proxy {
     pub use neuromance_tools::proxy::{ProxyAwareClient, ToolProxyConfig};
 }
-// --- Postgres conversation persistence ---
-#[cfg(feature = "db")]
-pub mod db {
-    pub use neuromance_db::{ConversationSink, ConversationSummary, DbError, PgConversationStore};
-}
-
-// --- Context management (optional) ---
-#[cfg(feature = "context")]
-pub use neuromance_context as context;

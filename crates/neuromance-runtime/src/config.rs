@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use neuromance::context::compaction::CompactionStrategy;
+use neuromance_context::compaction::CompactionStrategy;
 use neuromance_tools::ToolConfig;
 
 use crate::error::RuntimeError;
@@ -81,6 +81,11 @@ pub struct RuntimeConfig {
     /// skill's full instructions into context on demand.
     #[serde(default)]
     pub skills: Option<SkillsSettings>,
+    /// When set, rule files are discovered from on-host roots and/or a remote
+    /// endpoint. `always_apply` rules are injected at conversation start, and
+    /// glob-matched rules are injected when a tool touches a matching path.
+    #[serde(default)]
+    pub rules: Option<RulesSettings>,
     /// One-time tool setup run at container start, before tasks. Each entry
     /// spawns `command` with `args`; if `token_env` is set its value is fed on
     /// stdin. Best-effort — failures are logged, never fatal.
@@ -256,6 +261,29 @@ impl Invocation {
 
 const fn default_skill_budget() -> usize {
     8192
+}
+
+/// Rule-file discovery settings.
+///
+/// At least one of `roots` or `endpoint` must be set for rules to be enabled;
+/// an empty section disables them. On-host `roots` take precedence over the
+/// remote `endpoint` when a rule id appears in both.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RulesSettings {
+    /// On-host directories to discover rule files (`.md`/`.mdc`) in, highest
+    /// precedence first; searched recursively.
+    #[serde(default)]
+    pub roots: Vec<PathBuf>,
+    /// A corpus-shaped rules endpoint (e.g. `https://corpus/api/v1/rules`).
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// Environment variable holding a bearer token for `endpoint`, if it
+    /// requires authentication.
+    #[serde(default)]
+    pub endpoint_token_env: Option<String>,
+    /// Byte budget for each injected rule body (default: 8192).
+    #[serde(default = "default_skill_budget")]
+    pub body_budget_bytes: usize,
 }
 
 const fn default_compaction_threshold_ratio() -> f64 {

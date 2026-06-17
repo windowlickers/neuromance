@@ -2472,8 +2472,6 @@ dependencies = [
  "metrics",
  "neuromance-client",
  "neuromance-common",
- "neuromance-context",
- "neuromance-db",
  "neuromance-tools",
  "regex",
  "secrecy",
@@ -2580,6 +2578,7 @@ dependencies = [
  "dirs",
  "env_logger",
  "futures",
+ "globset",
  "hf-hub",
  "log",
  "minijinja",
@@ -2606,8 +2605,10 @@ dependencies = [
 name = "neuromance-db"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "chrono",
+ "metrics",
  "neuromance-common",
  "proptest",
  "serde",

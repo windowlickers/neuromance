@@ -5,21 +5,16 @@
 //! is bi-directional: Core pauses until the consumer answers via the attached
 //! `oneshot::Sender`.
 //!
-//! ## Approval: stream event or stored callback
+//! ## Approval: stream event or hook
 //!
 //! Two ways to answer tool-approval requests:
 //!
 //! 1. **Stream event** (default) — match [`CoreEvent::ApprovalRequest`] and
 //!    `responder.send(ToolApproval::...)`.
-//! 2. **Stored callback** — set [`Core::with_tool_approval_callback`] and Core
-//!    answers internally; [`CoreEvent::ApprovalRequest`] is never yielded.
-//!
-//! [`Core::with_tool_approval_callback`]: crate::Core::with_tool_approval_callback
+//! 2. **Hook** — register a [`Hook`](neuromance_common::hook::Hook) whose
+//!    `review_tool` returns a decision; Core answers internally and
+//!    [`CoreEvent::ApprovalRequest`] is never yielded.
 
-use std::future::Future;
-use std::pin::Pin;
-
-use anyhow::Result;
 use neuromance_common::chat::Message;
 use neuromance_common::client::Usage;
 use neuromance_common::tools::{ToolApproval, ToolCall};
@@ -64,10 +59,8 @@ pub enum CoreEvent {
     /// Answer by sending a [`ToolApproval`] on `responder`. If the sender is
     /// dropped, Core treats it as a denial.
     ///
-    /// Only yielded when no [`Core::with_tool_approval_callback`] is set —
-    /// otherwise Core answers internally.
-    ///
-    /// [`Core::with_tool_approval_callback`]: crate::Core::with_tool_approval_callback
+    /// Only yielded when no [`Hook`](neuromance_common::hook::Hook) decides the
+    /// call via `review_tool` — otherwise Core answers internally.
     ApprovalRequest {
         /// The tool call awaiting approval.
         tool_call: ToolCall,
@@ -79,20 +72,3 @@ pub enum CoreEvent {
     /// message history including assistant and tool messages produced this run.
     Completed(Vec<Message>),
 }
-
-/// Async callback for approving tool calls.
-///
-/// Escape hatch for consumers who prefer stored callbacks over reacting to
-/// [`CoreEvent::ApprovalRequest`] in the stream. See module docs.
-pub type ToolApprovalCallback =
-    Box<dyn Fn(&ToolCall) -> Pin<Box<dyn Future<Output = ToolApproval> + Send>> + Send + Sync>;
-
-/// Async callback for transforming messages between turns.
-///
-/// Receives the full message history after tool execution and returns a
-/// (potentially modified) version. Primary use case: context compaction.
-pub type TurnCallback = Box<
-    dyn Fn(Vec<Message>) -> Pin<Box<dyn Future<Output = Result<Vec<Message>>> + Send>>
-        + Send
-        + Sync,
->;
