@@ -55,9 +55,7 @@ pub fn current() -> DelegationContext {
     if let Ok(ctx) = TASK_CTX.try_with(Clone::clone) {
         return ctx;
     }
-    THREAD_CTX
-        .with(|c| c.borrow().clone())
-        .unwrap_or_default()
+    THREAD_CTX.with(|c| c.borrow().clone()).unwrap_or_default()
 }
 
 /// Run `fut` with `ctx` as the ambient delegation context for its task.

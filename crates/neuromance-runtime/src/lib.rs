@@ -30,13 +30,15 @@ pub mod oneshot;
 pub mod proxy;
 pub mod sandbox;
 pub mod serve;
+pub mod skills;
 pub mod subagents;
 pub mod telemetry;
 
 pub use config::{
-    AgentConfig, ApprovalConfig, ApprovalMode, ContextSettings, DatabaseSettings, Mode,
+    AgentConfig, ApprovalConfig, ApprovalMode, ContextSettings, DatabaseSettings, Invocation, Mode,
     OneshotConfig, ProviderConfig, ProviderProxyConfig, RuntimeConfig, RuntimeSettings,
-    SandboxConfig, SubagentConfig,
+    SandboxConfig, SkillsSettings, SubagentConfig,
 };
 pub use error::RuntimeError;
+pub use skills::SkillRuntime;
 pub use subagents::{SessionReset, build_parent_toolset};

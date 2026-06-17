@@ -23,6 +23,8 @@ thiserror = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+async-trait = { workspace = true }
 tracing = { workspace = true }
 neuromance-common = { workspace = true }
 neuromance-client = { workspace = true }
@@ -35,8 +37,8 @@ candle-core = { git = "https://github.com/ecdobry/candle.git", rev = "1cba3b35f1
 hf-hub = { version = "0.3", features = ["tokio"] }
 tokenizers = "0.21"
 
-# HTTP client for downloading chat templates
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# HTTP client for downloading chat templates and fetching remote skills
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 # Filesystem utilities
 dirs = "5.0"
@@ -51,7 +53,6 @@ minijinja = "2.13"
 ahash = { version = "0.8", optional = true }
 
 [dev-dependencies]
-async-trait = { workspace = true }
 tokio = { workspace = true }
 tracing-subscriber = { workspace = true }
 env_logger = { workspace = true }
@@ -59,6 +60,8 @@ log = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 futures = { workspace = true }
 proptest = "1.4"
+tempfile = { workspace = true }
+wiremock = "0.6"
 
 [[example]]
 name = "gguf_metadata"

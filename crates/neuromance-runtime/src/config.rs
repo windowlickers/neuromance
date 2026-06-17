@@ -75,6 +75,12 @@ pub struct RuntimeConfig {
     /// bridge.
     #[serde(default)]
     pub subagents: Vec<SubagentConfig>,
+    /// When set, skills are discovered from on-host roots and/or a remote
+    /// endpoint, their menu is injected into each conversation, and a
+    /// `load_skill` tool (and/or `$mention` parsing) lets the agent pull a
+    /// skill's full instructions into context on demand.
+    #[serde(default)]
+    pub skills: Option<SkillsSettings>,
     /// One-time tool setup run at container start, before tasks. Each entry
     /// spawns `command` with `args`; if `token_env` is set its value is fed on
     /// stdin. Best-effort — failures are logged, never fatal.
@@ -190,6 +196,66 @@ pub struct ContextSettings {
     /// Compaction strategy: `one_shot`, `hierarchical`, or `truncate`.
     #[serde(default)]
     pub strategy: CompactionStrategy,
+}
+
+/// Skill discovery and invocation settings.
+///
+/// At least one of `roots` or `endpoint` must be set for skills to be enabled;
+/// an empty section disables skills. On-host `roots` take precedence over the
+/// remote `endpoint` when a skill name appears in both.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SkillsSettings {
+    /// On-host directories to discover skills in, highest precedence first.
+    /// Each immediate subdirectory containing a `SKILL.md` is a skill.
+    #[serde(default)]
+    pub roots: Vec<PathBuf>,
+    /// A corpus-shaped skills endpoint (e.g. `https://corpus/api/v1/skills`).
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// Environment variable holding a bearer token for `endpoint`, if it
+    /// requires authentication.
+    #[serde(default)]
+    pub endpoint_token_env: Option<String>,
+    /// Which invocation mechanisms are enabled (default: `both`).
+    #[serde(default)]
+    pub invocation: Invocation,
+    /// Byte budget for the injected skills menu (default: 8192).
+    #[serde(default = "default_skill_budget")]
+    pub menu_budget_bytes: usize,
+    /// Byte budget for each loaded skill body (default: 8192).
+    #[serde(default = "default_skill_budget")]
+    pub body_budget_bytes: usize,
+}
+
+/// How a skill's full body may be summoned into context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Invocation {
+    /// Only the model-driven `load_skill` tool.
+    Tool,
+    /// Only `$mention` parsing of user input.
+    Mention,
+    /// Both the `load_skill` tool and `$mention` parsing.
+    #[default]
+    Both,
+}
+
+impl Invocation {
+    /// Whether the `load_skill` tool should be registered.
+    #[must_use]
+    pub const fn tool(self) -> bool {
+        matches!(self, Self::Tool | Self::Both)
+    }
+
+    /// Whether `$mention` bodies should be injected from user input.
+    #[must_use]
+    pub const fn mention(self) -> bool {
+        matches!(self, Self::Mention | Self::Both)
+    }
+}
+
+const fn default_skill_budget() -> usize {
+    8192
 }
 
 const fn default_compaction_threshold_ratio() -> f64 {

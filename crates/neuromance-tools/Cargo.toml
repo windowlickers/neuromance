@@ -37,3 +37,4 @@ rmcp.workspace = true
 url.workspace = true
 
 neuromance-common = { workspace = true }
+neuromance-context = { workspace = true }

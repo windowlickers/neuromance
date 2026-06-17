@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::sync::Arc;
 
 use uuid::Uuid;
 
@@ -8,9 +9,17 @@ use neuromance_common::agents::AgentState;
 use neuromance_common::chat::Message;
 use neuromance_common::client::ToolChoice;
 use neuromance_common::tools::{ToolApproval, ToolCall};
-use neuromance_tools::ToolImplementation;
+use neuromance_context::skills::SkillCatalog;
+use neuromance_tools::{SkillTool, ToolImplementation};
 
 use crate::Agent;
+
+/// Skills wiring captured by [`AgentBuilder::skills`], applied at build time.
+struct BuilderSkills {
+    catalog: Arc<SkillCatalog>,
+    menu_budget: usize,
+    body_budget: usize,
+}
 
 /// Simple builder for creating agents with common configuration
 ///
@@ -39,6 +48,7 @@ pub struct AgentBuilder<C: LLMClient> {
     system_prompt: Option<String>,
     user_prompt: Option<String>,
     tool_choice: ToolChoice,
+    skills: Option<BuilderSkills>,
 }
 
 impl<C: LLMClient> AgentBuilder<C> {
@@ -54,6 +64,7 @@ impl<C: LLMClient> AgentBuilder<C> {
             system_prompt: None,
             user_prompt: None,
             tool_choice: ToolChoice::Auto,
+            skills: None,
         }
     }
 
@@ -136,18 +147,63 @@ impl<C: LLMClient> AgentBuilder<C> {
         self
     }
 
+    /// Enable skills from `catalog`.
+    ///
+    /// At build time this registers the `load_skill` tool (so the model can
+    /// pull a skill's body into context) and injects the skills menu as a
+    /// system message. To also support `$mention` invocation, expand mentions
+    /// in incoming user input with
+    /// [`SkillCatalog::mention_messages`](neuromance_context::skills::SkillCatalog::mention_messages)
+    /// and prepend the result to the conversation.
+    ///
+    /// # Arguments
+    /// * `catalog` - The skill catalog to serve from
+    /// * `menu_budget` - Byte budget for the injected menu
+    /// * `body_budget` - Byte budget for each loaded skill body
+    #[must_use]
+    pub fn skills(
+        mut self,
+        catalog: Arc<SkillCatalog>,
+        menu_budget: usize,
+        body_budget: usize,
+    ) -> Self {
+        self.skills = Some(BuilderSkills {
+            catalog,
+            menu_budget,
+            body_budget,
+        });
+        self
+    }
+
     /// Build the agent
     ///
     /// # Returns
     /// A fully configured `Agent` instance
-    pub fn build(self) -> Agent<C> {
+    pub fn build(mut self) -> Agent<C> {
         let conversation_id = Uuid::new_v4();
+
+        // The load_skill tool is read-only and auto-approved, registered before
+        // the conversation is seeded so it is available on the first turn.
+        if let Some(skills) = &self.skills {
+            self.core.tool_executor.add_tool(SkillTool::new(
+                Arc::clone(&skills.catalog),
+                skills.body_budget,
+            ));
+        }
 
         // Build messages from system and user prompts
         let mut messages = Vec::new();
 
         if let Some(ref prompt) = self.system_prompt {
             messages.push(Message::system(conversation_id, prompt));
+        }
+
+        // The menu is stable for the conversation's life, so it sits in a
+        // system message without harming prompt caching.
+        if let Some(skills) = &self.skills
+            && let Some(menu) = skills.catalog.menu(skills.menu_budget)
+        {
+            messages.push(Message::system(conversation_id, menu));
         }
 
         if let Some(ref prompt) = self.user_prompt {

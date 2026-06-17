@@ -436,6 +436,7 @@ mod tests {
             database: None,
             context: None,
             subagents,
+            skills: None,
             bootstrap: Vec::new(),
             sandbox: None,
         }

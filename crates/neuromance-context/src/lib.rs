@@ -50,6 +50,7 @@ pub mod gguf;
 mod jinja_compat;
 pub mod metadata;
 mod navigation;
+pub mod skills;
 pub mod state;
 mod template;
 pub mod transforms;

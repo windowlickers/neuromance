@@ -11,6 +11,7 @@ use neuromance_client::LLMClient;
 use neuromance_common::chat::Message;
 
 use crate::config::RuntimeConfig;
+use crate::skills::SkillRuntime;
 
 #[derive(Debug, Serialize)]
 pub struct OneshotOutput {
@@ -31,6 +32,7 @@ pub struct OneshotOutput {
 pub async fn run<C: LLMClient + Send + Sync>(
     config: &RuntimeConfig,
     agent: &mut Agent<C>,
+    skills: Option<&SkillRuntime>,
     cancel: CancellationToken,
 ) -> Result<()> {
     let oneshot = config
@@ -39,10 +41,19 @@ pub async fn run<C: LLMClient + Send + Sync>(
         .context("oneshot mode requires [oneshot] section")?;
 
     let conversation_id = agent.conversation_id;
-    let messages = vec![
-        Message::system(conversation_id, &config.agent.system_prompt),
-        Message::user(conversation_id, &oneshot.input),
-    ];
+    let mut messages = vec![Message::system(
+        conversation_id,
+        &config.agent.system_prompt,
+    )];
+    if let Some(skills) = skills {
+        messages.extend(skills.menu_message(conversation_id));
+        messages.extend(
+            skills
+                .mention_messages(conversation_id, &oneshot.input)
+                .await,
+        );
+    }
+    messages.push(Message::user(conversation_id, &oneshot.input));
 
     info!(agent=%agent.id, conversation_id=%conversation_id, "running oneshot");
     let result = tokio::select! {
