@@ -33,6 +33,15 @@ pub struct RuleCatalog {
     by_id: HashMap<RuleId, usize>,
 }
 
+impl std::fmt::Debug for RuleCatalog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuleCatalog")
+            .field("sources", &self.sources.len())
+            .field("rules", &self.entries.len())
+            .finish()
+    }
+}
+
 impl RuleCatalog {
     /// Build a catalog by listing every source in precedence order.
     ///

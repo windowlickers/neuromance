@@ -20,6 +20,7 @@ use super::model::{RuleId, RuleMetadata};
 
 /// Conversation hook that injects rule-file bodies — always-apply rules at the
 /// start, and glob-matched rules after a tool touches a matching path.
+#[derive(Debug)]
 pub struct RulesHook {
     catalog: Arc<RuleCatalog>,
     body_budget: usize,

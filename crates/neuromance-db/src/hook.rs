@@ -38,6 +38,15 @@ pub struct PersistenceHook {
     lineage: ParentLineage,
 }
 
+impl std::fmt::Debug for PersistenceHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PersistenceHook")
+            .field("persisted", &self.persisted)
+            .field("lineage", &self.lineage)
+            .finish_non_exhaustive()
+    }
+}
+
 impl PersistenceHook {
     /// Build a persistence hook over `sink`.
     ///
