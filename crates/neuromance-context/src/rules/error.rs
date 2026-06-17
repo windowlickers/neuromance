@@ -26,8 +26,14 @@ pub enum RuleError {
     },
 
     /// An HTTP request to a remote rules endpoint failed at the transport layer.
-    #[error("rules endpoint request failed: {0}")]
-    Http(#[from] reqwest::Error),
+    #[error("request to rules endpoint `{url}` failed: {source}")]
+    Http {
+        /// The requested URL.
+        url: String,
+        /// The underlying transport error.
+        #[source]
+        source: reqwest::Error,
+    },
 
     /// A remote rules endpoint returned a non-success HTTP status.
     #[error("rules endpoint `{url}` returned HTTP {status}")]

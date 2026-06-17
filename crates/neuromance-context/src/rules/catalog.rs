@@ -41,9 +41,11 @@ impl RuleCatalog {
     pub async fn build(sources: Vec<Box<dyn RuleSource>>) -> Self {
         let mut entries: Vec<Entry> = Vec::new();
         let mut seen: HashSet<RuleId> = HashSet::new();
+        let mut any_listed = false;
         for (idx, source) in sources.iter().enumerate() {
             match source.list().await {
                 Ok(metas) => {
+                    any_listed = true;
                     for meta in metas {
                         if !seen.insert(meta.id.clone()) {
                             continue;
@@ -60,6 +62,12 @@ impl RuleCatalog {
                 }
                 Err(e) => warn!("rule source #{idx} failed to list, skipping: {e}"),
             }
+        }
+        if !sources.is_empty() && !any_listed {
+            warn!(
+                "all {} rule source(s) failed to list; catalog is empty",
+                sources.len()
+            );
         }
         entries.sort_by(|a, b| a.meta.id.cmp(&b.meta.id));
         let by_id = entries

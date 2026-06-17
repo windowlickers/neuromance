@@ -95,10 +95,13 @@ impl RuleSource for LocalRuleSource {
                 if seen.contains(&id) {
                     continue;
                 }
-                match std::fs::read_to_string(&path)
-                    .map_err(|e| e.to_string())
-                    .and_then(|content| parse_rule(&content).map_err(|e| e.to_string()))
-                {
+                let parsed = std::fs::read_to_string(&path)
+                    .map_err(|source| RuleError::Io {
+                        path: path.clone(),
+                        source,
+                    })
+                    .and_then(|content| parse_rule(&content));
+                match parsed {
                     Ok(parsed) => {
                         seen.insert(id.clone());
                         out.push(RuleMetadata {
@@ -199,19 +202,43 @@ impl HttpRuleSource {
     fn detail_url(&self, id: &str) -> String {
         format!("{}/{}", self.endpoint.trim_end_matches('/'), id)
     }
+
+    /// Send `req`, tagging any transport error with `url`.
+    async fn send(
+        &self,
+        req: reqwest::RequestBuilder,
+        url: &str,
+    ) -> Result<reqwest::Response, RuleError> {
+        req.send().await.map_err(|source| RuleError::Http {
+            url: url.to_string(),
+            source,
+        })
+    }
+
+    /// Deserialize `response`'s JSON body, tagging any decode error with `url`.
+    async fn read_json<T: serde::de::DeserializeOwned>(
+        &self,
+        response: reqwest::Response,
+        url: &str,
+    ) -> Result<T, RuleError> {
+        response.json().await.map_err(|source| RuleError::Http {
+            url: url.to_string(),
+            source,
+        })
+    }
 }
 
 #[async_trait]
 impl RuleSource for HttpRuleSource {
     async fn list(&self) -> Result<Vec<RuleMetadata>, RuleError> {
-        let response = self.get(&self.endpoint).send().await?;
+        let response = self.send(self.get(&self.endpoint), &self.endpoint).await?;
         if !response.status().is_success() {
             return Err(RuleError::HttpStatus {
                 url: self.endpoint.clone(),
                 status: response.status().as_u16(),
             });
         }
-        let listing: RuleListDto = response.json().await?;
+        let listing: RuleListDto = self.read_json(response, &self.endpoint).await?;
         let rules = listing
             .rules
             .into_iter()
@@ -232,7 +259,7 @@ impl RuleSource for HttpRuleSource {
 
     async fn load_body(&self, id: &RuleId) -> Result<String, RuleError> {
         let url = self.detail_url(id.as_str());
-        let response = self.get(&url).send().await?;
+        let response = self.send(self.get(&url), &url).await?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(RuleError::NotFound(id.to_string()));
         }
@@ -242,7 +269,8 @@ impl RuleSource for HttpRuleSource {
                 status: response.status().as_u16(),
             });
         }
-        Ok(response.json::<RuleDetailDto>().await?.body)
+        let detail: RuleDetailDto = self.read_json(response, &url).await?;
+        Ok(detail.body)
     }
 }
 
