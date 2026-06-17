@@ -5,6 +5,7 @@
 //! roots recursively for `.md`/`.mdc` files; [`HttpRuleSource`] consumes a
 //! corpus-shaped HTTP API.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
@@ -85,7 +86,7 @@ impl LocalRuleSource {
 impl RuleSource for LocalRuleSource {
     async fn list(&self) -> Result<Vec<RuleMetadata>, RuleError> {
         let mut out: Vec<RuleMetadata> = Vec::new();
-        let mut seen: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
         for root in &self.roots {
             let mut files = Vec::new();
             Self::collect(root, &mut files);
@@ -99,7 +100,7 @@ impl RuleSource for LocalRuleSource {
                     .and_then(|content| parse_rule(&content).map_err(|e| e.to_string()))
                 {
                     Ok(parsed) => {
-                        seen.push(id.clone());
+                        seen.insert(id.clone());
                         out.push(RuleMetadata {
                             id: RuleId::new(id),
                             globs: parsed.globs,
