@@ -217,6 +217,12 @@ pub struct FnReviewHook<F> {
     review: F,
 }
 
+impl<F> std::fmt::Debug for FnReviewHook<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FnReviewHook").finish_non_exhaustive()
+    }
+}
+
 impl<F, Fut> FnReviewHook<F>
 where
     F: Fn(&ToolCall) -> Fut + Send + Sync,

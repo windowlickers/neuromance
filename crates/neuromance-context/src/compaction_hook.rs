@@ -22,7 +22,7 @@ use crate::TokenCounter;
 use crate::compaction::CompactionStrategy;
 
 /// How conversation size is measured for compaction triggering.
-#[derive(Clone, Default)]
+#[derive(Debug, Clone, Default)]
 pub enum TokenSource {
     /// Use the provider-reported `Usage` from the latest response.
     ///
@@ -50,6 +50,7 @@ pub enum TokenSource {
 ///     .with_target_ratio(0.50)
 ///     .with_preserve_recent_turns(4);
 /// ```
+#[derive(Debug)]
 pub struct ContextConfig {
     /// Total context window size in tokens (e.g., `128_000`).
     pub context_window_size: usize,
@@ -166,6 +167,16 @@ pub struct CompactionHook<C: LLMClient> {
     /// Latest provider-reported token count, captured in `on_usage`.
     reported_tokens: Mutex<Option<usize>>,
     missing_usage_warned: AtomicBool,
+}
+
+impl<C: LLMClient> std::fmt::Debug for CompactionHook<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompactionHook")
+            .field("use_reported", &self.use_reported)
+            .field("reported_tokens", &self.reported_tokens)
+            .field("missing_usage_warned", &self.missing_usage_warned)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<C: LLMClient> CompactionHook<C> {

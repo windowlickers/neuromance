@@ -39,6 +39,7 @@ pub trait RuleSource: Send + Sync {
 /// Each root is walked recursively for `.md` / `.mdc` files; a rule's id is its
 /// path relative to the root. Roots are searched in order: when two roots define
 /// the same id, the earlier root wins (higher precedence).
+#[derive(Debug)]
 pub struct LocalRuleSource {
     roots: Vec<PathBuf>,
 }
@@ -168,6 +169,15 @@ pub struct HttpRuleSource {
     endpoint: String,
     client: reqwest::Client,
     auth: Option<(String, String)>,
+}
+
+impl std::fmt::Debug for HttpRuleSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpRuleSource")
+            .field("endpoint", &self.endpoint)
+            .field("auth", &self.auth.as_ref().map(|(name, _)| name))
+            .finish_non_exhaustive()
+    }
 }
 
 impl HttpRuleSource {
