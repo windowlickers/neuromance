@@ -53,6 +53,7 @@ use neuromance_db::PgConversationStore;
 use crate::SessionReset;
 use crate::config::RuntimeConfig;
 use crate::sandbox::{EXECUTE_PYTHON, SandboxClient};
+use crate::skills::SkillRuntime;
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -216,6 +217,9 @@ pub struct ServeState {
     agent_id: Arc<str>,
     /// Durable conversation record; `None` when `[database]` is not configured.
     store: Option<Arc<PgConversationStore>>,
+    /// Skill catalog used to seed the menu and expand `$mention`s; `None` when
+    /// `[skills]` is not configured.
+    skills: Option<Arc<SkillRuntime>>,
 }
 
 /// Cap on `POST /tasks` request bodies. Task input is a single user prompt;
@@ -264,7 +268,10 @@ pub fn router(state: ServeState) -> Router {
             "/conversations/{id}",
             get(get_conversation).delete(delete_conversation),
         )
-        .route("/conversations/{id}/children", get(list_conversation_children))
+        .route(
+            "/conversations/{id}/children",
+            get(list_conversation_children),
+        )
         .layer(DefaultBodyLimit::max(MAX_TASK_BODY_BYTES))
         .layer(trace_layer)
         .with_state(state)
@@ -280,6 +287,10 @@ fn seed_new_conversation(state: &ServeState, system_prompt: Option<&str>) -> Uui
     let id = Uuid::new_v4();
     let now = Utc::now();
     let prompt = system_prompt.unwrap_or_else(|| state.system_prompt.as_ref());
+    let mut messages = vec![Message::system(id, prompt)];
+    if let Some(skills) = &state.skills {
+        messages.extend(skills.menu_message(id));
+    }
     state.conversations.insert(
         id,
         ConversationRecord {
@@ -287,7 +298,7 @@ fn seed_new_conversation(state: &ServeState, system_prompt: Option<&str>) -> Uui
             created_at: now,
             updated_at: now,
             turn_count: 0,
-            messages: vec![Message::system(id, prompt)],
+            messages,
         },
     );
     // Record the conversation row up front so it carries the agent identity;
@@ -563,6 +574,8 @@ struct WorkerCtx<C: LLMClient + Send + Sync> {
     /// the next. `Some` only when `execute_python` runs locally (not in the
     /// sandbox) and the `python-repl` feature is built.
     local_python: Option<SessionReset>,
+    /// Skill catalog for `$mention` expansion; `None` when not configured.
+    skills: Option<Arc<SkillRuntime>>,
 }
 
 async fn worker_loop<C: LLMClient + Send + Sync + 'static>(
@@ -593,6 +606,7 @@ async fn worker_loop<C: LLMClient + Send + Sync + 'static>(
                     &ctx.tasks,
                     &ctx.conversations,
                     &ctx.agent,
+                    ctx.skills.as_deref(),
                     job,
                     cancel.clone(),
                 )
@@ -706,6 +720,7 @@ async fn process_job<C: LLMClient + Send + Sync>(
     tasks: &Arc<DashMap<Uuid, TaskRecord>>,
     conversations: &Arc<DashMap<Uuid, ConversationRecord>>,
     agent: &Arc<Mutex<Agent<C>>>,
+    skills: Option<&SkillRuntime>,
     job: WorkerJob,
     cancel: CancellationToken,
 ) -> JobOutcome {
@@ -729,12 +744,27 @@ async fn process_job<C: LLMClient + Send + Sync>(
         "task starting",
     );
 
+    // Expand any `$mention`s before taking the conversation lock, since body
+    // loading is async and the DashMap guard must not be held across an await.
+    let skill_msgs = match skills {
+        Some(skills) => {
+            skills
+                .mention_messages(job.conversation_id, &job.user)
+                .await
+        }
+        None => Vec::new(),
+    };
+
     // Snapshot + append-user inside a single get_mut so a racing DELETE
     // either commits the user message or fails the task cleanly, never
     // both.
     let user_msg = Message::user(job.conversation_id, &job.user);
     let input_messages = if let Some(mut entry) = conversations.get_mut(&job.conversation_id) {
         let mut snapshot = entry.messages.clone();
+        for skill_msg in skill_msgs {
+            snapshot.push(skill_msg.clone());
+            entry.messages.push(skill_msg);
+        }
         snapshot.push(user_msg.clone());
         entry.messages.push(user_msg);
         entry.turn_count = entry.turn_count.saturating_add(1);
@@ -813,6 +843,7 @@ pub async fn run<C: LLMClient + Send + Sync + 'static>(
     store: Option<Arc<PgConversationStore>>,
     sandbox_client: Option<SandboxClient>,
     local_python: Option<SessionReset>,
+    skills: Option<Arc<SkillRuntime>>,
     cancel: CancellationToken,
 ) -> Result<()> {
     let tasks: Arc<DashMap<Uuid, TaskRecord>> = Arc::new(DashMap::new());
@@ -835,6 +866,7 @@ pub async fn run<C: LLMClient + Send + Sync + 'static>(
             store: store.clone(),
             sandbox: session_closer,
             local_python,
+            skills: skills.clone(),
         },
         cancel.clone(),
     ));
@@ -846,6 +878,7 @@ pub async fn run<C: LLMClient + Send + Sync + 'static>(
         system_prompt,
         agent_id: Arc::from(config.agent.id.as_str()),
         store,
+        skills,
     };
     let app = router(state);
     let addr: std::net::SocketAddr = config
@@ -1088,6 +1121,7 @@ mod tests {
                 store: None,
                 sandbox: None,
                 local_python: None,
+                skills: None,
             },
             cancel.clone(),
         ));
@@ -1130,6 +1164,7 @@ mod tests {
                 system_prompt: Arc::from("system"),
                 agent_id: Arc::from("test-agent"),
                 store: None,
+                skills: None,
             },
             work_rx,
         )
@@ -1369,6 +1404,7 @@ mod tests {
             &state.tasks,
             &state.conversations,
             &agent,
+            None,
             WorkerJob {
                 task_id: first.id,
                 conversation_id: conv_id,
@@ -1408,6 +1444,7 @@ mod tests {
             &state.tasks,
             &state.conversations,
             &agent2,
+            None,
             WorkerJob {
                 task_id: second.id,
                 conversation_id: conv_id,
@@ -1458,6 +1495,7 @@ mod tests {
             &state.tasks,
             &state.conversations,
             &agent,
+            None,
             WorkerJob {
                 task_id: task.id,
                 conversation_id: conv_id,

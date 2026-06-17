@@ -135,6 +135,7 @@ mod ls_tool;
 pub mod mcp;
 pub mod proxy;
 mod read_tool;
+mod skill_tool;
 mod truncate;
 mod write_tool;
 pub use bash_tool::{BashTool, BashToolFactory};
@@ -145,6 +146,7 @@ pub use find_tool::{FindTool, FindToolFactory};
 pub use grep_tool::{GrepTool, GrepToolFactory};
 pub use ls_tool::{LsTool, LsToolFactory};
 pub use read_tool::{ReadTool, ReadToolFactory};
+pub use skill_tool::SkillTool;
 pub use write_tool::{WriteTool, WriteToolFactory};
 
 /// Resolves an optional `path` argument for the search tools (`grep`, `find`,

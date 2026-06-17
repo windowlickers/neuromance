@@ -14,16 +14,17 @@ use neuromance_agent::Agent;
 use neuromance_client::LLMClient;
 use neuromance_db::PgConversationStore;
 use neuromance_runtime::{
-    ApprovalMode, Mode, RuntimeConfig, RuntimeError, SessionReset,
+    ApprovalMode, Mode, RuntimeConfig, RuntimeError, SessionReset, SkillRuntime,
     approval::WebhookApprover,
     bootstrap, build_parent_toolset,
     health::{ReadinessGate, router as health_router},
     lifecycle::shutdown_handler,
     metrics as runtime_metrics, oneshot,
     proxy::build_provider_config,
-    sandbox, serve,
+    sandbox, serve, skills,
     telemetry::{self, BoxedLayer},
 };
+use neuromance_tools::SkillTool;
 
 /// Process role. Defaults to the orchestrator when no subcommand is given, so
 /// existing no-argument invocations keep working.
@@ -118,10 +119,17 @@ async fn run_orchestrator(config: &RuntimeConfig, cancel: CancellationToken) -> 
         None => None,
     };
 
-    let (agent, local_python) =
-        build_agent(config, store.as_ref(), sandbox_client.as_ref(), &cancel)
-            .await
-            .map_err(anyhow::Error::from)?;
+    let skills = skills::build(config.skills.as_ref()).await;
+
+    let (agent, local_python) = build_agent(
+        config,
+        store.as_ref(),
+        sandbox_client.as_ref(),
+        skills.as_ref(),
+        &cancel,
+    )
+    .await
+    .map_err(anyhow::Error::from)?;
 
     // Best-effort: run one-time tool setup before tasks, since the pod has no
     // persistent storage to cache credentials a tool writes to disk.
@@ -130,7 +138,7 @@ async fn run_orchestrator(config: &RuntimeConfig, cancel: CancellationToken) -> 
     readiness.set_ready(true);
 
     let result = match config.mode {
-        Mode::Oneshot => run_oneshot(config, agent, cancel.clone()).await,
+        Mode::Oneshot => run_oneshot(config, agent, skills, cancel.clone()).await,
         Mode::Serve => {
             run_serve(
                 config,
@@ -138,6 +146,7 @@ async fn run_orchestrator(config: &RuntimeConfig, cancel: CancellationToken) -> 
                 store,
                 sandbox_client,
                 local_python,
+                skills,
                 cancel.clone(),
             )
             .await
@@ -306,6 +315,7 @@ async fn build_agent(
     config: &RuntimeConfig,
     store: Option<&Arc<PgConversationStore>>,
     sandbox_client: Option<&sandbox::SandboxClient>,
+    skills: Option<&Arc<SkillRuntime>>,
     cancel: &CancellationToken,
 ) -> Result<(Agent<Box<dyn LLMClient>>, Option<SessionReset>), RuntimeError> {
     let provider = config.provider(&config.agent.provider).ok_or_else(|| {
@@ -381,6 +391,17 @@ async fn build_agent(
         core.tool_executor.add_tool_arc(tool);
     }
 
+    // The load_skill tool is always auto-approved (read-only), so it is
+    // registered after the approval safety check above without tripping it.
+    if let Some(skills) = skills
+        && skills.invocation.tool()
+    {
+        core.tool_executor.add_tool_arc(Arc::new(SkillTool::new(
+            Arc::clone(&skills.catalog),
+            skills.body_budget,
+        )));
+    }
+
     match config.approval.mode {
         ApprovalMode::Auto => {
             core.auto_approve_tools = true;
@@ -408,9 +429,10 @@ async fn build_agent(
 async fn run_oneshot(
     config: &RuntimeConfig,
     mut agent: Agent<Box<dyn LLMClient>>,
+    skills: Option<Arc<SkillRuntime>>,
     cancel: CancellationToken,
 ) -> Result<()> {
-    oneshot::run(config, &mut agent, cancel).await
+    oneshot::run(config, &mut agent, skills.as_deref(), cancel).await
 }
 
 async fn run_serve(
@@ -419,7 +441,17 @@ async fn run_serve(
     store: Option<Arc<PgConversationStore>>,
     sandbox_client: Option<sandbox::SandboxClient>,
     local_python: Option<SessionReset>,
+    skills: Option<Arc<SkillRuntime>>,
     cancel: CancellationToken,
 ) -> Result<()> {
-    serve::run(config, agent, store, sandbox_client, local_python, cancel).await
+    serve::run(
+        config,
+        agent,
+        store,
+        sandbox_client,
+        local_python,
+        skills,
+        cancel,
+    )
+    .await
 }

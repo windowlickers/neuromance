@@ -702,3 +702,71 @@ fn cache_metrics_records_output_tokens() {
     assert_eq!(m.total_output_tokens, 50);
     assert_eq!(m.total_input_tokens, 100);
 }
+
+/// A skill source backing exactly one skill, for builder integration tests.
+struct OneSkillSource;
+
+#[async_trait]
+impl neuromance_context::skills::SkillSource for OneSkillSource {
+    async fn list(
+        &self,
+    ) -> Result<
+        Vec<neuromance_context::skills::SkillMetadata>,
+        neuromance_context::skills::SkillError,
+    > {
+        use neuromance_context::skills::{SkillId, SkillLocator, SkillMetadata};
+        Ok(vec![SkillMetadata {
+            id: SkillId::new("deploy"),
+            name: "deploy".to_string(),
+            description: "deploy the app".to_string(),
+            locator: SkillLocator::Remote {
+                endpoint: "mem://skills".to_string(),
+                id: "deploy".to_string(),
+            },
+            extra: serde_yaml::Mapping::default(),
+        }])
+    }
+
+    async fn load_body(
+        &self,
+        _id: &neuromance_context::skills::SkillId,
+    ) -> Result<String, neuromance_context::skills::SkillError> {
+        Ok("deploy instructions".to_string())
+    }
+}
+
+#[tokio::test]
+async fn test_builder_skills_registers_tool_and_injects_menu() {
+    let catalog = Arc::new(
+        neuromance_context::skills::SkillCatalog::build(vec![Box::new(OneSkillSource)]).await,
+    );
+    let agent = crate::AgentBuilder::new("a", MockLLMClient::new())
+        .system_prompt("sys")
+        .user_prompt("do it")
+        .skills(catalog, 8192, 8192)
+        .build();
+
+    assert!(agent.core.tool_executor.has_tool("load_skill"));
+    let menu = agent
+        .messages
+        .iter()
+        .find(|m| m.content.contains("<skills_instructions>"))
+        .expect("menu system message should be injected");
+    assert_eq!(menu.role, MessageRole::System);
+    assert!(menu.content.contains("deploy: deploy the app"));
+}
+
+#[tokio::test]
+async fn test_builder_without_skills_has_no_menu_or_tool() {
+    let agent = crate::AgentBuilder::new("a", MockLLMClient::new())
+        .system_prompt("sys")
+        .build();
+
+    assert!(!agent.core.tool_executor.has_tool("load_skill"));
+    assert!(
+        agent
+            .messages
+            .iter()
+            .all(|m| !m.content.contains("<skills_instructions>"))
+    );
+}

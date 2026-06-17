@@ -420,7 +420,10 @@ async fn test_set_conversation_parent_links_child(pool: PgPool) {
         .expect("sample history has a tool-calling assistant message");
     let parent_message_id = launching.id;
     let parent_tool_call_id = launching.tool_calls[0].id.clone();
-    store.append_messages(parent, &parent_history).await.unwrap();
+    store
+        .append_messages(parent, &parent_history)
+        .await
+        .unwrap();
     assert_eq!(
         parent_link(&pool, parent).await,
         (None, None),
@@ -464,7 +467,10 @@ async fn test_set_conversation_parent_links_child(pool: PgPool) {
         (Some(parent), Some(task_retry))
     );
     let relinked = store.get_conversation(child).await.unwrap().unwrap();
-    assert_eq!(relinked.parent_message_id, None, "re-link cleared message id");
+    assert_eq!(
+        relinked.parent_message_id, None,
+        "re-link cleared message id"
+    );
     assert_eq!(relinked.parent_tool_call_id, None);
     let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversations WHERE id = $1")
         .bind(child)
@@ -486,7 +492,10 @@ async fn test_list_child_conversations(pool: PgPool) {
     let unrelated = Uuid::new_v4();
 
     for id in [parent, child_a, child_b, unrelated] {
-        store.append_messages(id, &sample_history(id)).await.unwrap();
+        store
+            .append_messages(id, &sample_history(id))
+            .await
+            .unwrap();
     }
     for child in [child_a, child_b] {
         store
