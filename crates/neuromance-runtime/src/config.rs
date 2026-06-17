@@ -634,6 +634,10 @@ impl RuntimeConfig {
             }
         }
 
+        if let Some(context) = &self.context {
+            context.validate()?;
+        }
+
         self.validate_sandbox()?;
         Ok(())
     }
@@ -710,9 +714,6 @@ impl RuntimeConfig {
             }
         }
 
-        if let Some(context) = &self.context {
-            context.validate()?;
-        }
         Ok(())
     }
 

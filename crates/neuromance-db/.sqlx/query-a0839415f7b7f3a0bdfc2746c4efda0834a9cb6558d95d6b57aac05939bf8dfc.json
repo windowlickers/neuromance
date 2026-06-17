@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO tasks\n                (id, conversation_id, status, output, error,\n                 queue_depth_at_enqueue, created_at, updated_at)\n            VALUES ($1, $2, $3, $4, $5, $6, $7, now())\n            ON CONFLICT (id) DO UPDATE SET\n                status                 = EXCLUDED.status,\n                output                 = EXCLUDED.output,\n                error                  = EXCLUDED.error,\n                queue_depth_at_enqueue = EXCLUDED.queue_depth_at_enqueue,\n                updated_at             = now()\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Int8",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a0839415f7b7f3a0bdfc2746c4efda0834a9cb6558d95d6b57aac05939bf8dfc"
+}

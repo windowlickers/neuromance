@@ -322,6 +322,33 @@ pub enum ConversationStatus {
     Deleted,
 }
 
+/// The lifecycle status of a serve-mode task.
+///
+/// Statuses serialize to lowercase strings: "pending", "running", "succeeded",
+/// "failed", "cancelled".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TaskStatus {
+    /// Accepted and queued, not yet started.
+    #[serde(rename = "pending")]
+    Pending,
+
+    /// Dequeued and currently executing.
+    #[serde(rename = "running")]
+    Running,
+
+    /// Completed successfully.
+    #[serde(rename = "succeeded")]
+    Succeeded,
+
+    /// Terminated by an error.
+    #[serde(rename = "failed")]
+    Failed,
+
+    /// Cancelled before completion (shutdown or explicit cancellation).
+    #[serde(rename = "cancelled")]
+    Cancelled,
+}
+
 /// Represents a conversation thread containing multiple messages.
 ///
 /// Manages conversation lifecycle, message ordering, and provides convenience methods

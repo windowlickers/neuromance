@@ -12,13 +12,29 @@
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::expect_used)]
 
-use chrono::SubsecRound;
-use neuromance_common::chat::{Conversation, ConversationStatus, Message, ReasoningContent};
+use chrono::{Duration, SubsecRound, Utc};
+use neuromance_common::chat::{
+    Conversation, ConversationStatus, Message, ReasoningContent, TaskStatus,
+};
 use neuromance_common::client::{InputTokensDetails, Usage};
 use neuromance_common::tools::ToolCall;
-use neuromance_db::{ConversationSink, PgConversationStore};
+use neuromance_db::{ConversationSink, PgConversationStore, TaskStatusUpdate};
 use sqlx::PgPool;
 use uuid::Uuid;
+
+/// A `pending`/no-output status update with a fresh `created_at`, for tests
+/// that don't care about the queue depth or output fields.
+fn task_update(id: Uuid, conversation_id: Uuid, status: TaskStatus) -> TaskStatusUpdate {
+    TaskStatusUpdate {
+        id,
+        conversation_id,
+        status,
+        output: None,
+        error: None,
+        queue_depth_at_enqueue: 0,
+        created_at: Utc::now(),
+    }
+}
 
 const fn sample_usage() -> Usage {
     Usage {
@@ -390,6 +406,171 @@ async fn test_task_provenance_brackets_each_run_by_seq_range(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(task_two_rows, 1);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires postgres via DATABASE_URL"]
+async fn test_record_task_status_round_trips_and_preserves_created_at(pool: PgPool) {
+    let store = PgConversationStore::new(pool);
+    let conversation_id = Uuid::new_v4();
+    let task_id = Uuid::new_v4();
+    let created = (Utc::now() - Duration::seconds(5)).trunc_subsecs(6);
+
+    store
+        .record_task_status(&TaskStatusUpdate {
+            id: task_id,
+            conversation_id,
+            status: TaskStatus::Pending,
+            output: None,
+            error: None,
+            queue_depth_at_enqueue: 7,
+            created_at: created,
+        })
+        .await
+        .unwrap();
+    let pending = store.get_task(task_id).await.unwrap().expect("pending row");
+    assert_eq!(pending.status, TaskStatus::Pending);
+    assert_eq!(pending.queue_depth_at_enqueue, 7);
+    assert_eq!(pending.conversation_id, conversation_id);
+    assert_eq!(pending.created_at, created);
+    assert_eq!(pending.output, None);
+
+    // A later transition advances `updated_at` but never rewrites `created_at`,
+    // even though this update passes a different `created_at`.
+    store
+        .record_task_status(&TaskStatusUpdate {
+            id: task_id,
+            conversation_id,
+            status: TaskStatus::Succeeded,
+            output: Some("done".to_string()),
+            error: None,
+            queue_depth_at_enqueue: 7,
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+    let done = store
+        .get_task(task_id)
+        .await
+        .unwrap()
+        .expect("succeeded row");
+    assert_eq!(done.status, TaskStatus::Succeeded);
+    assert_eq!(done.output.as_deref(), Some("done"));
+    assert_eq!(
+        done.created_at, created,
+        "created_at preserved across updates"
+    );
+    assert!(done.updated_at >= pending.updated_at);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires postgres via DATABASE_URL"]
+async fn test_get_task_returns_none_for_unknown_id(pool: PgPool) {
+    let store = PgConversationStore::new(pool);
+    assert!(store.get_task(Uuid::new_v4()).await.unwrap().is_none());
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires postgres via DATABASE_URL"]
+async fn test_record_task_status_creates_missing_conversation_row(pool: PgPool) {
+    let store = PgConversationStore::new(pool.clone());
+    let conversation_id = Uuid::new_v4();
+    let task_id = Uuid::new_v4();
+
+    // No conversation row exists yet: the FK pre-insert must let this succeed,
+    // mirroring the enqueue race where the conversation write is still in flight.
+    store
+        .record_task_status(&task_update(task_id, conversation_id, TaskStatus::Pending))
+        .await
+        .unwrap();
+
+    assert!(store.get_task(task_id).await.unwrap().is_some());
+    let conv_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversations WHERE id = $1")
+        .bind(conversation_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(conv_rows, 1, "the FK target was created as a side effect");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires postgres via DATABASE_URL"]
+async fn test_status_and_provenance_upserts_compose(pool: PgPool) {
+    let store = PgConversationStore::new(pool.clone());
+    let conversation_id = Uuid::new_v4();
+    let history = sample_history(conversation_id);
+    store
+        .append_messages(conversation_id, &history)
+        .await
+        .unwrap();
+    let history_ids: Vec<Uuid> = history.iter().map(|m| m.id).collect();
+
+    // Order A: status first, then provenance.
+    let task_a = Uuid::new_v4();
+    store
+        .record_task_status(&task_update(task_a, conversation_id, TaskStatus::Succeeded))
+        .await
+        .unwrap();
+    store
+        .record_task(task_a, conversation_id, 0, 3)
+        .await
+        .unwrap();
+
+    // Order B: provenance first, then status.
+    let task_b = Uuid::new_v4();
+    store
+        .record_task(task_b, conversation_id, 0, 3)
+        .await
+        .unwrap();
+    store
+        .record_task_status(&task_update(task_b, conversation_id, TaskStatus::Failed))
+        .await
+        .unwrap();
+
+    // Neither column-scoped upsert clobbers the other: the status survives AND
+    // the provenance join still resolves, regardless of write order.
+    let a = store.get_task(task_a).await.unwrap().expect("task a");
+    assert_eq!(a.status, TaskStatus::Succeeded);
+    assert_eq!(task_message_ids(&pool, task_a).await, history_ids);
+
+    let b = store.get_task(task_b).await.unwrap().expect("task b");
+    assert_eq!(b.status, TaskStatus::Failed);
+    assert_eq!(task_message_ids(&pool, task_b).await, history_ids);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires postgres via DATABASE_URL"]
+async fn test_list_active_tasks_returns_pending_and_running_ordered(pool: PgPool) {
+    let store = PgConversationStore::new(pool);
+    let conversation_id = Uuid::new_v4();
+    let now = Utc::now();
+
+    let running = Uuid::new_v4();
+    let pending = Uuid::new_v4();
+    let succeeded = Uuid::new_v4();
+    for (id, status, age) in [
+        (running, TaskStatus::Running, 2),
+        (pending, TaskStatus::Pending, 1),
+        (succeeded, TaskStatus::Succeeded, 0),
+    ] {
+        store
+            .record_task_status(&TaskStatusUpdate {
+                id,
+                conversation_id,
+                status,
+                output: None,
+                error: None,
+                queue_depth_at_enqueue: 0,
+                created_at: now - Duration::seconds(age),
+            })
+            .await
+            .unwrap();
+    }
+
+    // Terminal tasks are excluded; the rest come back oldest-first.
+    let active = store.list_active_tasks().await.unwrap();
+    let ids: Vec<Uuid> = active.iter().map(|t| t.id).collect();
+    assert_eq!(ids, vec![running, pending]);
 }
 
 /// Reads the lineage columns for a conversation row.

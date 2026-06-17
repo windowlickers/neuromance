@@ -14,14 +14,19 @@
 //! agent. Because that one agent is reused across tasks, the worker resets
 //! its `execute_python` interpreter after each run — the sandbox session
 //! when tools run remotely, the in-process interpreter otherwise — so one
-//! task's interpreter state never bleeds into the next. In-memory state is
-//! authoritative for serving; restarts lose
-//! pending and completed tasks. When `[database]` is configured,
-//! conversation history is additionally written through to postgres as a
-//! durable record: Core persists messages incrementally during each run,
-//! and this module records conversation metadata on creation and soft
-//! deletes (the database keeps the history when a conversation is
-//! `DELETE`d here).
+//! task's interpreter state never bleeds into the next. Without `[database]`,
+//! in-memory state is authoritative for serving and restarts lose pending and
+//! completed tasks.
+//!
+//! When `[database]` is configured, task status is written through to postgres
+//! at every transition, and `GET /tasks` and `GET /tasks/{id}` read from
+//! postgres so any replica behind a shared Service answers a poll for any
+//! task — not just the one it accepted. The enqueue `pending` write is
+//! synchronous and fail-closed (a returned `task_id` is always durably
+//! pollable); mid-run transitions are best-effort. Conversation history is
+//! likewise durable: Core persists messages incrementally during each run,
+//! and this module records conversation metadata on creation and soft deletes
+//! (the database keeps the history when a conversation is `DELETE`d here).
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -47,23 +52,13 @@ use uuid::Uuid;
 use neuromance::error::CoreError;
 use neuromance_agent::Agent;
 use neuromance_client::LLMClient;
-use neuromance_common::chat::{Conversation, ConversationStatus, Message};
-use neuromance_db::PgConversationStore;
+use neuromance_common::chat::{Conversation, ConversationStatus, Message, TaskStatus};
+use neuromance_db::{PgConversationStore, TaskStatusUpdate};
 
 use crate::SessionReset;
 use crate::config::RuntimeConfig;
 use crate::sandbox::{EXECUTE_PYTHON, SandboxClient};
 use crate::skills::SkillRuntime;
-
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum TaskStatus {
-    Pending,
-    Running,
-    Succeeded,
-    Failed,
-    Cancelled,
-}
 
 enum JobOutcome {
     Succeeded,
@@ -155,11 +150,17 @@ pub struct CreateTaskResponse {
 
 #[derive(Debug)]
 enum EnqueueError {
-    QueueFull { depth: usize, max: usize },
+    QueueFull {
+        depth: usize,
+        max: usize,
+    },
     WorkerShutdown,
     ConversationNotFound(Uuid),
     SystemPromptOnExisting(Uuid),
     EmptySystemPrompt,
+    /// The durable `pending` row could not be written, so the task was rejected
+    /// rather than handed back an id no sibling replica could resolve.
+    Persistence,
 }
 
 impl IntoResponse for EnqueueError {
@@ -196,6 +197,10 @@ impl IntoResponse for EnqueueError {
                 serde_json::json!({
                     "error": "system_prompt must not be empty or whitespace-only",
                 }),
+            ),
+            Self::Persistence => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                serde_json::json!({"error": "failed to persist task"}),
             ),
         };
         (status, Json(body)).into_response()
@@ -349,7 +354,29 @@ fn resolve_conversation(
     )
 }
 
-fn try_enqueue(
+/// Snapshots the durable status fields of an in-memory task record.
+fn task_status_update(record: &TaskRecord) -> TaskStatusUpdate {
+    TaskStatusUpdate {
+        id: record.id,
+        conversation_id: record.conversation_id,
+        status: record.status,
+        output: record.output.clone(),
+        error: record.error.clone(),
+        queue_depth_at_enqueue: i64::try_from(record.queue_depth_at_enqueue).unwrap_or(i64::MAX),
+        created_at: record.created_at,
+    }
+}
+
+/// Best-effort delete of a durable task row, used to roll back an enqueue whose
+/// `pending` write committed but whose hand-off to the worker then failed.
+async fn rollback_task_row(store: Option<&Arc<PgConversationStore>>, task_id: Uuid) {
+    let Some(store) = store else { return };
+    if let Err(e) = store.delete_task(task_id).await {
+        warn!(%task_id, error = %e, "rollback of durable task row failed");
+    }
+}
+
+async fn try_enqueue(
     state: &ServeState,
     user: String,
     conversation_id: Option<Uuid>,
@@ -371,6 +398,24 @@ fn try_enqueue(
     };
     state.tasks.insert(task_id, record.clone());
 
+    // Persist the pending row BEFORE handing the job to the worker. Intake and
+    // the worker are separate tasks, so writing after `try_send` would let the
+    // worker's `Running` write race ahead of (and be clobbered by) this one.
+    // Fail-closed: a returned task_id must be durably pollable from any replica,
+    // so a write failure rejects the enqueue. (Mid-run status writes stay
+    // best-effort — see `write_through_status`.)
+    if let Some(store) = &state.store
+        && let Err(e) = store.record_task_status(&task_status_update(&record)).await
+    {
+        error!(%task_id, error = %e, "persist pending task failed; rejecting enqueue");
+        state.tasks.remove(&task_id);
+        if seeded {
+            state.conversations.remove(&conversation_id);
+        }
+        counter!("neuromance_enqueue_rejections_total", "reason" => "persistence").increment(1);
+        return Err(EnqueueError::Persistence);
+    }
+
     match state.work_tx.try_send(WorkerJob {
         task_id,
         conversation_id,
@@ -386,6 +431,7 @@ fn try_enqueue(
             if seeded {
                 state.conversations.remove(&conversation_id);
             }
+            rollback_task_row(state.store.as_ref(), task_id).await;
             counter!("neuromance_enqueue_rejections_total", "reason" => "queue_full").increment(1);
             Err(EnqueueError::QueueFull {
                 depth,
@@ -401,6 +447,7 @@ fn try_enqueue(
             if seeded {
                 state.conversations.remove(&conversation_id);
             }
+            rollback_task_row(state.store.as_ref(), task_id).await;
             counter!("neuromance_enqueue_rejections_total", "reason" => "worker_shutdown")
                 .increment(1);
             Err(EnqueueError::WorkerShutdown)
@@ -417,7 +464,9 @@ async fn create_task(
         req.user,
         req.conversation_id,
         req.system_prompt.as_deref(),
-    ) {
+    )
+    .await
+    {
         Ok(record) => (
             StatusCode::ACCEPTED,
             Json(CreateTaskResponse {
@@ -443,10 +492,45 @@ fn active_tasks_sorted(tasks: &DashMap<Uuid, TaskRecord>) -> Vec<TaskRecord> {
 }
 
 async fn list_tasks(State(state): State<ServeState>) -> impl IntoResponse {
+    // With a database, list from postgres so any replica returns the same
+    // active queue; otherwise fall back to this replica's in-memory view.
+    if let Some(store) = &state.store {
+        return match store.list_active_tasks().await {
+            Ok(tasks) => (StatusCode::OK, Json(tasks)).into_response(),
+            Err(e) => {
+                warn!(error = %e, "failed to list active tasks");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "failed to list tasks"})),
+                )
+                    .into_response()
+            }
+        };
+    }
     (StatusCode::OK, Json(active_tasks_sorted(&state.tasks))).into_response()
 }
 
 async fn get_task(State(state): State<ServeState>, Path(id): Path<Uuid>) -> impl IntoResponse {
+    // With a database, postgres is authoritative so a poll landing on any
+    // replica resolves; otherwise serve from this replica's in-memory map.
+    if let Some(store) = &state.store {
+        return match store.get_task(id).await {
+            Ok(Some(task)) => (StatusCode::OK, Json(task)).into_response(),
+            Ok(None) => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "task not found"})),
+            )
+                .into_response(),
+            Err(e) => {
+                warn!(task_id = %id, error = %e, "failed to load task status");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "failed to load task"})),
+                )
+                    .into_response()
+            }
+        };
+    }
     state.tasks.get(&id).map_or_else(
         || {
             (
@@ -602,15 +686,7 @@ async fn worker_loop<C: LLMClient + Send + Sync + 'static>(
                 // boundaries. Best-effort, matching the log-and-continue policy.
                 let (task_id, conversation_id) = (job.task_id, job.conversation_id);
                 let start_seq = next_seq_before_run(ctx.store.as_ref(), conversation_id).await;
-                let _ = process_job(
-                    &ctx.tasks,
-                    &ctx.conversations,
-                    &ctx.agent,
-                    ctx.skills.as_deref(),
-                    job,
-                    cancel.clone(),
-                )
-                .await;
+                let _ = process_job(&ctx, job, cancel.clone()).await;
                 release_sandbox_session(ctx.sandbox.as_ref(), task_id).await;
                 reset_local_python(ctx.local_python.as_ref()).await;
                 record_task_provenance(ctx.store.as_ref(), task_id, conversation_id, start_seq)
@@ -694,6 +770,22 @@ async fn reset_local_python(local_python: Option<&SessionReset>) {
     }
 }
 
+/// Mirror a task's current in-memory state to the durable store. Best-effort:
+/// a write failure is logged and the task proceeds, matching the provenance and
+/// conversation-row write-through policy. The enqueue `pending` write is the
+/// sole fail-closed exception (see `try_enqueue`).
+async fn write_through_status<C: LLMClient + Send + Sync>(ctx: &WorkerCtx<C>, task_id: Uuid) {
+    let Some(store) = &ctx.store else {
+        return;
+    };
+    let Some(update) = ctx.tasks.get(&task_id).map(|rec| task_status_update(&rec)) else {
+        return;
+    };
+    if let Err(e) = store.record_task_status(&update).await {
+        warn!(%task_id, error = %e, "record task status failed");
+    }
+}
+
 /// Mark a task `Failed` with `reason` and emit the failure metric. Pulled out
 /// because both the early "conversation deleted" exit and the late
 /// agent-error path share this shape.
@@ -717,22 +809,20 @@ fn fail_task(tasks: &DashMap<Uuid, TaskRecord>, task_id: Uuid, reason: &str) {
     ),
 )]
 async fn process_job<C: LLMClient + Send + Sync>(
-    tasks: &Arc<DashMap<Uuid, TaskRecord>>,
-    conversations: &Arc<DashMap<Uuid, ConversationRecord>>,
-    agent: &Arc<Mutex<Agent<C>>>,
-    skills: Option<&SkillRuntime>,
+    ctx: &WorkerCtx<C>,
     job: WorkerJob,
     cancel: CancellationToken,
 ) -> JobOutcome {
     let dequeued_at = Utc::now();
     let run_start = Instant::now();
-    let (created_at, depth_at_enqueue) = if let Some(mut entry) = tasks.get_mut(&job.task_id) {
+    let (created_at, depth_at_enqueue) = if let Some(mut entry) = ctx.tasks.get_mut(&job.task_id) {
         entry.status = TaskStatus::Running;
         entry.updated_at = dequeued_at;
         (entry.created_at, entry.queue_depth_at_enqueue)
     } else {
         (dequeued_at, 0)
     };
+    write_through_status(ctx, job.task_id).await;
 
     let queue_wait_ms = (dequeued_at - created_at).num_milliseconds().max(0);
     #[allow(clippy::cast_precision_loss)]
@@ -746,7 +836,7 @@ async fn process_job<C: LLMClient + Send + Sync>(
 
     // Expand any `$mention`s before taking the conversation lock, since body
     // loading is async and the DashMap guard must not be held across an await.
-    let skill_msgs = match skills {
+    let skill_msgs = match ctx.skills.as_deref() {
         Some(skills) => {
             skills
                 .mention_messages(job.conversation_id, &job.user)
@@ -759,7 +849,7 @@ async fn process_job<C: LLMClient + Send + Sync>(
     // either commits the user message or fails the task cleanly, never
     // both.
     let user_msg = Message::user(job.conversation_id, &job.user);
-    let input_messages = if let Some(mut entry) = conversations.get_mut(&job.conversation_id) {
+    let input_messages = if let Some(mut entry) = ctx.conversations.get_mut(&job.conversation_id) {
         let mut snapshot = entry.messages.clone();
         for skill_msg in skill_msgs {
             snapshot.push(skill_msg.clone());
@@ -772,11 +862,12 @@ async fn process_job<C: LLMClient + Send + Sync>(
         snapshot
     } else {
         warn!("conversation deleted before task dequeue");
-        fail_task(tasks, job.task_id, "conversation deleted");
+        fail_task(&ctx.tasks, job.task_id, "conversation deleted");
+        write_through_status(ctx, job.task_id).await;
         return JobOutcome::Failed;
     };
 
-    let mut agent = agent.lock().await;
+    let mut agent = ctx.agent.lock().await;
     let span = Span::current();
     span.record("agent_id", field::display(agent.id()));
 
@@ -795,18 +886,18 @@ async fn process_job<C: LLMClient + Send + Sync>(
     let run_ms = u64::try_from(run_start.elapsed().as_millis()).unwrap_or(u64::MAX);
     #[allow(clippy::cast_precision_loss)]
     histogram!("neuromance_task_duration_seconds").record(run_ms as f64 / 1000.0);
-    match exec_result {
+    let outcome = match exec_result {
         Ok((response, full_history)) => {
             let output_bytes = response.content.content.len();
             info!(run_ms, queue_wait_ms, output_bytes, "task succeeded");
             // Replace stored messages with the full history (system + every
             // user/assistant/tool turn). If the conversation was DELETEd
             // mid-flight, silently drop the result — the deletion wins.
-            if let Some(mut entry) = conversations.get_mut(&job.conversation_id) {
+            if let Some(mut entry) = ctx.conversations.get_mut(&job.conversation_id) {
                 entry.messages = full_history;
                 entry.updated_at = Utc::now();
             }
-            if let Some(mut entry) = tasks.get_mut(&job.task_id) {
+            if let Some(mut entry) = ctx.tasks.get_mut(&job.task_id) {
                 entry.status = TaskStatus::Succeeded;
                 entry.output = Some(response.content.content);
                 entry.updated_at = Utc::now();
@@ -816,7 +907,7 @@ async fn process_job<C: LLMClient + Send + Sync>(
         }
         Err(CoreError::Cancelled(_)) => {
             warn!(run_ms, "task cancelled");
-            if let Some(mut entry) = tasks.get_mut(&job.task_id) {
+            if let Some(mut entry) = ctx.tasks.get_mut(&job.task_id) {
                 entry.status = TaskStatus::Cancelled;
                 entry.error = Some("cancelled".to_string());
                 entry.updated_at = Utc::now();
@@ -826,10 +917,12 @@ async fn process_job<C: LLMClient + Send + Sync>(
         }
         Err(e) => {
             error!(run_ms, error = %e, "task failed");
-            fail_task(tasks, job.task_id, &e.to_string());
+            fail_task(&ctx.tasks, job.task_id, &e.to_string());
             JobOutcome::Failed
         }
-    }
+    };
+    write_through_status(ctx, job.task_id).await;
+    outcome
 }
 
 /// Bind the task server, spawn the worker, and run until `cancel` fires.
@@ -877,7 +970,7 @@ pub async fn run<C: LLMClient + Send + Sync + 'static>(
         work_tx,
         system_prompt,
         agent_id: Arc::from(config.agent.id.as_str()),
-        store,
+        store: store.clone(),
         skills,
     };
     let app = router(state);
@@ -903,7 +996,7 @@ pub async fn run<C: LLMClient + Send + Sync + 'static>(
         warn!(error=%e, "worker task panicked or was cancelled");
     }
 
-    let summary = drain_pending_tasks(&tasks);
+    let summary = drain_pending_tasks(&tasks, store.as_ref()).await;
     info!(
         pending_dropped = summary.pending_dropped,
         in_flight_cancelled = summary.in_flight_cancelled,
@@ -927,9 +1020,13 @@ struct ShutdownSummary {
 /// Without this, dropped tasks would stay `Pending` in the in-memory state
 /// map forever — `GET /tasks/{id}` would return a misleading status after
 /// the server stopped.
-fn drain_pending_tasks(tasks: &DashMap<Uuid, TaskRecord>) -> ShutdownSummary {
+async fn drain_pending_tasks(
+    tasks: &DashMap<Uuid, TaskRecord>,
+    store: Option<&Arc<PgConversationStore>>,
+) -> ShutdownSummary {
     let mut summary = ShutdownSummary::default();
     let now = Utc::now();
+    let mut cancelled = Vec::new();
     for mut entry in tasks.iter_mut() {
         match entry.status {
             TaskStatus::Pending => {
@@ -942,6 +1039,7 @@ fn drain_pending_tasks(tasks: &DashMap<Uuid, TaskRecord>) -> ShutdownSummary {
                 entry.status = TaskStatus::Cancelled;
                 entry.error = Some("dropped at shutdown".to_string());
                 entry.updated_at = now;
+                cancelled.push(entry.value().clone());
                 summary.pending_dropped = summary.pending_dropped.saturating_add(1);
             }
             TaskStatus::Running => {
@@ -952,6 +1050,16 @@ fn drain_pending_tasks(tasks: &DashMap<Uuid, TaskRecord>) -> ShutdownSummary {
             }
             TaskStatus::Failed | TaskStatus::Cancelled => {
                 summary.failed = summary.failed.saturating_add(1);
+            }
+        }
+    }
+    // Mirror the shutdown cancellations to the durable store so a killed
+    // replica's dropped tasks read `cancelled` rather than a stuck `pending`.
+    // Best-effort: shutdown should not block on the database.
+    if let Some(store) = store {
+        for record in &cancelled {
+            if let Err(e) = store.record_task_status(&task_status_update(record)).await {
+                warn!(task_id = %record.id, error = %e, "record shutdown cancellation failed");
             }
         }
     }
@@ -1183,37 +1291,62 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_try_enqueue_records_queue_depth_zero_when_empty() {
+    /// Builds a store-less worker context sharing a state's task and
+    /// conversation maps, so `process_job` can be driven directly in tests.
+    fn worker_ctx<C: LLMClient + Send + Sync>(
+        state: &ServeState,
+        agent: Arc<Mutex<Agent<C>>>,
+    ) -> WorkerCtx<C> {
+        WorkerCtx {
+            tasks: Arc::clone(&state.tasks),
+            conversations: Arc::clone(&state.conversations),
+            agent,
+            store: None,
+            sandbox: None,
+            local_python: None,
+            skills: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_try_enqueue_records_queue_depth_zero_when_empty() {
         let (state, _rx) = fresh_state(4);
-        let record =
-            try_enqueue(&state, "hi".to_string(), None, None).expect("enqueue should succeed");
+        let record = try_enqueue(&state, "hi".to_string(), None, None)
+            .await
+            .expect("enqueue should succeed");
         assert_eq!(record.queue_depth_at_enqueue, 0);
         assert_eq!(record.status, TaskStatus::Pending);
         assert!(state.tasks.contains_key(&record.id));
     }
 
-    #[test]
-    fn test_try_enqueue_queue_depth_grows_as_channel_fills() {
+    #[tokio::test]
+    async fn test_try_enqueue_queue_depth_grows_as_channel_fills() {
         let (state, _rx) = fresh_state(4);
-        let depths: Vec<usize> = (0..3)
-            .map(|_| {
+        let mut depths = Vec::new();
+        for _ in 0..3 {
+            depths.push(
                 try_enqueue(&state, "hi".to_string(), None, None)
+                    .await
                     .expect("enqueue should succeed")
-                    .queue_depth_at_enqueue
-            })
-            .collect();
+                    .queue_depth_at_enqueue,
+            );
+        }
         assert_eq!(depths, vec![0, 1, 2]);
     }
 
-    #[test]
-    fn test_try_enqueue_returns_queue_full_at_capacity() {
+    #[tokio::test]
+    async fn test_try_enqueue_returns_queue_full_at_capacity() {
         let (state, _rx) = fresh_state(2);
-        let first = try_enqueue(&state, "a".to_string(), None, None).expect("first should fit");
-        let second = try_enqueue(&state, "b".to_string(), None, None).expect("second should fit");
+        let first = try_enqueue(&state, "a".to_string(), None, None)
+            .await
+            .expect("first should fit");
+        let second = try_enqueue(&state, "b".to_string(), None, None)
+            .await
+            .expect("second should fit");
 
-        let err =
-            try_enqueue(&state, "c".to_string(), None, None).expect_err("third should reject");
+        let err = try_enqueue(&state, "c".to_string(), None, None)
+            .await
+            .expect_err("third should reject");
         assert!(
             matches!(err, EnqueueError::QueueFull { depth: 2, max: 2 }),
             "got {err:?}"
@@ -1229,12 +1362,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_try_enqueue_returns_worker_shutdown_when_rx_dropped() {
+    #[tokio::test]
+    async fn test_try_enqueue_returns_worker_shutdown_when_rx_dropped() {
         let (state, rx) = fresh_state(4);
         drop(rx);
 
-        let err = try_enqueue(&state, "hi".to_string(), None, None).expect_err("send should fail");
+        let err = try_enqueue(&state, "hi".to_string(), None, None)
+            .await
+            .expect_err("send should fail");
         assert!(matches!(err, EnqueueError::WorkerShutdown), "got {err:?}");
 
         let task_id = state
@@ -1255,11 +1390,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_try_enqueue_seeds_fresh_conversation_with_system_prompt() {
+    #[tokio::test]
+    async fn test_try_enqueue_seeds_fresh_conversation_with_system_prompt() {
         let (state, _rx) = fresh_state(4);
-        let record =
-            try_enqueue(&state, "hi".to_string(), None, None).expect("enqueue should succeed");
+        let record = try_enqueue(&state, "hi".to_string(), None, None)
+            .await
+            .expect("enqueue should succeed");
 
         let (turn_count, messages) = {
             let conv = state
@@ -1275,10 +1411,11 @@ mod tests {
         assert_eq!(messages[0].conversation_id, record.conversation_id);
     }
 
-    #[test]
-    fn test_try_enqueue_override_seeds_custom_system_prompt() {
+    #[tokio::test]
+    async fn test_try_enqueue_override_seeds_custom_system_prompt() {
         let (state, _rx) = fresh_state(4);
         let record = try_enqueue(&state, "hi".to_string(), None, Some("be terse"))
+            .await
             .expect("enqueue should succeed");
 
         let messages = {
@@ -1293,11 +1430,12 @@ mod tests {
         assert_eq!(messages[0].content, "be terse");
     }
 
-    #[test]
-    fn test_try_enqueue_falls_back_to_configured_prompt_when_override_omitted() {
+    #[tokio::test]
+    async fn test_try_enqueue_falls_back_to_configured_prompt_when_override_omitted() {
         let (state, _rx) = fresh_state(4);
-        let record =
-            try_enqueue(&state, "hi".to_string(), None, None).expect("enqueue should succeed");
+        let record = try_enqueue(&state, "hi".to_string(), None, None)
+            .await
+            .expect("enqueue should succeed");
 
         let content = {
             let conv = state
@@ -1309,11 +1447,12 @@ mod tests {
         assert_eq!(content, "system");
     }
 
-    #[test]
-    fn test_try_enqueue_override_on_existing_conversation_is_rejected() {
+    #[tokio::test]
+    async fn test_try_enqueue_override_on_existing_conversation_is_rejected() {
         let (state, _rx) = fresh_state(4);
-        let first =
-            try_enqueue(&state, "hi".to_string(), None, None).expect("first should succeed");
+        let first = try_enqueue(&state, "hi".to_string(), None, None)
+            .await
+            .expect("first should succeed");
 
         let err = try_enqueue(
             &state,
@@ -1321,6 +1460,7 @@ mod tests {
             Some(first.conversation_id),
             Some("be terse"),
         )
+        .await
         .expect_err("override on existing conversation should be rejected");
         assert!(
             matches!(err, EnqueueError::SystemPromptOnExisting(id) if id == first.conversation_id)
@@ -1339,12 +1479,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_try_enqueue_rejects_empty_system_prompt() {
+    #[tokio::test]
+    async fn test_try_enqueue_rejects_empty_system_prompt() {
         let (state, _rx) = fresh_state(4);
 
         for prompt in ["", "   \n\t"] {
             let err = try_enqueue(&state, "hi".to_string(), None, Some(prompt))
+                .await
                 .expect_err("blank override should be rejected");
             assert!(
                 matches!(err, EnqueueError::EmptySystemPrompt),
@@ -1359,28 +1500,31 @@ mod tests {
         assert!(state.tasks.is_empty(), "rejected task must not be recorded");
     }
 
-    #[test]
-    fn test_try_enqueue_reuses_existing_conversation() {
+    #[tokio::test]
+    async fn test_try_enqueue_reuses_existing_conversation() {
         let (state, _rx) = fresh_state(4);
-        let first =
-            try_enqueue(&state, "hi".to_string(), None, None).expect("first should succeed");
+        let first = try_enqueue(&state, "hi".to_string(), None, None)
+            .await
+            .expect("first should succeed");
         let second = try_enqueue(
             &state,
             "again".to_string(),
             Some(first.conversation_id),
             None,
         )
+        .await
         .expect("continuation should succeed");
 
         assert_eq!(first.conversation_id, second.conversation_id);
         assert_eq!(state.conversations.len(), 1);
     }
 
-    #[test]
-    fn test_try_enqueue_unknown_conversation_returns_not_found() {
+    #[tokio::test]
+    async fn test_try_enqueue_unknown_conversation_returns_not_found() {
         let (state, _rx) = fresh_state(4);
         let bogus = Uuid::new_v4();
         let err = try_enqueue(&state, "hi".to_string(), Some(bogus), None)
+            .await
             .expect_err("unknown conv id should be rejected");
         assert!(matches!(err, EnqueueError::ConversationNotFound(id) if id == bogus));
         assert!(state.tasks.is_empty(), "rejected task must not be recorded");
@@ -1394,6 +1538,7 @@ mod tests {
     async fn process_job_continues_existing_conversation() {
         let (state, _rx) = fresh_state(4);
         let first = try_enqueue(&state, "hello".to_string(), None, None)
+            .await
             .expect("first enqueue should succeed");
         let conv_id = first.conversation_id;
 
@@ -1401,10 +1546,7 @@ mod tests {
         let agent = Arc::new(Mutex::new(Agent::new("test".into(), core)));
 
         process_job(
-            &state.tasks,
-            &state.conversations,
-            &agent,
-            None,
+            &worker_ctx(&state, agent),
             WorkerJob {
                 task_id: first.id,
                 conversation_id: conv_id,
@@ -1437,14 +1579,12 @@ mod tests {
         );
 
         let second = try_enqueue(&state, "again".to_string(), Some(conv_id), None)
+            .await
             .expect("second enqueue should succeed");
         let core2 = Core::new(EchoClient::new("hi-2"));
         let agent2 = Arc::new(Mutex::new(Agent::new("test".into(), core2)));
         process_job(
-            &state.tasks,
-            &state.conversations,
-            &agent2,
-            None,
+            &worker_ctx(&state, agent2),
             WorkerJob {
                 task_id: second.id,
                 conversation_id: conv_id,
@@ -1482,8 +1622,9 @@ mod tests {
     #[tokio::test]
     async fn process_job_fails_cleanly_when_conversation_deleted() {
         let (state, _rx) = fresh_state(4);
-        let task =
-            try_enqueue(&state, "hi".to_string(), None, None).expect("enqueue should succeed");
+        let task = try_enqueue(&state, "hi".to_string(), None, None)
+            .await
+            .expect("enqueue should succeed");
         let conv_id = task.conversation_id;
 
         // DELETE before the worker runs.
@@ -1492,10 +1633,7 @@ mod tests {
         let core = Core::new(EchoClient::new("never-runs"));
         let agent = Arc::new(Mutex::new(Agent::new("test".into(), core)));
         process_job(
-            &state.tasks,
-            &state.conversations,
-            &agent,
-            None,
+            &worker_ctx(&state, agent),
             WorkerJob {
                 task_id: task.id,
                 conversation_id: conv_id,
