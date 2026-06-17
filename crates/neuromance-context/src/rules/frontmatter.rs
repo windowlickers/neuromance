@@ -179,4 +179,28 @@ mod tests {
         assert!(parsed.always_apply);
         assert_eq!(parsed.body, "body");
     }
+
+    #[test]
+    fn test_crlf_fences_are_parsed() {
+        let parsed = parse_rule("---\r\nglobs: \"*.rs\"\r\n---\r\nbody line").unwrap();
+        assert_eq!(parsed.globs, vec!["*.rs"]);
+        assert_eq!(parsed.body, "body line");
+    }
+
+    #[test]
+    fn test_leading_bom_is_stripped() {
+        let parsed = parse_rule("\u{feff}---\nalwaysApply: true\n---\nbody").unwrap();
+        assert!(parsed.always_apply);
+        assert_eq!(parsed.body, "body");
+    }
+
+    #[test]
+    fn test_extracted_body_is_a_parse_fixed_point() {
+        let parsed = parse_rule("---\nglobs: \"*.rs\"\n---\n# Heading\ntext").unwrap();
+        // The body carries no frontmatter, so re-parsing it leaves it unchanged
+        // and yields no globs — body extraction does not double-strip.
+        let reparsed = parse_rule(&parsed.body).unwrap();
+        assert_eq!(reparsed.body, parsed.body);
+        assert!(reparsed.globs.is_empty());
+    }
 }

@@ -300,4 +300,26 @@ mod tests {
         assert!(body.starts_with("héll"));
         assert!(body.contains("truncated"));
     }
+
+    #[test]
+    fn test_normalize_glob_prepends_globstar_to_relative() {
+        assert_eq!(normalize_glob("*.ts"), "**/*.ts");
+        assert_eq!(normalize_glob("src/*.rs"), "**/src/*.rs");
+    }
+
+    #[test]
+    fn test_normalize_glob_passes_through_anchored() {
+        assert_eq!(normalize_glob("/abs/x.rs"), "/abs/x.rs");
+        assert_eq!(normalize_glob("**/already.rs"), "**/already.rs");
+    }
+
+    #[tokio::test]
+    async fn test_first_source_wins_on_duplicate_id() {
+        let first = MemSource::new(&[("dup", &["*.rs"], false, "first body")]);
+        let second = MemSource::new(&[("dup", &["*.rs"], false, "second body")]);
+        let cat = RuleCatalog::build(vec![Box::new(first), Box::new(second)]).await;
+        assert_eq!(cat.len(), 1);
+        let body = cat.load(&RuleId::new("dup"), 8192).await.unwrap();
+        assert_eq!(body, "first body");
+    }
 }
