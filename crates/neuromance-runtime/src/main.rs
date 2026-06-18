@@ -106,7 +106,18 @@ async fn run_orchestrator(config: &RuntimeConfig, cancel: CancellationToken) -> 
     let store = init_store(config)
         .await
         .context("initialize database store")?;
-    let agent = build_agent(config, store.as_ref(), &cancel)
+
+    // One sandbox client, shared by tool execution and (in serve mode) per-task
+    // session cleanup. The channel connects lazily, so this never blocks on a
+    // not-yet-ready sandbox.
+    let sandbox_client = match config.sandbox.as_ref().and_then(|s| s.endpoint.as_ref()) {
+        Some(endpoint) => {
+            Some(sandbox::SandboxClient::connect(endpoint).map_err(anyhow::Error::from)?)
+        }
+        None => None,
+    };
+
+    let agent = build_agent(config, store.as_ref(), sandbox_client.as_ref(), &cancel)
         .await
         .map_err(anyhow::Error::from)?;
 
@@ -118,7 +129,7 @@ async fn run_orchestrator(config: &RuntimeConfig, cancel: CancellationToken) -> 
 
     let result = match config.mode {
         Mode::Oneshot => run_oneshot(config, agent, cancel.clone()).await,
-        Mode::Serve => run_serve(config, agent, store, cancel.clone()).await,
+        Mode::Serve => run_serve(config, agent, store, sandbox_client, cancel.clone()).await,
     };
 
     readiness.set_ready(false);
@@ -252,6 +263,7 @@ async fn init_store(config: &RuntimeConfig) -> Result<Option<Arc<PgConversationS
 async fn build_agent(
     config: &RuntimeConfig,
     store: Option<&Arc<PgConversationStore>>,
+    sandbox_client: Option<&sandbox::SandboxClient>,
     cancel: &CancellationToken,
 ) -> Result<Agent<Box<dyn LLMClient>>, RuntimeError> {
     let provider = config.provider(&config.agent.provider).ok_or_else(|| {
@@ -285,8 +297,8 @@ async fn build_agent(
     // When a sandbox endpoint is configured, capability tools execute in the
     // sandbox process: fetch their definitions once and reuse the adapters
     // across the main agent and every subagent.
-    let remote_capabilities = match config.sandbox.as_ref().and_then(|s| s.endpoint.as_ref()) {
-        Some(endpoint) => Some(sandbox::connect_tools(endpoint).await?),
+    let remote_capabilities = match sandbox_client {
+        Some(client) => Some(sandbox::connect_tools(client).await?),
         None => None,
     };
 
@@ -360,7 +372,8 @@ async fn run_serve(
     config: &RuntimeConfig,
     agent: Agent<Box<dyn LLMClient>>,
     store: Option<Arc<PgConversationStore>>,
+    sandbox_client: Option<sandbox::SandboxClient>,
     cancel: CancellationToken,
 ) -> Result<()> {
-    serve::run(config, agent, store, cancel).await
+    serve::run(config, agent, store, sandbox_client, cancel).await
 }

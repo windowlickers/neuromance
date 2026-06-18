@@ -47,6 +47,7 @@ use neuromance_common::chat::{Conversation, ConversationStatus, Message};
 use neuromance_db::PgConversationStore;
 
 use crate::config::RuntimeConfig;
+use crate::sandbox::{EXECUTE_PYTHON, SandboxClient};
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -509,6 +510,10 @@ struct WorkerCtx<C: LLMClient + Send + Sync> {
     agent: Arc<Mutex<Agent<C>>>,
     /// Durable conversation store; `None` when `[database]` is not configured.
     store: Option<Arc<PgConversationStore>>,
+    /// Sandbox handle used to release a task's `execute_python` interpreter once
+    /// the run completes. `Some` only when the sandbox hosts `execute_python`;
+    /// the interpreter is keyed by task id (see `RemoteToolAdapter`).
+    sandbox: Option<SandboxClient>,
 }
 
 async fn worker_loop<C: LLMClient + Send + Sync + 'static>(
@@ -543,6 +548,7 @@ async fn worker_loop<C: LLMClient + Send + Sync + 'static>(
                     cancel.clone(),
                 )
                 .await;
+                release_sandbox_session(ctx.sandbox.as_ref(), task_id).await;
                 record_task_provenance(ctx.store.as_ref(), task_id, conversation_id, start_seq)
                     .await;
             }
@@ -595,6 +601,20 @@ async fn record_task_provenance(
         .await
     {
         warn!(%task_id, error = %e, "record task provenance failed");
+    }
+}
+
+/// Free the sandbox `execute_python` interpreter a task used. The interpreter
+/// is keyed by task id, so closing it after each run keeps state from bleeding
+/// into the next task and stops interpreters accumulating in a long-lived serve
+/// process. Best-effort: a failed close leaks one interpreter but never fails
+/// the task. No-op when the sandbox is absent or hosts no `execute_python`.
+async fn release_sandbox_session(sandbox: Option<&SandboxClient>, task_id: Uuid) {
+    let Some(client) = sandbox else {
+        return;
+    };
+    if let Err(e) = client.close_session(task_id.to_string()).await {
+        warn!(%task_id, error = %e, "failed to release sandbox interpreter session");
     }
 }
 
@@ -729,6 +749,7 @@ pub async fn run<C: LLMClient + Send + Sync + 'static>(
     config: &RuntimeConfig,
     agent: Agent<C>,
     store: Option<Arc<PgConversationStore>>,
+    sandbox_client: Option<SandboxClient>,
     cancel: CancellationToken,
 ) -> Result<()> {
     let tasks: Arc<DashMap<Uuid, TaskRecord>> = Arc::new(DashMap::new());
@@ -737,6 +758,11 @@ pub async fn run<C: LLMClient + Send + Sync + 'static>(
     let (work_tx, work_rx) = mpsc::channel::<WorkerJob>(config.runtime.max_queue_depth);
     let system_prompt: Arc<str> = Arc::from(config.agent.system_prompt.as_str());
 
+    // Per-task interpreter cleanup is only needed when the sandbox actually hosts
+    // execute_python; stateless tools create no session to release.
+    let session_closer =
+        sandbox_client.filter(|_| config.tools.iter().any(|t| t.name == EXECUTE_PYTHON));
+
     let worker = tokio::spawn(worker_loop(
         work_rx,
         WorkerCtx {
@@ -744,6 +770,7 @@ pub async fn run<C: LLMClient + Send + Sync + 'static>(
             conversations: Arc::clone(&conversations),
             agent: Arc::clone(&agent),
             store: store.clone(),
+            sandbox: session_closer,
         },
         cancel.clone(),
     ));
@@ -995,6 +1022,7 @@ mod tests {
                 conversations: Arc::clone(&conversations),
                 agent: Arc::clone(&agent),
                 store: None,
+                sandbox: None,
             },
             cancel.clone(),
         ));
