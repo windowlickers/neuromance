@@ -17,6 +17,7 @@
 //!
 //! Exactly one of these paths must be configured per provider.
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -24,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use neuromance_tools::ToolConfig;
 
 use crate::error::RuntimeError;
+use crate::sandbox::EXECUTE_PYTHON;
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -72,6 +74,35 @@ pub struct RuntimeConfig {
     /// stdin. Best-effort — failures are logged, never fatal.
     #[serde(default)]
     pub bootstrap: Vec<BootstrapCommand>,
+    /// Sandboxed tool-execution boundary. The `sandbox` subcommand binds
+    /// `listen_addr`; the orchestrator routes capability tools to `endpoint`
+    /// when it is set. See [`SandboxConfig`].
+    #[serde(default)]
+    pub sandbox: Option<SandboxConfig>,
+}
+
+/// Configuration for the sandboxed tool-execution boundary.
+///
+/// Tool execution can run in a separate sandbox process (the `sandbox`
+/// subcommand) under a restricted service account with no database access. The
+/// orchestrator advertises the sandbox's tools and dispatches each approved
+/// call over gRPC.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SandboxConfig {
+    /// Address the sandbox process binds its gRPC server to. Loopback-only:
+    /// the orchestrator and sandbox share the pod network namespace, so the
+    /// channel never leaves the pod.
+    #[serde(default = "default_sandbox_listen_addr")]
+    pub listen_addr: String,
+    /// gRPC endpoint the orchestrator dials (e.g. `http://127.0.0.1:50051`).
+    /// When set, the orchestrator builds remote tool adapters instead of
+    /// executing capability tools in-process.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+}
+
+fn default_sandbox_listen_addr() -> String {
+    "127.0.0.1:50051".to_string()
 }
 
 /// A command run once at container start to set up a tool.
@@ -451,6 +482,29 @@ impl RuntimeConfig {
             }
         }
 
+        self.validate_subagents()?;
+
+        for entry in &self.bootstrap {
+            if entry.name.trim().is_empty() {
+                return Err(RuntimeError::Config(
+                    "bootstrap entry name must not be empty".to_string(),
+                ));
+            }
+            if entry.command.trim().is_empty() {
+                return Err(RuntimeError::Config(format!(
+                    "bootstrap entry '{}' command must not be empty",
+                    entry.name
+                )));
+            }
+        }
+
+        self.validate_sandbox()?;
+        Ok(())
+    }
+
+    /// Validate `[[subagents]]`: non-empty unique ids, non-empty system
+    /// prompts, and that any `provider` override names a known provider.
+    fn validate_subagents(&self) -> Result<(), RuntimeError> {
         let mut seen_ids = std::collections::HashSet::new();
         for sub in &self.subagents {
             if sub.id.trim().is_empty() {
@@ -479,18 +533,44 @@ impl RuntimeConfig {
                 )));
             }
         }
+        Ok(())
+    }
 
-        for entry in &self.bootstrap {
-            if entry.name.trim().is_empty() {
+    /// Validate `[sandbox]`: a loopback `listen_addr`, a well-formed `endpoint`,
+    /// and that the orchestrator role does not request the unsupported
+    /// Python-over-subagents bridge across the sandbox boundary.
+    fn validate_sandbox(&self) -> Result<(), RuntimeError> {
+        let Some(sandbox) = &self.sandbox else {
+            return Ok(());
+        };
+
+        let addr: SocketAddr = sandbox.listen_addr.parse().map_err(|e| {
+            RuntimeError::Config(format!(
+                "sandbox.listen_addr '{}' is not a valid socket address: {e}",
+                sandbox.listen_addr
+            ))
+        })?;
+        if !addr.ip().is_loopback() {
+            return Err(RuntimeError::Config(format!(
+                "sandbox.listen_addr must be loopback (the sandbox shares the pod \
+                 network namespace), got '{}'",
+                sandbox.listen_addr
+            )));
+        }
+
+        if let Some(endpoint) = &sandbox.endpoint {
+            validate_http_url(endpoint, "sandbox.endpoint")?;
+            // The Python run_subagent/spawn_agents bridge needs the interpreter
+            // and the subagent tower in one process; it cannot cross the gRPC
+            // boundary in this release.
+            if !self.subagents.is_empty() && self.tools.iter().any(|t| t.name == EXECUTE_PYTHON) {
                 return Err(RuntimeError::Config(
-                    "bootstrap entry name must not be empty".to_string(),
+                    "sandbox.endpoint with both [[subagents]] and an execute_python tool is \
+                     not yet supported: the Python run_subagent/spawn_agents bridge requires \
+                     the interpreter and the subagent tower in the same process. Remove the \
+                     execute_python tool or [[subagents]], or unset sandbox.endpoint."
+                        .to_string(),
                 ));
-            }
-            if entry.command.trim().is_empty() {
-                return Err(RuntimeError::Config(format!(
-                    "bootstrap entry '{}' command must not be empty",
-                    entry.name
-                )));
             }
         }
         Ok(())
@@ -1401,5 +1481,100 @@ mod tests {
         );
         let err = config.validate().unwrap_err();
         assert!(matches!(err, RuntimeError::Config(_)));
+    }
+
+    #[test]
+    fn test_sandbox_defaults_listen_addr_to_loopback() {
+        let config = serve_config(
+            r"
+            [sandbox]
+        ",
+        );
+        config.validate().unwrap();
+        let sandbox = config.sandbox.expect("sandbox section present");
+        assert_eq!(sandbox.listen_addr, "127.0.0.1:50051");
+        assert!(sandbox.endpoint.is_none());
+    }
+
+    #[test]
+    fn test_sandbox_non_loopback_listen_addr_rejected() {
+        let config = serve_config(
+            r#"
+            [sandbox]
+            listen_addr = "0.0.0.0:50051"
+        "#,
+        );
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::Config(ref m) if m.contains("loopback")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_sandbox_malformed_listen_addr_rejected() {
+        let config = serve_config(
+            r#"
+            [sandbox]
+            listen_addr = "not-an-addr"
+        "#,
+        );
+        let err = config.validate().unwrap_err();
+        assert!(matches!(err, RuntimeError::Config(_)));
+    }
+
+    #[test]
+    fn test_sandbox_endpoint_must_be_http_url() {
+        let config = serve_config(
+            r#"
+            [sandbox]
+            endpoint = "127.0.0.1:50051"
+        "#,
+        );
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::Config(ref m) if m.contains("sandbox.endpoint")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_sandbox_endpoint_rejects_python_subagent_bridge() {
+        let config = serve_config(
+            r#"
+            [[tools]]
+            name = "execute_python"
+
+            [[subagents]]
+            id = "worker"
+            system_prompt = "you are a worker"
+
+            [sandbox]
+            endpoint = "http://127.0.0.1:50051"
+        "#,
+        );
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::Config(ref m) if m.contains("not yet supported")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_sandbox_endpoint_allows_subagents_without_python() {
+        let config = serve_config(
+            r#"
+            [[tools]]
+            name = "bash"
+
+            [[subagents]]
+            id = "worker"
+            system_prompt = "you are a worker"
+
+            [sandbox]
+            endpoint = "http://127.0.0.1:50051"
+        "#,
+        );
+        config.validate().unwrap();
     }
 }
