@@ -18,7 +18,7 @@ pub mod client;
 pub mod proto;
 pub mod server;
 
-pub use adapter::{RemoteToolAdapter, remote_tools};
+pub use adapter::{RemoteToolAdapter, connect_tools, remote_tools};
 pub use client::SandboxClient;
 
 /// Tool name whose interpreter state is session-scoped in the sandbox.

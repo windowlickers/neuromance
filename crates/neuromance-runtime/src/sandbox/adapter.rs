@@ -97,6 +97,36 @@ impl ToolImplementation for RemoteToolAdapter {
     }
 }
 
+/// Connect to the sandbox at `endpoint` and build adapters for its tools,
+/// retrying briefly so a sandbox container that is still starting does not
+/// crash-loop the orchestrator.
+///
+/// # Errors
+/// Returns [`RuntimeError`] if the endpoint is invalid or the sandbox stays
+/// unreachable across all retries.
+pub async fn connect_tools(
+    endpoint: &str,
+) -> Result<Vec<Arc<dyn ToolImplementation>>, RuntimeError> {
+    const ATTEMPTS: u32 = 10;
+    const BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
+
+    let client = SandboxClient::connect(endpoint)?;
+    let mut last_err = None;
+    for attempt in 1..=ATTEMPTS {
+        match remote_tools(&client).await {
+            Ok(tools) => return Ok(tools),
+            Err(e) => {
+                tracing::warn!(attempt, error = %e, "sandbox not ready; retrying");
+                last_err = Some(e);
+                tokio::time::sleep(BACKOFF).await;
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        RuntimeError::Config(format!("sandbox at {endpoint} is unreachable"))
+    }))
+}
+
 /// Connect to the sandbox and build a [`ToolImplementation`] adapter for each
 /// tool it hosts.
 ///

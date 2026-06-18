@@ -53,6 +53,11 @@ const EXECUTE_PYTHON: &str = "execute_python";
 /// conversations persist (and record their parent/child lineage) just like the
 /// main agent's.
 ///
+/// `remote_capabilities`, when present, are the sandbox-backed capability tools
+/// (`bash`, file tools, `execute_python`, …) that replace the locally-built
+/// ones. They are shared (cloned) across the main agent and every subagent;
+/// delegate tools are still built locally per level.
+///
 /// # Errors
 /// Returns [`RuntimeError`] if a subagent's provider/model/credentials fail to
 /// resolve, a tool factory fails, or a subagent id collides with a configured
@@ -61,6 +66,7 @@ pub fn build_parent_toolset(
     config: &RuntimeConfig,
     store: Option<&Arc<PgConversationStore>>,
     cancel: &CancellationToken,
+    remote_capabilities: Option<&[Arc<dyn ToolImplementation>]>,
 ) -> Result<Vec<Arc<dyn ToolImplementation>>, RuntimeError> {
     let children = if config.subagents.is_empty() {
         HashMap::new()
@@ -68,9 +74,9 @@ pub fn build_parent_toolset(
         // The main agent is depth 0; its children may delegate `depth - 1`
         // further hops.
         let remaining = config.runtime.max_delegation_depth.saturating_sub(1);
-        build_subagents_at_depth(config, remaining, store, cancel)?
+        build_subagents_at_depth(config, remaining, store, cancel, remote_capabilities)?
     };
-    assemble_toolset(config, &children, cancel)
+    assemble_toolset(config, &children, cancel, remote_capabilities)
 }
 
 /// Build the subagent registry for one tower level.
@@ -83,11 +89,12 @@ fn build_subagents_at_depth(
     remaining: u32,
     store: Option<&Arc<PgConversationStore>>,
     cancel: &CancellationToken,
+    remote_capabilities: Option<&[Arc<dyn ToolImplementation>]>,
 ) -> Result<HashMap<String, Arc<dyn Subagent>>, RuntimeError> {
     let children = if remaining == 0 {
         HashMap::new()
     } else {
-        build_subagents_at_depth(config, remaining - 1, store, cancel)?
+        build_subagents_at_depth(config, remaining - 1, store, cancel, remote_capabilities)?
     };
     // Shared across every subagent at this level and captured by each run's
     // builder. The toolset itself is *not* built here: each run reassembles it
@@ -130,12 +137,22 @@ fn build_subagents_at_depth(
         let children = Arc::clone(&children);
         let cancel = cancel.clone();
         let store = store.cloned();
+        // Shared sandbox capability tools (stateless handles), cloned into each
+        // run's toolset. Under the sandbox a subagent never carries
+        // execute_python (rejected by config validation), so there is no
+        // interpreter state to keep fresh across runs.
+        let remote_capabilities = remote_capabilities.map(<[_]>::to_vec);
         let build_agent = move || {
             // Reassemble the toolset per run so a fresh Python interpreter is
             // built each time; nothing persists across runs of one subagent or
             // across concurrent sibling runs.
-            let tools =
-                assemble_toolset(&config, &children, &cancel).map_err(SubagentError::execution)?;
+            let tools = assemble_toolset(
+                &config,
+                &children,
+                &cancel,
+                remote_capabilities.as_deref(),
+            )
+            .map_err(SubagentError::execution)?;
             let mut core = Core::new(Arc::clone(&client));
             if let Some(max) = max_turns {
                 core.max_turns = Some(max);
@@ -163,37 +180,51 @@ fn build_subagents_at_depth(
     Ok(registry)
 }
 
-/// Assemble the toolset for one agent level: the capability tools built from
-/// `[[tools]]`, a delegate tool per `child`, and (when `execute_python` is
-/// configured and `children` is non-empty) the Python delegation bridge over
-/// `children`.
+/// Assemble the toolset for one agent level: the capability tools, a delegate
+/// tool per `child`, and (when `execute_python` is configured and `children` is
+/// non-empty) the Python delegation bridge over `children`.
 ///
-/// With empty `children` this is the capability toolset only, and any
-/// configured `execute_python` is built as a plain REPL (no bridge).
+/// When `remote_capabilities` is `Some`, the capability tools are the
+/// sandbox-backed adapters rather than locally-built tools; the Python bridge
+/// is never built in that case (config validation forbids the combination).
+/// With empty `children` and no sandbox, this is the capability toolset only,
+/// and any configured `execute_python` is built as a plain REPL (no bridge).
 fn assemble_toolset(
     config: &RuntimeConfig,
     children: &HashMap<String, Arc<dyn Subagent>>,
     cancel: &CancellationToken,
+    remote_capabilities: Option<&[Arc<dyn ToolImplementation>]>,
 ) -> Result<Vec<Arc<dyn ToolImplementation>>, RuntimeError> {
-    let bridge = bridge_python(config, children);
-    // When bridging, the runtime builds `execute_python` itself (over the child
-    // subagents), so the factory must not also build a plain one under that name.
-    let factory_configs: Vec<ToolConfig> = if bridge {
-        config
-            .tools
-            .iter()
-            .filter(|t| t.name != EXECUTE_PYTHON)
-            .cloned()
-            .collect()
-    } else {
-        config.tools.clone()
-    };
+    // The Python->subagent bridge runs the interpreter in-process and cannot
+    // cross the sandbox boundary, so it is only ever built for the local path.
+    let bridge = remote_capabilities.is_none() && bridge_python(config, children);
 
-    #[cfg_attr(not(feature = "python-repl"), allow(unused_mut))]
-    let mut factories = ToolFactoryRegistry::with_builtin();
-    #[cfg(feature = "python-repl")]
-    factories.register(neuromance_repl::python::PythonReplToolFactory);
-    let staged = factories.build_all(&factory_configs)?;
+    let staged = if let Some(remote) = remote_capabilities {
+        let registry = ToolRegistry::new();
+        for tool in remote {
+            registry.register(Arc::clone(tool));
+        }
+        registry
+    } else {
+        // When bridging, the runtime builds `execute_python` itself (over the
+        // child subagents), so the factory must not also build a plain one.
+        let factory_configs: Vec<ToolConfig> = if bridge {
+            config
+                .tools
+                .iter()
+                .filter(|t| t.name != EXECUTE_PYTHON)
+                .cloned()
+                .collect()
+        } else {
+            config.tools.clone()
+        };
+
+        #[cfg_attr(not(feature = "python-repl"), allow(unused_mut))]
+        let mut factories = ToolFactoryRegistry::with_builtin();
+        #[cfg(feature = "python-repl")]
+        factories.register(neuromance_repl::python::PythonReplToolFactory);
+        factories.build_all(&factory_configs)?
+    };
 
     register_child_delegates(config, children, &staged, cancel)?;
     #[cfg(feature = "python-repl")]
@@ -411,7 +442,7 @@ mod tests {
         let mut config = config_with_subagents(vec![subagent("worker")]);
         config.tools = vec![read_tool()];
 
-        let tools = assemble_toolset(&config, &HashMap::new(), &CancellationToken::new()).unwrap();
+        let tools = assemble_toolset(&config, &HashMap::new(), &CancellationToken::new(), None).unwrap();
         let names = tool_names(&tools);
 
         assert_eq!(names, vec!["read".to_string()]);
@@ -426,7 +457,7 @@ mod tests {
         config.tools = vec![read_tool()];
 
         let children = mock_children(&["worker", "critic"]);
-        let tools = assemble_toolset(&config, &children, &CancellationToken::new()).unwrap();
+        let tools = assemble_toolset(&config, &children, &CancellationToken::new(), None).unwrap();
         let mut names = tool_names(&tools);
         names.sort();
 
@@ -453,7 +484,7 @@ mod tests {
         }];
 
         let children = mock_children(&["worker"]);
-        let tools = assemble_toolset(&config, &children, &CancellationToken::new()).unwrap();
+        let tools = assemble_toolset(&config, &children, &CancellationToken::new(), None).unwrap();
         let names = tool_names(&tools);
 
         assert_eq!(
@@ -472,7 +503,7 @@ mod tests {
         config.tools = vec![read_tool()];
 
         let children = mock_children(&["read"]);
-        let err = assemble_toolset(&config, &children, &CancellationToken::new())
+        let err = assemble_toolset(&config, &children, &CancellationToken::new(), None)
             .err()
             .expect("colliding subagent id must be rejected");
         assert!(
@@ -489,7 +520,7 @@ mod tests {
     #[test]
     fn test_build_surfaces_missing_credential_env() {
         let config = config_with_subagents(vec![subagent("alpha"), subagent("beta")]);
-        let err = build_parent_toolset(&config, None, &CancellationToken::new())
+        let err = build_parent_toolset(&config, None, &CancellationToken::new(), None)
             .err()
             .expect("build should fail without the credential env var set");
         assert!(
@@ -505,7 +536,7 @@ mod tests {
         let mut config = config_with_subagents(vec![]);
         config.tools = vec![read_tool()];
 
-        let tools = build_parent_toolset(&config, None, &CancellationToken::new()).unwrap();
+        let tools = build_parent_toolset(&config, None, &CancellationToken::new(), None).unwrap();
         assert_eq!(tool_names(&tools), vec!["read".to_string()]);
     }
 
@@ -514,7 +545,7 @@ mod tests {
     #[test]
     fn test_subagent_inherits_parent_provider_credential() {
         let config = config_with_subagents(vec![subagent("worker")]);
-        let err = build_parent_toolset(&config, None, &CancellationToken::new())
+        let err = build_parent_toolset(&config, None, &CancellationToken::new(), None)
             .err()
             .expect("build should fail on the inherited provider's unset env var");
         assert!(
@@ -539,7 +570,7 @@ mod tests {
                 ..subagent("worker")
             }],
         );
-        let err = build_parent_toolset(&config, None, &CancellationToken::new())
+        let err = build_parent_toolset(&config, None, &CancellationToken::new(), None)
             .err()
             .expect("build should fail on the overridden provider's unset env var");
         assert!(
@@ -556,7 +587,7 @@ mod tests {
             provider: Some("ghost".to_string()),
             ..subagent("worker")
         }]);
-        let err = build_parent_toolset(&config, None, &CancellationToken::new())
+        let err = build_parent_toolset(&config, None, &CancellationToken::new(), None)
             .err()
             .expect("build should fail for an unknown provider");
         assert!(
