@@ -70,7 +70,9 @@ impl SandboxToolset {
         session_id: &str,
     ) -> Result<String, ToolExecutorError> {
         #[cfg(feature = "python-repl")]
-        if name == EXECUTE_PYTHON && let Some(py) = &self.python {
+        if name == EXECUTE_PYTHON
+            && let Some(py) = &self.python
+        {
             let session = py.get_or_create(session_id).map_err(|e| {
                 ToolExecutorError::Tool(neuromance_tools::ToolError::execution(e.to_string()))
             })?;
@@ -300,9 +302,10 @@ mod python {
                 RuntimeError::Config(format!("build restricted python interpreter: {e}"))
             })?))
         } else {
-            PythonReplTool::with_interactive(Arc::new(InteractivePythonRepl::new().map_err(
-                |e| RuntimeError::Config(format!("build python interpreter: {e}")),
-            )?))
+            PythonReplTool::with_interactive(Arc::new(
+                InteractivePythonRepl::new()
+                    .map_err(|e| RuntimeError::Config(format!("build python interpreter: {e}")))?,
+            ))
         };
         let mut executor = ToolExecutor::new();
         executor.add_tool(tool);
@@ -344,8 +347,11 @@ mod tests {
             .unwrap()
             .into_inner();
 
-        let by_name: HashMap<String, ToolDefinition> =
-            resp.tools.into_iter().map(|t| (t.name.clone(), t)).collect();
+        let by_name: HashMap<String, ToolDefinition> = resp
+            .tools
+            .into_iter()
+            .map(|t| (t.name.clone(), t))
+            .collect();
 
         assert!(by_name["ls"].auto_approved, "ls should be auto-approved");
         assert!(
@@ -419,7 +425,10 @@ mod tests {
         let server = server_with(&[tool("execute_python")]);
 
         // Session "a" defines a variable and reads it back.
-        assert_eq!(run_python(&server, "stash = 42", "a").await["status"], "success");
+        assert_eq!(
+            run_python(&server, "stash = 42", "a").await["status"],
+            "success"
+        );
         let read = run_python(&server, "print(stash)", "a").await;
         assert_eq!(read["status"], "success");
         assert!(read["stdout"].as_str().unwrap().contains("42"));
@@ -437,6 +446,9 @@ mod tests {
             .await
             .unwrap();
         let after_close = run_python(&server, "print(stash)", "a").await;
-        assert_eq!(after_close["status"], "error", "closed session retained state");
+        assert_eq!(
+            after_close["status"], "error",
+            "closed session retained state"
+        );
     }
 }
