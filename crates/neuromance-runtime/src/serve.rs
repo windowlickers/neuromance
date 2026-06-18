@@ -11,7 +11,11 @@
 //! probes at the task port.
 //!
 //! Tasks are processed sequentially by a single worker that owns the
-//! agent. In-memory state is authoritative for serving; restarts lose
+//! agent. Because that one agent is reused across tasks, the worker resets
+//! its `execute_python` interpreter after each run — the sandbox session
+//! when tools run remotely, the in-process interpreter otherwise — so one
+//! task's interpreter state never bleeds into the next. In-memory state is
+//! authoritative for serving; restarts lose
 //! pending and completed tasks. When `[database]` is configured,
 //! conversation history is additionally written through to postgres as a
 //! durable record: Core persists messages incrementally during each run,
@@ -46,6 +50,7 @@ use neuromance_client::LLMClient;
 use neuromance_common::chat::{Conversation, ConversationStatus, Message};
 use neuromance_db::PgConversationStore;
 
+use crate::SessionReset;
 use crate::config::RuntimeConfig;
 use crate::sandbox::{EXECUTE_PYTHON, SandboxClient};
 
@@ -514,6 +519,11 @@ struct WorkerCtx<C: LLMClient + Send + Sync> {
     /// the run completes. `Some` only when the sandbox hosts `execute_python`;
     /// the interpreter is keyed by task id (see `RemoteToolAdapter`).
     sandbox: Option<SandboxClient>,
+    /// Reset handle for the main agent's in-process `execute_python`
+    /// interpreter, called after each task so user state does not bleed into
+    /// the next. `Some` only when `execute_python` runs locally (not in the
+    /// sandbox) and the `python-repl` feature is built.
+    local_python: Option<SessionReset>,
 }
 
 async fn worker_loop<C: LLMClient + Send + Sync + 'static>(
@@ -549,6 +559,7 @@ async fn worker_loop<C: LLMClient + Send + Sync + 'static>(
                 )
                 .await;
                 release_sandbox_session(ctx.sandbox.as_ref(), task_id).await;
+                reset_local_python(ctx.local_python.as_ref()).await;
                 record_task_provenance(ctx.store.as_ref(), task_id, conversation_id, start_seq)
                     .await;
             }
@@ -615,6 +626,18 @@ async fn release_sandbox_session(sandbox: Option<&SandboxClient>, task_id: Uuid)
     };
     if let Err(e) = client.close_session(task_id.to_string()).await {
         warn!(%task_id, error = %e, "failed to release sandbox interpreter session");
+    }
+}
+
+/// Clear the main agent's in-process `execute_python` interpreter after a task.
+/// The single agent is reused across tasks, so without this a task's variables,
+/// imports, and definitions would still be visible to the next one. The
+/// in-sandbox interpreter is handled separately by [`release_sandbox_session`];
+/// this is the local counterpart. No-op when there is no local interpreter to
+/// reset; the handle itself logs on failure.
+async fn reset_local_python(local_python: Option<&SessionReset>) {
+    if let Some(reset) = local_python {
+        reset().await;
     }
 }
 
@@ -750,6 +773,7 @@ pub async fn run<C: LLMClient + Send + Sync + 'static>(
     agent: Agent<C>,
     store: Option<Arc<PgConversationStore>>,
     sandbox_client: Option<SandboxClient>,
+    local_python: Option<SessionReset>,
     cancel: CancellationToken,
 ) -> Result<()> {
     let tasks: Arc<DashMap<Uuid, TaskRecord>> = Arc::new(DashMap::new());
@@ -771,6 +795,7 @@ pub async fn run<C: LLMClient + Send + Sync + 'static>(
             agent: Arc::clone(&agent),
             store: store.clone(),
             sandbox: session_closer,
+            local_python,
         },
         cancel.clone(),
     ));
@@ -1023,6 +1048,7 @@ mod tests {
                 agent: Arc::clone(&agent),
                 store: None,
                 sandbox: None,
+                local_python: None,
             },
             cancel.clone(),
         ));

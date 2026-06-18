@@ -13,7 +13,7 @@ use neuromance_agent::Agent;
 use neuromance_client::LLMClient;
 use neuromance_db::PgConversationStore;
 use neuromance_runtime::{
-    ApprovalMode, Mode, RuntimeConfig, RuntimeError,
+    ApprovalMode, Mode, RuntimeConfig, RuntimeError, SessionReset,
     approval::WebhookApprover,
     bootstrap, build_parent_toolset,
     health::{ReadinessGate, router as health_router},
@@ -117,9 +117,10 @@ async fn run_orchestrator(config: &RuntimeConfig, cancel: CancellationToken) -> 
         None => None,
     };
 
-    let agent = build_agent(config, store.as_ref(), sandbox_client.as_ref(), &cancel)
-        .await
-        .map_err(anyhow::Error::from)?;
+    let (agent, local_python) =
+        build_agent(config, store.as_ref(), sandbox_client.as_ref(), &cancel)
+            .await
+            .map_err(anyhow::Error::from)?;
 
     // Best-effort: run one-time tool setup before tasks, since the pod has no
     // persistent storage to cache credentials a tool writes to disk.
@@ -129,7 +130,17 @@ async fn run_orchestrator(config: &RuntimeConfig, cancel: CancellationToken) -> 
 
     let result = match config.mode {
         Mode::Oneshot => run_oneshot(config, agent, cancel.clone()).await,
-        Mode::Serve => run_serve(config, agent, store, sandbox_client, cancel.clone()).await,
+        Mode::Serve => {
+            run_serve(
+                config,
+                agent,
+                store,
+                sandbox_client,
+                local_python,
+                cancel.clone(),
+            )
+            .await
+        }
     };
 
     readiness.set_ready(false);
@@ -265,7 +276,7 @@ async fn build_agent(
     store: Option<&Arc<PgConversationStore>>,
     sandbox_client: Option<&sandbox::SandboxClient>,
     cancel: &CancellationToken,
-) -> Result<Agent<Box<dyn LLMClient>>, RuntimeError> {
+) -> Result<(Agent<Box<dyn LLMClient>>, Option<SessionReset>), RuntimeError> {
     let provider = config.provider(&config.agent.provider).ok_or_else(|| {
         RuntimeError::Config(format!(
             "agent.provider '{}' does not match any [[providers]] entry",
@@ -306,7 +317,8 @@ async fn build_agent(
     // subagent and the delegation tower beneath them (bounded by
     // runtime.max_delegation_depth). The store is threaded through so subagent
     // conversations persist and record their parent link too.
-    let tools = build_parent_toolset(config, store, cancel, remote_capabilities.as_deref())?;
+    let (tools, local_python) =
+        build_parent_toolset(config, store, cancel, remote_capabilities.as_deref())?;
 
     if matches!(config.approval.mode, ApprovalMode::Auto) {
         let mut needs_approval: Vec<String> = tools
@@ -357,7 +369,7 @@ async fn build_agent(
         }
     }
 
-    Ok(Agent::new(config.agent.id.clone(), core))
+    Ok((Agent::new(config.agent.id.clone(), core), local_python))
 }
 
 async fn run_oneshot(
@@ -373,7 +385,8 @@ async fn run_serve(
     agent: Agent<Box<dyn LLMClient>>,
     store: Option<Arc<PgConversationStore>>,
     sandbox_client: Option<sandbox::SandboxClient>,
+    local_python: Option<SessionReset>,
     cancel: CancellationToken,
 ) -> Result<()> {
-    serve::run(config, agent, store, sandbox_client, cancel).await
+    serve::run(config, agent, store, sandbox_client, local_python, cancel).await
 }

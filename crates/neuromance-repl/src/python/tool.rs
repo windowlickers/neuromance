@@ -34,6 +34,13 @@ impl Backend {
             Self::Unrestricted(repl) => repl.execute(code).await,
         }
     }
+
+    async fn reset(&self) -> Result<(), ReplError> {
+        match self {
+            Self::Restricted(repl) => repl.reset().await,
+            Self::Unrestricted(repl) => repl.reset().await,
+        }
+    }
 }
 
 /// Tool implementation for executing Python code in a REPL environment.
@@ -88,6 +95,23 @@ impl PythonReplTool {
         Self {
             backend: Backend::Unrestricted(repl),
         }
+    }
+
+    /// Clear the interpreter's user namespace.
+    ///
+    /// Drops variables, functions, classes, and imports the executed code
+    /// defined (these bind into the REPL's locals), while keeping the
+    /// configured baseline — allowlisted builtins, configured modules, and any
+    /// injected Rust callbacks — which live in globals. Use this to keep one
+    /// task's state from bleeding into the next when a single tool instance is
+    /// reused across runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReplError`] if the reset fails (e.g. the state mutex is
+    /// poisoned).
+    pub async fn reset(&self) -> Result<(), ReplError> {
+        self.backend.reset().await
     }
 }
 
@@ -222,12 +246,18 @@ impl Default for PythonReplToolConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PythonReplToolFactory;
 
-impl ToolFactory for PythonReplToolFactory {
-    fn name(&self) -> &'static str {
-        "execute_python"
-    }
-
-    fn build(&self, config: &Value, registry: &ToolRegistry) -> Result<(), ToolError> {
+impl PythonReplToolFactory {
+    /// Construct the `execute_python` tool from its config block.
+    ///
+    /// Returns the typed `Arc` so callers that need a handle on the tool (e.g.
+    /// to [`reset`](PythonReplTool::reset) it between runs) can keep one,
+    /// rather than only registering it behind `dyn ToolImplementation`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError`] if the config block is malformed or the
+    /// interpreter fails to initialize.
+    pub fn build_tool(config: &Value) -> Result<Arc<PythonReplTool>, ToolError> {
         let cfg: PythonReplToolConfig = if config.is_null() {
             PythonReplToolConfig::default()
         } else {
@@ -243,7 +273,17 @@ impl ToolFactory for PythonReplToolFactory {
             );
             PythonReplTool::with_interactive(Arc::new(InteractivePythonRepl::new()?))
         };
-        registry.register(Arc::new(tool));
+        Ok(Arc::new(tool))
+    }
+}
+
+impl ToolFactory for PythonReplToolFactory {
+    fn name(&self) -> &'static str {
+        "execute_python"
+    }
+
+    fn build(&self, config: &Value, registry: &ToolRegistry) -> Result<(), ToolError> {
+        registry.register(Self::build_tool(config)?);
         Ok(())
     }
 }
@@ -335,6 +375,37 @@ mod tests {
         assert!(parsed["execution_time_ms"].is_number());
         assert!(parsed.get("stdout").is_none());
         assert!(parsed.get("return_value").is_none());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_reset_clears_user_state() {
+        let tool = make_tool();
+
+        tool.execute(&json!({ "code": "marker = 41" }))
+            .await
+            .unwrap();
+        let before: Value = serde_json::from_str(
+            &tool
+                .execute(&json!({ "code": "print(marker)" }))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(before["status"], "success");
+        assert!(before["stdout"].as_str().unwrap().contains("41"));
+
+        tool.reset().await.unwrap();
+
+        let after: Value = serde_json::from_str(
+            &tool
+                .execute(&json!({ "code": "print(marker)" }))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(after["status"], "error");
+        assert!(after["stderr"].as_str().unwrap().contains("NameError"));
     }
 
     #[test]

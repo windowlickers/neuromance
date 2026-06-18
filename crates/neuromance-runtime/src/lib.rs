@@ -39,4 +39,4 @@ pub use config::{
     SubagentConfig,
 };
 pub use error::RuntimeError;
-pub use subagents::build_parent_toolset;
+pub use subagents::{SessionReset, build_parent_toolset};

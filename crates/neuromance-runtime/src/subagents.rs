@@ -23,6 +23,8 @@
 //! gets its own Python interpreter. No interpreter state bleeds across runs.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
@@ -39,6 +41,19 @@ use crate::proxy::build_provider_config;
 
 /// Tool name the runtime takes over to expose subagents in Python.
 const EXECUTE_PYTHON: &str = "execute_python";
+
+/// A per-task cleanup handle for the main agent's in-process `execute_python`
+/// interpreter. Calling it clears the interpreter's user namespace so state
+/// from one serve task never bleeds into the next.
+///
+/// `None` accompanies a toolset with no resettable interpreter: `execute_python`
+/// is unconfigured, runs in the sandbox (keyed by task there instead), or the
+/// `python-repl` feature is disabled.
+pub type SessionReset = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
+/// An assembled toolset paired with the optional reset handle for its
+/// in-process `execute_python` interpreter (see [`SessionReset`]).
+type Toolset = (Vec<Arc<dyn ToolImplementation>>, Option<SessionReset>);
 
 /// Build the main agent's toolset, including delegate tools for every
 /// configured subagent and (when `execute_python` is configured) the Python
@@ -67,7 +82,7 @@ pub fn build_parent_toolset(
     store: Option<&Arc<PgConversationStore>>,
     cancel: &CancellationToken,
     remote_capabilities: Option<&[Arc<dyn ToolImplementation>]>,
-) -> Result<Vec<Arc<dyn ToolImplementation>>, RuntimeError> {
+) -> Result<Toolset, RuntimeError> {
     let children = if config.subagents.is_empty() {
         HashMap::new()
     } else {
@@ -145,8 +160,9 @@ fn build_subagents_at_depth(
         let build_agent = move || {
             // Reassemble the toolset per run so a fresh Python interpreter is
             // built each time; nothing persists across runs of one subagent or
-            // across concurrent sibling runs.
-            let tools =
+            // across concurrent sibling runs. A subagent rebuilds per run, so it
+            // has no need of the parent's between-task reset handle.
+            let (tools, _reset) =
                 assemble_toolset(&config, &children, &cancel, remote_capabilities.as_deref())
                     .map_err(SubagentError::execution)?;
             let mut core = Core::new(Arc::clone(&client));
@@ -185,14 +201,21 @@ fn build_subagents_at_depth(
 /// is never built in that case (config validation forbids the combination).
 /// With empty `children` and no sandbox, this is the capability toolset only,
 /// and any configured `execute_python` is built as a plain REPL (no bridge).
+///
+/// The second return value is a reset handle for the in-process
+/// `execute_python` interpreter, or `None` when there is none to reset (no
+/// local interpreter, or the sandbox hosts it). Callers that reuse one agent
+/// across tasks (serve mode) call it between tasks; callers that rebuild per
+/// run (subagents) ignore it.
 fn assemble_toolset(
     config: &RuntimeConfig,
     children: &HashMap<String, Arc<dyn Subagent>>,
     cancel: &CancellationToken,
     remote_capabilities: Option<&[Arc<dyn ToolImplementation>]>,
-) -> Result<Vec<Arc<dyn ToolImplementation>>, RuntimeError> {
+) -> Result<Toolset, RuntimeError> {
     // The Python->subagent bridge runs the interpreter in-process and cannot
     // cross the sandbox boundary, so it is only ever built for the local path.
+    #[cfg_attr(not(feature = "python-repl"), allow(unused_variables))]
     let bridge = remote_capabilities.is_none() && bridge_python(config, children);
 
     let staged = if let Some(remote) = remote_capabilities {
@@ -202,9 +225,11 @@ fn assemble_toolset(
         }
         registry
     } else {
-        // When bridging, the runtime builds `execute_python` itself (over the
-        // child subagents), so the factory must not also build a plain one.
-        let factory_configs: Vec<ToolConfig> = if bridge {
+        // The runtime builds `execute_python` explicitly below (plain or
+        // bridged) so it can hold a typed handle to reset the interpreter; keep
+        // the factory from also building one. Without the python-repl feature
+        // there is no explicit build, so leave it in for `build_all` to reject.
+        let factory_configs: Vec<ToolConfig> = if cfg!(feature = "python-repl") {
             config
                 .tools
                 .iter()
@@ -215,24 +240,29 @@ fn assemble_toolset(
             config.tools.clone()
         };
 
-        #[cfg_attr(not(feature = "python-repl"), allow(unused_mut))]
-        let mut factories = ToolFactoryRegistry::with_builtin();
-        #[cfg(feature = "python-repl")]
-        factories.register(neuromance_repl::python::PythonReplToolFactory);
+        let factories = ToolFactoryRegistry::with_builtin();
         factories.build_all(&factory_configs)?
     };
 
     register_child_delegates(config, children, &staged, cancel)?;
-    #[cfg(feature = "python-repl")]
-    if bridge {
-        register_child_repl(config, children, &staged, cancel)?;
-    }
 
-    Ok(staged
+    // Only the in-process interpreter carries resettable state; the sandbox
+    // path keys it by task instead, so no reset handle is produced there.
+    #[cfg(feature = "python-repl")]
+    let reset = if remote_capabilities.is_none() {
+        register_local_python(config, children, &staged, cancel, bridge)?
+    } else {
+        None
+    };
+    #[cfg(not(feature = "python-repl"))]
+    let reset = None;
+
+    let tools = staged
         .tool_names()
         .into_iter()
         .filter_map(|name| staged.get(&name))
-        .collect())
+        .collect();
+    Ok((tools, reset))
 }
 
 /// Register one [`SubagentTool`] per child subagent into `staged`, so an agent
@@ -267,27 +297,57 @@ fn register_child_delegates(
     Ok(())
 }
 
-/// Build the subagent-enabled Python REPL over `children` and register it as the
-/// `execute_python` tool, exposing `run_subagent`/`spawn_agents`.
+/// Build the local in-process `execute_python` tool, register it into `staged`,
+/// and return a handle that resets its interpreter between runs.
+///
+/// In bridge mode (non-empty `children`) the tool exposes
+/// `run_subagent`/`spawn_agents` over the children; otherwise it is a plain
+/// REPL. Returns `None` when `[[tools]]` configures no `execute_python`.
 ///
 /// # Errors
-/// Returns [`RuntimeError::Config`] if the `execute_python` entry requests
-/// unrestricted mode (the bridge supports restricted mode only) or if building
-/// the REPL or bridge fails.
+/// Returns [`RuntimeError::Config`] if the `execute_python` entry is malformed,
+/// requests unrestricted mode while bridging (the bridge supports restricted
+/// mode only), or the interpreter fails to build.
 #[cfg(feature = "python-repl")]
-fn register_child_repl(
+fn register_local_python(
     config: &RuntimeConfig,
     children: &HashMap<String, Arc<dyn Subagent>>,
     staged: &ToolRegistry,
     cancel: &CancellationToken,
-) -> Result<(), RuntimeError> {
+    bridge: bool,
+) -> Result<Option<SessionReset>, RuntimeError> {
+    use neuromance_repl::python::PythonReplToolFactory;
+
+    let Some(entry) = config.tools.iter().find(|t| t.name == EXECUTE_PYTHON) else {
+        return Ok(None);
+    };
+
+    let tool = if bridge {
+        build_child_repl(children, cancel, entry)?
+    } else {
+        PythonReplToolFactory::build_tool(&entry.config)
+            .map_err(|e| RuntimeError::Config(format!("build execute_python tool: {e}")))?
+    };
+    let registered: Arc<dyn ToolImplementation> = tool.clone();
+    staged.register(registered);
+    Ok(Some(local_python_reset(tool)))
+}
+
+/// Build the subagent-enabled Python REPL over `children`, exposing
+/// `run_subagent`/`spawn_agents`.
+///
+/// # Errors
+/// Returns [`RuntimeError::Config`] if `entry` requests unrestricted mode (the
+/// bridge supports restricted mode only) or if building the REPL or bridge
+/// fails.
+#[cfg(feature = "python-repl")]
+fn build_child_repl(
+    children: &HashMap<String, Arc<dyn Subagent>>,
+    cancel: &CancellationToken,
+    entry: &ToolConfig,
+) -> Result<Arc<neuromance_repl::python::PythonReplTool>, RuntimeError> {
     use neuromance_repl::python::{PythonRepl, SubagentRepl};
 
-    let entry = config
-        .tools
-        .iter()
-        .find(|t| t.name == EXECUTE_PYTHON)
-        .ok_or_else(|| RuntimeError::Config("execute_python tool entry missing".to_string()))?;
     if entry.config.get("restricted") == Some(&serde_json::Value::Bool(false)) {
         return Err(RuntimeError::Config(
             "the subagent Python REPL bridge supports restricted mode only; remove \
@@ -301,8 +361,22 @@ fn register_child_repl(
     );
     let bridge = SubagentRepl::new(repl, children.clone(), cancel.clone())
         .map_err(|e| RuntimeError::Config(format!("build subagent repl bridge: {e}")))?;
-    staged.register(Arc::new(bridge.into_tool()));
-    Ok(())
+    Ok(Arc::new(bridge.into_tool()))
+}
+
+/// Wrap a [`PythonReplTool`](neuromance_repl::python::PythonReplTool) handle in a
+/// [`SessionReset`] closure that clears its interpreter, logging a warning if
+/// the reset fails rather than failing the caller.
+#[cfg(feature = "python-repl")]
+fn local_python_reset(tool: Arc<neuromance_repl::python::PythonReplTool>) -> SessionReset {
+    Arc::new(move || {
+        let tool = Arc::clone(&tool);
+        Box::pin(async move {
+            if let Err(e) = tool.reset().await {
+                tracing::warn!(error = %e, "failed to reset local execute_python interpreter");
+            }
+        })
+    })
 }
 
 /// Whether `execute_python` should be bridged over `children` rather than built
@@ -438,7 +512,7 @@ mod tests {
         let mut config = config_with_subagents(vec![subagent("worker")]);
         config.tools = vec![read_tool()];
 
-        let tools =
+        let (tools, _reset) =
             assemble_toolset(&config, &HashMap::new(), &CancellationToken::new(), None).unwrap();
         let names = tool_names(&tools);
 
@@ -454,7 +528,8 @@ mod tests {
         config.tools = vec![read_tool()];
 
         let children = mock_children(&["worker", "critic"]);
-        let tools = assemble_toolset(&config, &children, &CancellationToken::new(), None).unwrap();
+        let (tools, _reset) =
+            assemble_toolset(&config, &children, &CancellationToken::new(), None).unwrap();
         let mut names = tool_names(&tools);
         names.sort();
 
@@ -481,7 +556,8 @@ mod tests {
         }];
 
         let children = mock_children(&["worker"]);
-        let tools = assemble_toolset(&config, &children, &CancellationToken::new(), None).unwrap();
+        let (tools, _reset) =
+            assemble_toolset(&config, &children, &CancellationToken::new(), None).unwrap();
         let names = tool_names(&tools);
 
         assert_eq!(
@@ -526,6 +602,58 @@ mod tests {
         );
     }
 
+    /// A locally-built `execute_python` yields a [`SessionReset`] that clears
+    /// the very interpreter registered in the toolset: after the reset, a
+    /// variable a prior run defined is gone. This is what keeps serve-mode
+    /// tasks from leaking interpreter state into one another.
+    #[cfg(feature = "python-repl")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_session_reset_clears_registered_interpreter() {
+        use serde_json::json;
+
+        let mut config = config_with_subagents(vec![]);
+        config.tools = vec![ToolConfig {
+            name: "execute_python".to_string(),
+            config: serde_json::Value::Null,
+        }];
+
+        let (tools, reset) =
+            build_parent_toolset(&config, None, &CancellationToken::new(), None).unwrap();
+        let reset = reset.expect("a local execute_python tool must yield a reset handle");
+
+        let python = tools
+            .iter()
+            .find(|t| t.get_definition().function.name == "execute_python")
+            .expect("execute_python must be registered")
+            .clone();
+
+        python
+            .execute(&json!({ "code": "marker = 7" }))
+            .await
+            .unwrap();
+        let before: serde_json::Value = serde_json::from_str(
+            &python
+                .execute(&json!({ "code": "print(marker)" }))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(before["status"], "success");
+
+        reset().await;
+
+        let after: serde_json::Value = serde_json::from_str(
+            &python
+                .execute(&json!({ "code": "print(marker)" }))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(after["status"], "error");
+        assert!(after["stderr"].as_str().unwrap().contains("NameError"));
+    }
+
     /// With no subagents configured, the toolset is the capability tools only
     /// and no client is built.
     #[test]
@@ -533,7 +661,8 @@ mod tests {
         let mut config = config_with_subagents(vec![]);
         config.tools = vec![read_tool()];
 
-        let tools = build_parent_toolset(&config, None, &CancellationToken::new(), None).unwrap();
+        let (tools, _reset) =
+            build_parent_toolset(&config, None, &CancellationToken::new(), None).unwrap();
         assert_eq!(tool_names(&tools), vec!["read".to_string()]);
     }
 
