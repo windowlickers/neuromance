@@ -122,7 +122,7 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use serde_json::Value;
 
-use neuromance_common::tools::{FunctionCall, Tool, ToolCall};
+use neuromance_common::tools::{Tool, ToolCall};
 
 mod bash_tool;
 mod edit_tool;
@@ -311,23 +311,44 @@ impl ToolExecutor {
     /// or [`ToolExecutorError::Tool`] if execution fails.
     pub async fn execute_tool(&self, tool_call: &ToolCall) -> Result<String, ToolExecutorError> {
         let function = &tool_call.function;
+        self.execute_named(&function.name, function.arguments_json())
+            .await
+    }
 
+    /// Execute a tool by name with raw JSON-encoded arguments.
+    ///
+    /// The shared dispatch path behind [`execute_tool`](Self::execute_tool):
+    /// callers that don't hold a full [`ToolCall`] — e.g. a gRPC server
+    /// reconstructing a request from name + arguments — reuse the same registry
+    /// lookup and argument parsing.
+    ///
+    /// Cancellation is the caller's responsibility (see
+    /// [`execute_tool`](Self::execute_tool)).
+    ///
+    /// # Errors
+    /// Returns [`ToolExecutorError::UnknownTool`] if the tool is not found,
+    /// or [`ToolExecutorError::Tool`] if execution fails.
+    pub async fn execute_named(
+        &self,
+        name: &str,
+        arguments_json: &str,
+    ) -> Result<String, ToolExecutorError> {
         let tool = self
             .registry
-            .get(&function.name)
-            .ok_or_else(|| ToolExecutorError::UnknownTool(function.name.clone()))?;
+            .get(name)
+            .ok_or_else(|| ToolExecutorError::UnknownTool(name.to_owned()))?;
 
-        let args = Self::parse_arguments(function);
+        let args = Self::parse_arguments(arguments_json);
 
         Ok(tool.execute(&args).await?)
     }
 
-    fn parse_arguments(arguments: &FunctionCall) -> Value {
-        let json = arguments.arguments_json();
-        if json == "{}" {
+    fn parse_arguments(arguments_json: &str) -> Value {
+        if arguments_json.is_empty() || arguments_json == "{}" {
             Value::Object(serde_json::Map::new())
         } else {
-            serde_json::from_str(json).unwrap_or_else(|_| Value::String(json.to_owned()))
+            serde_json::from_str(arguments_json)
+                .unwrap_or_else(|_| Value::String(arguments_json.to_owned()))
         }
     }
 }
@@ -343,61 +364,104 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     #![allow(clippy::expect_used)]
 
-    use super::*;
+    use async_trait::async_trait;
+    use neuromance_common::tools::{Function, FunctionCall};
     use serde_json::json;
 
-    fn fc(args: &str) -> FunctionCall {
-        FunctionCall {
-            name: "test".to_string(),
-            arguments: args.to_string(),
-        }
-    }
+    use super::*;
 
     #[test]
     fn test_parse_arguments_empty() {
-        let result = ToolExecutor::parse_arguments(&fc(""));
-        assert_eq!(result, json!({}));
+        assert_eq!(ToolExecutor::parse_arguments(""), json!({}));
     }
 
     #[test]
     fn test_parse_arguments_json_object() {
-        let f = fc(r#"{"key": "value", "number": 42}"#);
-        let result = ToolExecutor::parse_arguments(&f);
+        let result = ToolExecutor::parse_arguments(r#"{"key": "value", "number": 42}"#);
         assert_eq!(result, json!({"key": "value", "number": 42}));
     }
 
     #[test]
     fn test_parse_arguments_json_array() {
-        let f = fc(r#"["item1", "item2", "item3"]"#);
-        let result = ToolExecutor::parse_arguments(&f);
+        let result = ToolExecutor::parse_arguments(r#"["item1", "item2", "item3"]"#);
         assert_eq!(result, json!(["item1", "item2", "item3"]));
     }
 
     #[test]
     fn test_parse_arguments_string_fallback() {
-        let f = fc("plain text argument");
-        let result = ToolExecutor::parse_arguments(&f);
+        let result = ToolExecutor::parse_arguments("plain text argument");
         assert_eq!(result, json!("plain text argument"));
     }
 
     #[test]
     fn test_parse_arguments_invalid_json_fallback() {
-        let f = fc(r#"{"incomplete json"#);
-        let result = ToolExecutor::parse_arguments(&f);
+        let result = ToolExecutor::parse_arguments(r#"{"incomplete json"#);
         assert_eq!(result, json!(r#"{"incomplete json"#));
     }
 
     #[test]
     fn test_parse_arguments_number_string() {
-        let f = fc("42");
-        let result = ToolExecutor::parse_arguments(&f);
-        assert_eq!(result, json!(42));
+        assert_eq!(ToolExecutor::parse_arguments("42"), json!(42));
     }
 
     #[test]
     fn test_parse_arguments_boolean_string() {
-        let f = fc("true");
-        let result = ToolExecutor::parse_arguments(&f);
-        assert_eq!(result, json!(true));
+        assert_eq!(ToolExecutor::parse_arguments("true"), json!(true));
+    }
+
+    /// A tool that echoes the `value` argument back so dispatch can be observed.
+    struct EchoTool;
+
+    #[async_trait]
+    impl ToolImplementation for EchoTool {
+        fn get_definition(&self) -> Tool {
+            Tool::builder()
+                .function(Function {
+                    name: "echo".to_string(),
+                    description: "echo".to_string(),
+                    parameters: json!({}),
+                })
+                .build()
+        }
+
+        async fn execute(&self, args: &Value) -> Result<String, ToolError> {
+            args.get("value")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+                .ok_or_else(|| ToolError::InvalidArguments("missing 'value'".into()))
+        }
+    }
+
+    /// `execute_named` and `execute_tool` share one dispatch path: routing the
+    /// same name + arguments through either reaches the same tool with the same
+    /// parsed arguments.
+    #[tokio::test]
+    async fn test_execute_named_matches_execute_tool() {
+        let mut executor = ToolExecutor::new();
+        executor.add_tool(EchoTool);
+
+        let args = r#"{"value": "hi"}"#;
+        let via_named = executor.execute_named("echo", args).await.unwrap();
+
+        let call = ToolCall {
+            id: "1".to_string(),
+            function: FunctionCall {
+                name: "echo".to_string(),
+                arguments: args.to_string(),
+            },
+            call_type: "function".to_string(),
+            index: None,
+        };
+        let via_call = executor.execute_tool(&call).await.unwrap();
+
+        assert_eq!(via_named, "hi");
+        assert_eq!(via_named, via_call);
+    }
+
+    #[tokio::test]
+    async fn test_execute_named_unknown_tool() {
+        let executor = ToolExecutor::new();
+        let err = executor.execute_named("missing", "{}").await.unwrap_err();
+        assert!(matches!(err, ToolExecutorError::UnknownTool(name) if name == "missing"));
     }
 }
