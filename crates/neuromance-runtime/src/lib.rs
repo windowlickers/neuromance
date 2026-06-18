@@ -35,7 +35,8 @@ pub mod telemetry;
 
 pub use config::{
     AgentConfig, ApprovalConfig, ApprovalMode, DatabaseSettings, Mode, OneshotConfig,
-    ProviderConfig, ProviderProxyConfig, RuntimeConfig, RuntimeSettings, SubagentConfig,
+    ProviderConfig, ProviderProxyConfig, RuntimeConfig, RuntimeSettings, SandboxConfig,
+    SubagentConfig,
 };
 pub use error::RuntimeError;
 pub use subagents::build_parent_toolset;

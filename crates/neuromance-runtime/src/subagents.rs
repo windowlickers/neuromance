@@ -337,6 +337,7 @@ mod tests {
             database: None,
             subagents,
             bootstrap: Vec::new(),
+            sandbox: None,
         }
     }
 
