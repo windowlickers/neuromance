@@ -393,4 +393,50 @@ mod tests {
         assert!(resp.is_error);
         assert!(resp.content.contains("does-not-exist"), "{}", resp.content);
     }
+
+    #[cfg(feature = "python-repl")]
+    async fn run_python(server: &SandboxToolServer, code: &str, session: &str) -> Value {
+        let resp = server
+            .execute_tool(Request::new(ExecuteToolRequest {
+                name: "execute_python".to_string(),
+                arguments_json: json!({ "code": code }).to_string(),
+                session_id: session.to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!resp.is_error, "transport error: {}", resp.content);
+        serde_json::from_str(&resp.content).unwrap()
+    }
+
+    /// Interpreter state is scoped to a session: a variable defined in one
+    /// session is invisible to another, and `CloseSession` frees the interpreter
+    /// so the same id starts fresh afterward.
+    #[cfg(feature = "python-repl")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_python_sessions_are_isolated_and_closeable() {
+        let server = server_with(&[tool("execute_python")]);
+
+        // Session "a" defines a variable and reads it back.
+        assert_eq!(run_python(&server, "stash = 42", "a").await["status"], "success");
+        let read = run_python(&server, "print(stash)", "a").await;
+        assert_eq!(read["status"], "success");
+        assert!(read["stdout"].as_str().unwrap().contains("42"));
+
+        // Session "b" cannot see session "a"'s state.
+        let other = run_python(&server, "print(stash)", "b").await;
+        assert_eq!(other["status"], "error", "session b leaked session a state");
+        assert!(other["stderr"].as_str().unwrap().contains("NameError"));
+
+        // Closing "a" frees its interpreter; the id then starts fresh.
+        server
+            .close_session(Request::new(CloseSessionRequest {
+                session_id: "a".to_string(),
+            }))
+            .await
+            .unwrap();
+        let after_close = run_python(&server, "print(stash)", "a").await;
+        assert_eq!(after_close["status"], "error", "closed session retained state");
+    }
 }

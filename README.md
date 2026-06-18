@@ -194,6 +194,39 @@ max_turns = 4
 name = "execute_python"
 ```
 
+## Sandboxed tool execution
+
+Tool execution can run in a separate **sandbox** process so that a misbehaving agent — one that escapes the in-process Python sandbox or abuses `bash` — has no path to the database or the LLM credentials. The orchestrator and the sandbox run as two containers in one pod under different service accounts: the orchestrator (`sa/mancer`) holds the DB and provider credentials and runs the agent loop, approval, and persistence; the sandbox (`sa/mancer-sandbox`) executes the capability tools (`bash`, file tools, `grep`/`find`/`ls`, `execute_python`) against the workspace, with an egress `NetworkPolicy` blocking Postgres and no place in the database `AuthorizationPolicy`.
+
+The same binary runs both roles, selected by subcommand:
+
+```bash
+neuromance-runtime           # orchestrator (default; also `run`)
+neuromance-runtime sandbox   # sandbox tool executor
+```
+
+Both processes read the same config file. The `[sandbox]` section configures the boundary:
+
+```toml
+[sandbox]
+# Address the sandbox process binds its gRPC server to. Loopback-only: the
+# two containers share the pod network namespace, so the channel never leaves
+# the pod. Optional; defaults to 127.0.0.1:50051.
+listen_addr = "127.0.0.1:50051"
+# Endpoint the orchestrator dials. When set, the orchestrator advertises the
+# sandbox's tools to the LLM and routes every approved tool call there instead
+# of executing in-process. Unset (or no [sandbox] section) keeps tools local.
+endpoint = "http://127.0.0.1:50051"
+```
+
+The orchestrator fetches the sandbox's tool definitions once at startup (retrying while the sandbox container comes up) and mirrors each tool's auto-approval requirement, so the startup approval gate behaves exactly as it does for local tools. Approval is always decided by the orchestrator before a call crosses the boundary; the sandbox only executes. A tool that runs but fails is returned as a normal tool error; a transport failure degrades to a failed tool call rather than crashing the orchestrator.
+
+The channel is loopback-only within the pod (Istio mesh covers transport; the channel construction is left pluggable for future SPIFFE/SPIRE identities). The **workspace volume mounts into the sandbox container only** — the orchestrator never touches the workspace and holds no credentials reachable from tool code.
+
+The gRPC build needs `protoc` (provided by the Nix dev shell and build inputs).
+
+**Limitation (this release):** the Python `run_subagent`/`spawn_agents` bridge cannot cross the sandbox boundary — it needs the interpreter and the subagent tower in one process. A config that sets `sandbox.endpoint` together with both `[[subagents]]` and an `execute_python` tool is rejected at startup. Subagents (delegation) and a standalone `execute_python` each work under the sandbox individually.
+
 ## Tool bootstrap
 
 Some tools cache their credentials to disk rather than reading them from the environment on each call. The agent pod has no persistent storage, so those tools must be logged in at container start. Each `[[bootstrap]]` entry names a command the runtime runs once before tasks begin; failures are logged but never fatal — a tool that can't be set up just isn't available, the same as any other tool error.

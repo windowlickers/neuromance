@@ -254,6 +254,31 @@ mod tests {
         cancel.cancel();
     }
 
+    /// `execute_python` runs in the sandbox over gRPC, and a result larger than
+    /// tonic's 4 MiB default still round-trips (the message-size limit is
+    /// raised on both ends).
+    #[cfg(feature = "python-repl")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_execute_python_large_output_round_trips() {
+        let (client, cancel) = spawn_sandbox(&[tool("execute_python")]).await;
+        let tools = remote_tools(&client).await.unwrap();
+        let python = tools
+            .iter()
+            .find(|t| t.get_definition().function.name == "execute_python")
+            .expect("execute_python adapter");
+
+        // Print ~5 MiB, past the 4 MiB default decode limit.
+        let out = python
+            .execute(&json!({ "code": "print('x' * (5 * 1024 * 1024))" }))
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["status"], "success", "{out:.200}");
+        assert!(parsed["stdout"].as_str().unwrap().len() >= 5 * 1024 * 1024);
+        cancel.cancel();
+    }
+
     /// When the sandbox is unreachable, execute returns a transport error
     /// rather than panicking.
     #[tokio::test]
