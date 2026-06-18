@@ -186,6 +186,14 @@ impl SandboxToolService for SandboxToolServer {
     }
 }
 
+/// The configured gRPC service for a toolset, with message-size limits applied.
+#[must_use]
+pub fn service(toolset: Arc<SandboxToolset>) -> SandboxToolServiceServer<SandboxToolServer> {
+    SandboxToolServiceServer::new(SandboxToolServer::new(toolset))
+        .max_decoding_message_size(MAX_MESSAGE_SIZE)
+        .max_encoding_message_size(MAX_MESSAGE_SIZE)
+}
+
 /// Serve the sandbox tool service on `addr` until `cancel` fires.
 ///
 /// # Errors
@@ -195,13 +203,9 @@ pub async fn serve(
     addr: SocketAddr,
     cancel: CancellationToken,
 ) -> Result<(), RuntimeError> {
-    let service = SandboxToolServiceServer::new(SandboxToolServer::new(toolset))
-        .max_decoding_message_size(MAX_MESSAGE_SIZE)
-        .max_encoding_message_size(MAX_MESSAGE_SIZE);
-
     tracing::info!(%addr, "sandbox tool service listening");
     tonic::transport::Server::builder()
-        .add_service(service)
+        .add_service(service(toolset))
         .serve_with_shutdown(addr, cancel.cancelled())
         .await
         .map_err(|e| RuntimeError::Other(anyhow::anyhow!("sandbox gRPC server: {e}")))
