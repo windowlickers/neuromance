@@ -146,13 +146,9 @@ fn build_subagents_at_depth(
             // Reassemble the toolset per run so a fresh Python interpreter is
             // built each time; nothing persists across runs of one subagent or
             // across concurrent sibling runs.
-            let tools = assemble_toolset(
-                &config,
-                &children,
-                &cancel,
-                remote_capabilities.as_deref(),
-            )
-            .map_err(SubagentError::execution)?;
+            let tools =
+                assemble_toolset(&config, &children, &cancel, remote_capabilities.as_deref())
+                    .map_err(SubagentError::execution)?;
             let mut core = Core::new(Arc::clone(&client));
             if let Some(max) = max_turns {
                 core.max_turns = Some(max);
@@ -442,7 +438,8 @@ mod tests {
         let mut config = config_with_subagents(vec![subagent("worker")]);
         config.tools = vec![read_tool()];
 
-        let tools = assemble_toolset(&config, &HashMap::new(), &CancellationToken::new(), None).unwrap();
+        let tools =
+            assemble_toolset(&config, &HashMap::new(), &CancellationToken::new(), None).unwrap();
         let names = tool_names(&tools);
 
         assert_eq!(names, vec!["read".to_string()]);
