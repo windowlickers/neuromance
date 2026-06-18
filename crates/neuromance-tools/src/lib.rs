@@ -268,6 +268,13 @@ impl ToolExecutor {
         }
     }
 
+    /// Wrap an already-populated [`ToolRegistry`], e.g. one returned by
+    /// [`ToolFactoryRegistry::build_all`](crate::ToolFactoryRegistry::build_all).
+    #[must_use]
+    pub const fn from_registry(registry: ToolRegistry) -> Self {
+        Self { registry }
+    }
+
     pub fn add_tool<T: ToolImplementation + 'static>(&mut self, tool: T) {
         self.registry.register(Arc::new(tool));
     }

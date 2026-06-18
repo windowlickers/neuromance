@@ -14,3 +14,11 @@
 //! the pod.
 
 pub mod proto;
+pub mod server;
+
+/// Tool name whose interpreter state is session-scoped in the sandbox.
+pub(crate) const EXECUTE_PYTHON: &str = "execute_python";
+
+/// gRPC message size ceiling, raised from tonic's 4 MiB default to admit large
+/// tool output (file reads, command output).
+pub(crate) const MAX_MESSAGE_SIZE: usize = 32 * 1024 * 1024;
