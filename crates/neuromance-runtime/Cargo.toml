@@ -70,3 +70,4 @@ python-repl = ["dep:neuromance-repl"]
 [dev-dependencies]
 futures = { workspace = true }
 tempfile = { workspace = true }
+serial_test = "3"
