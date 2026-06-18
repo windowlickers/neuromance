@@ -134,7 +134,7 @@ pub async fn connect_tools(
 /// # Errors
 /// Returns [`RuntimeError`] if the sandbox cannot be reached or advertises an
 /// invalid tool.
-pub async fn remote_tools(
+async fn remote_tools(
     client: &SandboxClient,
 ) -> Result<Vec<Arc<dyn ToolImplementation>>, RuntimeError> {
     let definitions = client
