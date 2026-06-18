@@ -1,7 +1,9 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use clap::Parser;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt, util::SubscriberInitExt};
@@ -18,13 +20,32 @@ use neuromance_runtime::{
     lifecycle::shutdown_handler,
     metrics as runtime_metrics, oneshot,
     proxy::build_provider_config,
-    serve,
+    sandbox, serve,
     telemetry::{self, BoxedLayer},
 };
 
+/// Process role. Defaults to the orchestrator when no subcommand is given, so
+/// existing no-argument invocations keep working.
+#[derive(Debug, Clone, Copy, Default, clap::Subcommand)]
+enum Command {
+    /// Run the orchestrator: HTTP task API, agent loop, and persistence.
+    #[default]
+    Run,
+    /// Run the sandbox tool executor: execute capability tools over gRPC on
+    /// behalf of an orchestrator, with no database access.
+    Sandbox,
+}
+
+#[derive(Debug, Parser)]
+#[command(name = "neuromance-runtime", about, version)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let prometheus_handle = runtime_metrics::init().map_err(anyhow::Error::from)?;
+    let cli = Cli::parse();
 
     let config = RuntimeConfig::load_default().map_err(anyhow::Error::from)?;
 
@@ -38,6 +59,32 @@ async fn main() -> Result<()> {
     if telemetry_guard.is_some() {
         info!("OTLP telemetry export enabled");
     }
+
+    let cancel = CancellationToken::new();
+    shutdown_handler(cancel.clone()).context("install shutdown handler")?;
+
+    let result = match cli.command.unwrap_or_default() {
+        Command::Run => run_orchestrator(&config, cancel.clone()).await,
+        Command::Sandbox => run_sandbox(&config, cancel.clone()).await,
+    };
+
+    cancel.cancel();
+
+    if let Err(ref e) = result {
+        error!(error=%e, "runtime exited with error");
+    }
+
+    if let Some(guard) = telemetry_guard {
+        guard.shutdown();
+    }
+
+    result
+}
+
+/// Run the orchestrator role: metrics, health server, agent, and the
+/// configured serving mode.
+async fn run_orchestrator(config: &RuntimeConfig, cancel: CancellationToken) -> Result<()> {
+    let prometheus_handle = runtime_metrics::init().map_err(anyhow::Error::from)?;
     info!(
         mode = ?config.mode,
         agent_id = %config.agent.id,
@@ -46,12 +93,9 @@ async fn main() -> Result<()> {
         "neuromance-runtime starting"
     );
 
-    let cancel = CancellationToken::new();
-    shutdown_handler(cancel.clone()).context("install shutdown handler")?;
-
     let readiness = Arc::new(ReadinessGate::new());
     let health_handle = spawn_health_server(
-        &config,
+        config,
         Arc::clone(&readiness),
         prometheus_handle,
         cancel.clone(),
@@ -59,10 +103,10 @@ async fn main() -> Result<()> {
     .await
     .context("start health server")?;
 
-    let store = init_store(&config)
+    let store = init_store(config)
         .await
         .context("initialize database store")?;
-    let agent = build_agent(&config, store.as_ref(), &cancel).map_err(anyhow::Error::from)?;
+    let agent = build_agent(config, store.as_ref(), &cancel).map_err(anyhow::Error::from)?;
 
     // Best-effort: run one-time tool setup before tasks, since the pod has no
     // persistent storage to cache credentials a tool writes to disk.
@@ -71,8 +115,8 @@ async fn main() -> Result<()> {
     readiness.set_ready(true);
 
     let result = match config.mode {
-        Mode::Oneshot => run_oneshot(&config, agent, cancel.clone()).await,
-        Mode::Serve => run_serve(&config, agent, store, cancel.clone()).await,
+        Mode::Oneshot => run_oneshot(config, agent, cancel.clone()).await,
+        Mode::Serve => run_serve(config, agent, store, cancel.clone()).await,
     };
 
     readiness.set_ready(false);
@@ -87,15 +131,26 @@ async fn main() -> Result<()> {
         warn!(error=%e, "health server did not shut down within grace period");
     }
 
-    if let Err(ref e) = result {
-        error!(error=%e, "runtime exited with error");
-    }
-
-    if let Some(guard) = telemetry_guard {
-        guard.shutdown();
-    }
-
     result
+}
+
+/// Run the sandbox role: serve the gRPC tool service until shutdown. No agent,
+/// database, or HTTP task API — just tool execution.
+async fn run_sandbox(config: &RuntimeConfig, cancel: CancellationToken) -> Result<()> {
+    let settings = config.sandbox.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("the sandbox subcommand requires a [sandbox] config section")
+    })?;
+    let addr: SocketAddr = settings
+        .listen_addr
+        .parse()
+        .with_context(|| format!("invalid sandbox.listen_addr: {}", settings.listen_addr))?;
+
+    let toolset = Arc::new(sandbox::server::build_sandbox_toolset(&config.tools)?);
+    info!(%addr, tools = config.tools.len(), "neuromance-runtime sandbox starting");
+
+    sandbox::server::serve(toolset, addr, cancel)
+        .await
+        .map_err(anyhow::Error::from)
 }
 
 fn init_tracing(extra_layer: Option<BoxedLayer<Registry>>) {

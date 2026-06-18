@@ -32,6 +32,7 @@ neuromance-tools = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }
+clap = { workspace = true }
 chrono = { workspace = true }
 dashmap = { workspace = true }
 metrics = { workspace = true }
