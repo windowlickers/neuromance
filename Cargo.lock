@@ -1988,6 +1988,7 @@ dependencies = [
  "async-trait",
  "axum",
  "chrono",
+ "clap",
  "dashmap",
  "futures",
  "metrics",
