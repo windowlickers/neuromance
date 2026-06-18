@@ -1,0 +1,64 @@
+syntax = "proto3";
+
+// Tool-execution boundary between the orchestrator process (which holds DB and
+// LLM credentials) and the sandbox process (which executes capability tools
+// against the filesystem and network under a restricted service account).
+//
+// The orchestrator advertises the sandbox's tools to the LLM via ListTools and
+// dispatches each approved tool call through ExecuteTool. The sandbox never
+// receives provider credentials and has no route to the database.
+package sandbox.v1;
+
+service SandboxToolService {
+  // Enumerate the tools the sandbox hosts so the orchestrator can advertise
+  // their schemas to the LLM and mirror their approval requirements.
+  rpc ListTools(ListToolsRequest) returns (ListToolsResponse);
+
+  // Execute a single tool call. The orchestrator has already applied approval
+  // before calling this; the sandbox just runs the tool.
+  rpc ExecuteTool(ExecuteToolRequest) returns (ExecuteToolResponse);
+
+  // Release a stateful interpreter session (see ExecuteToolRequest.session_id).
+  rpc CloseSession(CloseSessionRequest) returns (CloseSessionResponse);
+}
+
+message ListToolsRequest {}
+
+// A tool the sandbox can execute, mirroring neuromance_tools::ToolImplementation.
+message ToolDefinition {
+  string name = 1;
+  string description = 2;
+  // serde_json of the tool's JSON-Schema parameters
+  // (neuromance_common::tools::Function.parameters).
+  string parameters_json = 3;
+  // Mirrors ToolImplementation::is_auto_approved(); load-bearing for the
+  // orchestrator's approval decision.
+  bool auto_approved = 4;
+}
+
+message ListToolsResponse {
+  repeated ToolDefinition tools = 1;
+}
+
+message ExecuteToolRequest {
+  // FunctionCall.name
+  string name = 1;
+  // FunctionCall.arguments — a JSON-encoded object, parsed sandbox-side.
+  string arguments_json = 2;
+  // Stateful-interpreter session key. Empty for stateless tools; set per agent
+  // run for execute_python so interpreter state never bleeds across runs.
+  string session_id = 3;
+}
+
+message ExecuteToolResponse {
+  // The tool's textual result. When is_error is true this is the flattened
+  // error message.
+  string content = 1;
+  bool is_error = 2;
+}
+
+message CloseSessionRequest {
+  string session_id = 1;
+}
+
+message CloseSessionResponse {}
