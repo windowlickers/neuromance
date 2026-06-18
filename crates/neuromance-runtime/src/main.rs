@@ -106,7 +106,9 @@ async fn run_orchestrator(config: &RuntimeConfig, cancel: CancellationToken) -> 
     let store = init_store(config)
         .await
         .context("initialize database store")?;
-    let agent = build_agent(config, store.as_ref(), &cancel).map_err(anyhow::Error::from)?;
+    let agent = build_agent(config, store.as_ref(), &cancel)
+        .await
+        .map_err(anyhow::Error::from)?;
 
     // Best-effort: run one-time tool setup before tasks, since the pod has no
     // persistent storage to cache credentials a tool writes to disk.
@@ -247,7 +249,7 @@ async fn init_store(config: &RuntimeConfig) -> Result<Option<Arc<PgConversationS
     Ok(Some(Arc::new(store)))
 }
 
-fn build_agent(
+async fn build_agent(
     config: &RuntimeConfig,
     store: Option<&Arc<PgConversationStore>>,
     cancel: &CancellationToken,
@@ -280,11 +282,19 @@ fn build_agent(
         core = core.with_persistence(sink);
     }
 
+    // When a sandbox endpoint is configured, capability tools execute in the
+    // sandbox process: fetch their definitions once and reuse the adapters
+    // across the main agent and every subagent.
+    let remote_capabilities = match config.sandbox.as_ref().and_then(|s| s.endpoint.as_ref()) {
+        Some(endpoint) => Some(sandbox::connect_tools(endpoint).await?),
+        None => None,
+    };
+
     // The main agent's toolset, including delegate tools for every configured
     // subagent and the delegation tower beneath them (bounded by
     // runtime.max_delegation_depth). The store is threaded through so subagent
     // conversations persist and record their parent link too.
-    let tools = build_parent_toolset(config, store, cancel)?;
+    let tools = build_parent_toolset(config, store, cancel, remote_capabilities.as_deref())?;
 
     if matches!(config.approval.mode, ApprovalMode::Auto) {
         let mut needs_approval: Vec<String> = tools
