@@ -11,6 +11,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::Value;
 
+use neuromance_common::delegation;
 use neuromance_common::tools::{Function, Tool};
 use neuromance_tools::{ToolError, ToolImplementation};
 
@@ -18,13 +19,25 @@ use super::client::SandboxClient;
 use super::proto::ToolDefinition;
 use crate::error::RuntimeError;
 
+/// The session key for the current agent run: the ambient task id when one is in
+/// scope, else empty. Serve mode seeds a fresh task id per task (one
+/// `execute_with_history` call), so `execute_python` gets a per-run interpreter
+/// whose state never bleeds across tasks; the orchestrator frees it with
+/// [`SandboxClient::close_session`] once the run completes. Stateless tools
+/// ignore the session entirely. Empty outside any task scope (e.g. oneshot),
+/// which the sandbox maps to its single default interpreter.
+fn run_session_id() -> String {
+    delegation::current()
+        .task_id
+        .map(|id| id.to_string())
+        .unwrap_or_default()
+}
+
 /// A sandbox-hosted tool, executed remotely over gRPC.
 pub struct RemoteToolAdapter {
     client: SandboxClient,
     definition: Tool,
     auto_approved: bool,
-    /// Stateful-interpreter session key, empty for stateless tools.
-    session_id: String,
 }
 
 impl RemoteToolAdapter {
@@ -51,15 +64,7 @@ impl RemoteToolAdapter {
             client,
             definition,
             auto_approved: def.auto_approved,
-            session_id: String::new(),
         })
-    }
-
-    /// Scope this tool's execution to `session_id` (for stateful interpreters).
-    #[must_use]
-    pub fn with_session_id(mut self, session_id: String) -> Self {
-        self.session_id = session_id;
-        self
     }
 }
 
@@ -78,7 +83,7 @@ impl ToolImplementation for RemoteToolAdapter {
         // a tool error so the loop feeds it back to the LLM rather than crashing.
         let response = self
             .client
-            .execute_tool(name.clone(), arguments_json, self.session_id.clone())
+            .execute_tool(name.clone(), arguments_json, run_session_id())
             .await
             .map_err(|status| {
                 tracing::warn!(tool = %name, %status, "sandbox transport error");
@@ -97,23 +102,21 @@ impl ToolImplementation for RemoteToolAdapter {
     }
 }
 
-/// Connect to the sandbox at `endpoint` and build adapters for its tools,
-/// retrying briefly so a sandbox container that is still starting does not
-/// crash-loop the orchestrator.
+/// Build adapters for the sandbox's tools over `client`, retrying briefly so a
+/// sandbox container that is still starting does not crash-loop the
+/// orchestrator.
 ///
 /// # Errors
-/// Returns [`RuntimeError`] if the endpoint is invalid or the sandbox stays
-/// unreachable across all retries.
+/// Returns [`RuntimeError`] if the sandbox stays unreachable across all retries.
 pub async fn connect_tools(
-    endpoint: &str,
+    client: &SandboxClient,
 ) -> Result<Vec<Arc<dyn ToolImplementation>>, RuntimeError> {
     const ATTEMPTS: u32 = 10;
     const BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
 
-    let client = SandboxClient::connect(endpoint)?;
     let mut last_err = None;
     for attempt in 1..=ATTEMPTS {
-        match remote_tools(&client).await {
+        match remote_tools(client).await {
             Ok(tools) => return Ok(tools),
             Err(e) => {
                 tracing::warn!(attempt, error = %e, "sandbox not ready; retrying");
@@ -122,9 +125,7 @@ pub async fn connect_tools(
             }
         }
     }
-    Err(last_err.unwrap_or_else(|| {
-        RuntimeError::Config(format!("sandbox at {endpoint} is unreachable"))
-    }))
+    Err(last_err.unwrap_or_else(|| RuntimeError::Config("sandbox is unreachable".to_string())))
 }
 
 /// Connect to the sandbox and build a [`ToolImplementation`] adapter for each
@@ -184,9 +185,9 @@ mod tests {
 
         let cancel = CancellationToken::new();
         let serve_cancel = cancel.clone();
-        tokio::spawn(async move {
-            crate::sandbox::server::serve(toolset, addr, serve_cancel).await
-        });
+        tokio::spawn(
+            async move { crate::sandbox::server::serve(toolset, addr, serve_cancel).await },
+        );
 
         let client = SandboxClient::connect(&format!("http://{addr}")).unwrap();
         // Wait for the server to bind.
@@ -247,10 +248,7 @@ mod tests {
 
         // Missing the required "command" argument -> InvalidArguments.
         let err = bash.execute(&json!({})).await.unwrap_err();
-        assert!(
-            err.to_string().to_lowercase().contains("command"),
-            "{err}"
-        );
+        assert!(err.to_string().to_lowercase().contains("command"), "{err}");
         cancel.cancel();
     }
 
@@ -276,6 +274,60 @@ mod tests {
         let parsed: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(parsed["status"], "success", "{out:.200}");
         assert!(parsed["stdout"].as_str().unwrap().len() >= 5 * 1024 * 1024);
+        cancel.cancel();
+    }
+
+    /// `execute_python` isolation is driven by the ambient task id: two runs
+    /// under different task scopes get independent interpreters, and releasing a
+    /// run's session frees its interpreter so a later run with the same id
+    /// starts fresh. Exercises the production path — the session id is derived
+    /// from the delegation context, not hand-passed.
+    #[cfg(feature = "python-repl")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_execute_python_isolated_per_task_scope() {
+        use uuid::Uuid;
+
+        use neuromance_common::delegation::{self, DelegationContext};
+
+        async fn run_in(python: &Arc<dyn ToolImplementation>, task: Uuid, code: &str) -> Value {
+            let ctx = DelegationContext {
+                conversation_id: None,
+                task_id: Some(task),
+            };
+            let out = delegation::scope(ctx, python.execute(&json!({ "code": code })))
+                .await
+                .unwrap();
+            serde_json::from_str(&out).unwrap()
+        }
+
+        let (client, cancel) = spawn_sandbox(&[tool("execute_python")]).await;
+        let tools = remote_tools(&client).await.unwrap();
+        let python = tools
+            .iter()
+            .find(|t| t.get_definition().function.name == "execute_python")
+            .expect("execute_python adapter");
+
+        let task_a = Uuid::new_v4();
+        let task_b = Uuid::new_v4();
+
+        // Task A defines a variable and reads it back within its own scope.
+        assert_eq!(
+            run_in(python, task_a, "stash = 7").await["status"],
+            "success"
+        );
+        let read = run_in(python, task_a, "print(stash)").await;
+        assert!(read["stdout"].as_str().unwrap().contains('7'), "{read}");
+
+        // Task B gets a separate interpreter: it cannot see Task A's variable.
+        let other = run_in(python, task_b, "print(stash)").await;
+        assert_eq!(other["status"], "error", "task b leaked task a state");
+
+        // Releasing Task A's session frees its interpreter; the id starts fresh.
+        client.close_session(task_a.to_string()).await.unwrap();
+        let after = run_in(python, task_a, "print(stash)").await;
+        assert_eq!(after["status"], "error", "closed session retained state");
+
         cancel.cancel();
     }
 
