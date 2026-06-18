@@ -28,6 +28,7 @@ pub mod lifecycle;
 pub mod metrics;
 pub mod oneshot;
 pub mod proxy;
+pub mod sandbox;
 pub mod serve;
 pub mod subagents;
 pub mod telemetry;

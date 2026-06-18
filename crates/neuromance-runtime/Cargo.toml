@@ -55,6 +55,12 @@ tracing-opentelemetry = { workspace = true }
 opentelemetry-appender-tracing = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+prost = { workspace = true }
+
+[build-dependencies]
+tonic-prost-build = { workspace = true }
 
 [features]
 default = []
