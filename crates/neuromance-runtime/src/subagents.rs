@@ -38,9 +38,7 @@ use neuromance_tools::{ToolConfig, ToolFactoryRegistry, ToolImplementation, Tool
 use crate::config::RuntimeConfig;
 use crate::error::RuntimeError;
 use crate::proxy::build_provider_config;
-
-/// Tool name the runtime takes over to expose subagents in Python.
-const EXECUTE_PYTHON: &str = "execute_python";
+use crate::sandbox::EXECUTE_PYTHON;
 
 /// A per-task cleanup handle for the main agent's in-process `execute_python`
 /// interpreter. Calling it clears the interpreter's user namespace so state
