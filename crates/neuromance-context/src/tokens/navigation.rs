@@ -3,7 +3,7 @@
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::TokenCounter;
+use super::TokenCounter;
 use crate::error::TokenCounterError;
 
 /// Information about a single token including its position in the text.
