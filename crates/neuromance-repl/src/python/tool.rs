@@ -247,6 +247,29 @@ impl Default for PythonReplToolConfig {
 pub struct PythonReplToolFactory;
 
 impl PythonReplToolFactory {
+    /// Parse the `execute_python` config block into its restricted-mode flag.
+    ///
+    /// Applies the same `deny_unknown_fields` validation as [`build_tool`], so
+    /// callers that build their own interpreters (e.g. the sandbox server)
+    /// interpret the config identically and reject the same malformed blocks
+    /// instead of silently defaulting to restricted.
+    ///
+    /// [`build_tool`]: PythonReplToolFactory::build_tool
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError`] if the config block is malformed (unknown field,
+    /// wrong-typed value).
+    pub fn parse_restricted(config: &Value) -> Result<bool, ToolError> {
+        let cfg: PythonReplToolConfig = if config.is_null() {
+            PythonReplToolConfig::default()
+        } else {
+            serde_json::from_value(config.clone())
+                .map_err(|e| ToolError::execution(format!("invalid execute_python config: {e}")))?
+        };
+        Ok(cfg.restricted)
+    }
+
     /// Construct the `execute_python` tool from its config block.
     ///
     /// Returns the typed `Arc` so callers that need a handle on the tool (e.g.
@@ -258,14 +281,9 @@ impl PythonReplToolFactory {
     /// Returns [`ToolError`] if the config block is malformed or the
     /// interpreter fails to initialize.
     pub fn build_tool(config: &Value) -> Result<Arc<PythonReplTool>, ToolError> {
-        let cfg: PythonReplToolConfig = if config.is_null() {
-            PythonReplToolConfig::default()
-        } else {
-            serde_json::from_value(config.clone())
-                .map_err(|e| ToolError::execution(format!("invalid execute_python config: {e}")))?
-        };
+        let restricted = Self::parse_restricted(config)?;
 
-        let tool = if cfg.restricted {
+        let tool = if restricted {
             PythonReplTool::new(Arc::new(PythonRepl::new()?))
         } else {
             tracing::warn!(
