@@ -652,6 +652,84 @@ mod tests {
         assert!(after["stderr"].as_str().unwrap().contains("NameError"));
     }
 
+    /// The bridged `execute_python` (built when subagents exist) yields a reset
+    /// that clears user state while preserving the injected `run_subagent` and
+    /// `spawn_agents` primitives. This is what lets serve-mode delegation keep
+    /// working after the per-task reset; it would break if a future change moved
+    /// the callbacks out of the interpreter globals that reset re-establishes.
+    #[cfg(feature = "python-repl")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_bridge_session_reset_preserves_subagent_primitives() {
+        use serde_json::json;
+
+        let mut config = config_with_subagents(vec![subagent("worker")]);
+        config.tools = vec![ToolConfig {
+            name: "execute_python".to_string(),
+            config: serde_json::Value::Null,
+        }];
+        let children = mock_children(&["worker"]);
+
+        let (tools, reset) =
+            assemble_toolset(&config, &children, &CancellationToken::new(), None).unwrap();
+        let reset = reset.expect("a bridged execute_python must yield a reset handle");
+
+        let python = tools
+            .iter()
+            .find(|t| t.get_definition().function.name == "execute_python")
+            .expect("execute_python must be registered")
+            .clone();
+
+        // Define user state and prove the bridge is wired in before the reset.
+        // MockSubagent echoes "ok", so a successful delegation reaches stdout.
+        python
+            .execute(&json!({ "code": "marker = 7" }))
+            .await
+            .unwrap();
+        let before: serde_json::Value = serde_json::from_str(
+            &python
+                .execute(&json!({ "code": "print(run_subagent('worker', 'do x'))" }))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(before["status"], "success");
+        assert!(before["stdout"].as_str().unwrap().contains("ok"));
+
+        reset().await;
+
+        // User state is cleared...
+        let cleared: serde_json::Value = serde_json::from_str(
+            &python
+                .execute(&json!({ "code": "print(marker)" }))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cleared["status"], "error");
+        assert!(cleared["stderr"].as_str().unwrap().contains("NameError"));
+
+        // ...but run_subagent and the spawn_agents prelude still resolve and run.
+        let after: serde_json::Value = serde_json::from_str(
+            &python
+                .execute(&json!({
+                    "code": "print(run_subagent('worker', 'again'))\n\
+                             print(spawn_agents([Agent('worker', 'fan')]))"
+                }))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            after["status"], "success",
+            "delegation must survive reset: {after:?}"
+        );
+        assert!(
+            after["stdout"].as_str().unwrap().contains("ok"),
+            "run_subagent/spawn_agents output missing after reset: {after:?}"
+        );
+    }
+
     /// With no subagents configured, the toolset is the capability tools only
     /// and no client is built.
     #[test]
