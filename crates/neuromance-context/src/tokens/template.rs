@@ -10,7 +10,7 @@ use tokenizers::Tokenizer;
 use tracing::{debug, error};
 
 use crate::error::TokenCounterError;
-use crate::{ModelConfig, TokenCounter, jinja_compat};
+use super::{ModelConfig, TokenCounter, jinja_compat};
 
 impl TokenCounter {
     /// Loads the chat template for a model.
@@ -62,7 +62,7 @@ impl TokenCounter {
             return None;
         }
 
-        let info = crate::gguf::GGUFModelInfo::from_file(path).ok()?;
+        let info = super::gguf::GGUFModelInfo::from_file(path).ok()?;
         let template = info.chat_template?;
         debug!("Found chat template in GGUF metadata");
         Some(template)

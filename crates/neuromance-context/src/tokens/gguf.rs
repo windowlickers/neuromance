@@ -6,7 +6,7 @@
 //! ## Example
 //!
 //! ```no_run
-//! use neuromance_context::gguf::GGUFModelInfo;
+//! use neuromance_context::tokens::gguf::GGUFModelInfo;
 //!
 //! # fn example() -> Result<(), neuromance_context::TokenCounterError> {
 //! let info = GGUFModelInfo::from_file("model.gguf")?;

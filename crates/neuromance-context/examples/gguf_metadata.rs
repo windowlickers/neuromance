@@ -6,7 +6,7 @@
 //! Usage:
 //!   cargo run --example gguf_metadata -- path/to/model.gguf
 
-use neuromance_context::gguf::GGUFModelInfo;
+use neuromance_context::tokens::gguf::GGUFModelInfo;
 use std::env;
 
 fn main() -> anyhow::Result<()> {
@@ -69,7 +69,7 @@ fn main() -> anyhow::Result<()> {
     for key in keys.iter().take(20) {
         if let Some(value) = info.raw_metadata.get(*key) {
             match value {
-                neuromance_context::gguf::MetadataValue::String(s) => {
+                neuromance_context::tokens::gguf::MetadataValue::String(s) => {
                     if s.len() > 50 {
                         println!(
                             "  {} = \"{}...\"",
@@ -80,14 +80,14 @@ fn main() -> anyhow::Result<()> {
                         println!("  {} = \"{}\"", key, s);
                     }
                 }
-                neuromance_context::gguf::MetadataValue::U32(n) => println!("  {} = {}", key, n),
-                neuromance_context::gguf::MetadataValue::U64(n) => println!("  {} = {}", key, n),
-                neuromance_context::gguf::MetadataValue::I32(n) => println!("  {} = {}", key, n),
-                neuromance_context::gguf::MetadataValue::I64(n) => println!("  {} = {}", key, n),
-                neuromance_context::gguf::MetadataValue::F32(f) => println!("  {} = {}", key, f),
-                neuromance_context::gguf::MetadataValue::F64(f) => println!("  {} = {}", key, f),
-                neuromance_context::gguf::MetadataValue::Bool(b) => println!("  {} = {}", key, b),
-                neuromance_context::gguf::MetadataValue::Array(_) => {
+                neuromance_context::tokens::gguf::MetadataValue::U32(n) => println!("  {} = {}", key, n),
+                neuromance_context::tokens::gguf::MetadataValue::U64(n) => println!("  {} = {}", key, n),
+                neuromance_context::tokens::gguf::MetadataValue::I32(n) => println!("  {} = {}", key, n),
+                neuromance_context::tokens::gguf::MetadataValue::I64(n) => println!("  {} = {}", key, n),
+                neuromance_context::tokens::gguf::MetadataValue::F32(f) => println!("  {} = {}", key, f),
+                neuromance_context::tokens::gguf::MetadataValue::F64(f) => println!("  {} = {}", key, f),
+                neuromance_context::tokens::gguf::MetadataValue::Bool(b) => println!("  {} = {}", key, b),
+                neuromance_context::tokens::gguf::MetadataValue::Array(_) => {
                     println!("  {} = [array]", key)
                 }
             }
