@@ -744,7 +744,7 @@ impl neuromance_context::skills::SkillSource for OneSkillSource {
 }
 
 #[tokio::test]
-async fn test_builder_skills_registers_tool_and_injects_menu() {
+async fn test_builder_skills_registers_tool_and_keeps_clean_seed() {
     let catalog = Arc::new(
         neuromance_context::skills::SkillCatalog::build(vec![Box::new(OneSkillSource)]).await,
     );
@@ -755,13 +755,19 @@ async fn test_builder_skills_registers_tool_and_injects_menu() {
         .build();
 
     assert!(agent.core.tool_executor.has_tool("load_skill"));
-    let menu = agent
-        .messages
-        .iter()
-        .find(|m| m.content.contains("<skills_instructions>"))
-        .expect("menu system message should be injected");
-    assert_eq!(menu.role, MessageRole::System);
-    assert!(menu.content.contains("deploy: deploy the app"));
+    // The menu is injected by the SkillsHook inside the conversation loop, not
+    // baked into the seed, so the seed stays a precondition-satisfying
+    // [System, User] pair rather than [System, System(menu), User].
+    assert_eq!(agent.messages.len(), 2);
+    assert_eq!(agent.messages[0].role, MessageRole::System);
+    assert_eq!(agent.messages[1].role, MessageRole::User);
+    assert!(
+        agent
+            .messages
+            .iter()
+            .all(|m| !m.content.contains("<skills_instructions>")),
+        "menu must not be baked into the seed"
+    );
 }
 
 #[tokio::test]

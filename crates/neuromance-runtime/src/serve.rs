@@ -218,6 +218,9 @@ pub struct ServeState {
     conversations: Arc<DashMap<Uuid, ConversationRecord>>,
     work_tx: mpsc::Sender<WorkerJob>,
     system_prompt: Arc<str>,
+    /// File-oriented skills menu folded into each new conversation's system
+    /// prompt; `None` when no skills are configured.
+    skills_menu: Option<Arc<str>>,
     agent_id: Arc<str>,
     /// Durable conversation record; `None` when `[database]` is not configured.
     store: Option<Arc<PgConversationStore>>,
@@ -288,7 +291,14 @@ fn seed_new_conversation(state: &ServeState, system_prompt: Option<&str>) -> Uui
     let id = Uuid::new_v4();
     let now = Utc::now();
     let prompt = system_prompt.unwrap_or_else(|| state.system_prompt.as_ref());
-    let messages = vec![Message::system(id, prompt)];
+    // Fold the skills menu into the seed system message so the conversation
+    // opens as a clean [System(prompt+menu), …] — the menu lists on-disk paths
+    // the agent reads, and round-trips through persisted history thereafter.
+    let seed = state.skills_menu.as_ref().map_or_else(
+        || Message::system(id, prompt),
+        |menu| Message::system(id, format!("{prompt}\n\n{menu}")),
+    );
+    let messages = vec![seed];
     state.conversations.insert(
         id,
         ConversationRecord {
@@ -913,6 +923,7 @@ pub async fn run<C: LLMClient + Send + Sync + 'static>(
     store: Option<Arc<PgConversationStore>>,
     sandbox_client: Option<SandboxClient>,
     local_python: Option<SessionReset>,
+    skills_menu: Option<Arc<str>>,
     cancel: CancellationToken,
 ) -> Result<()> {
     let tasks: Arc<DashMap<Uuid, TaskRecord>> = Arc::new(DashMap::new());
@@ -944,6 +955,7 @@ pub async fn run<C: LLMClient + Send + Sync + 'static>(
         conversations: Arc::clone(&conversations),
         work_tx,
         system_prompt,
+        skills_menu,
         agent_id: Arc::from(config.agent.id.as_str()),
         store: store.clone(),
     };
@@ -1243,11 +1255,51 @@ mod tests {
                 conversations,
                 work_tx,
                 system_prompt: Arc::from("system"),
+                skills_menu: None,
                 agent_id: Arc::from("test-agent"),
                 store: None,
             },
             work_rx,
         )
+    }
+
+    #[test]
+    fn test_seed_folds_skills_menu_into_single_system_message() {
+        let (mut state, _rx) = fresh_state(4);
+        state.skills_menu = Some(Arc::from(
+            "<skills_instructions>\n- alpha: a (file: /tmp/x/SKILL.md)\n</skills_instructions>",
+        ));
+
+        let id = seed_new_conversation(&state, None);
+        let messages = state
+            .conversations
+            .get(&id)
+            .expect("conversation should be seeded")
+            .messages
+            .clone();
+
+        // Exactly one system message — the menu is folded in, not a second
+        // System message after the user turn.
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, MessageRole::System);
+        assert!(messages[0].content.starts_with("system"));
+        assert!(messages[0].content.contains("<skills_instructions>"));
+        assert!(messages[0].content.contains("file: /tmp/x/SKILL.md"));
+    }
+
+    #[test]
+    fn test_seed_without_skills_menu_is_plain_prompt() {
+        let (state, _rx) = fresh_state(4);
+        let id = seed_new_conversation(&state, None);
+        let messages = state
+            .conversations
+            .get(&id)
+            .expect("conversation should be seeded")
+            .messages
+            .clone();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "system");
     }
 
     fn record(status: TaskStatus, created_at: DateTime<Utc>) -> TaskRecord {

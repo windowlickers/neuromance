@@ -26,7 +26,6 @@ use neuromance_runtime::{
     rules, sandbox, serve, skills,
     telemetry::{self, BoxedLayer},
 };
-use neuromance_tools::SkillTool;
 
 /// Process role. Defaults to the orchestrator when no subcommand is given, so
 /// existing no-argument invocations keep working.
@@ -141,8 +140,12 @@ async fn run_orchestrator(config: &RuntimeConfig, cancel: CancellationToken) -> 
 
     readiness.set_ready(true);
 
+    // The menu lists each skill's materialized file path; fold it into the seed
+    // system prompt so the agent reads skills from disk.
+    let skills_menu = skills.as_ref().and_then(|s| s.menu());
+
     let result = match config.mode {
-        Mode::Oneshot => run_oneshot(config, agent, cancel.clone()).await,
+        Mode::Oneshot => run_oneshot(config, agent, skills_menu.as_deref(), cancel.clone()).await,
         Mode::Serve => {
             run_serve(
                 config,
@@ -150,6 +153,7 @@ async fn run_orchestrator(config: &RuntimeConfig, cancel: CancellationToken) -> 
                 store,
                 sandbox_client,
                 local_python,
+                skills_menu.map(Arc::from),
                 cancel.clone(),
             )
             .await
@@ -398,17 +402,6 @@ async fn build_agent(
         core.tool_executor.add_tool_arc(tool);
     }
 
-    // The load_skill tool is always auto-approved (read-only), so it is
-    // registered after the approval safety check above without tripping it.
-    if let Some(skills) = skills
-        && skills.invocation.tool()
-    {
-        core.tool_executor.add_tool_arc(Arc::new(SkillTool::new(
-            Arc::clone(&skills.catalog),
-            skills.body_budget,
-        )));
-    }
-
     match config.approval.mode {
         ApprovalMode::Auto => {
             core.auto_approve_tools = true;
@@ -430,8 +423,8 @@ async fn build_agent(
 
     core = apply_context_compaction(core, config, llm_config)?;
 
-    // Skills inject the menu at conversation start and expand `$mention`ed skill
-    // bodies from the latest user message, entirely inside the loop.
+    // The skills menu is folded into the system prompt at seed time; the hook
+    // only expands `$mention`ed bodies from the latest user message in-loop.
     if let Some(skills) = skills {
         core = core.with_hook(skills.hook() as Arc<dyn neuromance_common::hook::Hook>);
     }
@@ -448,9 +441,10 @@ async fn build_agent(
 async fn run_oneshot(
     config: &RuntimeConfig,
     mut agent: Agent<Box<dyn LLMClient>>,
+    skills_menu: Option<&str>,
     cancel: CancellationToken,
 ) -> Result<()> {
-    oneshot::run(config, &mut agent, cancel).await
+    oneshot::run(config, &mut agent, skills_menu, cancel).await
 }
 
 async fn run_serve(
@@ -459,7 +453,17 @@ async fn run_serve(
     store: Option<Arc<PgConversationStore>>,
     sandbox_client: Option<sandbox::SandboxClient>,
     local_python: Option<SessionReset>,
+    skills_menu: Option<Arc<str>>,
     cancel: CancellationToken,
 ) -> Result<()> {
-    serve::run(config, agent, store, sandbox_client, local_python, cancel).await
+    serve::run(
+        config,
+        agent,
+        store,
+        sandbox_client,
+        local_python,
+        skills_menu,
+        cancel,
+    )
+    .await
 }

@@ -269,14 +269,11 @@ strategy = "one_shot"
 
 ## Skills
 
-An optional `[skills]` section gives the agent **skills** — directories containing a `SKILL.md` (YAML frontmatter with `name` and `description`, plus optional [agentskills.io](https://agentskills.io) fields, followed by a Markdown body of reusable instructions). Skills use progressive disclosure: a cheap menu of `name: description` is injected once per conversation, and a skill's full body is loaded into context only when it is summoned. This keeps the system prompt stable and cache-friendly.
+An optional `[skills]` section gives the agent **skills** — directories containing a `SKILL.md` (YAML frontmatter with `name` and `description`, plus optional [agentskills.io](https://agentskills.io) fields, followed by a Markdown body of reusable instructions). Skills use progressive disclosure: a cheap menu of `name: description (file: …)` is folded into the system prompt, and a skill's full body lives on disk, read only when needed. This keeps the system prompt stable and cache-friendly.
 
 Skills are discovered from on-host directory `roots` (each immediate subdirectory containing a `SKILL.md` is a skill) and/or a corpus-shaped HTTP `endpoint` (`GET /skills` for the menu, `GET /skills/{id}` for a body). On-host roots take precedence over the endpoint when a skill name appears in both.
 
-A skill's body is summoned two ways, selected by `invocation`:
-
-- **`load_skill` tool** — the model calls `load_skill(name)` and the body is returned as the tool result. Suited to autonomous runs.
-- **`$mention`** — `$name`, `skill://id`, or a `[text](skill://id)` link in user input injects the body as a message. Common shell variables (`$PATH`, `$HOME`, …) are ignored.
+At startup the runtime **materializes** every discovered skill to a local temp directory and rebuilds the catalog over it, so the corpus is only a boot-time dependency. The menu then lists each skill's on-disk path, and the agent loads a skill by **reading that file** with its `read` tool — no fetch at reasoning time. In addition, when `mention` is enabled a `$name`, `skill://id`, or `[text](skill://id)` link in user input (for example a `/thing-skill` slash command) injects the body inline as a message; common shell variables (`$PATH`, `$HOME`, …) are ignored.
 
 ```toml
 [skills]
@@ -286,9 +283,9 @@ roots = ["/etc/neuromance/skills", "./skills"]
 endpoint = "https://corpus.internal/api/v1/skills"
 # Optional env var holding a bearer token for the endpoint.
 endpoint_token_env = "CORPUS_TOKEN"
-# tool | mention | both (default)
-invocation = "both"
-# Byte budgets for the menu and each loaded body (default 8192 each).
+# Expand `$name` mentions in user input into the skill body (default true).
+mention = true
+# Byte budgets for the menu and each mention-injected body (default 8192 each).
 menu_budget_bytes = 8192
 body_budget_bytes = 8192
 ```

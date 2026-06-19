@@ -10,7 +10,7 @@ use neuromance_common::chat::Message;
 use neuromance_common::client::ToolChoice;
 use neuromance_common::hook::{FnReviewHook, Hook};
 use neuromance_common::tools::{ToolApproval, ToolCall};
-use neuromance_context::skills::SkillCatalog;
+use neuromance_context::skills::{SkillCatalog, SkillsHook};
 use neuromance_tools::{SkillTool, ToolImplementation};
 
 use crate::Agent;
@@ -157,11 +157,9 @@ impl<C: LLMClient> AgentBuilder<C> {
     /// Enable skills from `catalog`.
     ///
     /// At build time this registers the `load_skill` tool (so the model can
-    /// pull a skill's body into context) and injects the skills menu as a
-    /// system message. To also support `$mention` invocation, expand mentions
-    /// in incoming user input with
-    /// [`SkillCatalog::mention_messages`](neuromance_context::skills::SkillCatalog::mention_messages)
-    /// and prepend the result to the conversation.
+    /// pull a skill's body into context) and a [`SkillsHook`] that injects the
+    /// skills menu at conversation start and expands `$mention`ed skill bodies
+    /// from the latest user message, both from inside the conversation loop.
     ///
     /// # Arguments
     /// * `catalog` - The skill catalog to serve from
@@ -190,12 +188,21 @@ impl<C: LLMClient> AgentBuilder<C> {
         let conversation_id = Uuid::new_v4();
 
         // The load_skill tool is read-only and auto-approved, registered before
-        // the conversation is seeded so it is available on the first turn.
-        if let Some(skills) = &self.skills {
+        // the conversation is seeded so it is available on the first turn. The
+        // SkillsHook injects the menu and `$mention` bodies from inside the
+        // loop, keeping the seed a clean [System, User] pair.
+        if let Some(skills) = self.skills.take() {
             self.core.tool_executor.add_tool(SkillTool::new(
                 Arc::clone(&skills.catalog),
                 skills.body_budget,
             ));
+            self.core = self.core.with_hook(Arc::new(SkillsHook::new(
+                skills.catalog,
+                skills.menu_budget,
+                skills.body_budget,
+                true,
+                true,
+            )));
         }
 
         // Build messages from system and user prompts
@@ -203,14 +210,6 @@ impl<C: LLMClient> AgentBuilder<C> {
 
         if let Some(ref prompt) = self.system_prompt {
             messages.push(Message::system(conversation_id, prompt));
-        }
-
-        // The menu is stable for the conversation's life, so it sits in a
-        // system message without harming prompt caching.
-        if let Some(skills) = &self.skills
-            && let Some(menu) = skills.catalog.menu(skills.menu_budget)
-        {
-            messages.push(Message::system(conversation_id, menu));
         }
 
         if let Some(ref prompt) = self.user_prompt {
