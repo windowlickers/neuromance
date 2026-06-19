@@ -1,34 +1,35 @@
 //! # neuromance-context
 //!
-//! Context management for LLM conversations, built around a typestate state
-//! machine.
+//! Context management for LLM conversations.
 //!
-//! [`Context<S>`] moves a conversation through `Raw → Filtered → Transformed →
-//! Ready`, with each transition enforced at compile time (see the [`state`] and
-//! [`transforms`] modules). [`Compactor`] plugs into the `Transformed` step to
-//! summarize history when the window fills up. The [`tokens`] module provides
-//! the [`TokenCounter`] that measures when that is needed, and the [`skills`]
-//! and [`rules`] modules inject additional context.
+//! The edit ledger itself — [`ContextLedger`](neuromance_common::context::ContextLedger),
+//! the single funnel through which a conversation's history is mutated — lives in
+//! [`neuromance_common`]. This crate provides the heavier operations layered on
+//! top: the [`context`] module's batch [`filter`](context::filter),
+//! [`transform`](context::transform), and [`compact`](context::compact)
+//! functions, the [`Compactor`] that summarizes history when the window fills up,
+//! the [`tokens`] module's [`TokenCounter`], and the [`skills`] and [`rules`]
+//! modules that inject additional context.
 //!
 //! ## Example
 //!
-//! ```no_run
-//! use neuromance_context::Context;
+//! ```
+//! use neuromance_context::context::filter;
 //! use neuromance_context::transforms::FilterCriteria;
+//! use neuromance_common::context::{ContextLedger, EditSource, Operation};
 //! use neuromance_common::Conversation;
+//! use neuromance_common::chat::{Message, MessageRole};
 //!
-//! # fn example() {
 //! let conversation = Conversation::new();
+//! let id = conversation.id;
+//! let mut ledger = ContextLedger::new(conversation);
 //!
-//! // Drive the conversation through the state machine.
-//! let ready = Context::new(conversation)
-//!     .filter(FilterCriteria::default())
-//!     .transform()
-//!     .ready();
+//! // Every edit is recorded with its provenance.
+//! ledger.append(EditSource::core(), [Message::user(id, "hi"), Message::system(id, "sys")]);
+//! filter(&mut ledger, &FilterCriteria::default().with_roles(vec![MessageRole::User]));
 //!
-//! let prepared = ready.into_conversation();
-//! # let _ = prepared;
-//! # }
+//! assert_eq!(ledger.messages().len(), 1);
+//! assert!(ledger.metadata().has_operation(Operation::Replace));
 //! ```
 
 mod error;
@@ -37,16 +38,13 @@ pub use error::TokenCounterError;
 pub mod compaction;
 pub mod compaction_hook;
 pub mod context;
-pub mod metadata;
 pub mod rules;
 pub mod skills;
-pub mod state;
 pub mod tokens;
 pub mod transforms;
 
 pub use compaction::{CompactionConfig, CompactionResult, CompactionStrategy, Compactor};
 pub use compaction_hook::{CompactionHook, ContextConfig, TokenSource};
-pub use context::Context;
 pub use tokens::{ModelConfig, SearchMatch, TokenCounter, TokenInfo, TokenizedText};
 
 /// Shared test fixtures used across the crate's unit tests.

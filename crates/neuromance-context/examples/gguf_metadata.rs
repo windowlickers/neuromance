@@ -80,13 +80,27 @@ fn main() -> anyhow::Result<()> {
                         println!("  {} = \"{}\"", key, s);
                     }
                 }
-                neuromance_context::tokens::gguf::MetadataValue::U32(n) => println!("  {} = {}", key, n),
-                neuromance_context::tokens::gguf::MetadataValue::U64(n) => println!("  {} = {}", key, n),
-                neuromance_context::tokens::gguf::MetadataValue::I32(n) => println!("  {} = {}", key, n),
-                neuromance_context::tokens::gguf::MetadataValue::I64(n) => println!("  {} = {}", key, n),
-                neuromance_context::tokens::gguf::MetadataValue::F32(f) => println!("  {} = {}", key, f),
-                neuromance_context::tokens::gguf::MetadataValue::F64(f) => println!("  {} = {}", key, f),
-                neuromance_context::tokens::gguf::MetadataValue::Bool(b) => println!("  {} = {}", key, b),
+                neuromance_context::tokens::gguf::MetadataValue::U32(n) => {
+                    println!("  {} = {}", key, n)
+                }
+                neuromance_context::tokens::gguf::MetadataValue::U64(n) => {
+                    println!("  {} = {}", key, n)
+                }
+                neuromance_context::tokens::gguf::MetadataValue::I32(n) => {
+                    println!("  {} = {}", key, n)
+                }
+                neuromance_context::tokens::gguf::MetadataValue::I64(n) => {
+                    println!("  {} = {}", key, n)
+                }
+                neuromance_context::tokens::gguf::MetadataValue::F32(f) => {
+                    println!("  {} = {}", key, f)
+                }
+                neuromance_context::tokens::gguf::MetadataValue::F64(f) => {
+                    println!("  {} = {}", key, f)
+                }
+                neuromance_context::tokens::gguf::MetadataValue::Bool(b) => {
+                    println!("  {} = {}", key, b)
+                }
                 neuromance_context::tokens::gguf::MetadataValue::Array(_) => {
                     println!("  {} = [array]", key)
                 }
