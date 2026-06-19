@@ -1,18 +1,18 @@
-//! Runtime assembly of the skill catalog and the messages it injects.
+//! Runtime assembly of the skill catalog into a [`SkillsHook`].
 //!
 //! [`build`] turns the `[skills]` config section into a [`SkillRuntime`]: a
-//! built [`SkillCatalog`] plus the resolved budgets and invocation modes. The
-//! oneshot and serve paths use it to inject the menu into a conversation seed
-//! and to expand `$mention`s in user input, while `build_agent` registers the
+//! built [`SkillCatalog`] plus the resolved budgets and invocation modes.
+//! `build_agent` turns it into a [`SkillsHook`] (which injects the menu and
+//! expands `$mention`s from inside the conversation loop) and registers the
 //! `load_skill` tool from the same catalog.
 
 use std::sync::Arc;
 
 use tracing::{info, warn};
-use uuid::Uuid;
 
-use neuromance_common::chat::Message;
-use neuromance_context::skills::{HttpSkillSource, LocalSkillSource, SkillCatalog, SkillSource};
+use neuromance_context::skills::{
+    HttpSkillSource, LocalSkillSource, SkillCatalog, SkillSource, SkillsHook,
+};
 
 use crate::config::{Invocation, SkillsSettings};
 
@@ -29,24 +29,16 @@ pub struct SkillRuntime {
 }
 
 impl SkillRuntime {
-    /// The menu message to seed a conversation with, if the catalog is non-empty.
+    /// Build the [`SkillsHook`] that injects the menu and expands `$mention`s
+    /// from inside the conversation loop.
     #[must_use]
-    pub fn menu_message(&self, conversation_id: Uuid) -> Option<Message> {
-        self.catalog
-            .menu(self.menu_budget)
-            .map(|menu| Message::system(conversation_id, menu))
-    }
-
-    /// The `<skill>` body messages for every skill `$mention`ed in `text`.
-    ///
-    /// Returns an empty vector when `$mention` invocation is disabled.
-    pub async fn mention_messages(&self, conversation_id: Uuid, text: &str) -> Vec<Message> {
-        if !self.invocation.mention() {
-            return Vec::new();
-        }
-        self.catalog
-            .mention_messages(conversation_id, text, self.body_budget)
-            .await
+    pub fn hook(&self) -> Arc<SkillsHook> {
+        Arc::new(SkillsHook::new(
+            Arc::clone(&self.catalog),
+            self.menu_budget,
+            self.body_budget,
+            self.invocation.mention(),
+        ))
     }
 }
 

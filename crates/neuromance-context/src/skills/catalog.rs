@@ -33,6 +33,15 @@ pub struct SkillCatalog {
     by_name: HashMap<String, usize>,
 }
 
+impl std::fmt::Debug for SkillCatalog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SkillCatalog")
+            .field("sources", &self.sources.len())
+            .field("skills", &self.entries.len())
+            .finish()
+    }
+}
+
 impl SkillCatalog {
     /// Build a catalog by listing every source in precedence order.
     ///

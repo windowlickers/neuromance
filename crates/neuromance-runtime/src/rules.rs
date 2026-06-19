@@ -1,10 +1,9 @@
 //! Runtime assembly of the rule catalog into a [`RulesHook`].
 //!
 //! [`build`] turns the `[rules]` config section into a [`RulesHook`] that
-//! `build_agent` registers on the agent's `Core`. Unlike skills, rules need no
-//! per-call-site wiring: the hook injects `always_apply` rules at conversation
-//! start and glob-matched rules after a tool touches a matching path, all inside
-//! the conversation loop.
+//! `build_agent` registers on the agent's `Core`: the hook injects
+//! `always_apply` rules at conversation start and glob-matched rules after a
+//! tool touches a matching path, all inside the conversation loop.
 
 use std::sync::Arc;
 
