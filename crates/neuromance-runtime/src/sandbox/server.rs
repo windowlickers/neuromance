@@ -226,9 +226,10 @@ mod python {
     use dashmap::DashMap;
 
     use neuromance_common::tools::Tool;
-    use neuromance_repl::python::{InteractivePythonRepl, PythonRepl, PythonReplTool};
+    use neuromance_repl::python::{
+        InteractivePythonRepl, PythonRepl, PythonReplTool, PythonReplToolFactory,
+    };
     use neuromance_tools::ToolExecutor;
-    use serde_json::Value;
 
     use super::{EXECUTE_PYTHON, ToolConfig};
     use crate::error::RuntimeError;
@@ -250,7 +251,8 @@ mod python {
             let Some(entry) = tools.iter().find(|t| t.name == EXECUTE_PYTHON) else {
                 return Ok(None);
             };
-            let restricted = entry.config.get("restricted") != Some(&Value::Bool(false));
+            let restricted = PythonReplToolFactory::parse_restricted(&entry.config)
+                .map_err(|e| RuntimeError::Config(e.to_string()))?;
 
             let default = Arc::new(build_executor(restricted)?);
             let definition = default
