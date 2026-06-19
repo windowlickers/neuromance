@@ -142,7 +142,7 @@ async fn run_orchestrator(config: &RuntimeConfig, cancel: CancellationToken) -> 
     readiness.set_ready(true);
 
     let result = match config.mode {
-        Mode::Oneshot => run_oneshot(config, agent, skills, cancel.clone()).await,
+        Mode::Oneshot => run_oneshot(config, agent, cancel.clone()).await,
         Mode::Serve => {
             run_serve(
                 config,
@@ -150,7 +150,6 @@ async fn run_orchestrator(config: &RuntimeConfig, cancel: CancellationToken) -> 
                 store,
                 sandbox_client,
                 local_python,
-                skills,
                 cancel.clone(),
             )
             .await
@@ -431,6 +430,12 @@ async fn build_agent(
 
     core = apply_context_compaction(core, config, llm_config)?;
 
+    // Skills inject the menu at conversation start and expand `$mention`ed skill
+    // bodies from the latest user message, entirely inside the loop.
+    if let Some(skills) = skills {
+        core = core.with_hook(skills.hook() as Arc<dyn neuromance_common::hook::Hook>);
+    }
+
     // Rules inject always-apply guidance at conversation start and glob-matched
     // guidance after a tool touches a matching path, entirely inside the loop.
     if let Some(rules) = rules {
@@ -443,10 +448,9 @@ async fn build_agent(
 async fn run_oneshot(
     config: &RuntimeConfig,
     mut agent: Agent<Box<dyn LLMClient>>,
-    skills: Option<Arc<SkillRuntime>>,
     cancel: CancellationToken,
 ) -> Result<()> {
-    oneshot::run(config, &mut agent, skills.as_deref(), cancel).await
+    oneshot::run(config, &mut agent, cancel).await
 }
 
 async fn run_serve(
@@ -455,17 +459,7 @@ async fn run_serve(
     store: Option<Arc<PgConversationStore>>,
     sandbox_client: Option<sandbox::SandboxClient>,
     local_python: Option<SessionReset>,
-    skills: Option<Arc<SkillRuntime>>,
     cancel: CancellationToken,
 ) -> Result<()> {
-    serve::run(
-        config,
-        agent,
-        store,
-        sandbox_client,
-        local_python,
-        skills,
-        cancel,
-    )
-    .await
+    serve::run(config, agent, store, sandbox_client, local_python, cancel).await
 }

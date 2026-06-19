@@ -27,6 +27,7 @@
 mod catalog;
 mod error;
 mod frontmatter;
+mod hook;
 mod mention;
 mod model;
 mod source;
@@ -34,5 +35,6 @@ mod source;
 pub use catalog::{DEFAULT_BUDGET_BYTES, SkillCatalog};
 pub use error::SkillError;
 pub use frontmatter::{ParsedSkill, parse_skill};
+pub use hook::SkillsHook;
 pub use model::{SkillId, SkillLocator, SkillMetadata};
 pub use source::{HttpSkillSource, LocalSkillSource, SkillSource};
