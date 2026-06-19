@@ -76,9 +76,9 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub subagents: Vec<SubagentConfig>,
     /// When set, skills are discovered from on-host roots and/or a remote
-    /// endpoint, their menu is injected into each conversation, and a
-    /// `load_skill` tool (and/or `$mention` parsing) lets the agent pull a
-    /// skill's full instructions into context on demand.
+    /// endpoint, materialized to local disk at startup, and their menu (listing
+    /// each skill's on-disk path) is folded into the system prompt so the agent
+    /// reads a skill's full instructions from a file on demand.
     #[serde(default)]
     pub skills: Option<SkillsSettings>,
     /// When set, rule files are discovered from on-host roots and/or a remote
@@ -203,7 +203,7 @@ pub struct ContextSettings {
     pub strategy: CompactionStrategy,
 }
 
-/// Skill discovery and invocation settings.
+/// Skill discovery settings.
 ///
 /// At least one of `roots` or `endpoint` must be set for skills to be enabled;
 /// an empty section disables skills. On-host `roots` take precedence over the
@@ -221,9 +221,11 @@ pub struct SkillsSettings {
     /// requires authentication.
     #[serde(default)]
     pub endpoint_token_env: Option<String>,
-    /// Which invocation mechanisms are enabled (default: `both`).
-    #[serde(default)]
-    pub invocation: Invocation,
+    /// Whether a `$mention` in user input expands the skill's body inline
+    /// (e.g. a `/thing-skill` slash command). The menu and on-demand bodies are
+    /// always available as files on disk regardless (default: `true`).
+    #[serde(default = "default_true")]
+    pub mention: bool,
     /// Byte budget for the injected skills menu (default: 8192).
     #[serde(default = "default_skill_budget")]
     pub menu_budget_bytes: usize,
@@ -232,31 +234,9 @@ pub struct SkillsSettings {
     pub body_budget_bytes: usize,
 }
 
-/// How a skill's full body may be summoned into context.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Invocation {
-    /// Only the model-driven `load_skill` tool.
-    Tool,
-    /// Only `$mention` parsing of user input.
-    Mention,
-    /// Both the `load_skill` tool and `$mention` parsing.
-    #[default]
-    Both,
-}
-
-impl Invocation {
-    /// Whether the `load_skill` tool should be registered.
-    #[must_use]
-    pub const fn tool(self) -> bool {
-        matches!(self, Self::Tool | Self::Both)
-    }
-
-    /// Whether `$mention` bodies should be injected from user input.
-    #[must_use]
-    pub const fn mention(self) -> bool {
-        matches!(self, Self::Mention | Self::Both)
-    }
+/// Default for boolean fields that should be on unless explicitly disabled.
+const fn default_true() -> bool {
+    true
 }
 
 const fn default_skill_budget() -> usize {

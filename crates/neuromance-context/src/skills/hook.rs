@@ -5,6 +5,9 @@
 //! message. The menu and each mentioned skill are injected at most once per
 //! conversation, so re-running the hook on later turns (with the menu already
 //! in the persisted history) does not duplicate them.
+//!
+//! Menu injection is optional (`inject_menu`): a host that folds the menu into
+//! the system prompt itself disables it and keeps only the `$mention` path.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -25,6 +28,9 @@ pub struct SkillsHook {
     menu_budget: usize,
     body_budget: usize,
     mention_enabled: bool,
+    /// Whether to inject the menu; off when the host folds it into the system
+    /// prompt and the hook only handles `$mention` expansion.
+    inject_menu: bool,
     /// Conversations whose menu has been injected, so it is injected once.
     menu_injected: Mutex<HashSet<Uuid>>,
     /// `(conversation, skill name)` pairs already injected, so each mentioned
@@ -35,19 +41,23 @@ pub struct SkillsHook {
 impl SkillsHook {
     /// Build a skills hook over `catalog`, rendering the menu within
     /// `menu_budget` and each mentioned body within `body_budget`. When
-    /// `mention_enabled` is false, `$mention` expansion is skipped.
+    /// `mention_enabled` is false, `$mention` expansion is skipped; when
+    /// `inject_menu` is false, the menu is never injected (the host is expected
+    /// to place it in the system prompt instead).
     #[must_use]
     pub fn new(
         catalog: Arc<SkillCatalog>,
         menu_budget: usize,
         body_budget: usize,
         mention_enabled: bool,
+        inject_menu: bool,
     ) -> Self {
         Self {
             catalog,
             menu_budget,
             body_budget,
             mention_enabled,
+            inject_menu,
             menu_injected: Mutex::new(HashSet::new()),
             injected: Mutex::new(HashSet::new()),
         }
@@ -93,7 +103,8 @@ impl Hook for SkillsHook {
         let conversation = ctx.conversation_id;
         let mut out = Vec::new();
 
-        if self.mark_menu(conversation)
+        if self.inject_menu
+            && self.mark_menu(conversation)
             && let Some(menu) = self.catalog.menu(self.menu_budget)
         {
             out.push(Message::system(conversation, menu));
@@ -187,14 +198,18 @@ mod tests {
         }
     }
 
-    async fn hook_over(skills: &[(&str, &str)], mention_enabled: bool) -> SkillsHook {
+    async fn hook_over(
+        skills: &[(&str, &str)],
+        mention_enabled: bool,
+        inject_menu: bool,
+    ) -> SkillsHook {
         let catalog = SkillCatalog::build(vec![Box::new(MemSource::new(skills))]).await;
-        SkillsHook::new(Arc::new(catalog), 8192, 8192, mention_enabled)
+        SkillsHook::new(Arc::new(catalog), 8192, 8192, mention_enabled, inject_menu)
     }
 
     #[tokio::test]
     async fn test_conversation_start_injects_menu_once() {
-        let hook = hook_over(&[("alpha", "alpha body")], true).await;
+        let hook = hook_over(&[("alpha", "alpha body")], true, true).await;
         let ctx = HookContext::new(Uuid::new_v4(), 0);
 
         let first = hook.on_conversation_start(&ctx, &[]).await.unwrap();
@@ -211,7 +226,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_distinct_conversations_inject_menu_independently() {
-        let hook = hook_over(&[("alpha", "alpha body")], true).await;
+        let hook = hook_over(&[("alpha", "alpha body")], true, true).await;
         let conv_a = HookContext::new(Uuid::new_v4(), 0);
         let conv_b = HookContext::new(Uuid::new_v4(), 0);
 
@@ -223,7 +238,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mention_injects_body_once() {
-        let hook = hook_over(&[("alpha", "alpha body")], true).await;
+        let hook = hook_over(&[("alpha", "alpha body")], true, true).await;
         let conv = Uuid::new_v4();
         let ctx = HookContext::new(conv, 0);
         let seed = vec![
@@ -252,7 +267,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mention_disabled_injects_no_body() {
-        let hook = hook_over(&[("alpha", "alpha body")], false).await;
+        let hook = hook_over(&[("alpha", "alpha body")], false, true).await;
         let conv = Uuid::new_v4();
         let ctx = HookContext::new(conv, 0);
         let seed = vec![Message::user(conv, "please use $alpha")];
@@ -272,8 +287,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_menu_disabled_still_expands_mentions() {
+        // Host folds the menu into the system prompt itself: the hook injects no
+        // System menu but still expands `$mention`ed bodies as User messages.
+        let hook = hook_over(&[("alpha", "alpha body")], true, false).await;
+        let conv = Uuid::new_v4();
+        let ctx = HookContext::new(conv, 0);
+        let seed = vec![
+            Message::system(conv, "system prompt with the menu folded in"),
+            Message::user(conv, "please use $alpha"),
+        ];
+
+        let outcome = hook.on_conversation_start(&ctx, &seed).await.unwrap();
+        assert!(
+            outcome
+                .messages
+                .iter()
+                .all(|m| m.role != MessageRole::System),
+            "menu must not be injected when inject_menu is false"
+        );
+        let bodies: Vec<&Message> = outcome
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::User)
+            .collect();
+        assert_eq!(bodies.len(), 1);
+        assert!(bodies[0].content.contains("alpha body"));
+    }
+
+    #[tokio::test]
     async fn test_empty_catalog_injects_nothing() {
-        let hook = hook_over(&[], true).await;
+        let hook = hook_over(&[], true, true).await;
         let conv = Uuid::new_v4();
         let ctx = HookContext::new(conv, 0);
         let seed = vec![Message::user(conv, "use $alpha")];

@@ -36,7 +36,7 @@ pub mod subagents;
 pub mod telemetry;
 
 pub use config::{
-    AgentConfig, ApprovalConfig, ApprovalMode, ContextSettings, DatabaseSettings, Invocation, Mode,
+    AgentConfig, ApprovalConfig, ApprovalMode, ContextSettings, DatabaseSettings, Mode,
     OneshotConfig, ProviderConfig, ProviderProxyConfig, RulesSettings, RuntimeConfig,
     RuntimeSettings, SandboxConfig, SkillsSettings, SubagentConfig,
 };

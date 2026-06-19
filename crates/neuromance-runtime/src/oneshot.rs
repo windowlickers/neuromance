@@ -31,6 +31,7 @@ pub struct OneshotOutput {
 pub async fn run<C: LLMClient + Send + Sync>(
     config: &RuntimeConfig,
     agent: &mut Agent<C>,
+    skills_menu: Option<&str>,
     cancel: CancellationToken,
 ) -> Result<()> {
     let oneshot = config
@@ -39,8 +40,12 @@ pub async fn run<C: LLMClient + Send + Sync>(
         .context("oneshot mode requires [oneshot] section")?;
 
     let conversation_id = agent.conversation_id;
+    let system_prompt = skills_menu.map_or_else(
+        || config.agent.system_prompt.clone(),
+        |menu| format!("{}\n\n{}", config.agent.system_prompt, menu),
+    );
     let messages = vec![
-        Message::system(conversation_id, &config.agent.system_prompt),
+        Message::system(conversation_id, system_prompt),
         Message::user(conversation_id, &oneshot.input),
     ];
 
