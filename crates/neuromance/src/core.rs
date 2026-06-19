@@ -16,8 +16,9 @@ use tracing::{debug, info, info_span, trace};
 const STREAM_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 
 use neuromance_client::LLMClient;
-use neuromance_common::chat::{Message, MessageRole};
+use neuromance_common::chat::{Conversation, Message, MessageRole};
 use neuromance_common::client::{ChatRequest, ChatResponse, ToolChoice, Usage};
+use neuromance_common::context::{ContextLedger, EditSource};
 use neuromance_common::features::ThinkingMode;
 use neuromance_common::hook::{CompactionStats, Hook, HookContext};
 use neuromance_common::tools::{ToolApproval, ToolCall};
@@ -143,21 +144,22 @@ impl<C: LLMClient> Core<C> {
         ))
     }
 
-    /// Run every hook's `on_conversation_start`, appending injected messages.
+    /// Run every hook's `on_conversation_start`, recording each hook's injected
+    /// messages in the ledger attributed to that hook.
     async fn hooks_conversation_start(
         &self,
         ctx: &HookContext,
-        messages: &mut Vec<Message>,
+        ledger: &mut ContextLedger,
         cancel: &CancellationToken,
     ) -> Result<(), CoreError> {
         for hook in &self.hooks {
             let outcome = run_hook(
                 cancel,
                 hook.name(),
-                hook.on_conversation_start(ctx, messages),
+                hook.on_conversation_start(ctx, ledger.messages()),
             )
             .await?;
-            messages.extend(outcome.messages);
+            ledger.append(EditSource::hook(hook.name()), outcome.messages);
         }
         Ok(())
     }
@@ -205,7 +207,12 @@ impl<C: LLMClient> Core<C> {
         Ok(None)
     }
 
-    /// Run every hook's `after_tool`, collecting injected messages.
+    /// Run every hook's `after_tool`, collecting each hook's injected messages
+    /// tagged with its source so the caller records them with provenance.
+    ///
+    /// `after_tool` hooks key off the tool result, not the message history, so
+    /// they need not observe one another's injections; gathering here and
+    /// applying at the call site is equivalent.
     async fn hooks_after_tool(
         &self,
         ctx: &HookContext,
@@ -213,7 +220,7 @@ impl<C: LLMClient> Core<C> {
         result: &str,
         success: bool,
         cancel: &CancellationToken,
-    ) -> Result<Vec<Message>, CoreError> {
+    ) -> Result<Vec<(EditSource, Vec<Message>)>, CoreError> {
         let mut injected = Vec::new();
         for hook in &self.hooks {
             let outcome = run_hook(
@@ -222,28 +229,43 @@ impl<C: LLMClient> Core<C> {
                 hook.after_tool(ctx, call, result, success),
             )
             .await?;
-            injected.extend(outcome.messages);
+            if !outcome.messages.is_empty() {
+                injected.push((EditSource::hook(hook.name()), outcome.messages));
+            }
         }
         Ok(injected)
     }
 
-    /// Fold the history through every hook's `on_turn_end`, collecting any
-    /// compaction statistics for the caller to emit.
+    /// Fold the history through every hook's `on_turn_end`, recording a ledger
+    /// `Replace` for any hook that actually rewrote the history and collecting
+    /// any compaction statistics for the caller to emit.
     async fn hooks_turn_end(
         &self,
         ctx: &HookContext,
-        mut messages: Vec<Message>,
+        ledger: &mut ContextLedger,
         cancel: &CancellationToken,
-    ) -> Result<(Vec<Message>, Vec<CompactionStats>), CoreError> {
+    ) -> Result<Vec<CompactionStats>, CoreError> {
         let mut stats = Vec::new();
         for hook in &self.hooks {
-            let end = run_hook(cancel, hook.name(), hook.on_turn_end(ctx, messages)).await?;
-            messages = end.messages;
+            let before: Vec<uuid::Uuid> = ledger.messages().iter().map(|m| m.id).collect();
+            let end = run_hook(
+                cancel,
+                hook.name(),
+                hook.on_turn_end(ctx, ledger.messages().to_vec()),
+            )
+            .await?;
+            let changed = end.messages.iter().map(|m| m.id).ne(before.iter().copied());
+            if changed {
+                let details = end
+                    .compaction
+                    .map(|s| serde_json::json!({ "was_compacted": s.was_compacted }));
+                ledger.replace(EditSource::hook(hook.name()), end.messages, details);
+            }
             if let Some(s) = end.compaction {
                 stats.push(s);
             }
         }
-        Ok((messages, stats))
+        Ok(stats)
     }
 
     /// Run every hook's `on_completion` observer.
@@ -293,7 +315,6 @@ impl<C: LLMClient> Core<C> {
         cancel: CancellationToken,
     ) -> impl Stream<Item = Result<CoreEvent, CoreError>> + Send + '_ {
         try_stream! {
-            let mut messages = messages;
             let mut turn_count: u32 = 0;
             // `prompt_tokens` from each turn is the whole context sent that turn,
             // so the turn-over-turn delta shows how fast the conversation grows.
@@ -307,16 +328,22 @@ impl<C: LLMClient> Core<C> {
                 .map_or_else(uuid::Uuid::new_v4, |m| m.conversation_id);
             let start_ctx = HookContext::new(conversation_id, 0);
 
+            // Every edit to the history funnels through the ledger, which records
+            // its provenance. The seed is the first recorded edit.
+            let mut seed_conversation = Conversation::new();
+            seed_conversation.id = conversation_id;
+            let mut ledger = ContextLedger::new(seed_conversation);
+            ledger.append(EditSource::core(), messages);
+
             // Conversation-start hooks inject always-on context before the
             // first LLM call (e.g. rule files that always apply).
-            self.hooks_conversation_start(&start_ctx, &mut messages, &cancel)
+            self.hooks_conversation_start(&start_ctx, &mut ledger, &cancel)
                 .await?;
-            let mut messages_arc: Arc<[Message]> = messages.clone().into();
 
             // Hooks observe the seed snapshot before the first LLM call (e.g.
             // persistence records it so the input is durable even if the call
             // fails, and links the conversation to its spawning parent).
-            self.hooks_messages(&start_ctx, &messages, &cancel).await?;
+            self.hooks_messages(&start_ctx, ledger.messages(), &cancel).await?;
 
             loop {
                 if cancel.is_cancelled() {
@@ -325,7 +352,7 @@ impl<C: LLMClient> Core<C> {
 
                 let turn_ctx = HookContext::new(conversation_id, turn_count);
 
-                let mut request = ChatRequest::from((self.client.config(), messages_arc.clone()))
+                let mut request = ChatRequest::from((self.client.config(), ledger.snapshot()))
                     .with_tools(self.tool_executor.get_all_tools())
                     .with_tool_choice(self.tool_choice.clone());
                 request = request.with_thinking_mode(self.thinking);
@@ -590,18 +617,17 @@ impl<C: LLMClient> Core<C> {
                 // Pins any subagent spawned by this turn's tool calls to the exact
                 // message that launched it (see the per-tool-call delegation scope).
                 let assistant_message_id = assistant_message.id;
-                messages.push(assistant_message);
+                ledger.append(EditSource::model(), [assistant_message]);
 
                 // Hooks observe the assistant message before tool execution
                 // (e.g. persistence records it so a crashed run keeps its prefix).
-                self.hooks_messages(&turn_ctx, &messages, &cancel).await?;
+                self.hooks_messages(&turn_ctx, ledger.messages(), &cancel).await?;
 
                 if tool_calls.is_empty() {
                     // End-of-turn hooks run on the final turn too; they may
                     // compact or rewrite the history handed back to the caller.
-                    let (turn_messages, turn_stats) =
-                        self.hooks_turn_end(&turn_ctx, messages, &cancel).await?;
-                    messages = turn_messages;
+                    let turn_stats =
+                        self.hooks_turn_end(&turn_ctx, &mut ledger, &cancel).await?;
                     for s in turn_stats {
                         if s.was_compacted {
                             counter!("neuromance_compactions_total").increment(1);
@@ -614,7 +640,7 @@ impl<C: LLMClient> Core<C> {
                         };
                     }
 
-                    self.hooks_completion(&turn_ctx, &messages, &cancel).await?;
+                    self.hooks_completion(&turn_ctx, ledger.messages(), &cancel).await?;
 
                     let total_ms =
                         u64::try_from(start_time.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -623,7 +649,7 @@ impl<C: LLMClient> Core<C> {
                         duration_ms = total_ms,
                         "chat completed",
                     );
-                    yield CoreEvent::Completed(messages);
+                    yield CoreEvent::Completed(ledger.into_messages());
                     return;
                 }
 
@@ -725,7 +751,7 @@ impl<C: LLMClient> Core<C> {
                                         tool_call.function.name.clone(),
                                     )
                                     .map_err(|e| CoreError::ToolError(e.to_string()))?;
-                                    messages.push(tool_message);
+                                    ledger.append(EditSource::tool(), [tool_message]);
                                     tool_outcome = Some((result, true));
                                 }
                                 Err(e) => {
@@ -754,7 +780,7 @@ impl<C: LLMClient> Core<C> {
                                         tool_call.function.name.clone(),
                                     )
                                     .map_err(|e| CoreError::ToolError(e.to_string()))?;
-                                    messages.push(error_message);
+                                    ledger.append(EditSource::tool(), [error_message]);
                                     tool_outcome = Some((error_msg, false));
                                 }
                             }
@@ -768,7 +794,7 @@ impl<C: LLMClient> Core<C> {
                                 tool_call.function.name.clone(),
                             )
                             .map_err(|e| CoreError::ToolError(e.to_string()))?;
-                            messages.push(denial_message);
+                            ledger.append(EditSource::core(), [denial_message]);
                         }
                         ToolApproval::Quit => {
                             debug!("user quit during tool approval");
@@ -784,7 +810,9 @@ impl<C: LLMClient> Core<C> {
                         let injected = self
                             .hooks_after_tool(&turn_ctx, tool_call, &result, success, &cancel)
                             .await?;
-                        messages.extend(injected);
+                        for (source, msgs) in injected {
+                            ledger.append(source, msgs);
+                        }
                     }
                 }
 
@@ -792,13 +820,12 @@ impl<C: LLMClient> Core<C> {
 
                 // Hooks observe this turn's tool results (e.g. persistence
                 // records them, retrying any backlog from earlier failed writes).
-                self.hooks_messages(&turn_ctx, &messages, &cancel).await?;
+                self.hooks_messages(&turn_ctx, ledger.messages(), &cancel).await?;
 
                 // End-of-turn hooks may rewrite or compact the history before
                 // the next turn; emit any compaction they report.
-                let (turn_messages, turn_stats) =
-                    self.hooks_turn_end(&turn_ctx, messages, &cancel).await?;
-                messages = turn_messages;
+                let turn_stats =
+                    self.hooks_turn_end(&turn_ctx, &mut ledger, &cancel).await?;
                 for s in turn_stats {
                     if s.was_compacted {
                         counter!("neuromance_compactions_total").increment(1);
@@ -811,7 +838,6 @@ impl<C: LLMClient> Core<C> {
                     };
                 }
 
-                messages_arc = messages.clone().into();
                 turn_count += 1;
 
                 if let Some(max) = self.max_turns
@@ -892,6 +918,7 @@ mod tests {
     use async_trait::async_trait;
     use neuromance_client::chat_completions::ChatCompletionsClient;
     use neuromance_common::client::Config;
+    use neuromance_common::context::Operation;
     use neuromance_common::hook::{HookOutcome, TurnEnd};
 
     /// Hook that appends a marker system message in `on_turn_end`.
@@ -942,6 +969,10 @@ mod tests {
 
     #[async_trait]
     impl Hook for StartInjectHook {
+        fn name(&self) -> &'static str {
+            "start-inject"
+        }
+
         async fn on_conversation_start(
             &self,
             ctx: &HookContext,
@@ -950,6 +981,28 @@ mod tests {
             Ok(HookOutcome::inject(vec![Message::system(
                 ctx.conversation_id,
                 self.0,
+            )]))
+        }
+    }
+
+    /// Mirrors the real `SkillsHook`: a hook named `"skills"` that appends a
+    /// `System` menu message at conversation start.
+    struct SkillsMenuHook;
+
+    #[async_trait]
+    impl Hook for SkillsMenuHook {
+        fn name(&self) -> &'static str {
+            "skills"
+        }
+
+        async fn on_conversation_start(
+            &self,
+            ctx: &HookContext,
+            _messages: &[Message],
+        ) -> anyhow::Result<HookOutcome> {
+            Ok(HookOutcome::inject(vec![Message::system(
+                ctx.conversation_id,
+                "<skills-menu>",
             )]))
         }
     }
@@ -1105,14 +1158,14 @@ mod tests {
 
         let conv_id = uuid::Uuid::new_v4();
         let ctx = HookContext::new(conv_id, 0);
-        let input = vec![Message::user(conv_id, "hello")];
-        let (output, stats) = core
-            .hooks_turn_end(&ctx, input, &CancellationToken::new())
+        let mut ledger = seeded_ledger(conv_id, vec![Message::user(conv_id, "hello")]);
+        let stats = core
+            .hooks_turn_end(&ctx, &mut ledger, &CancellationToken::new())
             .await
             .unwrap();
 
-        assert_eq!(output.len(), 2);
-        assert_eq!(output[1].content, "[compacted]");
+        assert_eq!(ledger.messages().len(), 2);
+        assert_eq!(ledger.messages()[1].content, "[compacted]");
         assert!(stats.is_empty());
     }
 
@@ -1121,20 +1174,55 @@ mod tests {
         Core::new(ChatCompletionsClient::new(config).expect("client"))
     }
 
+    /// Builds a ledger whose conversation carries `conv_id`, seeded with `msgs`.
+    fn seeded_ledger(conv_id: uuid::Uuid, msgs: Vec<Message>) -> ContextLedger {
+        let mut conversation = Conversation::new();
+        conversation.id = conv_id;
+        let mut ledger = ContextLedger::new(conversation);
+        ledger.append(EditSource::core(), msgs);
+        ledger
+    }
+
     /// `on_conversation_start` hooks append their injected messages.
     #[tokio::test]
     async fn test_on_conversation_start_injects() {
         let core = test_core().with_hook(Arc::new(StartInjectHook("[rules]")));
         let conv_id = uuid::Uuid::new_v4();
         let ctx = HookContext::new(conv_id, 0);
-        let mut messages = vec![Message::user(conv_id, "hi")];
+        let mut ledger = seeded_ledger(conv_id, vec![Message::user(conv_id, "hi")]);
 
-        core.hooks_conversation_start(&ctx, &mut messages, &CancellationToken::new())
+        core.hooks_conversation_start(&ctx, &mut ledger, &CancellationToken::new())
             .await
             .unwrap();
 
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[1].content, "[rules]");
+        assert_eq!(ledger.messages().len(), 2);
+        assert_eq!(ledger.messages()[1].content, "[rules]");
+        // The injected message is attributed to the hook that produced it.
+        let injected = ledger
+            .metadata()
+            .records_from(&EditSource::hook("start-inject"));
+        assert_eq!(injected.len(), 1);
+        assert_eq!(injected[0].roles, vec![MessageRole::System]);
+    }
+
+    /// Regression: the skills menu append is recorded in the ledger attributed
+    /// to the `"skills"` hook, rather than slipping into the history untracked.
+    #[tokio::test]
+    async fn test_skills_menu_append_is_tracked_with_provenance() {
+        let core = test_core().with_hook(Arc::new(SkillsMenuHook));
+        let conv_id = uuid::Uuid::new_v4();
+        let ctx = HookContext::new(conv_id, 0);
+        let mut ledger = seeded_ledger(conv_id, vec![Message::user(conv_id, "hi")]);
+
+        core.hooks_conversation_start(&ctx, &mut ledger, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        let from_skills = ledger.metadata().records_from(&EditSource::hook("skills"));
+        assert_eq!(from_skills.len(), 1);
+        assert_eq!(from_skills[0].operation, Operation::Append);
+        assert_eq!(from_skills[0].roles, vec![MessageRole::System]);
+        assert_eq!(ledger.messages().last().unwrap().content, "<skills-menu>");
     }
 
     /// The first hook to return a decision wins the approval.
@@ -1183,7 +1271,11 @@ mod tests {
             .await
             .unwrap();
 
-        let contents: Vec<&str> = injected.iter().map(|m| m.content.as_str()).collect();
+        let contents: Vec<&str> = injected
+            .iter()
+            .flat_map(|(_, msgs)| msgs.iter())
+            .map(|m| m.content.as_str())
+            .collect();
         assert_eq!(contents, vec!["[a]", "[b]"]);
     }
 
@@ -1195,14 +1287,14 @@ mod tests {
             .with_hook(Arc::new(AppendTurnEndHook("[second]")));
         let conv_id = uuid::Uuid::new_v4();
         let ctx = HookContext::new(conv_id, 0);
+        let mut ledger = seeded_ledger(conv_id, vec![]);
 
-        let (output, _) = core
-            .hooks_turn_end(&ctx, vec![], &CancellationToken::new())
+        core.hooks_turn_end(&ctx, &mut ledger, &CancellationToken::new())
             .await
             .unwrap();
 
-        assert_eq!(output[0].content, "[first]");
-        assert_eq!(output[1].content, "[second]");
+        assert_eq!(ledger.messages()[0].content, "[first]");
+        assert_eq!(ledger.messages()[1].content, "[second]");
     }
 
     /// `on_turn_end` surfaces the compaction stats a hook reports.
@@ -1210,9 +1302,10 @@ mod tests {
     async fn test_on_turn_end_collects_compaction_stats() {
         let core = test_core().with_hook(Arc::new(CompactingHook));
         let ctx = HookContext::new(uuid::Uuid::new_v4(), 0);
+        let mut ledger = seeded_ledger(ctx.conversation_id, vec![]);
 
-        let (_, stats) = core
-            .hooks_turn_end(&ctx, vec![], &CancellationToken::new())
+        let stats = core
+            .hooks_turn_end(&ctx, &mut ledger, &CancellationToken::new())
             .await
             .unwrap();
 
@@ -1269,9 +1362,12 @@ mod tests {
         let core = Core::new(client).with_hook(Arc::new(FailingTurnEndHook));
 
         let ctx = HookContext::new(uuid::Uuid::new_v4(), 0);
-        let input = vec![Message::user(ctx.conversation_id, "hello")];
+        let mut ledger = seeded_ledger(
+            ctx.conversation_id,
+            vec![Message::user(ctx.conversation_id, "hello")],
+        );
         let result = core
-            .hooks_turn_end(&ctx, input, &CancellationToken::new())
+            .hooks_turn_end(&ctx, &mut ledger, &CancellationToken::new())
             .await;
 
         let err = result.unwrap_err();

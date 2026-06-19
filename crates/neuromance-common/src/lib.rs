@@ -60,6 +60,11 @@ pub mod chat;
 ///
 /// Contains types for configuring LLM clients and making chat completion requests.
 pub mod client;
+/// The context edit ledger.
+///
+/// Provides [`context::ContextLedger`], the single funnel through which a
+/// conversation's history is mutated, recording every edit's provenance.
+pub mod context;
 /// Feature abstractions for cross-provider capabilities.
 ///
 /// Provides types like `ThinkingMode` and `ReasoningLevel` that abstract
@@ -93,6 +98,7 @@ pub use client::{
     CacheMetrics, ChatRequest, ChatResponse, Config, FinishReason, InputTokensDetails,
     OutputTokensDetails, Provider, ProxyConfig, ReasoningEffort, RetryConfig, ToolChoice, Usage,
 };
+pub use context::{ContextLedger, ContextMetadata, EditRecord, EditSource, Operation};
 pub use delegation::DelegationContext;
 pub use features::{ReasoningLevel, ThinkingMode};
 pub use hook::{CompactionStats, FnReviewHook, Hook, HookContext, HookOutcome, TurnEnd};

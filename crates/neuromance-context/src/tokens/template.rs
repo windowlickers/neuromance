@@ -9,8 +9,8 @@ use secrecy::ExposeSecret;
 use tokenizers::Tokenizer;
 use tracing::{debug, error};
 
-use crate::error::TokenCounterError;
 use super::{ModelConfig, TokenCounter, jinja_compat};
+use crate::error::TokenCounterError;
 
 impl TokenCounter {
     /// Loads the chat template for a model.
