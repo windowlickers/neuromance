@@ -207,6 +207,26 @@ impl PgConversationStore {
         Ok(())
     }
 
+    /// Returns whether a conversation row exists.
+    ///
+    /// Used by the serve loop's admission check to resolve a continuation
+    /// against durable state when the in-process cache misses (the request
+    /// reached a replica that did not handle earlier turns).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the query fails.
+    pub async fn conversation_exists(&self, id: Uuid) -> Result<bool, DbError> {
+        let exists = sqlx::query_scalar!(
+            "SELECT EXISTS(SELECT 1 FROM conversations WHERE id = $1)",
+            id,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .op("check conversation exists")?;
+        Ok(exists.unwrap_or(false))
+    }
+
     /// Loads a conversation and its full message log, ordered by `seq`.
     ///
     /// Returns `None` if no conversation row exists.

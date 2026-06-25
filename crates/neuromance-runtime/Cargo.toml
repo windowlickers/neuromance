@@ -72,3 +72,4 @@ python-repl = ["dep:neuromance-repl"]
 [dev-dependencies]
 futures = { workspace = true }
 serial_test = "3"
+sqlx = { workspace = true }

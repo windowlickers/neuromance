@@ -24,9 +24,11 @@
 //! task — not just the one it accepted. The enqueue `pending` write is
 //! synchronous and fail-closed (a returned `task_id` is always durably
 //! pollable); mid-run transitions are best-effort. Conversation history is
-//! likewise durable: Core persists messages incrementally during each run,
-//! and this module records conversation metadata on creation and soft deletes
-//! (the database keeps the history when a conversation is `DELETE`d here).
+//! likewise durable: Core persists messages incrementally during each run, and
+//! continuations are store-authoritative — an existing `conversation_id` is
+//! resolved against postgres when this replica's cache misses, and the worker
+//! reads the turn's history from postgres, so a conversation continues
+//! correctly on any replica regardless of which one accepted earlier turns.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -52,7 +54,7 @@ use uuid::Uuid;
 use neuromance::error::CoreError;
 use neuromance_agent::Agent;
 use neuromance_client::LLMClient;
-use neuromance_common::chat::{Conversation, ConversationStatus, Message, TaskStatus};
+use neuromance_common::chat::{Conversation, Message, TaskStatus};
 use neuromance_db::{PgConversationStore, TaskStatusUpdate};
 
 use crate::SessionReset;
@@ -210,6 +212,10 @@ struct WorkerJob {
     task_id: Uuid,
     conversation_id: Uuid,
     user: String,
+    /// Whether this request minted a fresh conversation. A seeded conversation's
+    /// system message lives only in the per-pod cache until Core persists it
+    /// mid-run; a continuation (`false`) reads its history from the store.
+    seeded: bool,
 }
 
 #[derive(Clone)]
@@ -268,10 +274,7 @@ pub fn router(state: ServeState) -> Router {
         .route("/tasks/new", post(create_task))
         .route("/tasks/{id}", get(get_task))
         .route("/conversations", get(list_conversations))
-        .route(
-            "/conversations/{id}",
-            get(get_conversation).delete(delete_conversation),
-        )
+        .route("/conversations/{id}", get(get_conversation))
         .route(
             "/conversations/{id}/children",
             get(list_conversation_children),
@@ -333,9 +336,13 @@ fn seed_new_conversation(state: &ServeState, system_prompt: Option<&str>) -> Uui
 /// unknown ids. A `system_prompt` supplied for an existing conversation is
 /// rejected, since that conversation already holds its system message.
 ///
+/// An existing id missing from this replica's cache is resolved against the
+/// durable store, so a continuation that load-balances to a replica which did
+/// not accept earlier turns still succeeds instead of 404ing.
+///
 /// Returns the id and whether a fresh conversation was seeded in this call, so
 /// the caller can roll the seed back if the task ultimately fails to enqueue.
-fn resolve_conversation(
+async fn resolve_conversation(
     state: &ServeState,
     requested: Option<Uuid>,
     system_prompt: Option<&str>,
@@ -343,18 +350,28 @@ fn resolve_conversation(
     if system_prompt.is_some_and(|p| p.trim().is_empty()) {
         return Err(EnqueueError::EmptySystemPrompt);
     }
-    requested.map_or_else(
-        || Ok((seed_new_conversation(state, system_prompt), true)),
-        |id| {
-            if !state.conversations.contains_key(&id) {
-                Err(EnqueueError::ConversationNotFound(id))
-            } else if system_prompt.is_some() {
-                Err(EnqueueError::SystemPromptOnExisting(id))
-            } else {
-                Ok((id, false))
+    let Some(id) = requested else {
+        return Ok((seed_new_conversation(state, system_prompt), true));
+    };
+    if system_prompt.is_some() {
+        return Err(EnqueueError::SystemPromptOnExisting(id));
+    }
+    if state.conversations.contains_key(&id) {
+        return Ok((id, false));
+    }
+    // Cold replica: the conversation may have been seeded on a sibling. Confirm
+    // it exists durably rather than 404ing on a local-cache miss.
+    match &state.store {
+        Some(store) => match store.conversation_exists(id).await {
+            Ok(true) => Ok((id, false)),
+            Ok(false) => Err(EnqueueError::ConversationNotFound(id)),
+            Err(e) => {
+                warn!(conversation_id = %id, error = %e, "conversation existence check failed");
+                Err(EnqueueError::Persistence)
             }
         },
-    )
+        None => Err(EnqueueError::ConversationNotFound(id)),
+    }
 }
 
 /// Snapshots the durable status fields of an in-memory task record.
@@ -385,7 +402,8 @@ async fn try_enqueue(
     conversation_id: Option<Uuid>,
     system_prompt: Option<&str>,
 ) -> Result<TaskRecord, EnqueueError> {
-    let (conversation_id, seeded) = resolve_conversation(state, conversation_id, system_prompt)?;
+    let (conversation_id, seeded) =
+        resolve_conversation(state, conversation_id, system_prompt).await?;
     let task_id = Uuid::new_v4();
     let now = Utc::now();
     let depth = queue_depth(&state.work_tx);
@@ -423,6 +441,7 @@ async fn try_enqueue(
         task_id,
         conversation_id,
         user,
+        seeded,
     }) {
         Ok(()) => {
             #[allow(clippy::cast_precision_loss)]
@@ -615,34 +634,6 @@ async fn list_conversation_children(
     }
 }
 
-async fn delete_conversation(
-    State(state): State<ServeState>,
-    Path(id): Path<Uuid>,
-) -> impl IntoResponse {
-    if state.conversations.remove(&id).is_some() {
-        // Soft delete in the durable record: the history stays queryable,
-        // only the lifecycle status changes.
-        if let Some(store) = &state.store {
-            let store = Arc::clone(store);
-            tokio::spawn(async move {
-                if let Err(e) = store
-                    .set_conversation_status(id, ConversationStatus::Deleted)
-                    .await
-                {
-                    warn!(error = %e, conversation_id = %id, "failed to soft-delete conversation");
-                }
-            });
-        }
-        StatusCode::NO_CONTENT.into_response()
-    } else {
-        (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "conversation not found"})),
-        )
-            .into_response()
-    }
-}
-
 /// Shared handles the worker needs to run a job and record its provenance.
 /// Bundled so [`worker_loop`] and [`run`] stay within the positional-argument
 /// budget as fields accrue.
@@ -799,6 +790,46 @@ fn fail_task(tasks: &DashMap<Uuid, TaskRecord>, task_id: Uuid, reason: &str) {
     counter!("neuromance_tasks_total", "outcome" => "failed").increment(1);
 }
 
+/// Assembles the history the agent runs against for one turn, appending the
+/// user message.
+///
+/// A continuation backed by a durable store reads history from postgres so a
+/// turn that lands on a replica without the local cache (or with a stale one)
+/// still sees every prior turn — the store is the single source of truth. A new
+/// conversation (or a store-less deployment) uses the per-pod record, which
+/// carries the just-minted system seed and is advanced in place here.
+async fn build_turn_input<C: LLMClient + Send + Sync>(
+    ctx: &WorkerCtx<C>,
+    job: &WorkerJob,
+    user_msg: Message,
+) -> Result<Vec<Message>, &'static str> {
+    if !job.seeded
+        && let Some(store) = &ctx.store
+    {
+        let conv = store
+            .get_conversation(job.conversation_id)
+            .await
+            .map_err(|e| {
+                warn!(error = %e, "load conversation history failed");
+                "failed to load conversation history"
+            })?
+            .ok_or("conversation not found")?;
+        let mut messages = conv.messages.as_ref().clone();
+        messages.push(user_msg);
+        return Ok(messages);
+    }
+    // New conversation, or no durable store: the per-pod record holds history.
+    let Some(mut entry) = ctx.conversations.get_mut(&job.conversation_id) else {
+        return Err("conversation record missing");
+    };
+    let mut snapshot = entry.messages.clone();
+    snapshot.push(user_msg.clone());
+    entry.messages.push(user_msg);
+    entry.turn_count = entry.turn_count.saturating_add(1);
+    entry.updated_at = Utc::now();
+    Ok(snapshot)
+}
+
 #[allow(clippy::significant_drop_tightening)]
 #[tracing::instrument(
     name = "task",
@@ -835,23 +866,17 @@ async fn process_job<C: LLMClient + Send + Sync>(
         "task starting",
     );
 
-    // Snapshot + append-user inside a single get_mut so a racing DELETE
-    // either commits the user message or fails the task cleanly, never
-    // both. Skill menu and `$mention` bodies are injected by the SkillsHook
-    // inside the conversation loop, not assembled here.
+    // Skill menu and `$mention` bodies are injected by the SkillsHook inside the
+    // conversation loop, not assembled here.
     let user_msg = Message::user(job.conversation_id, &job.user);
-    let input_messages = if let Some(mut entry) = ctx.conversations.get_mut(&job.conversation_id) {
-        let mut snapshot = entry.messages.clone();
-        snapshot.push(user_msg.clone());
-        entry.messages.push(user_msg);
-        entry.turn_count = entry.turn_count.saturating_add(1);
-        entry.updated_at = Utc::now();
-        snapshot
-    } else {
-        warn!("conversation deleted before task dequeue");
-        fail_task(&ctx.tasks, job.task_id, "conversation deleted");
-        write_through_status(ctx, job.task_id).await;
-        return JobOutcome::Failed;
+    let input_messages = match build_turn_input(ctx, &job, user_msg).await {
+        Ok(messages) => messages,
+        Err(reason) => {
+            warn!(conversation_id = %job.conversation_id, reason, "cannot build turn input");
+            fail_task(&ctx.tasks, job.task_id, reason);
+            write_through_status(ctx, job.task_id).await;
+            return JobOutcome::Failed;
+        }
     };
 
     let mut agent = ctx.agent.lock().await;
@@ -877,9 +902,10 @@ async fn process_job<C: LLMClient + Send + Sync>(
         Ok((response, full_history)) => {
             let output_bytes = response.content.content.len();
             info!(run_ms, queue_wait_ms, output_bytes, "task succeeded");
-            // Replace stored messages with the full history (system + every
-            // user/assistant/tool turn). If the conversation was DELETEd
-            // mid-flight, silently drop the result — the deletion wins.
+            // Refresh the per-pod cache with the full history (system + every
+            // user/assistant/tool turn) when this replica holds it. A replica
+            // that only continued from the store has no local entry; the durable
+            // history written by Core stands on its own, so the write is skipped.
             if let Some(mut entry) = ctx.conversations.get_mut(&job.conversation_id) {
                 entry.messages = full_history;
                 entry.updated_at = Utc::now();
@@ -1068,6 +1094,8 @@ mod tests {
     use neuromance_client::ClientError;
     use neuromance_common::chat::MessageRole;
     use neuromance_common::client::{ChatChunk, ChatRequest, ChatResponse, Config};
+    use neuromance_db::ConversationSink;
+    use sqlx::PgPool;
 
     use super::*;
 
@@ -1224,6 +1252,7 @@ mod tests {
                 task_id,
                 conversation_id: conv_id,
                 user: "hello".to_string(),
+                seeded: true,
             })
             .await
             .unwrap();
@@ -1574,6 +1603,7 @@ mod tests {
                 task_id: first.id,
                 conversation_id: conv_id,
                 user: "hello".to_string(),
+                seeded: true,
             },
             CancellationToken::new(),
         )
@@ -1612,6 +1642,7 @@ mod tests {
                 task_id: second.id,
                 conversation_id: conv_id,
                 user: "again".to_string(),
+                seeded: false,
             },
             CancellationToken::new(),
         )
@@ -1643,14 +1674,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_job_fails_cleanly_when_conversation_deleted() {
+    async fn process_job_fails_cleanly_when_conversation_record_missing() {
         let (state, _rx) = fresh_state(4);
         let task = try_enqueue(&state, "hi".to_string(), None, None)
             .await
             .expect("enqueue should succeed");
         let conv_id = task.conversation_id;
 
-        // DELETE before the worker runs.
+        // Drop the per-pod record before the worker runs.
         state.conversations.remove(&conv_id);
 
         let core = Core::new(EchoClient::new("never-runs"));
@@ -1661,6 +1692,7 @@ mod tests {
                 task_id: task.id,
                 conversation_id: conv_id,
                 user: "hi".to_string(),
+                seeded: true,
             },
             CancellationToken::new(),
         )
@@ -1671,7 +1703,7 @@ mod tests {
             (entry.status, entry.error.clone())
         };
         assert_eq!(status, TaskStatus::Failed);
-        assert_eq!(error.as_deref(), Some("conversation deleted"));
+        assert_eq!(error.as_deref(), Some("conversation record missing"));
     }
 
     #[test]
@@ -1749,5 +1781,166 @@ mod tests {
             tasks.insert(rec.id, rec);
         }
         assert!(active_tasks_sorted(&tasks).is_empty());
+    }
+
+    // --- Postgres-backed continuation tests --------------------------------
+    //
+    // These exercise the store-authoritative continuation path. They are
+    // `#[ignore]`d because CI has no postgres; run locally with `DATABASE_URL`
+    // set, matching `crates/neuromance-db/tests/store.rs`:
+    //
+    //   DATABASE_URL=postgres://postgres:pg@localhost:5432/neuromance \
+    //       cargo test -p neuromance-runtime -- --ignored
+
+    /// `fresh_state` plus a durable store wrapping `pool`.
+    fn state_with_store(capacity: usize, pool: PgPool) -> (ServeState, mpsc::Receiver<WorkerJob>) {
+        let (mut state, rx) = fresh_state(capacity);
+        state.store = Some(Arc::new(PgConversationStore::new(pool)));
+        (state, rx)
+    }
+
+    /// `worker_ctx` that shares the state's durable store.
+    fn worker_ctx_with_store<C: LLMClient + Send + Sync>(
+        state: &ServeState,
+        agent: Arc<Mutex<Agent<C>>>,
+    ) -> WorkerCtx<C> {
+        WorkerCtx {
+            tasks: Arc::clone(&state.tasks),
+            conversations: Arc::clone(&state.conversations),
+            agent,
+            store: state.store.clone(),
+            sandbox: None,
+            local_python: None,
+        }
+    }
+
+    #[sqlx::test(migrations = "../neuromance-db/migrations")]
+    #[ignore = "requires postgres via DATABASE_URL"]
+    async fn resolve_continuation_rehydrates_from_store_on_cold_cache(pool: PgPool) {
+        let (state, _rx) = state_with_store(4, pool);
+        let conv_id = Uuid::new_v4();
+        // Seed durable history but leave the in-memory cache empty — the
+        // cross-pod scenario where the request lands on a replica that never
+        // accepted earlier turns.
+        let store = state.store.clone().expect("store configured");
+        store
+            .append_messages(
+                conv_id,
+                &[
+                    Message::system(conv_id, "system"),
+                    Message::user(conv_id, "first"),
+                    Message::assistant(conv_id, "reply"),
+                ],
+            )
+            .await
+            .expect("seed durable history");
+
+        let record = try_enqueue(&state, "again".to_string(), Some(conv_id), None)
+            .await
+            .expect("continuation against a store-only conversation should enqueue");
+
+        assert_eq!(record.conversation_id, conv_id);
+        assert!(
+            !state.conversations.contains_key(&conv_id),
+            "resolution must not be gated on the local cache"
+        );
+    }
+
+    #[sqlx::test(migrations = "../neuromance-db/migrations")]
+    #[ignore = "requires postgres via DATABASE_URL"]
+    async fn resolve_unknown_id_with_store_returns_not_found(pool: PgPool) {
+        let (state, _rx) = state_with_store(4, pool);
+        let bogus = Uuid::new_v4();
+        let err = try_enqueue(&state, "hi".to_string(), Some(bogus), None)
+            .await
+            .expect_err("id absent from both cache and store must 404");
+        assert!(matches!(err, EnqueueError::ConversationNotFound(id) if id == bogus));
+    }
+
+    #[sqlx::test(migrations = "../neuromance-db/migrations")]
+    #[ignore = "requires postgres via DATABASE_URL"]
+    async fn process_job_reads_history_from_store_not_stale_cache(pool: PgPool) {
+        let (state, _rx) = state_with_store(4, pool);
+        let conv_id = Uuid::new_v4();
+        let store = state.store.clone().expect("store configured");
+
+        // The store holds two completed turns...
+        store
+            .append_messages(
+                conv_id,
+                &[
+                    Message::system(conv_id, "system"),
+                    Message::user(conv_id, "turn-1"),
+                    Message::assistant(conv_id, "reply-1"),
+                    Message::user(conv_id, "turn-2"),
+                    Message::assistant(conv_id, "reply-2"),
+                ],
+            )
+            .await
+            .expect("seed durable history");
+
+        // ...but this replica's cache is stale at turn 1 only. If the worker
+        // trusted the cache it would silently drop turn 2.
+        state.conversations.insert(
+            conv_id,
+            ConversationRecord {
+                id: conv_id,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                turn_count: 1,
+                messages: vec![
+                    Message::system(conv_id, "system"),
+                    Message::user(conv_id, "turn-1"),
+                    Message::assistant(conv_id, "reply-1"),
+                ],
+            },
+        );
+
+        let task_id = Uuid::new_v4();
+        let now = Utc::now();
+        state.tasks.insert(
+            task_id,
+            TaskRecord {
+                id: task_id,
+                status: TaskStatus::Pending,
+                conversation_id: conv_id,
+                created_at: now,
+                updated_at: now,
+                output: None,
+                error: None,
+                queue_depth_at_enqueue: 0,
+            },
+        );
+
+        let core = Core::new(EchoClient::new("reply-3"));
+        let agent = Arc::new(Mutex::new(Agent::new("test".into(), core)));
+        process_job(
+            &worker_ctx_with_store(&state, agent),
+            WorkerJob {
+                task_id,
+                conversation_id: conv_id,
+                user: "turn-3".to_string(),
+                seeded: false,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        // Run input came from the store (5 prior + user-3 + assistant-3 = 7),
+        // not the 3-message stale cache (which would yield 5).
+        let history = state
+            .conversations
+            .get(&conv_id)
+            .expect("conv exists")
+            .messages
+            .clone();
+        assert_eq!(history.len(), 7, "history must include the store's turn 2");
+        assert_eq!(history[3].content, "turn-2");
+        assert_eq!(history[5].content, "turn-3");
+        assert_eq!(history[6].content, "reply-3");
+        assert_eq!(
+            state.tasks.get(&task_id).expect("task record").status,
+            TaskStatus::Succeeded
+        );
     }
 }
