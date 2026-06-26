@@ -2,9 +2,11 @@
 //!
 //! [`PersistenceHook`] records conversation history through a
 //! [`ConversationSink`] as a run progresses: the seed snapshot at conversation
-//! start and every subsequent assistant/tool message. Writes are best-effort
-//! and idempotent per [`Message::id`] — a failed write leaves its ids unmarked
-//! so the next persist point retries the backlog.
+//! start and every subsequent assistant/tool message. Mid-run writes are
+//! best-effort and idempotent per [`Message::id`] — a failed write leaves its
+//! ids unmarked so the next persist point retries the backlog. At completion the
+//! write is fail-closed: any backlog is flushed and a remaining failure aborts
+//! the run, so a task reports success only when its history is durable.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -70,12 +72,14 @@ impl PersistenceHook {
         }
     }
 
-    /// Persist messages not yet recorded this run, tolerating failures.
+    /// Persist messages not yet recorded this run.
     ///
     /// On success the ids are marked persisted; on failure they are left
     /// unmarked so the next persist point retries the backlog (the sink's
-    /// per-id idempotency makes the retry safe).
-    async fn persist(&self, messages: &[Message]) {
+    /// per-id idempotency makes the retry safe), and the error is returned so
+    /// the caller can decide whether to tolerate it (mid-run) or fail the run
+    /// (at completion).
+    async fn persist(&self, messages: &[Message]) -> anyhow::Result<()> {
         let pending: Vec<Message> = {
             let persisted = self
                 .persisted
@@ -88,13 +92,10 @@ impl PersistenceHook {
                 .collect()
         };
         let Some(first) = pending.first() else {
-            return;
+            return Ok(());
         };
-        match self
-            .sink
-            .append_messages(first.conversation_id, &pending)
-            .await
-        {
+        let conversation_id = first.conversation_id;
+        match self.sink.append_messages(conversation_id, &pending).await {
             Ok(inserted) => {
                 {
                     let mut persisted = self
@@ -104,16 +105,26 @@ impl PersistenceHook {
                     persisted.extend(pending.iter().map(|m| m.id));
                 }
                 metrics::counter!("neuromance_db_messages_persisted_total").increment(inserted);
+                Ok(())
             }
             Err(e) => {
-                tracing::warn!(
-                    conversation_id = %first.conversation_id,
-                    error = %e,
-                    pending = pending.len(),
-                    "conversation persistence failed; continuing without it"
-                );
                 metrics::counter!("neuromance_db_persist_failures_total").increment(1);
+                Err(anyhow::Error::new(e).context(format!(
+                    "persist {} message(s) for conversation {conversation_id}",
+                    pending.len(),
+                )))
             }
+        }
+    }
+
+    /// Persist messages, logging and swallowing any failure.
+    ///
+    /// Used at mid-run persist points where a transient failure should not abort
+    /// the run: the unmarked ids are retried at the next persist point and the
+    /// write is ultimately enforced by [`PersistenceHook::on_completion`].
+    async fn persist_best_effort(&self, messages: &[Message]) {
+        if let Err(e) = self.persist(messages).await {
+            tracing::warn!(error = %e, "conversation persistence failed; will retry");
         }
     }
 
@@ -154,15 +165,28 @@ impl Hook for PersistenceHook {
     ) -> anyhow::Result<HookOutcome> {
         // Persist the seed snapshot up front so the input is durable even if
         // the first LLM call fails, then link to the spawning parent once the
-        // append has created the conversation row.
-        self.persist(messages).await;
+        // append has created the conversation row. Best-effort: a failure here
+        // is retried by the next persist point and enforced at completion.
+        self.persist_best_effort(messages).await;
         self.link_parent(messages).await;
         Ok(HookOutcome::none())
     }
 
     async fn on_messages(&self, _ctx: &HookContext, messages: &[Message]) -> anyhow::Result<()> {
-        self.persist(messages).await;
+        // Best-effort mid-run: a transient write failure leaves ids unmarked so
+        // the next persist point (or completion) retries the backlog, rather
+        // than aborting a run that may still recover.
+        self.persist_best_effort(messages).await;
         Ok(())
+    }
+
+    async fn on_completion(&self, _ctx: &HookContext, messages: &[Message]) -> anyhow::Result<()> {
+        // Fail-closed barrier: flush any messages earlier persist points failed
+        // to write before the run reports success. A continuation served from
+        // another replica reads history from the store, so a `Succeeded` task
+        // must imply its history is durable — otherwise the continuation would
+        // silently resume from a truncated conversation.
+        self.persist(messages).await
     }
 }
 
@@ -247,6 +271,54 @@ mod tests {
 
         // Next persist retries the backlog.
         hook.on_messages(&ctx, &seed).await.unwrap();
+        assert_eq!(sink.appended.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_on_completion_propagates_persist_failure() {
+        let sink = Arc::new(RecordingSink::default());
+        *sink.fail_next.lock().unwrap() = true;
+        let hook = hook(Arc::clone(&sink));
+        let conv = Uuid::new_v4();
+        let ctx = HookContext::new(conv, 0);
+        let messages = vec![Message::system(conv, "s")];
+
+        // A write failure at completion must surface, not be swallowed.
+        assert!(hook.on_completion(&ctx, &messages).await.is_err());
+        assert!(sink.appended.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_on_completion_flushes_backlog() {
+        let sink = Arc::new(RecordingSink::default());
+        *sink.fail_next.lock().unwrap() = true;
+        let hook = hook(Arc::clone(&sink));
+        let conv = Uuid::new_v4();
+        let ctx = HookContext::new(conv, 0);
+        let messages = vec![Message::system(conv, "s")];
+
+        // Mid-run write fails and is swallowed, leaving the id unmarked.
+        hook.on_messages(&ctx, &messages).await.unwrap();
+        assert!(sink.appended.lock().unwrap().is_empty());
+
+        // Completion flushes the backlog and succeeds.
+        hook.on_completion(&ctx, &messages).await.unwrap();
+        assert_eq!(sink.appended.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_on_completion_noop_when_all_persisted() {
+        let sink = Arc::new(RecordingSink::default());
+        let hook = hook(Arc::clone(&sink));
+        let conv = Uuid::new_v4();
+        let ctx = HookContext::new(conv, 0);
+        let messages = vec![Message::system(conv, "s")];
+
+        hook.on_messages(&ctx, &messages).await.unwrap();
+        assert_eq!(sink.appended.lock().unwrap().len(), 1);
+
+        // Nothing pending: completion appends nothing and still succeeds.
+        hook.on_completion(&ctx, &messages).await.unwrap();
         assert_eq!(sink.appended.lock().unwrap().len(), 1);
     }
 }
