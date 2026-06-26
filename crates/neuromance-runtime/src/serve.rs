@@ -54,7 +54,7 @@ use uuid::Uuid;
 use neuromance::error::CoreError;
 use neuromance_agent::Agent;
 use neuromance_client::LLMClient;
-use neuromance_common::chat::{Conversation, Message, TaskStatus};
+use neuromance_common::chat::{Message, TaskStatus};
 use neuromance_db::{PgConversationStore, TaskStatusUpdate};
 
 use crate::SessionReset;
@@ -227,7 +227,6 @@ pub struct ServeState {
     /// File-oriented skills menu folded into each new conversation's system
     /// prompt; `None` when no skills are configured.
     skills_menu: Option<Arc<str>>,
-    agent_id: Arc<str>,
     /// Durable conversation record; `None` when `[database]` is not configured.
     store: Option<Arc<PgConversationStore>>,
 }
@@ -312,22 +311,9 @@ fn seed_new_conversation(state: &ServeState, system_prompt: Option<&str>) -> Uui
             messages,
         },
     );
-    // Record the conversation row up front so it carries the agent identity;
-    // the messages themselves are persisted by Core during the run.
-    if let Some(store) = &state.store {
-        let store = Arc::clone(store);
-        let mut conversation = Conversation::new();
-        conversation.id = id;
-        conversation.metadata.insert(
-            "agent_id".to_string(),
-            serde_json::json!(state.agent_id.as_ref()),
-        );
-        tokio::spawn(async move {
-            if let Err(e) = store.upsert_conversation(&conversation).await {
-                warn!(error = %e, conversation_id = %id, "failed to record conversation row");
-            }
-        });
-    }
+    // The durable conversation row is created fail-closed by `record_task_status`
+    // in `try_enqueue` (it pre-inserts the row in the same transaction as the
+    // pending task), so seeding only has to establish the in-memory record here.
     id
 }
 
@@ -982,7 +968,6 @@ pub async fn run<C: LLMClient + Send + Sync + 'static>(
         work_tx,
         system_prompt,
         skills_menu,
-        agent_id: Arc::from(config.agent.id.as_str()),
         store: store.clone(),
     };
     let app = router(state);
@@ -1285,7 +1270,6 @@ mod tests {
                 work_tx,
                 system_prompt: Arc::from("system"),
                 skills_menu: None,
-                agent_id: Arc::from("test-agent"),
                 store: None,
             },
             work_rx,
