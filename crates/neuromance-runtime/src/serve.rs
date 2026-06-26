@@ -52,14 +52,20 @@ use tracing::{Level, Span, error, field, info, info_span, warn};
 use uuid::Uuid;
 
 use neuromance::error::CoreError;
-use neuromance_agent::Agent;
+use neuromance_agent::{Agent, AgentResponse};
 use neuromance_client::LLMClient;
 use neuromance_common::chat::{Message, TaskStatus};
+use neuromance_common::client::Config;
 use neuromance_db::{PgConversationStore, TaskStatusUpdate};
 
+use crate::AgentBuilder;
 use crate::SessionReset;
 use crate::config::RuntimeConfig;
 use crate::sandbox::{EXECUTE_PYTHON, SandboxClient};
+
+/// The agent type the worker drives. Serve always boots a boxed client, and a
+/// per-task override produces the same type, so both run paths share it.
+type ServeAgent = Agent<Box<dyn LLMClient>>;
 
 enum JobOutcome {
     Succeeded,
@@ -139,6 +145,14 @@ pub struct CreateTaskRequest {
     /// message; an unknown `conversation_id` still returns 404.
     #[serde(default)]
     pub system_prompt: Option<String>,
+    /// Override the model for this task as a raw `provider:model` string (e.g.
+    /// `anthropic:claude-opus-4-8`). The runtime builds a one-off agent for the
+    /// task bound to this model, reusing the configured provider's credential
+    /// and endpoint — so the override must name a model that credential covers.
+    /// Omitted runs on the runtime's configured model. A malformed string is
+    /// rejected with 400.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -159,6 +173,8 @@ enum EnqueueError {
     ConversationNotFound(Uuid),
     SystemPromptOnExisting(Uuid),
     EmptySystemPrompt,
+    /// The `model` override could not be parsed as a `provider:model` string.
+    InvalidModel(String),
     /// The durable `pending` row could not be written, so the task was rejected
     /// rather than handed back an id no sibling replica could resolve.
     Persistence,
@@ -199,6 +215,13 @@ impl IntoResponse for EnqueueError {
                     "error": "system_prompt must not be empty or whitespace-only",
                 }),
             ),
+            Self::InvalidModel(detail) => (
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({
+                    "error": "invalid model override",
+                    "detail": detail,
+                }),
+            ),
             Self::Persistence => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 serde_json::json!({"error": "failed to persist task"}),
@@ -216,6 +239,9 @@ struct WorkerJob {
     /// system message lives only in the per-pod cache until Core persists it
     /// mid-run; a continuation (`false`) reads its history from the store.
     seeded: bool,
+    /// Per-task model override (raw `provider:model`); `None` uses the shared
+    /// agent. Validated at enqueue time, so the worker can trust it parses.
+    model: Option<String>,
 }
 
 #[derive(Clone)]
@@ -387,7 +413,16 @@ async fn try_enqueue(
     user: String,
     conversation_id: Option<Uuid>,
     system_prompt: Option<&str>,
+    model: Option<&str>,
 ) -> Result<TaskRecord, EnqueueError> {
+    // Reject a malformed model override before minting a task, so the caller
+    // gets a 400 at submit instead of a mid-run failure. Parsing also fixes the
+    // client family the worker will build against.
+    if let Some(model) = model
+        && let Err(e) = Config::from_model(model)
+    {
+        return Err(EnqueueError::InvalidModel(format!("{model}: {e}")));
+    }
     let (conversation_id, seeded) =
         resolve_conversation(state, conversation_id, system_prompt).await?;
     let task_id = Uuid::new_v4();
@@ -428,6 +463,7 @@ async fn try_enqueue(
         conversation_id,
         user,
         seeded,
+        model: model.map(str::to_owned),
     }) {
         Ok(()) => {
             #[allow(clippy::cast_precision_loss)]
@@ -472,6 +508,7 @@ async fn create_task(
         req.user,
         req.conversation_id,
         req.system_prompt.as_deref(),
+        req.model.as_deref(),
     )
     .await
     {
@@ -623,10 +660,13 @@ async fn list_conversation_children(
 /// Shared handles the worker needs to run a job and record its provenance.
 /// Bundled so [`worker_loop`] and [`run`] stay within the positional-argument
 /// budget as fields accrue.
-struct WorkerCtx<C: LLMClient + Send + Sync> {
+struct WorkerCtx {
     tasks: Arc<DashMap<Uuid, TaskRecord>>,
     conversations: Arc<DashMap<Uuid, ConversationRecord>>,
-    agent: Arc<Mutex<Agent<C>>>,
+    /// Shared agent reused by every task that does not override the model.
+    agent: Arc<Mutex<ServeAgent>>,
+    /// Builds a throwaway agent for a task that overrides the model.
+    builder: Arc<dyn AgentBuilder>,
     /// Durable conversation store; `None` when `[database]` is not configured.
     store: Option<Arc<PgConversationStore>>,
     /// Sandbox handle used to release a task's `execute_python` interpreter once
@@ -640,11 +680,7 @@ struct WorkerCtx<C: LLMClient + Send + Sync> {
     local_python: Option<SessionReset>,
 }
 
-async fn worker_loop<C: LLMClient + Send + Sync + 'static>(
-    mut rx: mpsc::Receiver<WorkerJob>,
-    ctx: WorkerCtx<C>,
-    cancel: CancellationToken,
-) {
+async fn worker_loop(mut rx: mpsc::Receiver<WorkerJob>, ctx: WorkerCtx, cancel: CancellationToken) {
     loop {
         tokio::select! {
             () = cancel.cancelled() => {
@@ -752,7 +788,7 @@ async fn reset_local_python(local_python: Option<&SessionReset>) {
 /// a write failure is logged and the task proceeds, matching the provenance and
 /// conversation-row write-through policy. The enqueue `pending` write is the
 /// sole fail-closed exception (see `try_enqueue`).
-async fn write_through_status<C: LLMClient + Send + Sync>(ctx: &WorkerCtx<C>, task_id: Uuid) {
+async fn write_through_status(ctx: &WorkerCtx, task_id: Uuid) {
     let Some(store) = &ctx.store else {
         return;
     };
@@ -784,8 +820,8 @@ fn fail_task(tasks: &DashMap<Uuid, TaskRecord>, task_id: Uuid, reason: &str) {
 /// still sees every prior turn — the store is the single source of truth. A new
 /// conversation (or a store-less deployment) uses the per-pod record, which
 /// carries the just-minted system seed and is advanced in place here.
-async fn build_turn_input<C: LLMClient + Send + Sync>(
-    ctx: &WorkerCtx<C>,
+async fn build_turn_input(
+    ctx: &WorkerCtx,
     job: &WorkerJob,
     user_msg: Message,
 ) -> Result<Vec<Message>, &'static str> {
@@ -816,6 +852,29 @@ async fn build_turn_input<C: LLMClient + Send + Sync>(
     Ok(snapshot)
 }
 
+/// Drives one agent turn over `input_messages`, racing it against `cancel` so a
+/// shutdown abandons the run rather than stalling the drain. Records the running
+/// agent's id on the current task span.
+async fn run_turn(
+    agent: &mut ServeAgent,
+    task_id: Uuid,
+    input_messages: Vec<Message>,
+    cancel: &CancellationToken,
+) -> Result<(AgentResponse, Vec<Message>), CoreError> {
+    Span::current().record("agent_id", field::display(agent.id()));
+    // Seed the runtime task id so subagent conversations spawned during this
+    // run inherit it as their `parent_task_id`. The root conversation itself
+    // has no parent, so no conversation id is seeded here.
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => Err(CoreError::Cancelled("worker shutdown".to_string())),
+        res = neuromance_agent::scope_task(
+            Some(task_id),
+            agent.execute_with_history(Some(input_messages), cancel.child_token()),
+        ) => res,
+    }
+}
+
 #[allow(clippy::significant_drop_tightening)]
 #[tracing::instrument(
     name = "task",
@@ -826,11 +885,7 @@ async fn build_turn_input<C: LLMClient + Send + Sync>(
         conversation_id = %job.conversation_id,
     ),
 )]
-async fn process_job<C: LLMClient + Send + Sync>(
-    ctx: &WorkerCtx<C>,
-    job: WorkerJob,
-    cancel: CancellationToken,
-) -> JobOutcome {
+async fn process_job(ctx: &WorkerCtx, job: WorkerJob, cancel: CancellationToken) -> JobOutcome {
     let dequeued_at = Utc::now();
     let run_start = Instant::now();
     let (created_at, depth_at_enqueue) = if let Some(mut entry) = ctx.tasks.get_mut(&job.task_id) {
@@ -865,20 +920,30 @@ async fn process_job<C: LLMClient + Send + Sync>(
         }
     };
 
-    let mut agent = ctx.agent.lock().await;
-    let span = Span::current();
-    span.record("agent_id", field::display(agent.id()));
-
-    // Seed the runtime task id so subagent conversations spawned during this
-    // run inherit it as their `parent_task_id`. The root conversation itself
-    // has no parent, so no conversation id is seeded here.
-    let exec_result = tokio::select! {
-        biased;
-        () = cancel.cancelled() => Err(CoreError::Cancelled("worker shutdown".to_string())),
-        res = neuromance_agent::scope_task(
-            Some(job.task_id),
-            agent.execute_with_history(Some(input_messages), cancel.child_token()),
-        ) => res,
+    // A task with a model override runs on a throwaway agent built for it and
+    // dropped after the turn; everything else reuses the shared agent. The
+    // override string was validated at enqueue, but the build can still fail
+    // (e.g. a missing provider credential), which fails just this task.
+    let exec_result = if let Some(model) = job.model.as_deref() {
+        match ctx.builder.build(Some(model)).await {
+            Ok((mut agent, _local_python)) => {
+                info!(model, "task running on per-task model override");
+                run_turn(&mut agent, job.task_id, input_messages, &cancel).await
+            }
+            Err(e) => {
+                error!(model, error = %e, "failed to build agent for model override");
+                fail_task(
+                    &ctx.tasks,
+                    job.task_id,
+                    &format!("model override '{model}': {e}"),
+                );
+                write_through_status(ctx, job.task_id).await;
+                return JobOutcome::Failed;
+            }
+        }
+    } else {
+        let mut agent = ctx.agent.lock().await;
+        run_turn(&mut agent, job.task_id, input_messages, &cancel).await
     };
 
     let run_ms = u64::try_from(run_start.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -929,9 +994,11 @@ async fn process_job<C: LLMClient + Send + Sync>(
 /// # Errors
 /// Returns an error if `runtime.listen_addr` is invalid, the bind fails,
 /// or the HTTP server returns an error during operation.
-pub async fn run<C: LLMClient + Send + Sync + 'static>(
+#[allow(clippy::too_many_arguments)]
+pub async fn run(
     config: &RuntimeConfig,
-    agent: Agent<C>,
+    agent: ServeAgent,
+    builder: Arc<dyn AgentBuilder>,
     store: Option<Arc<PgConversationStore>>,
     sandbox_client: Option<SandboxClient>,
     local_python: Option<SessionReset>,
@@ -955,6 +1022,7 @@ pub async fn run<C: LLMClient + Send + Sync + 'static>(
             tasks: Arc::clone(&tasks),
             conversations: Arc::clone(&conversations),
             agent: Arc::clone(&agent),
+            builder,
             store: store.clone(),
             sandbox: session_closer,
             local_python,
@@ -1214,7 +1282,8 @@ mod tests {
             },
         );
 
-        let core = Core::new(SleepingClient::new()).with_streaming();
+        let core =
+            Core::new(Box::new(SleepingClient::new()) as Box<dyn LLMClient>).with_streaming();
         let agent = Arc::new(Mutex::new(Agent::new("test".into(), core)));
         let (work_tx, work_rx) = mpsc::channel::<WorkerJob>(1);
         let cancel = CancellationToken::new();
@@ -1225,6 +1294,7 @@ mod tests {
                 tasks: Arc::clone(&tasks),
                 conversations: Arc::clone(&conversations),
                 agent: Arc::clone(&agent),
+                builder: stub_builder(),
                 store: None,
                 sandbox: None,
                 local_python: None,
@@ -1238,6 +1308,7 @@ mod tests {
                 conversation_id: conv_id,
                 user: "hello".to_string(),
                 seeded: true,
+                model: None,
             })
             .await
             .unwrap();
@@ -1328,16 +1399,45 @@ mod tests {
         }
     }
 
+    /// Boxes a mock client into the agent type the worker drives.
+    fn boxed_agent(client: impl LLMClient + 'static) -> Arc<Mutex<ServeAgent>> {
+        let core = Core::new(Box::new(client) as Box<dyn LLMClient>);
+        Arc::new(Mutex::new(Agent::new("test".into(), core)))
+    }
+
+    /// An [`AgentBuilder`] that yields an echo agent. The non-override tests
+    /// never call it — the shared agent handles those — so a stub reply is fine;
+    /// the override test points it at a distinct reply and asserts that reply
+    /// lands, proving the per-task build path ran instead of the shared agent.
+    struct TestBuilder {
+        reply: String,
+    }
+
+    #[async_trait]
+    impl AgentBuilder for TestBuilder {
+        async fn build(
+            &self,
+            _model_override: Option<&str>,
+        ) -> Result<(ServeAgent, Option<SessionReset>), crate::RuntimeError> {
+            let core = Core::new(Box::new(EchoClient::new(&self.reply)) as Box<dyn LLMClient>);
+            Ok((Agent::new("override-agent".into(), core), None))
+        }
+    }
+
+    fn stub_builder() -> Arc<dyn AgentBuilder> {
+        Arc::new(TestBuilder {
+            reply: "unused".to_string(),
+        })
+    }
+
     /// Builds a store-less worker context sharing a state's task and
     /// conversation maps, so `process_job` can be driven directly in tests.
-    fn worker_ctx<C: LLMClient + Send + Sync>(
-        state: &ServeState,
-        agent: Arc<Mutex<Agent<C>>>,
-    ) -> WorkerCtx<C> {
+    fn worker_ctx(state: &ServeState, agent: Arc<Mutex<ServeAgent>>) -> WorkerCtx {
         WorkerCtx {
             tasks: Arc::clone(&state.tasks),
             conversations: Arc::clone(&state.conversations),
             agent,
+            builder: stub_builder(),
             store: None,
             sandbox: None,
             local_python: None,
@@ -1347,7 +1447,7 @@ mod tests {
     #[tokio::test]
     async fn test_try_enqueue_records_queue_depth_zero_when_empty() {
         let (state, _rx) = fresh_state(4);
-        let record = try_enqueue(&state, "hi".to_string(), None, None)
+        let record = try_enqueue(&state, "hi".to_string(), None, None, None)
             .await
             .expect("enqueue should succeed");
         assert_eq!(record.queue_depth_at_enqueue, 0);
@@ -1361,7 +1461,7 @@ mod tests {
         let mut depths = Vec::new();
         for _ in 0..3 {
             depths.push(
-                try_enqueue(&state, "hi".to_string(), None, None)
+                try_enqueue(&state, "hi".to_string(), None, None, None)
                     .await
                     .expect("enqueue should succeed")
                     .queue_depth_at_enqueue,
@@ -1373,14 +1473,14 @@ mod tests {
     #[tokio::test]
     async fn test_try_enqueue_returns_queue_full_at_capacity() {
         let (state, _rx) = fresh_state(2);
-        let first = try_enqueue(&state, "a".to_string(), None, None)
+        let first = try_enqueue(&state, "a".to_string(), None, None, None)
             .await
             .expect("first should fit");
-        let second = try_enqueue(&state, "b".to_string(), None, None)
+        let second = try_enqueue(&state, "b".to_string(), None, None, None)
             .await
             .expect("second should fit");
 
-        let err = try_enqueue(&state, "c".to_string(), None, None)
+        let err = try_enqueue(&state, "c".to_string(), None, None, None)
             .await
             .expect_err("third should reject");
         assert!(
@@ -1403,7 +1503,7 @@ mod tests {
         let (state, rx) = fresh_state(4);
         drop(rx);
 
-        let err = try_enqueue(&state, "hi".to_string(), None, None)
+        let err = try_enqueue(&state, "hi".to_string(), None, None, None)
             .await
             .expect_err("send should fail");
         assert!(matches!(err, EnqueueError::WorkerShutdown), "got {err:?}");
@@ -1429,7 +1529,7 @@ mod tests {
     #[tokio::test]
     async fn test_try_enqueue_seeds_fresh_conversation_with_system_prompt() {
         let (state, _rx) = fresh_state(4);
-        let record = try_enqueue(&state, "hi".to_string(), None, None)
+        let record = try_enqueue(&state, "hi".to_string(), None, None, None)
             .await
             .expect("enqueue should succeed");
 
@@ -1450,7 +1550,7 @@ mod tests {
     #[tokio::test]
     async fn test_try_enqueue_override_seeds_custom_system_prompt() {
         let (state, _rx) = fresh_state(4);
-        let record = try_enqueue(&state, "hi".to_string(), None, Some("be terse"))
+        let record = try_enqueue(&state, "hi".to_string(), None, Some("be terse"), None)
             .await
             .expect("enqueue should succeed");
 
@@ -1469,7 +1569,7 @@ mod tests {
     #[tokio::test]
     async fn test_try_enqueue_falls_back_to_configured_prompt_when_override_omitted() {
         let (state, _rx) = fresh_state(4);
-        let record = try_enqueue(&state, "hi".to_string(), None, None)
+        let record = try_enqueue(&state, "hi".to_string(), None, None, None)
             .await
             .expect("enqueue should succeed");
 
@@ -1486,7 +1586,7 @@ mod tests {
     #[tokio::test]
     async fn test_try_enqueue_override_on_existing_conversation_is_rejected() {
         let (state, _rx) = fresh_state(4);
-        let first = try_enqueue(&state, "hi".to_string(), None, None)
+        let first = try_enqueue(&state, "hi".to_string(), None, None, None)
             .await
             .expect("first should succeed");
 
@@ -1495,6 +1595,7 @@ mod tests {
             "again".to_string(),
             Some(first.conversation_id),
             Some("be terse"),
+            None,
         )
         .await
         .expect_err("override on existing conversation should be rejected");
@@ -1520,7 +1621,7 @@ mod tests {
         let (state, _rx) = fresh_state(4);
 
         for prompt in ["", "   \n\t"] {
-            let err = try_enqueue(&state, "hi".to_string(), None, Some(prompt))
+            let err = try_enqueue(&state, "hi".to_string(), None, Some(prompt), None)
                 .await
                 .expect_err("blank override should be rejected");
             assert!(
@@ -1539,13 +1640,14 @@ mod tests {
     #[tokio::test]
     async fn test_try_enqueue_reuses_existing_conversation() {
         let (state, _rx) = fresh_state(4);
-        let first = try_enqueue(&state, "hi".to_string(), None, None)
+        let first = try_enqueue(&state, "hi".to_string(), None, None, None)
             .await
             .expect("first should succeed");
         let second = try_enqueue(
             &state,
             "again".to_string(),
             Some(first.conversation_id),
+            None,
             None,
         )
         .await
@@ -1559,7 +1661,7 @@ mod tests {
     async fn test_try_enqueue_unknown_conversation_returns_not_found() {
         let (state, _rx) = fresh_state(4);
         let bogus = Uuid::new_v4();
-        let err = try_enqueue(&state, "hi".to_string(), Some(bogus), None)
+        let err = try_enqueue(&state, "hi".to_string(), Some(bogus), None, None)
             .await
             .expect_err("unknown conv id should be rejected");
         assert!(matches!(err, EnqueueError::ConversationNotFound(id) if id == bogus));
@@ -1573,13 +1675,12 @@ mod tests {
     #[tokio::test]
     async fn process_job_continues_existing_conversation() {
         let (state, _rx) = fresh_state(4);
-        let first = try_enqueue(&state, "hello".to_string(), None, None)
+        let first = try_enqueue(&state, "hello".to_string(), None, None, None)
             .await
             .expect("first enqueue should succeed");
         let conv_id = first.conversation_id;
 
-        let core = Core::new(EchoClient::new("hi-1"));
-        let agent = Arc::new(Mutex::new(Agent::new("test".into(), core)));
+        let agent = boxed_agent(EchoClient::new("hi-1"));
 
         process_job(
             &worker_ctx(&state, agent),
@@ -1588,6 +1689,7 @@ mod tests {
                 conversation_id: conv_id,
                 user: "hello".to_string(),
                 seeded: true,
+                model: None,
             },
             CancellationToken::new(),
         )
@@ -1615,11 +1717,10 @@ mod tests {
             1
         );
 
-        let second = try_enqueue(&state, "again".to_string(), Some(conv_id), None)
+        let second = try_enqueue(&state, "again".to_string(), Some(conv_id), None, None)
             .await
             .expect("second enqueue should succeed");
-        let core2 = Core::new(EchoClient::new("hi-2"));
-        let agent2 = Arc::new(Mutex::new(Agent::new("test".into(), core2)));
+        let agent2 = boxed_agent(EchoClient::new("hi-2"));
         process_job(
             &worker_ctx(&state, agent2),
             WorkerJob {
@@ -1627,6 +1728,7 @@ mod tests {
                 conversation_id: conv_id,
                 user: "again".to_string(),
                 seeded: false,
+                model: None,
             },
             CancellationToken::new(),
         )
@@ -1660,7 +1762,7 @@ mod tests {
     #[tokio::test]
     async fn process_job_fails_cleanly_when_conversation_record_missing() {
         let (state, _rx) = fresh_state(4);
-        let task = try_enqueue(&state, "hi".to_string(), None, None)
+        let task = try_enqueue(&state, "hi".to_string(), None, None, None)
             .await
             .expect("enqueue should succeed");
         let conv_id = task.conversation_id;
@@ -1668,8 +1770,7 @@ mod tests {
         // Drop the per-pod record before the worker runs.
         state.conversations.remove(&conv_id);
 
-        let core = Core::new(EchoClient::new("never-runs"));
-        let agent = Arc::new(Mutex::new(Agent::new("test".into(), core)));
+        let agent = boxed_agent(EchoClient::new("never-runs"));
         process_job(
             &worker_ctx(&state, agent),
             WorkerJob {
@@ -1677,6 +1778,7 @@ mod tests {
                 conversation_id: conv_id,
                 user: "hi".to_string(),
                 seeded: true,
+                model: None,
             },
             CancellationToken::new(),
         )
@@ -1688,6 +1790,76 @@ mod tests {
         };
         assert_eq!(status, TaskStatus::Failed);
         assert_eq!(error.as_deref(), Some("conversation record missing"));
+    }
+
+    #[tokio::test]
+    async fn test_try_enqueue_rejects_invalid_model() {
+        let (state, _rx) = fresh_state(4);
+        let err = try_enqueue(
+            &state,
+            "hi".to_string(),
+            None,
+            None,
+            Some("not-a-valid-model"),
+        )
+        .await
+        .expect_err("malformed model override should be rejected");
+        assert!(matches!(err, EnqueueError::InvalidModel(_)), "got {err:?}");
+        assert!(state.tasks.is_empty(), "rejected task must not be recorded");
+        assert!(
+            state.conversations.is_empty(),
+            "rejected request must not seed a conversation"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_job_with_model_override_runs_built_agent() {
+        let (state, _rx) = fresh_state(4);
+        let task = try_enqueue(&state, "hi".to_string(), None, None, None)
+            .await
+            .expect("enqueue should succeed");
+        let conv_id = task.conversation_id;
+
+        // The shared agent and the per-task builder return different replies, so
+        // the assistant message that lands tells us which agent actually ran.
+        let ctx = WorkerCtx {
+            tasks: Arc::clone(&state.tasks),
+            conversations: Arc::clone(&state.conversations),
+            agent: boxed_agent(EchoClient::new("from-shared")),
+            builder: Arc::new(TestBuilder {
+                reply: "from-override".to_string(),
+            }),
+            store: None,
+            sandbox: None,
+            local_python: None,
+        };
+        process_job(
+            &ctx,
+            WorkerJob {
+                task_id: task.id,
+                conversation_id: conv_id,
+                user: "hi".to_string(),
+                seeded: true,
+                model: Some("anthropic:claude-haiku-4-5".to_string()),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let last = state
+            .conversations
+            .get(&conv_id)
+            .expect("conv exists")
+            .messages
+            .last()
+            .expect("assistant reply")
+            .content
+            .clone();
+        assert_eq!(last, "from-override", "the override agent should have run");
+        assert_eq!(
+            state.tasks.get(&task.id).expect("task record").status,
+            TaskStatus::Succeeded
+        );
     }
 
     #[test]
@@ -1784,14 +1956,12 @@ mod tests {
     }
 
     /// `worker_ctx` that shares the state's durable store.
-    fn worker_ctx_with_store<C: LLMClient + Send + Sync>(
-        state: &ServeState,
-        agent: Arc<Mutex<Agent<C>>>,
-    ) -> WorkerCtx<C> {
+    fn worker_ctx_with_store(state: &ServeState, agent: Arc<Mutex<ServeAgent>>) -> WorkerCtx {
         WorkerCtx {
             tasks: Arc::clone(&state.tasks),
             conversations: Arc::clone(&state.conversations),
             agent,
+            builder: stub_builder(),
             store: state.store.clone(),
             sandbox: None,
             local_python: None,
@@ -1819,7 +1989,7 @@ mod tests {
             .await
             .expect("seed durable history");
 
-        let record = try_enqueue(&state, "again".to_string(), Some(conv_id), None)
+        let record = try_enqueue(&state, "again".to_string(), Some(conv_id), None, None)
             .await
             .expect("continuation against a store-only conversation should enqueue");
 
@@ -1835,7 +2005,7 @@ mod tests {
     async fn resolve_unknown_id_with_store_returns_not_found(pool: PgPool) {
         let (state, _rx) = state_with_store(4, pool);
         let bogus = Uuid::new_v4();
-        let err = try_enqueue(&state, "hi".to_string(), Some(bogus), None)
+        let err = try_enqueue(&state, "hi".to_string(), Some(bogus), None, None)
             .await
             .expect_err("id absent from both cache and store must 404");
         assert!(matches!(err, EnqueueError::ConversationNotFound(id) if id == bogus));
@@ -1896,8 +2066,7 @@ mod tests {
             },
         );
 
-        let core = Core::new(EchoClient::new("reply-3"));
-        let agent = Arc::new(Mutex::new(Agent::new("test".into(), core)));
+        let agent = boxed_agent(EchoClient::new("reply-3"));
         process_job(
             &worker_ctx_with_store(&state, agent),
             WorkerJob {
@@ -1905,6 +2074,7 @@ mod tests {
                 conversation_id: conv_id,
                 user: "turn-3".to_string(),
                 seeded: false,
+                model: None,
             },
             CancellationToken::new(),
         )
