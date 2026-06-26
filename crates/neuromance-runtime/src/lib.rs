@@ -23,6 +23,7 @@ pub mod approval;
 pub mod bootstrap;
 pub mod config;
 pub mod error;
+pub mod factory;
 pub mod health;
 pub mod lifecycle;
 pub mod metrics;
@@ -41,5 +42,6 @@ pub use config::{
     RuntimeSettings, SandboxConfig, SkillsSettings, SubagentConfig,
 };
 pub use error::RuntimeError;
+pub use factory::AgentBuilder;
 pub use skills::SkillRuntime;
 pub use subagents::{SessionReset, build_parent_toolset};

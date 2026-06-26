@@ -16,7 +16,7 @@ use neuromance_context::rules::RulesHook;
 use neuromance_context::{CompactionHook, ContextConfig};
 use neuromance_db::{PersistenceHook, PgConversationStore};
 use neuromance_runtime::{
-    ApprovalMode, Mode, RuntimeConfig, RuntimeError, SessionReset, SkillRuntime,
+    AgentBuilder, ApprovalMode, Mode, RuntimeConfig, RuntimeError, SessionReset, SkillRuntime,
     approval::WebhookApprover,
     bootstrap, build_parent_toolset,
     health::{ReadinessGate, router as health_router},
@@ -123,16 +123,19 @@ async fn run_orchestrator(config: &RuntimeConfig, cancel: CancellationToken) -> 
     let skills = skills::build(config.skills.as_ref()).await;
 
     let rules = rules::build(config.rules.as_ref()).await;
-    let (agent, local_python) = build_agent(
-        config,
-        store.as_ref(),
-        sandbox_client.as_ref(),
-        skills.as_ref(),
-        rules.as_ref(),
-        &cancel,
-    )
-    .await
-    .map_err(anyhow::Error::from)?;
+
+    // The factory owns every input `build_agent` needs so serve mode can rebuild
+    // a fresh agent for a task that overrides the model. The initial shared agent
+    // is built through it too, so there is a single construction path.
+    let factory = Arc::new(AgentFactory {
+        config: Arc::new(config.clone()),
+        store: store.clone(),
+        sandbox_client: sandbox_client.clone(),
+        skills: skills.clone(),
+        rules: rules.clone(),
+        cancel: cancel.clone(),
+    });
+    let (agent, local_python) = factory.build(None).await.map_err(anyhow::Error::from)?;
 
     // Best-effort: run one-time tool setup before tasks, since the pod has no
     // persistent storage to cache credentials a tool writes to disk.
@@ -150,6 +153,7 @@ async fn run_orchestrator(config: &RuntimeConfig, cancel: CancellationToken) -> 
             run_serve(
                 config,
                 agent,
+                factory,
                 store,
                 sandbox_client,
                 local_python,
@@ -328,6 +332,7 @@ async fn build_agent(
     skills: Option<&Arc<SkillRuntime>>,
     rules: Option<&Arc<RulesHook>>,
     cancel: &CancellationToken,
+    model_override: Option<&str>,
 ) -> Result<(Agent<Box<dyn LLMClient>>, Option<SessionReset>), RuntimeError> {
     let provider = config.provider(&config.agent.provider).ok_or_else(|| {
         RuntimeError::Config(format!(
@@ -335,12 +340,18 @@ async fn build_agent(
             config.agent.provider
         ))
     })?;
-    let model = config.agent_model().ok_or_else(|| {
-        RuntimeError::Config(format!(
-            "agent has no model: set agent.model or provider '{}' model",
-            config.agent.provider
-        ))
-    })?;
+    // A per-task override swaps only the model string; the configured provider
+    // still supplies the credential and endpoint. The override's `provider:`
+    // prefix selects the client family (see `Config::from_model`).
+    let model = match model_override {
+        Some(model) => model,
+        None => config.agent_model().ok_or_else(|| {
+            RuntimeError::Config(format!(
+                "agent has no model: set agent.model or provider '{}' model",
+                config.agent.provider
+            ))
+        })?,
+    };
     let llm_config = build_provider_config(provider, model)?;
     let client = build_client(llm_config.clone())
         .map_err(|e| RuntimeError::Config(format!("build client: {e}")))?;
@@ -438,6 +449,38 @@ async fn build_agent(
     Ok((Agent::new(config.agent.id.clone(), core), local_python))
 }
 
+/// Owns the startup inputs `build_agent` needs so the serve worker can build a
+/// fresh agent per task when a task carries a model override. Every input is
+/// already cheap to share (`Arc`, a lazy sandbox channel, a token), so cloning
+/// it into the factory costs nothing meaningful.
+struct AgentFactory {
+    config: Arc<RuntimeConfig>,
+    store: Option<Arc<PgConversationStore>>,
+    sandbox_client: Option<sandbox::SandboxClient>,
+    skills: Option<Arc<SkillRuntime>>,
+    rules: Option<Arc<RulesHook>>,
+    cancel: CancellationToken,
+}
+
+#[async_trait::async_trait]
+impl AgentBuilder for AgentFactory {
+    async fn build(
+        &self,
+        model_override: Option<&str>,
+    ) -> Result<(Agent<Box<dyn LLMClient>>, Option<SessionReset>), RuntimeError> {
+        build_agent(
+            &self.config,
+            self.store.as_ref(),
+            self.sandbox_client.as_ref(),
+            self.skills.as_ref(),
+            self.rules.as_ref(),
+            &self.cancel,
+            model_override,
+        )
+        .await
+    }
+}
+
 async fn run_oneshot(
     config: &RuntimeConfig,
     mut agent: Agent<Box<dyn LLMClient>>,
@@ -447,9 +490,11 @@ async fn run_oneshot(
     oneshot::run(config, &mut agent, skills_menu, cancel).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_serve(
     config: &RuntimeConfig,
     agent: Agent<Box<dyn LLMClient>>,
+    builder: Arc<dyn AgentBuilder>,
     store: Option<Arc<PgConversationStore>>,
     sandbox_client: Option<sandbox::SandboxClient>,
     local_python: Option<SessionReset>,
@@ -459,6 +504,7 @@ async fn run_serve(
     serve::run(
         config,
         agent,
+        builder,
         store,
         sandbox_client,
         local_python,
