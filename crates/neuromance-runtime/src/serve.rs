@@ -145,12 +145,19 @@ pub struct CreateTaskRequest {
     /// message; an unknown `conversation_id` still returns 404.
     #[serde(default)]
     pub system_prompt: Option<String>,
+    /// Select a configured `[[providers]]` entry (its credential and endpoint)
+    /// for this task by name. The runtime builds a one-off agent bound to that
+    /// provider, so distinct providers let a single workflow run tasks against
+    /// different credentials. Omitted uses the runtime's configured
+    /// `agent.provider`. An unknown name is rejected with 400.
+    #[serde(default)]
+    pub provider: Option<String>,
     /// Override the model for this task as a raw `provider:model` string (e.g.
     /// `anthropic:claude-opus-4-8`). The runtime builds a one-off agent for the
-    /// task bound to this model, reusing the configured provider's credential
-    /// and endpoint — so the override must name a model that credential covers.
-    /// Omitted runs on the runtime's configured model. A malformed string is
-    /// rejected with 400.
+    /// task bound to this model, using the selected provider's credential and
+    /// endpoint — so the override must name a model that credential covers (pair
+    /// it with `provider` to point at one that does). Omitted runs on the
+    /// selected provider's default model. A malformed string is rejected with 400.
     #[serde(default)]
     pub model: Option<String>,
 }
@@ -173,6 +180,8 @@ enum EnqueueError {
     ConversationNotFound(Uuid),
     SystemPromptOnExisting(Uuid),
     EmptySystemPrompt,
+    /// The `provider` override names no configured `[[providers]]` entry.
+    UnknownProvider(String),
     /// The `model` override could not be parsed as a `provider:model` string.
     InvalidModel(String),
     /// The durable `pending` row could not be written, so the task was rejected
@@ -215,6 +224,13 @@ impl IntoResponse for EnqueueError {
                     "error": "system_prompt must not be empty or whitespace-only",
                 }),
             ),
+            Self::UnknownProvider(name) => (
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({
+                    "error": "unknown provider override",
+                    "detail": format!("provider '{name}' does not match any configured provider"),
+                }),
+            ),
             Self::InvalidModel(detail) => (
                 StatusCode::BAD_REQUEST,
                 serde_json::json!({
@@ -239,8 +255,14 @@ struct WorkerJob {
     /// system message lives only in the per-pod cache until Core persists it
     /// mid-run; a continuation (`false`) reads its history from the store.
     seeded: bool,
-    /// Per-task model override (raw `provider:model`); `None` uses the shared
-    /// agent. Validated at enqueue time, so the worker can trust it parses.
+    /// Per-task provider override naming a configured `[[providers]]` entry;
+    /// `None` uses the configured `agent.provider`. Validated at enqueue time,
+    /// so the worker can trust it resolves.
+    provider: Option<String>,
+    /// Per-task model override (raw `provider:model`); `None` uses the selected
+    /// provider's default model. Validated at enqueue time, so the worker can
+    /// trust it parses. When both this and `provider` are `None`, the shared
+    /// agent runs the task.
     model: Option<String>,
 }
 
@@ -255,6 +277,10 @@ pub struct ServeState {
     skills_menu: Option<Arc<str>>,
     /// Durable conversation record; `None` when `[database]` is not configured.
     store: Option<Arc<PgConversationStore>>,
+    /// Names of the configured `[[providers]]` entries, used to reject an unknown
+    /// per-task `provider` override at enqueue time (400) rather than failing the
+    /// task mid-run.
+    provider_names: Arc<[String]>,
 }
 
 /// Cap on `POST /tasks` request bodies. Task input is a single user prompt;
@@ -413,8 +439,16 @@ async fn try_enqueue(
     user: String,
     conversation_id: Option<Uuid>,
     system_prompt: Option<&str>,
+    provider: Option<&str>,
     model: Option<&str>,
 ) -> Result<TaskRecord, EnqueueError> {
+    // Reject an unknown provider override before minting a task, so the caller
+    // gets a 400 at submit instead of a mid-run failure.
+    if let Some(provider) = provider
+        && !state.provider_names.iter().any(|p| p == provider)
+    {
+        return Err(EnqueueError::UnknownProvider(provider.to_owned()));
+    }
     // Reject a malformed model override before minting a task, so the caller
     // gets a 400 at submit instead of a mid-run failure. Parsing also fixes the
     // client family the worker will build against.
@@ -463,6 +497,7 @@ async fn try_enqueue(
         conversation_id,
         user,
         seeded,
+        provider: provider.map(str::to_owned),
         model: model.map(str::to_owned),
     }) {
         Ok(()) => {
@@ -508,6 +543,7 @@ async fn create_task(
         req.user,
         req.conversation_id,
         req.system_prompt.as_deref(),
+        req.provider.as_deref(),
         req.model.as_deref(),
     )
     .await
@@ -920,22 +956,27 @@ async fn process_job(ctx: &WorkerCtx, job: WorkerJob, cancel: CancellationToken)
         }
     };
 
-    // A task with a model override runs on a throwaway agent built for it and
-    // dropped after the turn; everything else reuses the shared agent. The
-    // override string was validated at enqueue, but the build can still fail
-    // (e.g. a missing provider credential), which fails just this task.
-    let exec_result = if let Some(model) = job.model.as_deref() {
-        match ctx.builder.build(Some(model)).await {
+    // A task with a provider and/or model override runs on a throwaway agent
+    // built for it and dropped after the turn; everything else reuses the shared
+    // agent. The override values were validated at enqueue, but the build can
+    // still fail (e.g. a missing provider credential), which fails just this task.
+    let exec_result = if job.provider.is_some() || job.model.is_some() {
+        let provider = job.provider.as_deref();
+        let model = job.model.as_deref();
+        match ctx.builder.build(provider, model).await {
             Ok((mut agent, _local_python)) => {
-                info!(model, "task running on per-task model override");
+                info!(
+                    provider,
+                    model, "task running on per-task provider/model override"
+                );
                 run_turn(&mut agent, job.task_id, input_messages, &cancel).await
             }
             Err(e) => {
-                error!(model, error = %e, "failed to build agent for model override");
+                error!(provider, model, error = %e, "failed to build agent for override");
                 fail_task(
                     &ctx.tasks,
                     job.task_id,
-                    &format!("model override '{model}': {e}"),
+                    &format!("task override (provider={provider:?}, model={model:?}): {e}"),
                 );
                 write_through_status(ctx, job.task_id).await;
                 return JobOutcome::Failed;
@@ -1030,6 +1071,7 @@ pub async fn run(
         cancel.clone(),
     ));
 
+    let provider_names: Arc<[String]> = config.providers.iter().map(|p| p.name.clone()).collect();
     let state = ServeState {
         tasks: Arc::clone(&tasks),
         conversations: Arc::clone(&conversations),
@@ -1037,6 +1079,7 @@ pub async fn run(
         system_prompt,
         skills_menu,
         store: store.clone(),
+        provider_names,
     };
     let app = router(state);
     let addr: std::net::SocketAddr = config
@@ -1308,6 +1351,7 @@ mod tests {
                 conversation_id: conv_id,
                 user: "hello".to_string(),
                 seeded: true,
+                provider: None,
                 model: None,
             })
             .await
@@ -1342,6 +1386,7 @@ mod tests {
                 system_prompt: Arc::from("system"),
                 skills_menu: None,
                 store: None,
+                provider_names: ["primary".to_owned(), "secondary".to_owned()].into(),
             },
             work_rx,
         )
@@ -1417,6 +1462,7 @@ mod tests {
     impl AgentBuilder for TestBuilder {
         async fn build(
             &self,
+            _provider_override: Option<&str>,
             _model_override: Option<&str>,
         ) -> Result<(ServeAgent, Option<SessionReset>), crate::RuntimeError> {
             let core = Core::new(Box::new(EchoClient::new(&self.reply)) as Box<dyn LLMClient>);
@@ -1447,7 +1493,7 @@ mod tests {
     #[tokio::test]
     async fn test_try_enqueue_records_queue_depth_zero_when_empty() {
         let (state, _rx) = fresh_state(4);
-        let record = try_enqueue(&state, "hi".to_string(), None, None, None)
+        let record = try_enqueue(&state, "hi".to_string(), None, None, None, None)
             .await
             .expect("enqueue should succeed");
         assert_eq!(record.queue_depth_at_enqueue, 0);
@@ -1461,7 +1507,7 @@ mod tests {
         let mut depths = Vec::new();
         for _ in 0..3 {
             depths.push(
-                try_enqueue(&state, "hi".to_string(), None, None, None)
+                try_enqueue(&state, "hi".to_string(), None, None, None, None)
                     .await
                     .expect("enqueue should succeed")
                     .queue_depth_at_enqueue,
@@ -1473,14 +1519,14 @@ mod tests {
     #[tokio::test]
     async fn test_try_enqueue_returns_queue_full_at_capacity() {
         let (state, _rx) = fresh_state(2);
-        let first = try_enqueue(&state, "a".to_string(), None, None, None)
+        let first = try_enqueue(&state, "a".to_string(), None, None, None, None)
             .await
             .expect("first should fit");
-        let second = try_enqueue(&state, "b".to_string(), None, None, None)
+        let second = try_enqueue(&state, "b".to_string(), None, None, None, None)
             .await
             .expect("second should fit");
 
-        let err = try_enqueue(&state, "c".to_string(), None, None, None)
+        let err = try_enqueue(&state, "c".to_string(), None, None, None, None)
             .await
             .expect_err("third should reject");
         assert!(
@@ -1503,7 +1549,7 @@ mod tests {
         let (state, rx) = fresh_state(4);
         drop(rx);
 
-        let err = try_enqueue(&state, "hi".to_string(), None, None, None)
+        let err = try_enqueue(&state, "hi".to_string(), None, None, None, None)
             .await
             .expect_err("send should fail");
         assert!(matches!(err, EnqueueError::WorkerShutdown), "got {err:?}");
@@ -1529,7 +1575,7 @@ mod tests {
     #[tokio::test]
     async fn test_try_enqueue_seeds_fresh_conversation_with_system_prompt() {
         let (state, _rx) = fresh_state(4);
-        let record = try_enqueue(&state, "hi".to_string(), None, None, None)
+        let record = try_enqueue(&state, "hi".to_string(), None, None, None, None)
             .await
             .expect("enqueue should succeed");
 
@@ -1550,7 +1596,7 @@ mod tests {
     #[tokio::test]
     async fn test_try_enqueue_override_seeds_custom_system_prompt() {
         let (state, _rx) = fresh_state(4);
-        let record = try_enqueue(&state, "hi".to_string(), None, Some("be terse"), None)
+        let record = try_enqueue(&state, "hi".to_string(), None, Some("be terse"), None, None)
             .await
             .expect("enqueue should succeed");
 
@@ -1569,7 +1615,7 @@ mod tests {
     #[tokio::test]
     async fn test_try_enqueue_falls_back_to_configured_prompt_when_override_omitted() {
         let (state, _rx) = fresh_state(4);
-        let record = try_enqueue(&state, "hi".to_string(), None, None, None)
+        let record = try_enqueue(&state, "hi".to_string(), None, None, None, None)
             .await
             .expect("enqueue should succeed");
 
@@ -1586,7 +1632,7 @@ mod tests {
     #[tokio::test]
     async fn test_try_enqueue_override_on_existing_conversation_is_rejected() {
         let (state, _rx) = fresh_state(4);
-        let first = try_enqueue(&state, "hi".to_string(), None, None, None)
+        let first = try_enqueue(&state, "hi".to_string(), None, None, None, None)
             .await
             .expect("first should succeed");
 
@@ -1595,6 +1641,7 @@ mod tests {
             "again".to_string(),
             Some(first.conversation_id),
             Some("be terse"),
+            None,
             None,
         )
         .await
@@ -1621,7 +1668,7 @@ mod tests {
         let (state, _rx) = fresh_state(4);
 
         for prompt in ["", "   \n\t"] {
-            let err = try_enqueue(&state, "hi".to_string(), None, Some(prompt), None)
+            let err = try_enqueue(&state, "hi".to_string(), None, Some(prompt), None, None)
                 .await
                 .expect_err("blank override should be rejected");
             assert!(
@@ -1640,13 +1687,14 @@ mod tests {
     #[tokio::test]
     async fn test_try_enqueue_reuses_existing_conversation() {
         let (state, _rx) = fresh_state(4);
-        let first = try_enqueue(&state, "hi".to_string(), None, None, None)
+        let first = try_enqueue(&state, "hi".to_string(), None, None, None, None)
             .await
             .expect("first should succeed");
         let second = try_enqueue(
             &state,
             "again".to_string(),
             Some(first.conversation_id),
+            None,
             None,
             None,
         )
@@ -1661,7 +1709,7 @@ mod tests {
     async fn test_try_enqueue_unknown_conversation_returns_not_found() {
         let (state, _rx) = fresh_state(4);
         let bogus = Uuid::new_v4();
-        let err = try_enqueue(&state, "hi".to_string(), Some(bogus), None, None)
+        let err = try_enqueue(&state, "hi".to_string(), Some(bogus), None, None, None)
             .await
             .expect_err("unknown conv id should be rejected");
         assert!(matches!(err, EnqueueError::ConversationNotFound(id) if id == bogus));
@@ -1675,7 +1723,7 @@ mod tests {
     #[tokio::test]
     async fn process_job_continues_existing_conversation() {
         let (state, _rx) = fresh_state(4);
-        let first = try_enqueue(&state, "hello".to_string(), None, None, None)
+        let first = try_enqueue(&state, "hello".to_string(), None, None, None, None)
             .await
             .expect("first enqueue should succeed");
         let conv_id = first.conversation_id;
@@ -1689,6 +1737,7 @@ mod tests {
                 conversation_id: conv_id,
                 user: "hello".to_string(),
                 seeded: true,
+                provider: None,
                 model: None,
             },
             CancellationToken::new(),
@@ -1717,7 +1766,7 @@ mod tests {
             1
         );
 
-        let second = try_enqueue(&state, "again".to_string(), Some(conv_id), None, None)
+        let second = try_enqueue(&state, "again".to_string(), Some(conv_id), None, None, None)
             .await
             .expect("second enqueue should succeed");
         let agent2 = boxed_agent(EchoClient::new("hi-2"));
@@ -1728,6 +1777,7 @@ mod tests {
                 conversation_id: conv_id,
                 user: "again".to_string(),
                 seeded: false,
+                provider: None,
                 model: None,
             },
             CancellationToken::new(),
@@ -1762,7 +1812,7 @@ mod tests {
     #[tokio::test]
     async fn process_job_fails_cleanly_when_conversation_record_missing() {
         let (state, _rx) = fresh_state(4);
-        let task = try_enqueue(&state, "hi".to_string(), None, None, None)
+        let task = try_enqueue(&state, "hi".to_string(), None, None, None, None)
             .await
             .expect("enqueue should succeed");
         let conv_id = task.conversation_id;
@@ -1778,6 +1828,7 @@ mod tests {
                 conversation_id: conv_id,
                 user: "hi".to_string(),
                 seeded: true,
+                provider: None,
                 model: None,
             },
             CancellationToken::new(),
@@ -1800,6 +1851,7 @@ mod tests {
             "hi".to_string(),
             None,
             None,
+            None,
             Some("not-a-valid-model"),
         )
         .await
@@ -1813,9 +1865,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_try_enqueue_rejects_unknown_provider() {
+        // `fresh_state` configures providers "primary" and "secondary"; anything
+        // else is rejected at enqueue with a 400-mapped error, before a task or
+        // conversation is minted.
+        let (state, _rx) = fresh_state(4);
+        let err = try_enqueue(&state, "hi".to_string(), None, None, Some("ghost"), None)
+            .await
+            .expect_err("unknown provider override should be rejected");
+        assert!(
+            matches!(&err, EnqueueError::UnknownProvider(name) if name == "ghost"),
+            "got {err:?}",
+        );
+        assert!(state.tasks.is_empty(), "rejected task must not be recorded");
+        assert!(
+            state.conversations.is_empty(),
+            "rejected request must not seed a conversation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_try_enqueue_accepts_known_provider() {
+        let (state, _rx) = fresh_state(4);
+        let record = try_enqueue(
+            &state,
+            "hi".to_string(),
+            None,
+            None,
+            Some("secondary"),
+            None,
+        )
+        .await
+        .expect("a configured provider override should be accepted");
+        assert_eq!(
+            state.tasks.get(&record.id).expect("task record").status,
+            TaskStatus::Pending,
+        );
+    }
+
+    #[tokio::test]
+    async fn process_job_with_provider_override_runs_built_agent() {
+        // A provider override with no model still routes through the per-task
+        // builder rather than the shared agent.
+        let (state, _rx) = fresh_state(4);
+        let task = try_enqueue(
+            &state,
+            "hi".to_string(),
+            None,
+            None,
+            Some("secondary"),
+            None,
+        )
+        .await
+        .expect("enqueue should succeed");
+        let conv_id = task.conversation_id;
+
+        let ctx = WorkerCtx {
+            tasks: Arc::clone(&state.tasks),
+            conversations: Arc::clone(&state.conversations),
+            agent: boxed_agent(EchoClient::new("from-shared")),
+            builder: Arc::new(TestBuilder {
+                reply: "from-override".to_string(),
+            }),
+            store: None,
+            sandbox: None,
+            local_python: None,
+        };
+        process_job(
+            &ctx,
+            WorkerJob {
+                task_id: task.id,
+                conversation_id: conv_id,
+                user: "hi".to_string(),
+                seeded: true,
+                provider: Some("secondary".to_string()),
+                model: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let last = state
+            .conversations
+            .get(&conv_id)
+            .expect("conv exists")
+            .messages
+            .last()
+            .expect("assistant reply")
+            .content
+            .clone();
+        assert_eq!(last, "from-override", "the override agent should have run");
+        assert_eq!(
+            state.tasks.get(&task.id).expect("task record").status,
+            TaskStatus::Succeeded
+        );
+    }
+
+    #[tokio::test]
     async fn process_job_with_model_override_runs_built_agent() {
         let (state, _rx) = fresh_state(4);
-        let task = try_enqueue(&state, "hi".to_string(), None, None, None)
+        let task = try_enqueue(&state, "hi".to_string(), None, None, None, None)
             .await
             .expect("enqueue should succeed");
         let conv_id = task.conversation_id;
@@ -1840,6 +1989,7 @@ mod tests {
                 conversation_id: conv_id,
                 user: "hi".to_string(),
                 seeded: true,
+                provider: None,
                 model: Some("anthropic:claude-haiku-4-5".to_string()),
             },
             CancellationToken::new(),
@@ -1989,7 +2139,7 @@ mod tests {
             .await
             .expect("seed durable history");
 
-        let record = try_enqueue(&state, "again".to_string(), Some(conv_id), None, None)
+        let record = try_enqueue(&state, "again".to_string(), Some(conv_id), None, None, None)
             .await
             .expect("continuation against a store-only conversation should enqueue");
 
@@ -2005,7 +2155,7 @@ mod tests {
     async fn resolve_unknown_id_with_store_returns_not_found(pool: PgPool) {
         let (state, _rx) = state_with_store(4, pool);
         let bogus = Uuid::new_v4();
-        let err = try_enqueue(&state, "hi".to_string(), Some(bogus), None, None)
+        let err = try_enqueue(&state, "hi".to_string(), Some(bogus), None, None, None)
             .await
             .expect_err("id absent from both cache and store must 404");
         assert!(matches!(err, EnqueueError::ConversationNotFound(id) if id == bogus));
@@ -2074,6 +2224,7 @@ mod tests {
                 conversation_id: conv_id,
                 user: "turn-3".to_string(),
                 seeded: false,
+                provider: None,
                 model: None,
             },
             CancellationToken::new(),
