@@ -163,6 +163,14 @@ impl Hook for PersistenceHook {
         _ctx: &HookContext,
         messages: &[Message],
     ) -> anyhow::Result<HookOutcome> {
+        // Reset per-run dedup state: a shared serve agent reuses one hook across
+        // every task, so without this the set would accumulate every message id
+        // the process ever persists. Intra-run dedup is all that is needed since
+        // the sink's append is idempotent per message id.
+        self.persisted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
         // Persist the seed snapshot up front so the input is durable even if
         // the first LLM call fails, then link to the spawning parent once the
         // append has created the conversation row. Best-effort: a failure here
@@ -304,6 +312,25 @@ mod tests {
         // Completion flushes the backlog and succeeds.
         hook.on_completion(&ctx, &messages).await.unwrap();
         assert_eq!(sink.appended.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_dedup_state_resets_each_run() {
+        // A shared serve agent reuses one hook across runs; starting a new
+        // conversation must clear the dedup set so it cannot grow without bound.
+        let sink = Arc::new(RecordingSink::default());
+        let hook = hook(Arc::clone(&sink));
+        let conv = Uuid::new_v4();
+        let ctx = HookContext::new(conv, 0);
+        let seed = vec![Message::system(conv, "s")];
+
+        hook.on_conversation_start(&ctx, &seed).await.unwrap();
+        assert_eq!(sink.appended.lock().unwrap().len(), 1);
+
+        // Starting the next run clears prior ids, so the same slice is treated
+        // as unseen and persisted again rather than retained forever.
+        hook.on_conversation_start(&ctx, &seed).await.unwrap();
+        assert_eq!(sink.appended.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
