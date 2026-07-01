@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT c.id, c.title, c.status, c.created_at, c.updated_at,\n                   c.parent_conversation_id, c.parent_message_id, c.parent_tool_call_id,\n                   COUNT(m.id) AS \"message_count!\"\n            FROM conversations c\n            LEFT JOIN messages m ON m.conversation_id = c.id\n            WHERE c.parent_conversation_id = $1\n            GROUP BY c.id\n            ORDER BY c.updated_at DESC\n            LIMIT $2 OFFSET $3\n            ",
+  "query": "\n            SELECT c.id, c.title, c.status, c.created_at, c.updated_at,\n                   c.parent_conversation_id, c.parent_message_id, c.parent_tool_call_id,\n                   COUNT(m.id) AS \"message_count!\",\n                   COUNT(m.id) FILTER (WHERE m.role = 'user') AS \"turn_count!\"\n            FROM conversations c\n            LEFT JOIN messages m ON m.conversation_id = c.id\n            WHERE c.parent_conversation_id = $1\n            GROUP BY c.id\n            ORDER BY c.updated_at DESC\n            LIMIT $2 OFFSET $3\n            ",
   "describe": {
     "columns": [
       {
@@ -47,6 +47,11 @@
         "ordinal": 8,
         "name": "message_count!",
         "type_info": "Int8"
+      },
+      {
+        "ordinal": 9,
+        "name": "turn_count!",
+        "type_info": "Int8"
       }
     ],
     "parameters": {
@@ -65,8 +70,9 @@
       true,
       true,
       true,
+      null,
       null
     ]
   },
-  "hash": "df9dbf03c140b93ec73fa606ade80beb97da6c9a59a5e9669bb5608fb3cf6650"
+  "hash": "474f218357feb20ab0642d0db73b66b2dd550fdc3c0d376ad60a9b10e560be50"
 }

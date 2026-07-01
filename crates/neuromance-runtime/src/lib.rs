@@ -34,6 +34,7 @@ pub mod sandbox;
 pub mod serve;
 pub mod skills;
 pub mod subagents;
+pub mod task_store;
 pub mod telemetry;
 
 pub use config::{

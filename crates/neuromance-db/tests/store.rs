@@ -278,6 +278,7 @@ async fn test_status_update_and_listing(pool: PgPool) {
     assert_eq!(summaries[0].id, conversation_id);
     assert_eq!(summaries[0].status, ConversationStatus::Deleted);
     assert_eq!(summaries[0].message_count, 4);
+    assert_eq!(summaries[0].turn_count, 1);
 }
 
 #[sqlx::test(migrations = "./migrations")]
