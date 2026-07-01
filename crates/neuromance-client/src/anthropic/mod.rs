@@ -652,6 +652,9 @@ pub enum StreamEvent {
 // ============================================================================
 
 /// API error detail.
+///
+/// Carried by the in-band streaming error event ([`StreamEvent::Error`]); HTTP
+/// error responses are mapped by [`crate::transport::map_http_error`] instead.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiError {
     /// Error type (e.g., "`invalid_request_error`").
@@ -659,19 +662,6 @@ pub struct ApiError {
     pub error_type: String,
     /// Error message.
     pub message: String,
-}
-
-/// Full error response from the API.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ErrorResponse {
-    /// Response type, always "error".
-    #[serde(rename = "type")]
-    pub response_type: String,
-    /// Error details.
-    pub error: ApiError,
-    /// Optional request ID for debugging.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub request_id: Option<String>,
 }
 
 // ============================================================================

@@ -16,7 +16,7 @@ use tracing::{debug, error, warn};
 use neuromance_common::client::ChatChunk;
 
 use crate::NoRetryPolicy;
-use crate::error::{ClientError, ErrorResponse};
+use crate::error::ClientError;
 
 /// Boxed, pinned, send-able stream of [`ChatChunk`] results — the public
 /// shape returned by streaming chat APIs across all providers.
@@ -171,34 +171,17 @@ struct StreamState<S> {
     terminated: bool,
 }
 
-/// Extract a typed [`ClientError`] from an HTTP error response body.
+/// Extract a typed [`ClientError`] from an HTTP error response.
 ///
-/// Tries to parse the body as a structured [`ErrorResponse`], falling back
-/// to raw text when it isn't JSON. Maps the HTTP status to a specific
-/// [`ClientError`] variant.
+/// Reads the body text and delegates the status/body-to-error mapping to
+/// [`crate::transport::map_http_error`], the single canonical mapping shared
+/// with the non-streaming request path.
 async fn extract_error_from_response(
     status: reqwest::StatusCode,
     response: reqwest::Response,
 ) -> ClientError {
     let error_text = response.text().await.unwrap_or_default();
-
-    let error_message = match serde_json::from_str::<ErrorResponse>(&error_text) {
-        Ok(parsed) => parsed.error.message,
-        Err(_) => {
-            if error_text.is_empty() {
-                format!("HTTP {status}")
-            } else {
-                error_text
-            }
-        }
-    };
-
-    match status.as_u16() {
-        401 => ClientError::AuthenticationError(error_message),
-        429 => ClientError::RateLimitError { retry_after: None },
-        500..=599 => ClientError::ServiceUnavailable(error_message),
-        _ => ClientError::RequestError(error_message),
-    }
+    crate::transport::map_http_error(status, &error_text)
 }
 
 #[cfg(test)]

@@ -113,7 +113,7 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
-use tracing::{debug, error, trace, warn};
+use tracing::{error, warn};
 
 use neuromance_common::chat::Message;
 use neuromance_common::client::{ChatChunk, ChatRequest, ChatResponse, Config, ProxyConfig, Usage};
@@ -122,10 +122,10 @@ use neuromance_common::tools::{FunctionCall, ToolCall};
 use crate::chat_completions::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatCompletionsMessage,
 };
-use crate::error::{ClientError, ErrorResponse};
+use crate::error::ClientError;
 use crate::message::MessageBuilder;
 use crate::streaming::{StreamingProvider, run_sse_stream};
-use crate::transport::add_proxy_headers;
+use crate::transport::{add_proxy_headers, send_json};
 use crate::{LLMClient, build_client_resources};
 
 /// Type-state marker types for compile-time validation.
@@ -511,51 +511,10 @@ impl ChatCompletionsClient {
         request_builder =
             add_proxy_headers(request_builder, self.proxy_config.as_ref(), &self.api_key);
 
-        let response = request_builder
-            .body(serde_json::to_string(body).map_err(ClientError::SerializationError)?)
-            .send()
-            .await?;
+        let request_builder = request_builder
+            .body(serde_json::to_string(body).map_err(ClientError::SerializationError)?);
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response.text().await.map_err(|e| {
-                warn!("Failed to read error response body: {e}");
-                ClientError::NetworkError(e)
-            })?;
-
-            // Extract the error message from structured response or use raw text
-            let error_message = match serde_json::from_str::<ErrorResponse>(&error_text) {
-                Ok(parsed) => {
-                    debug!("Parsed structured error response");
-                    parsed.error.message
-                }
-                Err(parse_err) => {
-                    debug!(
-                        "Failed to parse error response as JSON: {parse_err}. Using raw text instead."
-                    );
-                    error_text
-                }
-            };
-
-            error!(
-                "API request failed with status {}: {}",
-                status.as_u16(),
-                error_message
-            );
-
-            return Err(match status.as_u16() {
-                401 => ClientError::AuthenticationError(error_message),
-                429 => ClientError::RateLimitError { retry_after: None },
-                _ => ClientError::RequestError(error_message),
-            });
-        }
-
-        let response_text = response.text().await?;
-        trace!(target: "neuromance::wire", body = %response_text, "raw API response");
-        let parsed_response: T =
-            serde_json::from_str(&response_text).map_err(ClientError::SerializationError)?;
-
-        Ok(parsed_response)
+        send_json(request_builder).await
     }
 
     /// Convert a Chat Completions message to our internal message format.

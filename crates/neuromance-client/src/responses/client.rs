@@ -11,14 +11,15 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
-use tracing::{debug, error, trace, warn};
+use tracing::{error, warn};
 
 use neuromance_common::chat::MessageRole;
-use neuromance_common::client::{ChatChunk, ChatRequest, ChatResponse, Config, Usage};
+use neuromance_common::client::{ChatChunk, ChatRequest, ChatResponse, Config, ProxyConfig, Usage};
 use neuromance_common::tools::{FunctionCall, ToolCall};
 
-use crate::error::{ClientError, ErrorResponse};
+use crate::error::ClientError;
 use crate::streaming::{StreamingProvider, run_sse_stream};
+use crate::transport::{add_proxy_headers, send_json};
 use crate::{LLMClient, build_client_resources};
 
 use super::{
@@ -44,6 +45,8 @@ pub struct ResponsesClient {
     base_url: String,
     /// Client configuration.
     config: Arc<Config>,
+    /// Tokenizer-proxy configuration, when the client routes through a proxy.
+    proxy_config: Option<ProxyConfig>,
 }
 
 impl std::fmt::Debug for ResponsesClient {
@@ -52,6 +55,7 @@ impl std::fmt::Debug for ResponsesClient {
             .field("api_key", &"[REDACTED]")
             .field("base_url", &self.base_url)
             .field("config", &self.config)
+            .field("proxy_config", &self.proxy_config)
             .finish_non_exhaustive()
     }
 }
@@ -75,6 +79,7 @@ impl ResponsesClient {
             api_key: r.api_key,
             base_url: r.base_url,
             config: r.config,
+            proxy_config: r.proxy_config,
         })
     }
 
@@ -113,58 +118,23 @@ impl ResponsesClient {
         reqwest::Url::parse(&url)
             .map_err(|e| ClientError::ConfigurationError(format!("Invalid URL '{url}': {e}")))?;
 
-        let response = self
+        let mut request_builder = self
             .client
             .post(&url)
             .header(
                 "Authorization",
                 format!("Bearer {}", self.api_key.expose_secret()),
             )
-            .header("Content-Type", "application/json")
-            .body(serde_json::to_string(body).map_err(ClientError::SerializationError)?)
-            .send()
-            .await?;
+            .header("Content-Type", "application/json");
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response.text().await.map_err(|e| {
-                warn!("Failed to read error response body: {e}");
-                ClientError::NetworkError(e)
-            })?;
+        // Add proxy headers if configured
+        request_builder =
+            add_proxy_headers(request_builder, self.proxy_config.as_ref(), &self.api_key);
 
-            // Extract the error message from structured response or use raw text
-            let error_message = match serde_json::from_str::<ErrorResponse>(&error_text) {
-                Ok(parsed) => {
-                    debug!("Parsed structured error response");
-                    parsed.error.message
-                }
-                Err(parse_err) => {
-                    debug!(
-                        "Failed to parse error response as JSON: {parse_err}. Using raw text instead."
-                    );
-                    error_text
-                }
-            };
+        let request_builder = request_builder
+            .body(serde_json::to_string(body).map_err(ClientError::SerializationError)?);
 
-            error!(
-                "API request failed with status {}: {}",
-                status.as_u16(),
-                error_message
-            );
-
-            return Err(match status.as_u16() {
-                401 => ClientError::AuthenticationError(error_message),
-                429 => ClientError::RateLimitError { retry_after: None },
-                _ => ClientError::RequestError(error_message),
-            });
-        }
-
-        let response_text = response.text().await?;
-        trace!(target: "neuromance::wire", body = %response_text, "raw API response");
-        let parsed_response: T =
-            serde_json::from_str(&response_text).map_err(ClientError::SerializationError)?;
-
-        Ok(parsed_response)
+        send_json(request_builder).await
     }
 }
 
@@ -236,15 +206,20 @@ impl LLMClient for ResponsesClient {
         reqwest::Url::parse(&url)
             .map_err(|e| ClientError::ConfigurationError(format!("Invalid URL '{url}': {e}")))?;
 
-        let request_builder = self
+        let mut request_builder = self
             .streaming_client
             .post(&url)
             .header(
                 "Authorization",
                 format!("Bearer {}", self.api_key.expose_secret()),
             )
-            .header("Content-Type", "application/json")
-            .json(&responses_request);
+            .header("Content-Type", "application/json");
+
+        // Add proxy headers if configured
+        request_builder =
+            add_proxy_headers(request_builder, self.proxy_config.as_ref(), &self.api_key);
+
+        let request_builder = request_builder.json(&responses_request);
 
         run_sse_stream(self, request_builder)
     }
