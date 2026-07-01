@@ -140,9 +140,16 @@ async fn run_orchestrator(config: &RuntimeConfig, cancel: CancellationToken) -> 
         .await
         .map_err(anyhow::Error::from)?;
 
-    // Best-effort: run one-time tool setup before tasks, since the pod has no
-    // persistent storage to cache credentials a tool writes to disk.
-    bootstrap::run(&config.bootstrap).await;
+    // Best-effort one-time tool setup before tasks (the pod has no persistent
+    // storage to cache credentials a tool writes to disk). Bootstrap must run in
+    // the process that hosts the tool executor. With a sandbox configured, tools
+    // run there and `run_sandbox` bootstraps instead — this orchestrator executes
+    // no tools, and its container has a separate home, so a login written here is
+    // invisible to the sandbox. Without a sandbox, capability tools run in-process
+    // here, so bootstrap here.
+    if sandbox_client.is_none() {
+        bootstrap::run(&config.bootstrap).await;
+    }
 
     readiness.set_ready(true);
 
@@ -192,6 +199,12 @@ async fn run_sandbox(config: &RuntimeConfig, cancel: CancellationToken) -> Resul
         .listen_addr
         .parse()
         .with_context(|| format!("invalid sandbox.listen_addr: {}", settings.listen_addr))?;
+
+    // The sandbox process hosts the tool executor, so any tool that caches
+    // credentials on disk (see `bootstrap`) must be set up here: this container's
+    // home is separate from the orchestrator's, so a login written there is
+    // invisible to tools running in the sandbox. Best-effort; never fails startup.
+    bootstrap::run(&config.bootstrap).await;
 
     let toolset = Arc::new(sandbox::server::build_sandbox_toolset(&config.tools)?);
     info!(%addr, tools = config.tools.len(), "neuromance-runtime sandbox starting");

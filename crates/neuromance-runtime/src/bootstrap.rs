@@ -6,6 +6,12 @@
 //! to run; if it carries a `token_env`, that env var's value is fed to the
 //! command on stdin (so a sealed token never lands in argv). The runtime has no
 //! per-tool knowledge — the operator bakes the full argv into the config.
+//!
+//! Bootstrap runs in whichever process hosts the tool executor, because a
+//! credential written to one container's filesystem is invisible to another: in
+//! sandbox deployments the sandbox process bootstraps (that is where tools run),
+//! and in single-process deployments the orchestrator does. See the call sites
+//! in `main`.
 
 use std::process::Stdio;
 
