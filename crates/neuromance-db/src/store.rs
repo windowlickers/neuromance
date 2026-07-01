@@ -35,6 +35,8 @@ pub struct ConversationSummary {
     pub updated_at: DateTime<Utc>,
     /// Number of persisted messages.
     pub message_count: u64,
+    /// Number of user messages submitted against this conversation.
+    pub turn_count: u64,
     /// Conversation that spawned this one, or `None` for a root conversation.
     pub parent_conversation_id: Option<Uuid>,
     /// Assistant message in the parent that emitted the spawning tool call.
@@ -289,7 +291,9 @@ impl PgConversationStore {
         }))
     }
 
-    /// Lists stored conversations, most recently updated first.
+    /// Lists stored **root** conversations (no parent), most recently updated
+    /// first. Delegated subagent conversations are excluded — list them for a
+    /// given parent with [`Self::list_child_conversations`].
     ///
     /// # Errors
     ///
@@ -303,9 +307,11 @@ impl PgConversationStore {
             r#"
             SELECT c.id, c.title, c.status, c.created_at, c.updated_at,
                    c.parent_conversation_id, c.parent_message_id, c.parent_tool_call_id,
-                   COUNT(m.id) AS "message_count!"
+                   COUNT(m.id) AS "message_count!",
+                   COUNT(m.id) FILTER (WHERE m.role = 'user') AS "turn_count!"
             FROM conversations c
             LEFT JOIN messages m ON m.conversation_id = c.id
+            WHERE c.parent_conversation_id IS NULL
             GROUP BY c.id
             ORDER BY c.updated_at DESC
             LIMIT $1 OFFSET $2
@@ -326,6 +332,7 @@ impl PgConversationStore {
                     created_at: row.created_at,
                     updated_at: row.updated_at,
                     message_count: u64::try_from(row.message_count).unwrap_or(0),
+                    turn_count: u64::try_from(row.turn_count).unwrap_or(0),
                     parent_conversation_id: row.parent_conversation_id,
                     parent_message_id: row.parent_message_id,
                     parent_tool_call_id: row.parent_tool_call_id,
@@ -352,7 +359,8 @@ impl PgConversationStore {
             r#"
             SELECT c.id, c.title, c.status, c.created_at, c.updated_at,
                    c.parent_conversation_id, c.parent_message_id, c.parent_tool_call_id,
-                   COUNT(m.id) AS "message_count!"
+                   COUNT(m.id) AS "message_count!",
+                   COUNT(m.id) FILTER (WHERE m.role = 'user') AS "turn_count!"
             FROM conversations c
             LEFT JOIN messages m ON m.conversation_id = c.id
             WHERE c.parent_conversation_id = $1
@@ -377,6 +385,7 @@ impl PgConversationStore {
                     created_at: row.created_at,
                     updated_at: row.updated_at,
                     message_count: u64::try_from(row.message_count).unwrap_or(0),
+                    turn_count: u64::try_from(row.turn_count).unwrap_or(0),
                     parent_conversation_id: row.parent_conversation_id,
                     parent_message_id: row.parent_message_id,
                     parent_tool_call_id: row.parent_tool_call_id,

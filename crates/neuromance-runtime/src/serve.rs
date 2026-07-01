@@ -41,8 +41,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use chrono::{DateTime, Utc};
-use dashmap::DashMap;
+use chrono::Utc;
 use metrics::{counter, gauge, histogram};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, mpsc};
@@ -56,12 +55,15 @@ use neuromance_agent::{Agent, AgentResponse};
 use neuromance_client::LLMClient;
 use neuromance_common::chat::{Message, TaskStatus};
 use neuromance_common::client::Config;
-use neuromance_db::{PgConversationStore, TaskStatusUpdate};
+use neuromance_db::PgConversationStore;
 
 use crate::AgentBuilder;
 use crate::SessionReset;
 use crate::config::RuntimeConfig;
 use crate::sandbox::{EXECUTE_PYTHON, SandboxClient};
+use crate::task_store::{
+    ConversationRecord, InMemoryTaskStore, PostgresTaskStore, TaskRecord, TaskStore,
+};
 
 /// The agent type the worker drives. Serve always boots a boxed client, and a
 /// per-task override produces the same type, so both run paths share it.
@@ -71,61 +73,6 @@ enum JobOutcome {
     Succeeded,
     Failed,
     Cancelled,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct TaskRecord {
-    pub id: Uuid,
-    pub status: TaskStatus,
-    pub conversation_id: Uuid,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-    pub output: Option<String>,
-    pub error: Option<String>,
-    /// Number of tasks already buffered when this task was accepted.
-    /// Frozen at submit time so postmortems can answer
-    /// "how deep was the queue when this landed?" after the task has run.
-    pub queue_depth_at_enqueue: usize,
-}
-
-/// Full conversation history, stored across many tasks.
-///
-/// The first message is always a system message stamped at conversation
-/// creation. Each `POST /tasks/new` referencing this conversation appends a
-/// user message immediately; on a successful turn, the canonical history is
-/// replaced with the vec returned by `Agent::execute_with_history`, which
-/// includes every intermediate assistant and tool message.
-#[derive(Debug, Clone, Serialize)]
-pub struct ConversationRecord {
-    pub id: Uuid,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-    /// Number of user messages submitted against this conversation.
-    pub turn_count: usize,
-    pub messages: Vec<Message>,
-}
-
-/// Summary view used by `GET /conversations` — omits the message vec so
-/// list responses don't grow unboundedly with conversation length.
-#[derive(Debug, Clone, Serialize)]
-pub struct ConversationSummary {
-    pub id: Uuid,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-    pub turn_count: usize,
-    pub message_count: usize,
-}
-
-impl From<&ConversationRecord> for ConversationSummary {
-    fn from(record: &ConversationRecord) -> Self {
-        Self {
-            id: record.id,
-            created_at: record.created_at,
-            updated_at: record.updated_at,
-            turn_count: record.turn_count,
-            message_count: record.messages.len(),
-        }
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -268,15 +215,16 @@ struct WorkerJob {
 
 #[derive(Clone)]
 pub struct ServeState {
-    tasks: Arc<DashMap<Uuid, TaskRecord>>,
-    conversations: Arc<DashMap<Uuid, ConversationRecord>>,
+    /// Task and conversation storage. Backed by an in-memory working set alone,
+    /// or by postgres write-through when `[database]` is configured. The worker
+    /// shares this exact instance so a conversation seeded by a handler is
+    /// visible to the run that continues it.
+    task_store: Arc<dyn TaskStore>,
     work_tx: mpsc::Sender<WorkerJob>,
     system_prompt: Arc<str>,
     /// File-oriented skills menu folded into each new conversation's system
     /// prompt; `None` when no skills are configured.
     skills_menu: Option<Arc<str>>,
-    /// Durable conversation record; `None` when `[database]` is not configured.
-    store: Option<Arc<PgConversationStore>>,
     /// Names of the configured `[[providers]]` entries, used to reject an unknown
     /// per-task `provider` override at enqueue time (400) rather than failing the
     /// task mid-run.
@@ -352,20 +300,16 @@ fn seed_new_conversation(state: &ServeState, system_prompt: Option<&str>) -> Uui
         || Message::system(id, prompt),
         |menu| Message::system(id, format!("{prompt}\n\n{menu}")),
     );
-    let messages = vec![seed];
-    state.conversations.insert(
-        id,
-        ConversationRecord {
-            id,
-            created_at: now,
-            updated_at: now,
-            turn_count: 0,
-            messages,
-        },
-    );
     // The durable conversation row is created fail-closed by `record_task_status`
     // in `try_enqueue` (it pre-inserts the row in the same transaction as the
     // pending task), so seeding only has to establish the in-memory record here.
+    state.task_store.seed_conversation(ConversationRecord {
+        id,
+        created_at: now,
+        updated_at: now,
+        turn_count: 0,
+        messages: vec![seed],
+    });
     id
 }
 
@@ -394,43 +338,16 @@ async fn resolve_conversation(
     if system_prompt.is_some() {
         return Err(EnqueueError::SystemPromptOnExisting(id));
     }
-    if state.conversations.contains_key(&id) {
-        return Ok((id, false));
-    }
-    // Cold replica: the conversation may have been seeded on a sibling. Confirm
-    // it exists durably rather than 404ing on a local-cache miss.
-    match &state.store {
-        Some(store) => match store.conversation_exists(id).await {
-            Ok(true) => Ok((id, false)),
-            Ok(false) => Err(EnqueueError::ConversationNotFound(id)),
-            Err(e) => {
-                warn!(conversation_id = %id, error = %e, "conversation existence check failed");
-                Err(EnqueueError::Persistence)
-            }
-        },
-        None => Err(EnqueueError::ConversationNotFound(id)),
-    }
-}
-
-/// Snapshots the durable status fields of an in-memory task record.
-fn task_status_update(record: &TaskRecord) -> TaskStatusUpdate {
-    TaskStatusUpdate {
-        id: record.id,
-        conversation_id: record.conversation_id,
-        status: record.status,
-        output: record.output.clone(),
-        error: record.error.clone(),
-        queue_depth_at_enqueue: i64::try_from(record.queue_depth_at_enqueue).unwrap_or(i64::MAX),
-        created_at: record.created_at,
-    }
-}
-
-/// Best-effort delete of a durable task row, used to roll back an enqueue whose
-/// `pending` write committed but whose hand-off to the worker then failed.
-async fn rollback_task_row(store: Option<&Arc<PgConversationStore>>, task_id: Uuid) {
-    let Some(store) = store else { return };
-    if let Err(e) = store.delete_task(task_id).await {
-        warn!(%task_id, error = %e, "rollback of durable task row failed");
+    // A cache miss falls through to the durable store (when configured), so a
+    // continuation that load-balances to a replica which did not accept earlier
+    // turns still resolves instead of 404ing on a local-cache miss.
+    match state.task_store.conversation_exists(id).await {
+        Ok(true) => Ok((id, false)),
+        Ok(false) => Err(EnqueueError::ConversationNotFound(id)),
+        Err(e) => {
+            warn!(conversation_id = %id, error = %e, "conversation existence check failed");
+            Err(EnqueueError::Persistence)
+        }
     }
 }
 
@@ -472,21 +389,16 @@ async fn try_enqueue(
         error: None,
         queue_depth_at_enqueue: depth,
     };
-    state.tasks.insert(task_id, record.clone());
-
-    // Persist the pending row BEFORE handing the job to the worker. Intake and
-    // the worker are separate tasks, so writing after `try_send` would let the
+    // Record the pending task BEFORE handing the job to the worker. Intake and
+    // the worker are separate tasks, so persisting after `try_send` would let the
     // worker's `Running` write race ahead of (and be clobbered by) this one.
     // Fail-closed: a returned task_id must be durably pollable from any replica,
-    // so a write failure rejects the enqueue. (Mid-run status writes stay
-    // best-effort — see `write_through_status`.)
-    if let Some(store) = &state.store
-        && let Err(e) = store.record_task_status(&task_status_update(&record)).await
-    {
+    // so a durable write failure rejects the enqueue. (Mid-run status writes stay
+    // best-effort — see the `mark_*` methods.)
+    if let Err(e) = state.task_store.insert_pending(&record).await {
         error!(%task_id, error = %e, "persist pending task failed; rejecting enqueue");
-        state.tasks.remove(&task_id);
         if seeded {
-            state.conversations.remove(&conversation_id);
+            state.task_store.remove_conversation(conversation_id).await;
         }
         counter!("neuromance_enqueue_rejections_total", "reason" => "persistence").increment(1);
         return Err(EnqueueError::Persistence);
@@ -506,11 +418,10 @@ async fn try_enqueue(
             Ok(record)
         }
         Err(mpsc::error::TrySendError::Full(_)) => {
-            state.tasks.remove(&task_id);
+            state.task_store.remove_task(task_id).await;
             if seeded {
-                state.conversations.remove(&conversation_id);
+                state.task_store.remove_conversation(conversation_id).await;
             }
-            rollback_task_row(state.store.as_ref(), task_id).await;
             counter!("neuromance_enqueue_rejections_total", "reason" => "queue_full").increment(1);
             Err(EnqueueError::QueueFull {
                 depth,
@@ -518,15 +429,13 @@ async fn try_enqueue(
             })
         }
         Err(mpsc::error::TrySendError::Closed(_)) => {
-            if let Some(mut entry) = state.tasks.get_mut(&task_id) {
-                entry.status = TaskStatus::Failed;
-                entry.error = Some("worker shutting down".to_string());
-                entry.updated_at = Utc::now();
-            }
+            state
+                .task_store
+                .mark_failed(task_id, "worker shutting down")
+                .await;
             if seeded {
-                state.conversations.remove(&conversation_id);
+                state.task_store.remove_conversation(conversation_id).await;
             }
-            rollback_task_row(state.store.as_ref(), task_id).await;
             counter!("neuromance_enqueue_rejections_total", "reason" => "worker_shutdown")
                 .increment(1);
             Err(EnqueueError::WorkerShutdown)
@@ -562,101 +471,73 @@ async fn create_task(
     }
 }
 
-fn active_tasks_sorted(tasks: &DashMap<Uuid, TaskRecord>) -> Vec<TaskRecord> {
-    let mut active: Vec<TaskRecord> = tasks
-        .iter()
-        .filter(|e| matches!(e.value().status, TaskStatus::Pending | TaskStatus::Running))
-        .map(|e| e.value().clone())
-        .collect();
-    active.sort_by_key(|r| r.created_at);
-    active
-}
-
 async fn list_tasks(State(state): State<ServeState>) -> impl IntoResponse {
-    // With a database, list from postgres so any replica returns the same
-    // active queue; otherwise fall back to this replica's in-memory view.
-    if let Some(store) = &state.store {
-        return match store.list_active_tasks().await {
-            Ok(tasks) => (StatusCode::OK, Json(tasks)).into_response(),
-            Err(e) => {
-                warn!(error = %e, "failed to list active tasks");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": "failed to list tasks"})),
-                )
-                    .into_response()
-            }
-        };
+    match state.task_store.list_active_tasks().await {
+        Ok(tasks) => (StatusCode::OK, Json(tasks)).into_response(),
+        Err(e) => {
+            warn!(error = %e, "failed to list active tasks");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "failed to list tasks"})),
+            )
+                .into_response()
+        }
     }
-    (StatusCode::OK, Json(active_tasks_sorted(&state.tasks))).into_response()
 }
 
 async fn get_task(State(state): State<ServeState>, Path(id): Path<Uuid>) -> impl IntoResponse {
-    // With a database, postgres is authoritative so a poll landing on any
-    // replica resolves; otherwise serve from this replica's in-memory map.
-    if let Some(store) = &state.store {
-        return match store.get_task(id).await {
-            Ok(Some(task)) => (StatusCode::OK, Json(task)).into_response(),
-            Ok(None) => (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "task not found"})),
-            )
-                .into_response(),
-            Err(e) => {
-                warn!(task_id = %id, error = %e, "failed to load task status");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": "failed to load task"})),
-                )
-                    .into_response()
-            }
-        };
-    }
-    state.tasks.get(&id).map_or_else(
-        || {
+    match state.task_store.get_task(id).await {
+        Ok(Some(task)) => (StatusCode::OK, Json(task)).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "task not found"})),
+        )
+            .into_response(),
+        Err(e) => {
+            warn!(task_id = %id, error = %e, "failed to load task status");
             (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "task not found"})),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "failed to load task"})),
             )
                 .into_response()
-        },
-        |rec| (StatusCode::OK, Json(rec.clone())).into_response(),
-    )
-}
-
-fn conversations_sorted(
-    conversations: &DashMap<Uuid, ConversationRecord>,
-) -> Vec<ConversationSummary> {
-    let mut summaries: Vec<ConversationSummary> = conversations
-        .iter()
-        .map(|e| ConversationSummary::from(e.value()))
-        .collect();
-    summaries.sort_by_key(|s| s.created_at);
-    summaries
+        }
+    }
 }
 
 async fn list_conversations(State(state): State<ServeState>) -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        Json(conversations_sorted(&state.conversations)),
-    )
-        .into_response()
+    match state.task_store.list_conversations().await {
+        Ok(summaries) => (StatusCode::OK, Json(summaries)).into_response(),
+        Err(e) => {
+            warn!(error = %e, "failed to list conversations");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "failed to list conversations"})),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn get_conversation(
     State(state): State<ServeState>,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
-    state.conversations.get(&id).map_or_else(
-        || {
+    match state.task_store.get_conversation_view(id).await {
+        Ok(Some(record)) => (StatusCode::OK, Json(record)).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "conversation not found"})),
+        )
+            .into_response(),
+        Err(e) => {
+            warn!(conversation_id = %id, error = %e, "failed to load conversation");
             (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "conversation not found"})),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "failed to load conversation"})),
             )
                 .into_response()
-        },
-        |rec| (StatusCode::OK, Json(rec.clone())).into_response(),
-    )
+        }
+    }
 }
 
 /// Lists the child conversations (e.g. subagent delegations) of a conversation.
@@ -668,20 +549,19 @@ async fn list_conversation_children(
     State(state): State<ServeState>,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
-    let Some(store) = &state.store else {
-        return (
+    match state
+        .task_store
+        .list_conversation_children(id, CHILDREN_PAGE_LIMIT, 0)
+        .await
+    {
+        Ok(Some(children)) => (StatusCode::OK, Json(children)).into_response(),
+        Ok(None) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
                 "error": "conversation lineage requires a configured database",
             })),
         )
-            .into_response();
-    };
-    match store
-        .list_child_conversations(id, CHILDREN_PAGE_LIMIT, 0)
-        .await
-    {
-        Ok(children) => (StatusCode::OK, Json(children)).into_response(),
+            .into_response(),
         Err(e) => {
             warn!(error = %e, conversation_id = %id, "failed to list conversation children");
             (
@@ -697,14 +577,12 @@ async fn list_conversation_children(
 /// Bundled so [`worker_loop`] and [`run`] stay within the positional-argument
 /// budget as fields accrue.
 struct WorkerCtx {
-    tasks: Arc<DashMap<Uuid, TaskRecord>>,
-    conversations: Arc<DashMap<Uuid, ConversationRecord>>,
+    /// Task and conversation storage — the same instance held by [`ServeState`].
+    task_store: Arc<dyn TaskStore>,
     /// Shared agent reused by every task that does not override the model.
     agent: Arc<Mutex<ServeAgent>>,
     /// Builds a throwaway agent for a task that overrides the model.
     builder: Arc<dyn AgentBuilder>,
-    /// Durable conversation store; `None` when `[database]` is not configured.
-    store: Option<Arc<PgConversationStore>>,
     /// Sandbox handle used to release a task's `execute_python` interpreter once
     /// the run completes. `Some` only when the sandbox hosts `execute_python`;
     /// the interpreter is keyed by task id (see `RemoteToolAdapter`).
@@ -735,62 +613,15 @@ async fn worker_loop(mut rx: mpsc::Receiver<WorkerJob>, ctx: WorkerCtx, cancel: 
                 // the messages themselves during the run; this only reads the
                 // boundaries. Best-effort, matching the log-and-continue policy.
                 let (task_id, conversation_id) = (job.task_id, job.conversation_id);
-                let start_seq = next_seq_before_run(ctx.store.as_ref(), conversation_id).await;
+                let start_seq = ctx.task_store.begin_provenance(conversation_id).await;
                 let _ = process_job(&ctx, job, cancel.clone()).await;
                 release_sandbox_session(ctx.sandbox.as_ref(), task_id).await;
                 reset_local_python(ctx.local_python.as_ref()).await;
-                record_task_provenance(ctx.store.as_ref(), task_id, conversation_id, start_seq)
+                ctx.task_store
+                    .record_provenance(task_id, conversation_id, start_seq)
                     .await;
             }
         }
-    }
-}
-
-/// Reads the `seq` a task's first message will occupy, or `None` when
-/// persistence is off or the read fails. A failed read drops this task's
-/// provenance without failing the task.
-async fn next_seq_before_run(
-    store: Option<&Arc<PgConversationStore>>,
-    conversation_id: Uuid,
-) -> Option<i64> {
-    let store = store?;
-    match store.max_seq(conversation_id).await {
-        Ok(max) => Some(max.map_or(0, |m| m + 1)),
-        Err(e) => {
-            warn!(%conversation_id, error = %e, "max_seq before run failed; task provenance skipped");
-            None
-        }
-    }
-}
-
-/// Records the `[start_seq, end_seq]` range a task contributed. Skips silently
-/// when persistence is off, the boundary read fails, or the run persisted no
-/// new messages (`end < start`).
-async fn record_task_provenance(
-    store: Option<&Arc<PgConversationStore>>,
-    task_id: Uuid,
-    conversation_id: Uuid,
-    start_seq: Option<i64>,
-) {
-    let (Some(store), Some(start)) = (store, start_seq) else {
-        return;
-    };
-    let end = match store.max_seq(conversation_id).await {
-        Ok(Some(end)) => end,
-        Ok(None) => return,
-        Err(e) => {
-            warn!(%conversation_id, error = %e, "max_seq after run failed; task provenance skipped");
-            return;
-        }
-    };
-    if end < start {
-        return;
-    }
-    if let Err(e) = store
-        .record_task(task_id, conversation_id, start, end)
-        .await
-    {
-        warn!(%task_id, error = %e, "record task provenance failed");
     }
 }
 
@@ -820,72 +651,12 @@ async fn reset_local_python(local_python: Option<&SessionReset>) {
     }
 }
 
-/// Mirror a task's current in-memory state to the durable store. Best-effort:
-/// a write failure is logged and the task proceeds, matching the provenance and
-/// conversation-row write-through policy. The enqueue `pending` write is the
-/// sole fail-closed exception (see `try_enqueue`).
-async fn write_through_status(ctx: &WorkerCtx, task_id: Uuid) {
-    let Some(store) = &ctx.store else {
-        return;
-    };
-    let Some(update) = ctx.tasks.get(&task_id).map(|rec| task_status_update(&rec)) else {
-        return;
-    };
-    if let Err(e) = store.record_task_status(&update).await {
-        warn!(%task_id, error = %e, "record task status failed");
-    }
-}
-
 /// Mark a task `Failed` with `reason` and emit the failure metric. Pulled out
 /// because both the early "conversation deleted" exit and the late
 /// agent-error path share this shape.
-fn fail_task(tasks: &DashMap<Uuid, TaskRecord>, task_id: Uuid, reason: &str) {
-    if let Some(mut entry) = tasks.get_mut(&task_id) {
-        entry.status = TaskStatus::Failed;
-        entry.error = Some(reason.to_string());
-        entry.updated_at = Utc::now();
-    }
+async fn fail_task(ctx: &WorkerCtx, task_id: Uuid, reason: &str) {
+    ctx.task_store.mark_failed(task_id, reason).await;
     counter!("neuromance_tasks_total", "outcome" => "failed").increment(1);
-}
-
-/// Assembles the history the agent runs against for one turn, appending the
-/// user message.
-///
-/// A continuation backed by a durable store reads history from postgres so a
-/// turn that lands on a replica without the local cache (or with a stale one)
-/// still sees every prior turn — the store is the single source of truth. A new
-/// conversation (or a store-less deployment) uses the per-pod record, which
-/// carries the just-minted system seed and is advanced in place here.
-async fn build_turn_input(
-    ctx: &WorkerCtx,
-    job: &WorkerJob,
-    user_msg: Message,
-) -> Result<Vec<Message>, &'static str> {
-    if !job.seeded
-        && let Some(store) = &ctx.store
-    {
-        let conv = store
-            .get_conversation(job.conversation_id)
-            .await
-            .map_err(|e| {
-                warn!(error = %e, "load conversation history failed");
-                "failed to load conversation history"
-            })?
-            .ok_or("conversation not found")?;
-        let mut messages = conv.messages.as_ref().clone();
-        messages.push(user_msg);
-        return Ok(messages);
-    }
-    // New conversation, or no durable store: the per-pod record holds history.
-    let Some(mut entry) = ctx.conversations.get_mut(&job.conversation_id) else {
-        return Err("conversation record missing");
-    };
-    let mut snapshot = entry.messages.clone();
-    snapshot.push(user_msg.clone());
-    entry.messages.push(user_msg);
-    entry.turn_count = entry.turn_count.saturating_add(1);
-    entry.updated_at = Utc::now();
-    Ok(snapshot)
 }
 
 /// Drives one agent turn over `input_messages`, racing it against `cancel` so a
@@ -924,14 +695,13 @@ async fn run_turn(
 async fn process_job(ctx: &WorkerCtx, job: WorkerJob, cancel: CancellationToken) -> JobOutcome {
     let dequeued_at = Utc::now();
     let run_start = Instant::now();
-    let (created_at, depth_at_enqueue) = if let Some(mut entry) = ctx.tasks.get_mut(&job.task_id) {
-        entry.status = TaskStatus::Running;
-        entry.updated_at = dequeued_at;
-        (entry.created_at, entry.queue_depth_at_enqueue)
-    } else {
-        (dequeued_at, 0)
-    };
-    write_through_status(ctx, job.task_id).await;
+    let (created_at, depth_at_enqueue) = ctx
+        .task_store
+        .mark_running(job.task_id)
+        .await
+        .map_or((dequeued_at, 0), |timing| {
+            (timing.created_at, timing.queue_depth_at_enqueue)
+        });
 
     let queue_wait_ms = (dequeued_at - created_at).num_milliseconds().max(0);
     #[allow(clippy::cast_precision_loss)]
@@ -946,12 +716,16 @@ async fn process_job(ctx: &WorkerCtx, job: WorkerJob, cancel: CancellationToken)
     // Skill menu and `$mention` bodies are injected by the SkillsHook inside the
     // conversation loop, not assembled here.
     let user_msg = Message::user(job.conversation_id, &job.user);
-    let input_messages = match build_turn_input(ctx, &job, user_msg).await {
+    let input_messages = match ctx
+        .task_store
+        .build_turn_input(job.conversation_id, job.seeded, user_msg)
+        .await
+    {
         Ok(messages) => messages,
-        Err(reason) => {
+        Err(err) => {
+            let reason = err.reason();
             warn!(conversation_id = %job.conversation_id, reason, "cannot build turn input");
-            fail_task(&ctx.tasks, job.task_id, reason);
-            write_through_status(ctx, job.task_id).await;
+            fail_task(ctx, job.task_id, reason).await;
             return JobOutcome::Failed;
         }
     };
@@ -974,11 +748,11 @@ async fn process_job(ctx: &WorkerCtx, job: WorkerJob, cancel: CancellationToken)
             Err(e) => {
                 error!(provider, model, error = %e, "failed to build agent for override");
                 fail_task(
-                    &ctx.tasks,
+                    ctx,
                     job.task_id,
                     &format!("task override (provider={provider:?}, model={model:?}): {e}"),
-                );
-                write_through_status(ctx, job.task_id).await;
+                )
+                .await;
                 return JobOutcome::Failed;
             }
         }
@@ -990,44 +764,37 @@ async fn process_job(ctx: &WorkerCtx, job: WorkerJob, cancel: CancellationToken)
     let run_ms = u64::try_from(run_start.elapsed().as_millis()).unwrap_or(u64::MAX);
     #[allow(clippy::cast_precision_loss)]
     histogram!("neuromance_task_duration_seconds").record(run_ms as f64 / 1000.0);
-    let outcome = match exec_result {
+    match exec_result {
         Ok((response, full_history)) => {
             let output_bytes = response.content.content.len();
             info!(run_ms, queue_wait_ms, output_bytes, "task succeeded");
             // Refresh the per-pod cache with the full history (system + every
             // user/assistant/tool turn) when this replica holds it. A replica
             // that only continued from the store has no local entry; the durable
-            // history written by Core stands on its own, so the write is skipped.
-            if let Some(mut entry) = ctx.conversations.get_mut(&job.conversation_id) {
-                entry.messages = full_history;
-                entry.updated_at = Utc::now();
-            }
-            if let Some(mut entry) = ctx.tasks.get_mut(&job.task_id) {
-                entry.status = TaskStatus::Succeeded;
-                entry.output = Some(response.content.content);
-                entry.updated_at = Utc::now();
-            }
+            // history written by Core stands on its own, so the refresh is a no-op.
+            ctx.task_store
+                .refresh_conversation(job.conversation_id, full_history)
+                .await;
+            ctx.task_store
+                .mark_succeeded(job.task_id, response.content.content)
+                .await;
             counter!("neuromance_tasks_total", "outcome" => "succeeded").increment(1);
             JobOutcome::Succeeded
         }
         Err(CoreError::Cancelled(_)) => {
             warn!(run_ms, "task cancelled");
-            if let Some(mut entry) = ctx.tasks.get_mut(&job.task_id) {
-                entry.status = TaskStatus::Cancelled;
-                entry.error = Some("cancelled".to_string());
-                entry.updated_at = Utc::now();
-            }
+            ctx.task_store
+                .mark_cancelled(job.task_id, "cancelled")
+                .await;
             counter!("neuromance_tasks_total", "outcome" => "cancelled").increment(1);
             JobOutcome::Cancelled
         }
         Err(e) => {
             error!(run_ms, error = %e, "task failed");
-            fail_task(&ctx.tasks, job.task_id, &e.to_string());
+            fail_task(ctx, job.task_id, &e.to_string()).await;
             JobOutcome::Failed
         }
-    };
-    write_through_status(ctx, job.task_id).await;
-    outcome
+    }
 }
 
 /// Bind the task server, spawn the worker, and run until `cancel` fires.
@@ -1046,8 +813,14 @@ pub async fn run(
     skills_menu: Option<Arc<str>>,
     cancel: CancellationToken,
 ) -> Result<()> {
-    let tasks: Arc<DashMap<Uuid, TaskRecord>> = Arc::new(DashMap::new());
-    let conversations: Arc<DashMap<Uuid, ConversationRecord>> = Arc::new(DashMap::new());
+    // One storage instance, shared by the worker and the handlers: a conversation
+    // a handler seeds must be visible to the run that continues it. Postgres
+    // deployment writes through and reads authoritatively; otherwise the working
+    // set alone is authoritative.
+    let task_store: Arc<dyn TaskStore> = match store {
+        Some(store) => Arc::new(PostgresTaskStore::new(store)),
+        None => Arc::new(InMemoryTaskStore::new()),
+    };
     let agent = Arc::new(Mutex::new(agent));
     let (work_tx, work_rx) = mpsc::channel::<WorkerJob>(config.runtime.max_queue_depth);
     let system_prompt: Arc<str> = Arc::from(config.agent.system_prompt.as_str());
@@ -1060,11 +833,9 @@ pub async fn run(
     let worker = tokio::spawn(worker_loop(
         work_rx,
         WorkerCtx {
-            tasks: Arc::clone(&tasks),
-            conversations: Arc::clone(&conversations),
+            task_store: Arc::clone(&task_store),
             agent: Arc::clone(&agent),
             builder,
-            store: store.clone(),
             sandbox: session_closer,
             local_python,
         },
@@ -1073,12 +844,10 @@ pub async fn run(
 
     let provider_names: Arc<[String]> = config.providers.iter().map(|p| p.name.clone()).collect();
     let state = ServeState {
-        tasks: Arc::clone(&tasks),
-        conversations: Arc::clone(&conversations),
+        task_store: Arc::clone(&task_store),
         work_tx,
         system_prompt,
         skills_menu,
-        store: store.clone(),
         provider_names,
     };
     let app = router(state);
@@ -1104,7 +873,7 @@ pub async fn run(
         warn!(error=%e, "worker task panicked or was cancelled");
     }
 
-    let summary = drain_pending_tasks(&tasks, store.as_ref()).await;
+    let summary = task_store.drain_pending().await;
     info!(
         pending_dropped = summary.pending_dropped,
         in_flight_cancelled = summary.in_flight_cancelled,
@@ -1113,65 +882,6 @@ pub async fn run(
         "serve mode shutdown",
     );
     Ok(())
-}
-
-#[derive(Debug, Default, Clone, Copy)]
-struct ShutdownSummary {
-    pending_dropped: usize,
-    in_flight_cancelled: usize,
-    succeeded: usize,
-    failed: usize,
-}
-
-/// Mark any tasks still `Pending` as `Cancelled` and return a summary.
-///
-/// Without this, dropped tasks would stay `Pending` in the in-memory state
-/// map forever — `GET /tasks/{id}` would return a misleading status after
-/// the server stopped.
-async fn drain_pending_tasks(
-    tasks: &DashMap<Uuid, TaskRecord>,
-    store: Option<&Arc<PgConversationStore>>,
-) -> ShutdownSummary {
-    let mut summary = ShutdownSummary::default();
-    let now = Utc::now();
-    let mut cancelled = Vec::new();
-    for mut entry in tasks.iter_mut() {
-        match entry.status {
-            TaskStatus::Pending => {
-                let queue_age_ms = (now - entry.created_at).num_milliseconds().max(0);
-                warn!(
-                    task_id = %entry.id,
-                    queue_age_ms,
-                    "task dropped at shutdown",
-                );
-                entry.status = TaskStatus::Cancelled;
-                entry.error = Some("dropped at shutdown".to_string());
-                entry.updated_at = now;
-                cancelled.push(entry.value().clone());
-                summary.pending_dropped = summary.pending_dropped.saturating_add(1);
-            }
-            TaskStatus::Running => {
-                summary.in_flight_cancelled = summary.in_flight_cancelled.saturating_add(1);
-            }
-            TaskStatus::Succeeded => {
-                summary.succeeded = summary.succeeded.saturating_add(1);
-            }
-            TaskStatus::Failed | TaskStatus::Cancelled => {
-                summary.failed = summary.failed.saturating_add(1);
-            }
-        }
-    }
-    // Mirror the shutdown cancellations to the durable store so a killed
-    // replica's dropped tasks read `cancelled` rather than a stuck `pending`.
-    // Best-effort: shutdown should not block on the database.
-    if let Some(store) = store {
-        for record in &cancelled {
-            if let Err(e) = store.record_task_status(&task_status_update(record)).await {
-                warn!(task_id = %record.id, error = %e, "record shutdown cancellation failed");
-            }
-        }
-    }
-    summary
 }
 
 #[cfg(test)]
@@ -1299,11 +1009,9 @@ mod tests {
         let task_id = Uuid::new_v4();
         let conv_id = Uuid::new_v4();
         let now = Utc::now();
-        let tasks: Arc<DashMap<Uuid, TaskRecord>> = Arc::new(DashMap::new());
-        let conversations: Arc<DashMap<Uuid, ConversationRecord>> = Arc::new(DashMap::new());
-        tasks.insert(
-            task_id,
-            TaskRecord {
+        let store = Arc::new(InMemoryTaskStore::new());
+        store
+            .insert_pending(&TaskRecord {
                 id: task_id,
                 status: TaskStatus::Pending,
                 conversation_id: conv_id,
@@ -1312,18 +1020,16 @@ mod tests {
                 output: None,
                 error: None,
                 queue_depth_at_enqueue: 0,
-            },
-        );
-        conversations.insert(
-            conv_id,
-            ConversationRecord {
-                id: conv_id,
-                created_at: now,
-                updated_at: now,
-                turn_count: 0,
-                messages: vec![Message::system(conv_id, "system")],
-            },
-        );
+            })
+            .await
+            .unwrap();
+        store.seed_conversation(ConversationRecord {
+            id: conv_id,
+            created_at: now,
+            updated_at: now,
+            turn_count: 0,
+            messages: vec![Message::system(conv_id, "system")],
+        });
 
         let core =
             Core::new(Box::new(SleepingClient::new()) as Box<dyn LLMClient>).with_streaming();
@@ -1334,11 +1040,9 @@ mod tests {
         let worker = tokio::spawn(worker_loop(
             work_rx,
             WorkerCtx {
-                tasks: Arc::clone(&tasks),
-                conversations: Arc::clone(&conversations),
+                task_store: Arc::clone(&store) as Arc<dyn TaskStore>,
                 agent: Arc::clone(&agent),
                 builder: stub_builder(),
-                store: None,
                 sandbox: None,
                 local_python: None,
             },
@@ -1366,46 +1070,44 @@ mod tests {
             .expect("worker did not exit within timeout")
             .unwrap();
 
-        let (status, error) = {
-            let entry = tasks.get(&task_id).expect("task record should exist");
-            (entry.status, entry.error.clone())
-        };
-        assert_eq!(status, TaskStatus::Cancelled);
-        assert_eq!(error.as_deref(), Some("cancelled"));
+        let task = store.get_task(task_id).await.unwrap().expect("task record");
+        assert_eq!(task.status, TaskStatus::Cancelled);
+        assert_eq!(task.error.as_deref(), Some("cancelled"));
     }
 
-    fn fresh_state(capacity: usize) -> (ServeState, mpsc::Receiver<WorkerJob>) {
-        let tasks: Arc<DashMap<Uuid, TaskRecord>> = Arc::new(DashMap::new());
-        let conversations: Arc<DashMap<Uuid, ConversationRecord>> = Arc::new(DashMap::new());
+    fn fresh_state(
+        capacity: usize,
+    ) -> (
+        ServeState,
+        Arc<InMemoryTaskStore>,
+        mpsc::Receiver<WorkerJob>,
+    ) {
+        let store = Arc::new(InMemoryTaskStore::new());
         let (work_tx, work_rx) = mpsc::channel::<WorkerJob>(capacity);
         (
             ServeState {
-                tasks,
-                conversations,
+                task_store: Arc::clone(&store) as Arc<dyn TaskStore>,
                 work_tx,
                 system_prompt: Arc::from("system"),
                 skills_menu: None,
-                store: None,
                 provider_names: ["primary".to_owned(), "secondary".to_owned()].into(),
             },
+            store,
             work_rx,
         )
     }
 
     #[test]
     fn test_seed_folds_skills_menu_into_single_system_message() {
-        let (mut state, _rx) = fresh_state(4);
+        let (mut state, store, _rx) = fresh_state(4);
         state.skills_menu = Some(Arc::from(
             "<skills_instructions>\n- alpha: a (file: /tmp/x/SKILL.md)\n</skills_instructions>",
         ));
 
         let id = seed_new_conversation(&state, None);
-        let messages = state
-            .conversations
-            .get(&id)
-            .expect("conversation should be seeded")
-            .messages
-            .clone();
+        let messages = store
+            .conversation_messages(id)
+            .expect("conversation should be seeded");
 
         // Exactly one system message — the menu is folded in, not a second
         // System message after the user turn.
@@ -1418,30 +1120,14 @@ mod tests {
 
     #[test]
     fn test_seed_without_skills_menu_is_plain_prompt() {
-        let (state, _rx) = fresh_state(4);
+        let (state, store, _rx) = fresh_state(4);
         let id = seed_new_conversation(&state, None);
-        let messages = state
-            .conversations
-            .get(&id)
-            .expect("conversation should be seeded")
-            .messages
-            .clone();
+        let messages = store
+            .conversation_messages(id)
+            .expect("conversation should be seeded");
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content, "system");
-    }
-
-    fn record(status: TaskStatus, created_at: DateTime<Utc>) -> TaskRecord {
-        TaskRecord {
-            id: Uuid::new_v4(),
-            status,
-            conversation_id: Uuid::new_v4(),
-            created_at,
-            updated_at: created_at,
-            output: None,
-            error: None,
-            queue_depth_at_enqueue: 0,
-        }
     }
 
     /// Boxes a mock client into the agent type the worker drives.
@@ -1476,15 +1162,13 @@ mod tests {
         })
     }
 
-    /// Builds a store-less worker context sharing a state's task and
-    /// conversation maps, so `process_job` can be driven directly in tests.
+    /// Builds a worker context sharing a state's task store, so `process_job`
+    /// can be driven directly in tests.
     fn worker_ctx(state: &ServeState, agent: Arc<Mutex<ServeAgent>>) -> WorkerCtx {
         WorkerCtx {
-            tasks: Arc::clone(&state.tasks),
-            conversations: Arc::clone(&state.conversations),
+            task_store: Arc::clone(&state.task_store),
             agent,
             builder: stub_builder(),
-            store: None,
             sandbox: None,
             local_python: None,
         }
@@ -1492,18 +1176,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_enqueue_records_queue_depth_zero_when_empty() {
-        let (state, _rx) = fresh_state(4);
+        let (state, store, _rx) = fresh_state(4);
         let record = try_enqueue(&state, "hi".to_string(), None, None, None, None)
             .await
             .expect("enqueue should succeed");
         assert_eq!(record.queue_depth_at_enqueue, 0);
         assert_eq!(record.status, TaskStatus::Pending);
-        assert!(state.tasks.contains_key(&record.id));
+        assert!(store.get_task(record.id).await.unwrap().is_some());
     }
 
     #[tokio::test]
     async fn test_try_enqueue_queue_depth_grows_as_channel_fills() {
-        let (state, _rx) = fresh_state(4);
+        let (state, _store, _rx) = fresh_state(4);
         let mut depths = Vec::new();
         for _ in 0..3 {
             depths.push(
@@ -1518,7 +1202,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_enqueue_returns_queue_full_at_capacity() {
-        let (state, _rx) = fresh_state(2);
+        let (state, store, _rx) = fresh_state(2);
         let first = try_enqueue(&state, "a".to_string(), None, None, None, None)
             .await
             .expect("first should fit");
@@ -1534,11 +1218,11 @@ mod tests {
             "got {err:?}"
         );
 
-        assert!(state.tasks.contains_key(&first.id));
-        assert!(state.tasks.contains_key(&second.id));
-        assert_eq!(state.tasks.len(), 2, "rejected task must not linger");
+        assert!(store.get_task(first.id).await.unwrap().is_some());
+        assert!(store.get_task(second.id).await.unwrap().is_some());
+        assert_eq!(store.task_count(), 2, "rejected task must not linger");
         assert_eq!(
-            state.conversations.len(),
+            store.conversation_count(),
             2,
             "rejected enqueue must not leak a seeded conversation"
         );
@@ -1546,7 +1230,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_enqueue_returns_worker_shutdown_when_rx_dropped() {
-        let (state, rx) = fresh_state(4);
+        let (state, store, rx) = fresh_state(4);
         drop(rx);
 
         let err = try_enqueue(&state, "hi".to_string(), None, None, None, None)
@@ -1554,38 +1238,30 @@ mod tests {
             .expect_err("send should fail");
         assert!(matches!(err, EnqueueError::WorkerShutdown), "got {err:?}");
 
-        let task_id = state
-            .tasks
-            .iter()
-            .next()
-            .map(|e| *e.key())
-            .expect("record should exist");
-        let (status, error) = {
-            let entry = state.tasks.get(&task_id).expect("record should exist");
-            (entry.status, entry.error.clone())
-        };
-        assert_eq!(status, TaskStatus::Failed);
-        assert_eq!(error.as_deref(), Some("worker shutting down"));
-        assert!(
-            state.conversations.is_empty(),
+        let tasks = store.all_tasks();
+        assert_eq!(tasks.len(), 1, "record should exist");
+        assert_eq!(tasks[0].status, TaskStatus::Failed);
+        assert_eq!(tasks[0].error.as_deref(), Some("worker shutting down"));
+        assert_eq!(
+            store.conversation_count(),
+            0,
             "worker-shutdown rejection must not leak a seeded conversation"
         );
     }
 
     #[tokio::test]
     async fn test_try_enqueue_seeds_fresh_conversation_with_system_prompt() {
-        let (state, _rx) = fresh_state(4);
+        let (state, store, _rx) = fresh_state(4);
         let record = try_enqueue(&state, "hi".to_string(), None, None, None, None)
             .await
             .expect("enqueue should succeed");
 
-        let (turn_count, messages) = {
-            let conv = state
-                .conversations
-                .get(&record.conversation_id)
-                .expect("conversation should exist");
-            (conv.turn_count, conv.messages.clone())
-        };
+        let turn_count = store
+            .conversation_turn_count(record.conversation_id)
+            .expect("conversation should exist");
+        let messages = store
+            .conversation_messages(record.conversation_id)
+            .expect("conversation should exist");
         assert_eq!(turn_count, 0);
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, MessageRole::System);
@@ -1595,18 +1271,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_enqueue_override_seeds_custom_system_prompt() {
-        let (state, _rx) = fresh_state(4);
+        let (state, store, _rx) = fresh_state(4);
         let record = try_enqueue(&state, "hi".to_string(), None, Some("be terse"), None, None)
             .await
             .expect("enqueue should succeed");
 
-        let messages = {
-            let conv = state
-                .conversations
-                .get(&record.conversation_id)
-                .expect("conversation should exist");
-            conv.messages.clone()
-        };
+        let messages = store
+            .conversation_messages(record.conversation_id)
+            .expect("conversation should exist");
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, MessageRole::System);
         assert_eq!(messages[0].content, "be terse");
@@ -1614,24 +1286,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_enqueue_falls_back_to_configured_prompt_when_override_omitted() {
-        let (state, _rx) = fresh_state(4);
+        let (state, store, _rx) = fresh_state(4);
         let record = try_enqueue(&state, "hi".to_string(), None, None, None, None)
             .await
             .expect("enqueue should succeed");
 
-        let content = {
-            let conv = state
-                .conversations
-                .get(&record.conversation_id)
-                .expect("conversation should exist");
-            conv.messages[0].content.clone()
-        };
-        assert_eq!(content, "system");
+        let messages = store
+            .conversation_messages(record.conversation_id)
+            .expect("conversation should exist");
+        assert_eq!(messages[0].content, "system");
     }
 
     #[tokio::test]
     async fn test_try_enqueue_override_on_existing_conversation_is_rejected() {
-        let (state, _rx) = fresh_state(4);
+        let (state, store, _rx) = fresh_state(4);
         let first = try_enqueue(&state, "hi".to_string(), None, None, None, None)
             .await
             .expect("first should succeed");
@@ -1650,22 +1318,18 @@ mod tests {
             matches!(err, EnqueueError::SystemPromptOnExisting(id) if id == first.conversation_id)
         );
 
-        let content = {
-            let conv = state
-                .conversations
-                .get(&first.conversation_id)
-                .expect("conversation should exist");
-            conv.messages[0].content.clone()
-        };
+        let messages = store
+            .conversation_messages(first.conversation_id)
+            .expect("conversation should exist");
         assert_eq!(
-            content, "system",
+            messages[0].content, "system",
             "rejected override must not mutate the prompt"
         );
     }
 
     #[tokio::test]
     async fn test_try_enqueue_rejects_empty_system_prompt() {
-        let (state, _rx) = fresh_state(4);
+        let (state, store, _rx) = fresh_state(4);
 
         for prompt in ["", "   \n\t"] {
             let err = try_enqueue(&state, "hi".to_string(), None, Some(prompt), None, None)
@@ -1677,16 +1341,17 @@ mod tests {
             );
         }
 
-        assert!(
-            state.conversations.is_empty(),
+        assert_eq!(
+            store.conversation_count(),
+            0,
             "rejected request must not seed a conversation"
         );
-        assert!(state.tasks.is_empty(), "rejected task must not be recorded");
+        assert_eq!(store.task_count(), 0, "rejected task must not be recorded");
     }
 
     #[tokio::test]
     async fn test_try_enqueue_reuses_existing_conversation() {
-        let (state, _rx) = fresh_state(4);
+        let (state, store, _rx) = fresh_state(4);
         let first = try_enqueue(&state, "hi".to_string(), None, None, None, None)
             .await
             .expect("first should succeed");
@@ -1702,27 +1367,28 @@ mod tests {
         .expect("continuation should succeed");
 
         assert_eq!(first.conversation_id, second.conversation_id);
-        assert_eq!(state.conversations.len(), 1);
+        assert_eq!(store.conversation_count(), 1);
     }
 
     #[tokio::test]
     async fn test_try_enqueue_unknown_conversation_returns_not_found() {
-        let (state, _rx) = fresh_state(4);
+        let (state, store, _rx) = fresh_state(4);
         let bogus = Uuid::new_v4();
         let err = try_enqueue(&state, "hi".to_string(), Some(bogus), None, None, None)
             .await
             .expect_err("unknown conv id should be rejected");
         assert!(matches!(err, EnqueueError::ConversationNotFound(id) if id == bogus));
-        assert!(state.tasks.is_empty(), "rejected task must not be recorded");
-        assert!(
-            state.conversations.is_empty(),
+        assert_eq!(store.task_count(), 0, "rejected task must not be recorded");
+        assert_eq!(
+            store.conversation_count(),
+            0,
             "conv must not be auto-created"
         );
     }
 
     #[tokio::test]
     async fn process_job_continues_existing_conversation() {
-        let (state, _rx) = fresh_state(4);
+        let (state, store, _rx) = fresh_state(4);
         let first = try_enqueue(&state, "hello".to_string(), None, None, None, None)
             .await
             .expect("first enqueue should succeed");
@@ -1745,26 +1411,14 @@ mod tests {
         .await;
 
         // The first turn must have appended user + assistant messages.
-        let after_first = state
-            .conversations
-            .get(&conv_id)
-            .expect("conv exists")
-            .messages
-            .clone();
+        let after_first = store.conversation_messages(conv_id).expect("conv exists");
         assert_eq!(after_first.len(), 3, "expected system + user + assistant");
         assert_eq!(after_first[0].role, MessageRole::System);
         assert_eq!(after_first[1].role, MessageRole::User);
         assert_eq!(after_first[1].content, "hello");
         assert_eq!(after_first[2].role, MessageRole::Assistant);
         assert_eq!(after_first[2].content, "hi-1");
-        assert_eq!(
-            state
-                .conversations
-                .get(&conv_id)
-                .expect("conv exists")
-                .turn_count,
-            1
-        );
+        assert_eq!(store.conversation_turn_count(conv_id), Some(1));
 
         let second = try_enqueue(&state, "again".to_string(), Some(conv_id), None, None, None)
             .await
@@ -1784,12 +1438,7 @@ mod tests {
         )
         .await;
 
-        let after_second = state
-            .conversations
-            .get(&conv_id)
-            .expect("conv exists")
-            .messages
-            .clone();
+        let after_second = store.conversation_messages(conv_id).expect("conv exists");
         assert_eq!(
             after_second.len(),
             5,
@@ -1799,26 +1448,19 @@ mod tests {
         assert_eq!(after_second[3].content, "again");
         assert_eq!(after_second[4].role, MessageRole::Assistant);
         assert_eq!(after_second[4].content, "hi-2");
-        assert_eq!(
-            state
-                .conversations
-                .get(&conv_id)
-                .expect("conv exists")
-                .turn_count,
-            2
-        );
+        assert_eq!(store.conversation_turn_count(conv_id), Some(2));
     }
 
     #[tokio::test]
     async fn process_job_fails_cleanly_when_conversation_record_missing() {
-        let (state, _rx) = fresh_state(4);
+        let (state, store, _rx) = fresh_state(4);
         let task = try_enqueue(&state, "hi".to_string(), None, None, None, None)
             .await
             .expect("enqueue should succeed");
         let conv_id = task.conversation_id;
 
         // Drop the per-pod record before the worker runs.
-        state.conversations.remove(&conv_id);
+        store.remove_conversation(conv_id).await;
 
         let agent = boxed_agent(EchoClient::new("never-runs"));
         process_job(
@@ -1835,17 +1477,14 @@ mod tests {
         )
         .await;
 
-        let (status, error) = {
-            let entry = state.tasks.get(&task.id).expect("task record");
-            (entry.status, entry.error.clone())
-        };
-        assert_eq!(status, TaskStatus::Failed);
-        assert_eq!(error.as_deref(), Some("conversation record missing"));
+        let record = store.get_task(task.id).await.unwrap().expect("task record");
+        assert_eq!(record.status, TaskStatus::Failed);
+        assert_eq!(record.error.as_deref(), Some("conversation record missing"));
     }
 
     #[tokio::test]
     async fn test_try_enqueue_rejects_invalid_model() {
-        let (state, _rx) = fresh_state(4);
+        let (state, store, _rx) = fresh_state(4);
         let err = try_enqueue(
             &state,
             "hi".to_string(),
@@ -1857,9 +1496,10 @@ mod tests {
         .await
         .expect_err("malformed model override should be rejected");
         assert!(matches!(err, EnqueueError::InvalidModel(_)), "got {err:?}");
-        assert!(state.tasks.is_empty(), "rejected task must not be recorded");
-        assert!(
-            state.conversations.is_empty(),
+        assert_eq!(store.task_count(), 0, "rejected task must not be recorded");
+        assert_eq!(
+            store.conversation_count(),
+            0,
             "rejected request must not seed a conversation"
         );
     }
@@ -1869,7 +1509,7 @@ mod tests {
         // `fresh_state` configures providers "primary" and "secondary"; anything
         // else is rejected at enqueue with a 400-mapped error, before a task or
         // conversation is minted.
-        let (state, _rx) = fresh_state(4);
+        let (state, store, _rx) = fresh_state(4);
         let err = try_enqueue(&state, "hi".to_string(), None, None, Some("ghost"), None)
             .await
             .expect_err("unknown provider override should be rejected");
@@ -1877,16 +1517,17 @@ mod tests {
             matches!(&err, EnqueueError::UnknownProvider(name) if name == "ghost"),
             "got {err:?}",
         );
-        assert!(state.tasks.is_empty(), "rejected task must not be recorded");
-        assert!(
-            state.conversations.is_empty(),
+        assert_eq!(store.task_count(), 0, "rejected task must not be recorded");
+        assert_eq!(
+            store.conversation_count(),
+            0,
             "rejected request must not seed a conversation"
         );
     }
 
     #[tokio::test]
     async fn test_try_enqueue_accepts_known_provider() {
-        let (state, _rx) = fresh_state(4);
+        let (state, store, _rx) = fresh_state(4);
         let record = try_enqueue(
             &state,
             "hi".to_string(),
@@ -1898,7 +1539,12 @@ mod tests {
         .await
         .expect("a configured provider override should be accepted");
         assert_eq!(
-            state.tasks.get(&record.id).expect("task record").status,
+            store
+                .get_task(record.id)
+                .await
+                .unwrap()
+                .expect("task record")
+                .status,
             TaskStatus::Pending,
         );
     }
@@ -1907,7 +1553,7 @@ mod tests {
     async fn process_job_with_provider_override_runs_built_agent() {
         // A provider override with no model still routes through the per-task
         // builder rather than the shared agent.
-        let (state, _rx) = fresh_state(4);
+        let (state, store, _rx) = fresh_state(4);
         let task = try_enqueue(
             &state,
             "hi".to_string(),
@@ -1921,13 +1567,11 @@ mod tests {
         let conv_id = task.conversation_id;
 
         let ctx = WorkerCtx {
-            tasks: Arc::clone(&state.tasks),
-            conversations: Arc::clone(&state.conversations),
+            task_store: Arc::clone(&state.task_store),
             agent: boxed_agent(EchoClient::new("from-shared")),
             builder: Arc::new(TestBuilder {
                 reply: "from-override".to_string(),
             }),
-            store: None,
             sandbox: None,
             local_python: None,
         };
@@ -1945,25 +1589,28 @@ mod tests {
         )
         .await;
 
-        let last = state
-            .conversations
-            .get(&conv_id)
+        let last = store
+            .conversation_messages(conv_id)
             .expect("conv exists")
-            .messages
             .last()
             .expect("assistant reply")
             .content
             .clone();
         assert_eq!(last, "from-override", "the override agent should have run");
         assert_eq!(
-            state.tasks.get(&task.id).expect("task record").status,
+            store
+                .get_task(task.id)
+                .await
+                .unwrap()
+                .expect("task record")
+                .status,
             TaskStatus::Succeeded
         );
     }
 
     #[tokio::test]
     async fn process_job_with_model_override_runs_built_agent() {
-        let (state, _rx) = fresh_state(4);
+        let (state, store, _rx) = fresh_state(4);
         let task = try_enqueue(&state, "hi".to_string(), None, None, None, None)
             .await
             .expect("enqueue should succeed");
@@ -1972,13 +1619,11 @@ mod tests {
         // The shared agent and the per-task builder return different replies, so
         // the assistant message that lands tells us which agent actually ran.
         let ctx = WorkerCtx {
-            tasks: Arc::clone(&state.tasks),
-            conversations: Arc::clone(&state.conversations),
+            task_store: Arc::clone(&state.task_store),
             agent: boxed_agent(EchoClient::new("from-shared")),
             builder: Arc::new(TestBuilder {
                 reply: "from-override".to_string(),
             }),
-            store: None,
             sandbox: None,
             local_python: None,
         };
@@ -1996,98 +1641,28 @@ mod tests {
         )
         .await;
 
-        let last = state
-            .conversations
-            .get(&conv_id)
+        let last = store
+            .conversation_messages(conv_id)
             .expect("conv exists")
-            .messages
             .last()
             .expect("assistant reply")
             .content
             .clone();
         assert_eq!(last, "from-override", "the override agent should have run");
         assert_eq!(
-            state.tasks.get(&task.id).expect("task record").status,
+            store
+                .get_task(task.id)
+                .await
+                .unwrap()
+                .expect("task record")
+                .status,
             TaskStatus::Succeeded
         );
     }
 
-    #[test]
-    fn test_conversations_sorted_by_created_at() {
-        let conversations: DashMap<Uuid, ConversationRecord> = DashMap::new();
-        let base = Utc::now();
-        for offset in [3, 1, 2, 0] {
-            let id = Uuid::new_v4();
-            let ts = base + chrono::Duration::seconds(offset);
-            conversations.insert(
-                id,
-                ConversationRecord {
-                    id,
-                    created_at: ts,
-                    updated_at: ts,
-                    turn_count: 0,
-                    messages: vec![Message::system(id, "system")],
-                },
-            );
-        }
-        let listed = conversations_sorted(&conversations);
-        assert!(
-            listed
-                .windows(2)
-                .all(|w| w[0].created_at <= w[1].created_at)
-        );
-        assert_eq!(listed.len(), 4);
-        assert!(listed.iter().all(|s| s.message_count == 1));
-    }
-
-    #[test]
-    fn test_list_tasks_returns_active_sorted_by_created_at() {
-        let tasks: DashMap<Uuid, TaskRecord> = DashMap::new();
-        let base = Utc::now();
-        let inserts = [
-            (TaskStatus::Succeeded, base),
-            (TaskStatus::Running, base + chrono::Duration::seconds(1)),
-            (TaskStatus::Pending, base + chrono::Duration::seconds(3)),
-            (TaskStatus::Failed, base + chrono::Duration::seconds(2)),
-            (TaskStatus::Pending, base + chrono::Duration::seconds(4)),
-            (TaskStatus::Cancelled, base + chrono::Duration::seconds(5)),
-        ];
-        for (status, created_at) in inserts {
-            let rec = record(status, created_at);
-            tasks.insert(rec.id, rec);
-        }
-
-        let active = active_tasks_sorted(&tasks);
-        let statuses: Vec<TaskStatus> = active.iter().map(|r| r.status).collect();
-        assert_eq!(
-            statuses,
-            vec![
-                TaskStatus::Running,
-                TaskStatus::Pending,
-                TaskStatus::Pending
-            ]
-        );
-        assert!(
-            active
-                .windows(2)
-                .all(|w| w[0].created_at <= w[1].created_at)
-        );
-    }
-
-    #[test]
-    fn test_list_tasks_empty_when_only_finished() {
-        let tasks: DashMap<Uuid, TaskRecord> = DashMap::new();
-        let now = Utc::now();
-        for status in [
-            TaskStatus::Succeeded,
-            TaskStatus::Failed,
-            TaskStatus::Cancelled,
-        ] {
-            let rec = record(status, now);
-            tasks.insert(rec.id, rec);
-        }
-        assert!(active_tasks_sorted(&tasks).is_empty());
-    }
+    // The active-task filtering/sorting and conversation-summary ordering that
+    // used to be tested through serve's free functions now live behind the
+    // `TaskStore` seam — see `task_store::tests`.
 
     // --- Postgres-backed continuation tests --------------------------------
     //
@@ -2098,21 +1673,38 @@ mod tests {
     //   DATABASE_URL=postgres://postgres:pg@localhost:5432/neuromance \
     //       cargo test -p neuromance-runtime -- --ignored
 
-    /// `fresh_state` plus a durable store wrapping `pool`.
-    fn state_with_store(capacity: usize, pool: PgPool) -> (ServeState, mpsc::Receiver<WorkerJob>) {
-        let (mut state, rx) = fresh_state(capacity);
-        state.store = Some(Arc::new(PgConversationStore::new(pool)));
-        (state, rx)
+    /// `fresh_state` backed by a postgres write-through store wrapping `pool`.
+    fn state_with_store(
+        capacity: usize,
+        pool: PgPool,
+    ) -> (
+        ServeState,
+        Arc<PostgresTaskStore>,
+        mpsc::Receiver<WorkerJob>,
+    ) {
+        let store = Arc::new(PostgresTaskStore::new(Arc::new(PgConversationStore::new(
+            pool,
+        ))));
+        let (work_tx, work_rx) = mpsc::channel::<WorkerJob>(capacity);
+        (
+            ServeState {
+                task_store: Arc::clone(&store) as Arc<dyn TaskStore>,
+                work_tx,
+                system_prompt: Arc::from("system"),
+                skills_menu: None,
+                provider_names: ["primary".to_owned(), "secondary".to_owned()].into(),
+            },
+            store,
+            work_rx,
+        )
     }
 
-    /// `worker_ctx` that shares the state's durable store.
+    /// `worker_ctx` sharing the state's postgres-backed task store.
     fn worker_ctx_with_store(state: &ServeState, agent: Arc<Mutex<ServeAgent>>) -> WorkerCtx {
         WorkerCtx {
-            tasks: Arc::clone(&state.tasks),
-            conversations: Arc::clone(&state.conversations),
+            task_store: Arc::clone(&state.task_store),
             agent,
             builder: stub_builder(),
-            store: state.store.clone(),
             sandbox: None,
             local_python: None,
         }
@@ -2121,12 +1713,12 @@ mod tests {
     #[sqlx::test(migrations = "../neuromance-db/migrations")]
     #[ignore = "requires postgres via DATABASE_URL"]
     async fn resolve_continuation_rehydrates_from_store_on_cold_cache(pool: PgPool) {
-        let (state, _rx) = state_with_store(4, pool);
+        let (state, task_store, _rx) = state_with_store(4, pool);
         let conv_id = Uuid::new_v4();
         // Seed durable history but leave the in-memory cache empty — the
         // cross-pod scenario where the request lands on a replica that never
         // accepted earlier turns.
-        let store = state.store.clone().expect("store configured");
+        let store = task_store.durable_store();
         store
             .append_messages(
                 conv_id,
@@ -2145,7 +1737,7 @@ mod tests {
 
         assert_eq!(record.conversation_id, conv_id);
         assert!(
-            !state.conversations.contains_key(&conv_id),
+            !task_store.has_cached_conversation(conv_id),
             "resolution must not be gated on the local cache"
         );
     }
@@ -2153,7 +1745,7 @@ mod tests {
     #[sqlx::test(migrations = "../neuromance-db/migrations")]
     #[ignore = "requires postgres via DATABASE_URL"]
     async fn resolve_unknown_id_with_store_returns_not_found(pool: PgPool) {
-        let (state, _rx) = state_with_store(4, pool);
+        let (state, _task_store, _rx) = state_with_store(4, pool);
         let bogus = Uuid::new_v4();
         let err = try_enqueue(&state, "hi".to_string(), Some(bogus), None, None, None)
             .await
@@ -2164,9 +1756,9 @@ mod tests {
     #[sqlx::test(migrations = "../neuromance-db/migrations")]
     #[ignore = "requires postgres via DATABASE_URL"]
     async fn process_job_reads_history_from_store_not_stale_cache(pool: PgPool) {
-        let (state, _rx) = state_with_store(4, pool);
+        let (state, task_store, _rx) = state_with_store(4, pool);
         let conv_id = Uuid::new_v4();
-        let store = state.store.clone().expect("store configured");
+        let store = task_store.durable_store();
 
         // The store holds two completed turns...
         store
@@ -2185,36 +1777,30 @@ mod tests {
 
         // ...but this replica's cache is stale at turn 1 only. If the worker
         // trusted the cache it would silently drop turn 2.
-        state.conversations.insert(
-            conv_id,
-            ConversationRecord {
-                id: conv_id,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-                turn_count: 1,
-                messages: vec![
-                    Message::system(conv_id, "system"),
-                    Message::user(conv_id, "turn-1"),
-                    Message::assistant(conv_id, "reply-1"),
-                ],
-            },
-        );
+        task_store.seed_cache(ConversationRecord {
+            id: conv_id,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            turn_count: 1,
+            messages: vec![
+                Message::system(conv_id, "system"),
+                Message::user(conv_id, "turn-1"),
+                Message::assistant(conv_id, "reply-1"),
+            ],
+        });
 
         let task_id = Uuid::new_v4();
         let now = Utc::now();
-        state.tasks.insert(
-            task_id,
-            TaskRecord {
-                id: task_id,
-                status: TaskStatus::Pending,
-                conversation_id: conv_id,
-                created_at: now,
-                updated_at: now,
-                output: None,
-                error: None,
-                queue_depth_at_enqueue: 0,
-            },
-        );
+        task_store.seed_task(TaskRecord {
+            id: task_id,
+            status: TaskStatus::Pending,
+            conversation_id: conv_id,
+            created_at: now,
+            updated_at: now,
+            output: None,
+            error: None,
+            queue_depth_at_enqueue: 0,
+        });
 
         let agent = boxed_agent(EchoClient::new("reply-3"));
         process_job(
@@ -2233,19 +1819,198 @@ mod tests {
 
         // Run input came from the store (5 prior + user-3 + assistant-3 = 7),
         // not the 3-message stale cache (which would yield 5).
-        let history = state
-            .conversations
-            .get(&conv_id)
-            .expect("conv exists")
-            .messages
-            .clone();
+        let history = task_store
+            .conversation_messages(conv_id)
+            .expect("conv exists");
         assert_eq!(history.len(), 7, "history must include the store's turn 2");
         assert_eq!(history[3].content, "turn-2");
         assert_eq!(history[5].content, "turn-3");
         assert_eq!(history[6].content, "reply-3");
         assert_eq!(
-            state.tasks.get(&task_id).expect("task record").status,
+            task_store
+                .get_task(task_id)
+                .await
+                .unwrap()
+                .expect("task record")
+                .status,
             TaskStatus::Succeeded
         );
+    }
+
+    #[sqlx::test(migrations = "../neuromance-db/migrations")]
+    #[ignore = "requires postgres via DATABASE_URL"]
+    async fn conversation_reads_are_store_authoritative_on_cold_cache(pool: PgPool) {
+        let (_state, task_store, _rx) = state_with_store(4, pool);
+        let store = task_store.durable_store();
+
+        // A root conversation with two user turns, seeded only in postgres.
+        let conv_id = Uuid::new_v4();
+        store
+            .append_messages(
+                conv_id,
+                &[
+                    Message::system(conv_id, "system"),
+                    Message::user(conv_id, "turn-1"),
+                    Message::assistant(conv_id, "reply-1"),
+                    Message::user(conv_id, "turn-2"),
+                    Message::assistant(conv_id, "reply-2"),
+                ],
+            )
+            .await
+            .expect("seed durable history");
+
+        // A delegated child conversation, which the list endpoint must exclude.
+        let child_id = Uuid::new_v4();
+        store
+            .append_messages(child_id, &[Message::user(child_id, "child")])
+            .await
+            .expect("seed child history");
+        store
+            .set_conversation_parent(child_id, conv_id, None, None, None)
+            .await
+            .expect("link child to parent");
+
+        assert!(
+            !task_store.has_cached_conversation(conv_id),
+            "the replica must not have cached the conversation"
+        );
+
+        // get_conversation answers from postgres, deriving turn_count.
+        let view = task_store
+            .get_conversation_view(conv_id)
+            .await
+            .expect("read ok")
+            .expect("conversation resolves from the store");
+        assert_eq!(view.messages.len(), 5);
+        assert_eq!(view.turn_count, 2);
+
+        // list_conversations answers from postgres and lists roots only.
+        let summaries = task_store.list_conversations().await.expect("list ok");
+        assert_eq!(summaries.len(), 1, "child conversation must be excluded");
+        assert_eq!(summaries[0].id, conv_id);
+        assert_eq!(summaries[0].message_count, 5);
+        assert_eq!(summaries[0].turn_count, 2);
+    }
+
+    /// A `TaskStore` whose `insert_pending` always fails, to exercise the
+    /// fail-closed enqueue path in CI without a live database.
+    struct FailingTaskStore {
+        inner: InMemoryTaskStore,
+    }
+
+    #[async_trait]
+    impl TaskStore for FailingTaskStore {
+        async fn insert_pending(&self, _task: &TaskRecord) -> Result<(), neuromance_db::DbError> {
+            Err(neuromance_db::DbError::UnknownTaskStatus {
+                value: "insert_pending forced failure".to_string(),
+                task_id: Uuid::nil(),
+            })
+        }
+        async fn remove_task(&self, id: Uuid) {
+            self.inner.remove_task(id).await;
+        }
+        async fn mark_running(&self, id: Uuid) -> Option<crate::task_store::TaskTiming> {
+            self.inner.mark_running(id).await
+        }
+        async fn mark_succeeded(&self, id: Uuid, output: String) {
+            self.inner.mark_succeeded(id, output).await;
+        }
+        async fn mark_failed(&self, id: Uuid, reason: &str) {
+            self.inner.mark_failed(id, reason).await;
+        }
+        async fn mark_cancelled(&self, id: Uuid, reason: &str) {
+            self.inner.mark_cancelled(id, reason).await;
+        }
+        async fn get_task(
+            &self,
+            id: Uuid,
+        ) -> Result<Option<neuromance_db::StoredTask>, neuromance_db::DbError> {
+            self.inner.get_task(id).await
+        }
+        async fn list_active_tasks(
+            &self,
+        ) -> Result<Vec<neuromance_db::StoredTask>, neuromance_db::DbError> {
+            self.inner.list_active_tasks().await
+        }
+        async fn begin_provenance(&self, conversation_id: Uuid) -> Option<i64> {
+            self.inner.begin_provenance(conversation_id).await
+        }
+        async fn record_provenance(
+            &self,
+            task_id: Uuid,
+            conversation_id: Uuid,
+            start: Option<i64>,
+        ) {
+            self.inner
+                .record_provenance(task_id, conversation_id, start)
+                .await;
+        }
+        fn seed_conversation(&self, record: ConversationRecord) {
+            self.inner.seed_conversation(record);
+        }
+        async fn conversation_exists(&self, id: Uuid) -> Result<bool, neuromance_db::DbError> {
+            self.inner.conversation_exists(id).await
+        }
+        async fn remove_conversation(&self, id: Uuid) {
+            self.inner.remove_conversation(id).await;
+        }
+        async fn build_turn_input(
+            &self,
+            conversation_id: Uuid,
+            seeded: bool,
+            user_msg: Message,
+        ) -> Result<Vec<Message>, crate::task_store::TurnInputError> {
+            self.inner
+                .build_turn_input(conversation_id, seeded, user_msg)
+                .await
+        }
+        async fn refresh_conversation(&self, id: Uuid, full_history: Vec<Message>) {
+            self.inner.refresh_conversation(id, full_history).await;
+        }
+        async fn list_conversations(
+            &self,
+        ) -> Result<Vec<crate::task_store::ConversationSummary>, neuromance_db::DbError> {
+            self.inner.list_conversations().await
+        }
+        async fn get_conversation_view(
+            &self,
+            id: Uuid,
+        ) -> Result<Option<ConversationRecord>, neuromance_db::DbError> {
+            self.inner.get_conversation_view(id).await
+        }
+        async fn list_conversation_children(
+            &self,
+            id: Uuid,
+            limit: u32,
+            offset: u32,
+        ) -> Result<Option<Vec<neuromance_db::ConversationSummary>>, neuromance_db::DbError>
+        {
+            self.inner
+                .list_conversation_children(id, limit, offset)
+                .await
+        }
+        async fn drain_pending(&self) -> crate::task_store::ShutdownSummary {
+            self.inner.drain_pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn test_try_enqueue_fail_closed_when_pending_write_fails() {
+        let store: Arc<dyn TaskStore> = Arc::new(FailingTaskStore {
+            inner: InMemoryTaskStore::new(),
+        });
+        let (work_tx, _rx) = mpsc::channel::<WorkerJob>(4);
+        let state = ServeState {
+            task_store: store,
+            work_tx,
+            system_prompt: Arc::from("system"),
+            skills_menu: None,
+            provider_names: ["primary".to_owned()].into(),
+        };
+
+        let err = try_enqueue(&state, "hi".to_string(), None, None, None, None)
+            .await
+            .expect_err("a failed durable pending write must reject the enqueue");
+        assert!(matches!(err, EnqueueError::Persistence), "got {err:?}");
     }
 }
