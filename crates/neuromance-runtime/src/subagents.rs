@@ -442,6 +442,7 @@ mod tests {
             rules: None,
             bootstrap: Vec::new(),
             sandbox: None,
+            workspace: None,
         }
     }
 

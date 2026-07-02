@@ -341,54 +341,6 @@ fn apply_context_compaction(
     Ok(core)
 }
 
-/// Resolve a task's provider and model from optional per-task overrides.
-///
-/// Mirrors subagent resolution (see `subagents.rs`): the named provider falls
-/// back to `agent.provider`, and the model override's `provider:` prefix only
-/// selects the client family — the credential always comes from the resolved
-/// provider. With no overrides this reduces to `agent.provider` +
-/// `config.agent_model()`, leaving the shared agent unchanged.
-///
-/// # Errors
-/// Returns [`RuntimeError::Config`] when the provider names no `[[providers]]`
-/// entry or no effective model can be resolved.
-fn resolve_provider_and_model<'a>(
-    config: &'a RuntimeConfig,
-    provider_override: Option<&str>,
-    model_override: Option<&'a str>,
-) -> Result<(&'a neuromance_runtime::ProviderConfig, &'a str), RuntimeError> {
-    let provider_name = provider_override.unwrap_or(&config.agent.provider);
-    let provider = config.provider(provider_name).ok_or_else(|| {
-        RuntimeError::Config(format!(
-            "provider '{provider_name}' does not match any [[providers]] entry"
-        ))
-    })?;
-    let model = match (model_override, provider_override) {
-        (Some(model), _) => model,
-        // No model override but a provider override: prefer that provider's
-        // default model, then the agent's effective model.
-        (None, Some(_)) => provider
-            .model
-            .as_deref()
-            .or_else(|| config.agent_model())
-            .ok_or_else(|| {
-                RuntimeError::Config(format!(
-                    "agent has no model: set agent.model, provider '{provider_name}' model, or \
-                     a per-task model override"
-                ))
-            })?,
-        // The shared agent path: identical to before — `agent.model` wins over
-        // the agent provider's default.
-        (None, None) => config.agent_model().ok_or_else(|| {
-            RuntimeError::Config(format!(
-                "agent has no model: set agent.model or provider '{}' model",
-                config.agent.provider
-            ))
-        })?,
-    };
-    Ok((provider, model))
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn build_agent(
     config: &RuntimeConfig,
@@ -400,7 +352,7 @@ async fn build_agent(
     provider_override: Option<&str>,
     model_override: Option<&str>,
 ) -> Result<(Agent<Box<dyn LLMClient>>, Option<SessionReset>), RuntimeError> {
-    let (provider, model) = resolve_provider_and_model(config, provider_override, model_override)?;
+    let (provider, model) = config.resolve_provider_and_model(provider_override, model_override)?;
     let llm_config = build_provider_config(provider, model)?;
     let client = build_client(llm_config.clone())
         .map_err(|e| RuntimeError::Config(format!("build client: {e}")))?;

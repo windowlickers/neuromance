@@ -96,6 +96,11 @@ pub struct RuntimeConfig {
     /// when it is set. See [`SandboxConfig`].
     #[serde(default)]
     pub sandbox: Option<SandboxConfig>,
+    /// Per-conversation working directories under a shared root, with
+    /// optional named seed definitions and snapshot persistence. The feature
+    /// is fully off when the section is absent. See [`WorkspaceSettings`].
+    #[serde(default)]
+    pub workspace: Option<WorkspaceSettings>,
 }
 
 /// Configuration for the sandboxed tool-execution boundary.
@@ -474,6 +479,133 @@ pub struct OneshotConfig {
     pub output_path: Option<PathBuf>,
 }
 
+/// Per-conversation workspace settings.
+///
+/// Each conversation gets a working directory at `<root>/<conversation_id>`,
+/// created on first use and reused by continuations. `root` is expected to be
+/// a volume shared with the sandbox container (a k8s `emptyDir`) so tools
+/// executed there see the same files the orchestrator seeds and snapshots.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WorkspaceSettings {
+    /// Absolute directory under which per-conversation workspaces are
+    /// created, e.g. the `emptyDir` mount `/workspace`.
+    pub root: PathBuf,
+    /// Named seed definitions (`[[workspace.definitions]]`). A task selects
+    /// one by request override or by provider/model auto-selection; seeding
+    /// runs once, when the conversation's workspace is first created.
+    #[serde(default)]
+    pub definitions: Vec<WorkspaceDefinition>,
+    /// S3-compatible object storage (garage) used by object seeds and
+    /// snapshot persistence.
+    #[serde(default)]
+    pub storage: Option<WorkspaceStorageSettings>,
+    /// Snapshot/restore of workspaces across replicas. Requires `storage`;
+    /// absent means workspaces are purely local to the pod.
+    #[serde(default)]
+    pub persistence: Option<WorkspacePersistenceSettings>,
+    /// Tokenizer-proxy auth for git seeds, shaped like a provider's
+    /// `[providers.proxy]`. Absent means git seeds clone anonymously.
+    #[serde(default)]
+    pub git_proxy: Option<ProviderProxyConfig>,
+}
+
+/// A named workspace definition selecting seed content for new workspaces.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WorkspaceDefinition {
+    /// Unique name, referenced by the task request's `workspace` field.
+    pub name: String,
+    /// Auto-select this definition when the task's *resolved* provider name
+    /// is listed here. A request-level `workspace` override wins.
+    #[serde(default)]
+    pub providers: Vec<String>,
+    /// Auto-select this definition when the task's *resolved* model string
+    /// (e.g. `anthropic:claude-opus-4-8`) is listed here. Exact match, no
+    /// normalization.
+    #[serde(default)]
+    pub models: Vec<String>,
+    /// Git repositories cloned into the workspace on first creation.
+    #[serde(default)]
+    pub git: Vec<GitSeed>,
+    /// Object archives (tar.zst) unpacked into the workspace on first
+    /// creation. Requires `[workspace.storage]`.
+    #[serde(default)]
+    pub objects: Vec<ObjectSeed>,
+}
+
+/// A git repository seeded into a fresh workspace.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GitSeed {
+    /// Remote URL. Authenticated clones require an `http://` scheme so the
+    /// tokenizer proxy can read the sealed header (it upgrades to TLS
+    /// upstream).
+    pub url: String,
+    /// Branch, tag, or commit SHA to check out; defaults to the remote HEAD.
+    #[serde(default, rename = "ref")]
+    pub reference: Option<String>,
+    /// Clone target relative to the workspace dir; must not be absolute or
+    /// contain `..`. Defaults to the repository basename.
+    #[serde(default)]
+    pub dest: Option<String>,
+}
+
+/// An object-storage archive seeded into a fresh workspace.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ObjectSeed {
+    /// Object key within `workspace.storage.bucket`; the object is a
+    /// tar.zst archive.
+    pub key: String,
+    /// Unpack target relative to the workspace dir; must not be absolute or
+    /// contain `..`. Defaults to the workspace dir itself.
+    #[serde(default)]
+    pub dest: Option<String>,
+}
+
+/// S3-compatible object storage for workspace seeds and snapshots.
+///
+/// Credentials come from the environment — the TOML ships in a `ConfigMap`
+/// and never holds secrets, the same policy as a provider's `api_key_env`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WorkspaceStorageSettings {
+    /// Endpoint URL, e.g. `http://garage.storage.svc.cluster.local:3900`.
+    pub endpoint: String,
+    /// Bucket holding seed archives and snapshots.
+    pub bucket: String,
+    /// Region string presented to the S3 API. Garage accepts its configured
+    /// region name; defaults to `garage`.
+    #[serde(default = "default_storage_region")]
+    pub region: String,
+    /// Environment variable holding the S3 access key id.
+    pub access_key_id_env: String,
+    /// Environment variable holding the S3 secret access key.
+    pub secret_access_key_env: String,
+}
+
+fn default_storage_region() -> String {
+    "garage".to_string()
+}
+
+/// Workspace snapshot/restore settings.
+///
+/// When present, the worker restores a conversation's workspace from the
+/// last snapshot before a continuation run and snapshots it after every run.
+/// Retention is expiry-based and external: point a garage lifecycle rule at
+/// `prefix` rather than deleting from the runtime.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WorkspacePersistenceSettings {
+    /// Object key prefix for snapshots. A conversation's snapshot lives at
+    /// `<prefix><conversation_id>.tar.zst`.
+    #[serde(default = "default_snapshot_prefix")]
+    pub prefix: String,
+    /// Glob patterns excluded from snapshots, matched against paths relative
+    /// to the workspace dir (e.g. `target/**`, `node_modules/**`).
+    #[serde(default)]
+    pub exclude: Vec<String>,
+}
+
+fn default_snapshot_prefix() -> String {
+    "snapshots/".to_string()
+}
+
 impl RuntimeConfig {
     /// Load from `$NEUROMANCE_CONFIG`, defaulting to `/etc/neuromance/config.toml`.
     ///
@@ -516,6 +648,75 @@ impl RuntimeConfig {
             return Some(model);
         }
         self.provider(&self.agent.provider)?.model.as_deref()
+    }
+
+    /// Resolve a task's provider and model from optional per-task overrides.
+    ///
+    /// Mirrors subagent resolution (see `subagents.rs`): the named provider
+    /// falls back to `agent.provider`, and the model override's `provider:`
+    /// prefix only selects the client family — the credential always comes
+    /// from the resolved provider. With no overrides this reduces to
+    /// `agent.provider` + [`Self::agent_model`], leaving the shared agent
+    /// unchanged.
+    ///
+    /// # Errors
+    /// Returns [`RuntimeError::Config`] when the provider names no
+    /// `[[providers]]` entry or no effective model can be resolved.
+    pub fn resolve_provider_and_model<'a>(
+        &'a self,
+        provider_override: Option<&str>,
+        model_override: Option<&'a str>,
+    ) -> Result<(&'a ProviderConfig, &'a str), RuntimeError> {
+        let provider_name = provider_override.unwrap_or(&self.agent.provider);
+        let provider = self.provider(provider_name).ok_or_else(|| {
+            RuntimeError::Config(format!(
+                "provider '{provider_name}' does not match any [[providers]] entry"
+            ))
+        })?;
+        let model = match (model_override, provider_override) {
+            (Some(model), _) => model,
+            // No model override but a provider override: prefer that
+            // provider's default model, then the agent's effective model.
+            (None, Some(_)) => provider
+                .model
+                .as_deref()
+                .or_else(|| self.agent_model())
+                .ok_or_else(|| {
+                    RuntimeError::Config(format!(
+                        "agent has no model: set agent.model, provider '{provider_name}' \
+                         model, or a per-task model override"
+                    ))
+                })?,
+            // The shared agent path: identical to before — `agent.model` wins
+            // over the agent provider's default.
+            (None, None) => self.agent_model().ok_or_else(|| {
+                RuntimeError::Config(format!(
+                    "agent has no model: set agent.model or provider '{}' model",
+                    self.agent.provider
+                ))
+            })?,
+        };
+        Ok((provider, model))
+    }
+
+    /// The first workspace definition bound to `provider` or `model`, in
+    /// config order. Request-level overrides bypass this — see
+    /// [`Self::workspace_definition`].
+    #[must_use]
+    pub fn select_workspace(&self, provider: &str, model: &str) -> Option<&WorkspaceDefinition> {
+        self.workspace.as_ref()?.definitions.iter().find(|def| {
+            def.providers.iter().any(|p| p == provider) || def.models.iter().any(|m| m == model)
+        })
+    }
+
+    /// Look up a workspace definition by name.
+    #[must_use]
+    pub fn workspace_definition(&self, name: &str) -> Option<&WorkspaceDefinition> {
+        self.workspace
+            .as_ref()?
+            .definitions
+            .iter()
+            .find(|def| def.name == name)
     }
 
     /// Cross-field validation that serde alone cannot express.
@@ -619,6 +820,7 @@ impl RuntimeConfig {
         }
 
         self.validate_sandbox()?;
+        self.validate_workspace()?;
         Ok(())
     }
 
@@ -737,27 +939,147 @@ impl RuntimeConfig {
                 validate_http_url(url, &format!("provider '{}' base_url", provider.name))?;
             }
             if let Some(proxy) = &provider.proxy {
-                validate_http_url(
-                    &proxy.base_url,
-                    &format!("provider '{}' proxy.base_url", provider.name),
-                )?;
-                if !proxy.token_file.is_absolute() {
-                    return Err(RuntimeError::Config(format!(
-                        "provider '{}' proxy.token_file must be an absolute path, got '{}'",
-                        provider.name,
-                        proxy.token_file.display()
-                    )));
-                }
-                if proxy.token_header.trim().is_empty() {
-                    return Err(RuntimeError::Config(format!(
-                        "provider '{}' proxy.token_header must not be empty",
-                        provider.name
-                    )));
-                }
+                validate_proxy_config(proxy, &format!("provider '{}' proxy", provider.name))?;
             }
         }
         Ok(())
     }
+
+    /// Validate `[workspace]`: an absolute root, unique definition names,
+    /// contained seed destinations, storage present wherever object seeds or
+    /// persistence need it, and compiling exclusion globs.
+    fn validate_workspace(&self) -> Result<(), RuntimeError> {
+        let Some(workspace) = &self.workspace else {
+            return Ok(());
+        };
+
+        if !workspace.root.is_absolute() {
+            return Err(RuntimeError::Config(format!(
+                "workspace.root must be an absolute path, got '{}'",
+                workspace.root.display()
+            )));
+        }
+
+        let mut seen_names = std::collections::HashSet::new();
+        for def in &workspace.definitions {
+            if def.name.trim().is_empty() {
+                return Err(RuntimeError::Config(
+                    "workspace definition name must not be empty".to_string(),
+                ));
+            }
+            if !seen_names.insert(def.name.as_str()) {
+                return Err(RuntimeError::Config(format!(
+                    "duplicate workspace definition name '{}'",
+                    def.name
+                )));
+            }
+            for seed in &def.git {
+                if seed.url.trim().is_empty() {
+                    return Err(RuntimeError::Config(format!(
+                        "workspace definition '{}': git seed url must not be empty",
+                        def.name
+                    )));
+                }
+                validate_seed_dest(seed.dest.as_deref(), &def.name)?;
+            }
+            for seed in &def.objects {
+                if seed.key.trim().is_empty() {
+                    return Err(RuntimeError::Config(format!(
+                        "workspace definition '{}': object seed key must not be empty",
+                        def.name
+                    )));
+                }
+                validate_seed_dest(seed.dest.as_deref(), &def.name)?;
+            }
+            if !def.objects.is_empty() && workspace.storage.is_none() {
+                return Err(RuntimeError::Config(format!(
+                    "workspace definition '{}' has object seeds but [workspace.storage] is \
+                     not configured",
+                    def.name
+                )));
+            }
+        }
+
+        if let Some(storage) = &workspace.storage {
+            validate_http_url(&storage.endpoint, "workspace.storage.endpoint")?;
+            for (value, field) in [
+                (&storage.bucket, "bucket"),
+                (&storage.region, "region"),
+                (&storage.access_key_id_env, "access_key_id_env"),
+                (&storage.secret_access_key_env, "secret_access_key_env"),
+            ] {
+                if value.trim().is_empty() {
+                    return Err(RuntimeError::Config(format!(
+                        "workspace.storage.{field} must not be empty"
+                    )));
+                }
+            }
+        }
+
+        if let Some(persistence) = &workspace.persistence {
+            if workspace.storage.is_none() {
+                return Err(RuntimeError::Config(
+                    "[workspace.persistence] requires [workspace.storage]".to_string(),
+                ));
+            }
+            for pattern in &persistence.exclude {
+                globset::Glob::new(pattern).map_err(|e| {
+                    RuntimeError::Config(format!(
+                        "workspace.persistence.exclude pattern '{pattern}' is not a valid \
+                         glob: {e}"
+                    ))
+                })?;
+            }
+        }
+
+        if let Some(proxy) = &workspace.git_proxy {
+            validate_proxy_config(proxy, "workspace.git_proxy")?;
+        }
+
+        Ok(())
+    }
+}
+
+/// Validate a seed `dest`: relative and free of `..` components, so it cannot
+/// escape the workspace dir it is joined onto.
+fn validate_seed_dest(dest: Option<&str>, definition: &str) -> Result<(), RuntimeError> {
+    let Some(dest) = dest else {
+        return Ok(());
+    };
+    let path = Path::new(dest);
+    if path.is_absolute() {
+        return Err(RuntimeError::Config(format!(
+            "workspace definition '{definition}': seed dest must be relative, got '{dest}'"
+        )));
+    }
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(RuntimeError::Config(format!(
+            "workspace definition '{definition}': seed dest must not contain '..', got '{dest}'"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a tokenizer-proxy table: http(s) `base_url`, absolute
+/// `token_file`, non-empty `token_header`. `ctx` names the owning section in
+/// error messages (e.g. `provider 'x' proxy`, `workspace.git_proxy`).
+fn validate_proxy_config(proxy: &ProviderProxyConfig, ctx: &str) -> Result<(), RuntimeError> {
+    validate_http_url(&proxy.base_url, &format!("{ctx}.base_url"))?;
+    if !proxy.token_file.is_absolute() {
+        return Err(RuntimeError::Config(format!(
+            "{ctx}.token_file must be an absolute path, got '{}'",
+            proxy.token_file.display()
+        )));
+    }
+    if proxy.token_header.trim().is_empty() {
+        return Err(RuntimeError::Config(format!(
+            "{ctx}.token_header must not be empty"
+        )));
+    }
+    Ok(())
 }
 
 impl ContextSettings {
@@ -1889,5 +2211,265 @@ mod tests {
         "#,
         );
         config.validate().unwrap();
+    }
+
+    /// A full `[workspace]` section: storage, persistence, git proxy, and one
+    /// definition with both seed kinds.
+    const FULL_WORKSPACE: &str = r#"
+            [workspace]
+            root = "/workspace"
+
+            [workspace.storage]
+            endpoint = "http://garage.storage.svc:3900"
+            bucket = "workspaces"
+            access_key_id_env = "GARAGE_KEY_ID"
+            secret_access_key_env = "GARAGE_SECRET"
+
+            [workspace.persistence]
+            exclude = ["target/**", "node_modules/**"]
+
+            [workspace.git_proxy]
+            base_url = "http://tokenizer-proxy.svc:8080"
+            token_file = "/var/run/tokens/git"
+
+            [[workspace.definitions]]
+            name = "org-dev"
+            providers = ["default"]
+            models = ["anthropic:claude-opus-4-8"]
+
+            [[workspace.definitions.git]]
+            url = "http://git.example/org/repo.git"
+            ref = "main"
+            dest = "repo"
+
+            [[workspace.definitions.objects]]
+            key = "seeds/scratch.tar.zst"
+            dest = "scratch"
+    "#;
+
+    #[test]
+    fn test_workspace_absent_is_none() {
+        let config: RuntimeConfig = toml::from_str(minimal_oneshot_toml()).unwrap();
+        config.validate().unwrap();
+        assert!(config.workspace.is_none());
+    }
+
+    #[test]
+    fn test_workspace_full_section_round_trips() {
+        let config = serve_config(FULL_WORKSPACE);
+        config.validate().unwrap();
+
+        // Serialize back out and reparse to exercise the Serialize impl.
+        let reserialized = toml::to_string(&config).unwrap();
+        let config: RuntimeConfig = toml::from_str(&reserialized).unwrap();
+        config.validate().unwrap();
+
+        let workspace = config.workspace.expect("workspace section");
+        assert_eq!(workspace.root, PathBuf::from("/workspace"));
+        let storage = workspace.storage.expect("storage");
+        assert_eq!(storage.region, "garage"); // default applied
+        assert_eq!(storage.bucket, "workspaces");
+        let persistence = workspace.persistence.expect("persistence");
+        assert_eq!(persistence.prefix, "snapshots/"); // default applied
+        assert_eq!(persistence.exclude.len(), 2);
+        let def = &workspace.definitions[0];
+        assert_eq!(def.name, "org-dev");
+        assert_eq!(def.git[0].reference.as_deref(), Some("main"));
+        assert_eq!(def.git[0].dest.as_deref(), Some("repo"));
+        assert_eq!(def.objects[0].key, "seeds/scratch.tar.zst");
+    }
+
+    #[test]
+    fn test_workspace_minimal_root_only_validates() {
+        let config = serve_config(
+            r#"
+            [workspace]
+            root = "/workspace"
+        "#,
+        );
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn test_workspace_relative_root_fails_validation() {
+        let config = serve_config(
+            r#"
+            [workspace]
+            root = "relative/workspace"
+        "#,
+        );
+        let err = config.validate().unwrap_err();
+        assert!(format!("{err}").contains("workspace.root"), "{err}");
+    }
+
+    #[test]
+    fn test_workspace_duplicate_definition_name_fails() {
+        let config = serve_config(
+            r#"
+            [workspace]
+            root = "/workspace"
+            [[workspace.definitions]]
+            name = "dup"
+            [[workspace.definitions]]
+            name = "dup"
+        "#,
+        );
+        let err = config.validate().unwrap_err();
+        assert!(
+            format!("{err}").contains("duplicate workspace definition name 'dup'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_workspace_object_seed_without_storage_fails() {
+        let config = serve_config(
+            r#"
+            [workspace]
+            root = "/workspace"
+            [[workspace.definitions]]
+            name = "seeded"
+            [[workspace.definitions.objects]]
+            key = "seeds/scratch.tar.zst"
+        "#,
+        );
+        let err = config.validate().unwrap_err();
+        assert!(format!("{err}").contains("[workspace.storage]"), "{err}");
+    }
+
+    #[test]
+    fn test_workspace_persistence_without_storage_fails() {
+        let config = serve_config(
+            r#"
+            [workspace]
+            root = "/workspace"
+            [workspace.persistence]
+        "#,
+        );
+        let err = config.validate().unwrap_err();
+        assert!(
+            format!("{err}").contains("requires [workspace.storage]"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_workspace_invalid_exclude_glob_fails() {
+        let config = serve_config(
+            r#"
+            [workspace]
+            root = "/workspace"
+            [workspace.storage]
+            endpoint = "http://garage.svc:3900"
+            bucket = "b"
+            access_key_id_env = "K"
+            secret_access_key_env = "S"
+            [workspace.persistence]
+            exclude = ["target/[!"]
+        "#,
+        );
+        let err = config.validate().unwrap_err();
+        assert!(format!("{err}").contains("not a valid glob"), "{err}");
+    }
+
+    #[test]
+    fn test_workspace_seed_dest_rejects_traversal_and_absolute() {
+        for dest in ["../escape", "/absolute"] {
+            let config = serve_config(&format!(
+                r#"
+                [workspace]
+                root = "/workspace"
+                [[workspace.definitions]]
+                name = "seeded"
+                [[workspace.definitions.git]]
+                url = "http://git.example/org/repo.git"
+                dest = "{dest}"
+            "#
+            ));
+            let err = config.validate().unwrap_err();
+            assert!(format!("{err}").contains("seed dest"), "{dest}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_workspace_git_proxy_relative_token_file_fails() {
+        let config = serve_config(
+            r#"
+            [workspace]
+            root = "/workspace"
+            [workspace.git_proxy]
+            base_url = "http://tokenizer-proxy.svc:8080"
+            token_file = "relative/token"
+        "#,
+        );
+        let err = config.validate().unwrap_err();
+        assert!(
+            format!("{err}").contains("workspace.git_proxy.token_file"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_workspace_storage_empty_bucket_fails() {
+        let config = serve_config(
+            r#"
+            [workspace]
+            root = "/workspace"
+            [workspace.storage]
+            endpoint = "http://garage.svc:3900"
+            bucket = "  "
+            access_key_id_env = "K"
+            secret_access_key_env = "S"
+        "#,
+        );
+        let err = config.validate().unwrap_err();
+        assert!(
+            format!("{err}").contains("workspace.storage.bucket"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_select_workspace_matches_provider_then_model_first_wins() {
+        let config = serve_config(
+            r#"
+            [workspace]
+            root = "/workspace"
+            [[workspace.definitions]]
+            name = "by-provider"
+            providers = ["default"]
+            [[workspace.definitions]]
+            name = "by-model"
+            models = ["openai:gpt-4o"]
+        "#,
+        );
+        config.validate().unwrap();
+
+        // Provider match: first definition wins even though the second also
+        // matches on model.
+        let def = config.select_workspace("default", "openai:gpt-4o").unwrap();
+        assert_eq!(def.name, "by-provider");
+
+        // Model-only match falls through to the second definition.
+        let def = config.select_workspace("other", "openai:gpt-4o").unwrap();
+        assert_eq!(def.name, "by-model");
+
+        // No match at all.
+        assert!(config.select_workspace("other", "other:model").is_none());
+
+        // Lookup by name, known and unknown.
+        assert!(config.workspace_definition("by-model").is_some());
+        assert!(config.workspace_definition("ghost").is_none());
+    }
+
+    #[test]
+    fn test_select_workspace_none_without_section() {
+        let config = serve_config("");
+        assert!(
+            config
+                .select_workspace("default", "openai:gpt-4o")
+                .is_none()
+        );
+        assert!(config.workspace_definition("any").is_none());
     }
 }

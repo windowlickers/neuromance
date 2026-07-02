@@ -38,9 +38,10 @@ pub mod task_store;
 pub mod telemetry;
 
 pub use config::{
-    AgentConfig, ApprovalConfig, ApprovalMode, ContextSettings, DatabaseSettings, Mode,
-    OneshotConfig, ProviderConfig, ProviderProxyConfig, RulesSettings, RuntimeConfig,
-    RuntimeSettings, SandboxConfig, SkillsSettings, SubagentConfig,
+    AgentConfig, ApprovalConfig, ApprovalMode, ContextSettings, DatabaseSettings, GitSeed, Mode,
+    ObjectSeed, OneshotConfig, ProviderConfig, ProviderProxyConfig, RulesSettings, RuntimeConfig,
+    RuntimeSettings, SandboxConfig, SkillsSettings, SubagentConfig, WorkspaceDefinition,
+    WorkspacePersistenceSettings, WorkspaceSettings, WorkspaceStorageSettings,
 };
 pub use error::RuntimeError;
 pub use factory::AgentBuilder;
