@@ -28,7 +28,7 @@ neuromance-common = { workspace = true }
 neuromance-context = { workspace = true }
 neuromance-db = { workspace = true }
 neuromance-repl = { workspace = true, features = ["full"], optional = true }
-neuromance-tools = { workspace = true }
+neuromance-tools = { workspace = true, features = ["git"] }
 
 anyhow = { workspace = true }
 async-trait = { workspace = true }
@@ -37,6 +37,9 @@ clap = { workspace = true }
 chrono = { workspace = true }
 dashmap = { workspace = true }
 globset = { workspace = true }
+object_store = { workspace = true }
+tar = { workspace = true }
+zstd = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 reqwest = { workspace = true }
@@ -72,5 +75,7 @@ python-repl = ["dep:neuromance-repl"]
 
 [dev-dependencies]
 futures = { workspace = true }
+git2 = { workspace = true }
 serial_test = "3"
 sqlx = { workspace = true }
+tempfile = { workspace = true }

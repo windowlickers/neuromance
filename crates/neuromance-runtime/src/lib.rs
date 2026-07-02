@@ -36,6 +36,7 @@ pub mod skills;
 pub mod subagents;
 pub mod task_store;
 pub mod telemetry;
+pub mod workspace;
 
 pub use config::{
     AgentConfig, ApprovalConfig, ApprovalMode, ContextSettings, DatabaseSettings, GitSeed, Mode,
