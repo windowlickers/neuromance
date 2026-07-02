@@ -56,6 +56,7 @@ impl SandboxClient {
         name: String,
         arguments_json: String,
         session_id: String,
+        workspace_root: String,
     ) -> Result<ExecuteToolResponse, tonic::Status> {
         let mut client = self.inner.clone();
         let response = client
@@ -63,6 +64,7 @@ impl SandboxClient {
                 name,
                 arguments_json,
                 session_id,
+                workspace_root,
             })
             .await?;
         Ok(response.into_inner())

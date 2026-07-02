@@ -55,15 +55,17 @@ use neuromance_agent::{Agent, AgentResponse};
 use neuromance_client::LLMClient;
 use neuromance_common::chat::{Message, TaskStatus};
 use neuromance_common::client::Config;
+use neuromance_common::delegation::{self, DelegationContext};
 use neuromance_db::PgConversationStore;
 
 use crate::AgentBuilder;
 use crate::SessionReset;
-use crate::config::RuntimeConfig;
+use crate::config::{RuntimeConfig, WorkspaceDefinition};
 use crate::sandbox::{EXECUTE_PYTHON, SandboxClient};
 use crate::task_store::{
     ConversationRecord, InMemoryTaskStore, PostgresTaskStore, TaskRecord, TaskStore,
 };
+use crate::workspace::WorkspaceManager;
 
 /// The agent type the worker drives. Serve always boots a boxed client, and a
 /// per-task override produces the same type, so both run paths share it.
@@ -107,6 +109,14 @@ pub struct CreateTaskRequest {
     /// selected provider's default model. A malformed string is rejected with 400.
     #[serde(default)]
     pub model: Option<String>,
+    /// Select a named `[[workspace.definitions]]` entry to seed this task's
+    /// workspace, winning over provider/model auto-selection. Only applied
+    /// when the conversation's workspace is first created — a continuation
+    /// keeps the workspace it was seeded with, and a differing name is
+    /// ignored with a warning. An unknown name (or any value when no
+    /// `[workspace]` section is configured) is rejected with 400.
+    #[serde(default)]
+    pub workspace: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -131,6 +141,9 @@ enum EnqueueError {
     UnknownProvider(String),
     /// The `model` override could not be parsed as a `provider:model` string.
     InvalidModel(String),
+    /// The `workspace` override names no `[[workspace.definitions]]` entry,
+    /// or no `[workspace]` section is configured at all.
+    UnknownWorkspace(String),
     /// The durable `pending` row could not be written, so the task was rejected
     /// rather than handed back an id no sibling replica could resolve.
     Persistence,
@@ -185,6 +198,15 @@ impl IntoResponse for EnqueueError {
                     "detail": detail,
                 }),
             ),
+            Self::UnknownWorkspace(name) => (
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({
+                    "error": "unknown workspace",
+                    "detail": format!(
+                        "workspace '{name}' does not match any [[workspace.definitions]] entry"
+                    ),
+                }),
+            ),
             Self::Persistence => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 serde_json::json!({"error": "failed to persist task"}),
@@ -211,6 +233,11 @@ struct WorkerJob {
     /// trust it parses. When both this and `provider` are `None`, the shared
     /// agent runs the task.
     model: Option<String>,
+    /// Workspace definition resolved at enqueue time (request override first,
+    /// then provider/model auto-selection). Only consulted when the
+    /// conversation's workspace is first created; `None` prepares an unseeded
+    /// workspace.
+    workspace: Option<WorkspaceDefinition>,
 }
 
 #[derive(Clone)]
@@ -225,10 +252,11 @@ pub struct ServeState {
     /// File-oriented skills menu folded into each new conversation's system
     /// prompt; `None` when no skills are configured.
     skills_menu: Option<Arc<str>>,
-    /// Names of the configured `[[providers]]` entries, used to reject an unknown
-    /// per-task `provider` override at enqueue time (400) rather than failing the
-    /// task mid-run.
-    provider_names: Arc<[String]>,
+    /// The runtime config, used at enqueue time to reject unknown
+    /// provider/workspace overrides with a 400 (rather than failing the task
+    /// mid-run) and to auto-select a workspace definition from the task's
+    /// resolved provider and model.
+    config: Arc<RuntimeConfig>,
 }
 
 /// Cap on `POST /tasks` request bodies. Task input is a single user prompt;
@@ -296,10 +324,23 @@ fn seed_new_conversation(state: &ServeState, system_prompt: Option<&str>) -> Uui
     // Fold the skills menu into the seed system message so the conversation
     // opens as a clean [System(prompt+menu), …] — the menu lists on-disk paths
     // the agent reads, and round-trips through persisted history thereafter.
-    let seed = state.skills_menu.as_ref().map_or_else(
-        || Message::system(id, prompt),
-        |menu| Message::system(id, format!("{prompt}\n\n{menu}")),
-    );
+    // The workspace note rides the same message: it persists with the
+    // conversation, so continuations see their working directory without
+    // recomputation on any replica.
+    let mut content = prompt.to_string();
+    if let Some(menu) = state.skills_menu.as_ref() {
+        content.push_str("\n\n");
+        content.push_str(menu);
+    }
+    if let Some(workspace) = state.config.workspace.as_ref() {
+        let dir = workspace.root.join(id.to_string());
+        content = format!(
+            "{content}\n\nYour working directory is {}. Do all file work there; \
+             use absolute paths beneath it.",
+            dir.display()
+        );
+    }
+    let seed = Message::system(id, content);
     // The durable conversation row is created fail-closed by `record_task_status`
     // in `try_enqueue` (it pre-inserts the row in the same transaction as the
     // pending task), so seeding only has to establish the in-memory record here.
@@ -351,18 +392,46 @@ async fn resolve_conversation(
     }
 }
 
-async fn try_enqueue(
-    state: &ServeState,
-    user: String,
-    conversation_id: Option<Uuid>,
-    system_prompt: Option<&str>,
+/// Resolve the workspace definition a task will seed with: the request-level
+/// override when named (unknown names reject with 400), otherwise the first
+/// definition bound to the task's resolved provider/model. `None` when no
+/// `[workspace]` is configured or nothing matches.
+fn resolve_workspace_definition(
+    config: &RuntimeConfig,
+    requested: Option<&str>,
     provider: Option<&str>,
     model: Option<&str>,
+) -> Result<Option<WorkspaceDefinition>, EnqueueError> {
+    if let Some(name) = requested {
+        return config
+            .workspace_definition(name)
+            .cloned()
+            .map(Some)
+            .ok_or_else(|| EnqueueError::UnknownWorkspace(name.to_owned()));
+    }
+    if config.workspace.is_none() {
+        return Ok(None);
+    }
+    // Auto-selection matches against the *resolved* provider and model. The
+    // overrides were already validated, and a validated config always yields
+    // an effective model, so resolution failing here is a config regression —
+    // surface it rather than silently skipping the workspace.
+    let (provider, model) = config
+        .resolve_provider_and_model(provider, model)
+        .map_err(|e| EnqueueError::InvalidModel(e.to_string()))?;
+    Ok(config.select_workspace(&provider.name, model).cloned())
+}
+
+async fn try_enqueue(
+    state: &ServeState,
+    req: CreateTaskRequest,
 ) -> Result<TaskRecord, EnqueueError> {
+    let provider = req.provider.as_deref();
+    let model = req.model.as_deref();
     // Reject an unknown provider override before minting a task, so the caller
     // gets a 400 at submit instead of a mid-run failure.
     if let Some(provider) = provider
-        && !state.provider_names.iter().any(|p| p == provider)
+        && state.config.provider(provider).is_none()
     {
         return Err(EnqueueError::UnknownProvider(provider.to_owned()));
     }
@@ -374,8 +443,10 @@ async fn try_enqueue(
     {
         return Err(EnqueueError::InvalidModel(format!("{model}: {e}")));
     }
+    let workspace =
+        resolve_workspace_definition(&state.config, req.workspace.as_deref(), provider, model)?;
     let (conversation_id, seeded) =
-        resolve_conversation(state, conversation_id, system_prompt).await?;
+        resolve_conversation(state, req.conversation_id, req.system_prompt.as_deref()).await?;
     let task_id = Uuid::new_v4();
     let now = Utc::now();
     let depth = queue_depth(&state.work_tx);
@@ -407,10 +478,11 @@ async fn try_enqueue(
     match state.work_tx.try_send(WorkerJob {
         task_id,
         conversation_id,
-        user,
+        user: req.user,
         seeded,
-        provider: provider.map(str::to_owned),
-        model: model.map(str::to_owned),
+        provider: req.provider,
+        model: req.model,
+        workspace,
     }) {
         Ok(()) => {
             #[allow(clippy::cast_precision_loss)]
@@ -447,16 +519,7 @@ async fn create_task(
     State(state): State<ServeState>,
     Json(req): Json<CreateTaskRequest>,
 ) -> impl IntoResponse {
-    match try_enqueue(
-        &state,
-        req.user,
-        req.conversation_id,
-        req.system_prompt.as_deref(),
-        req.provider.as_deref(),
-        req.model.as_deref(),
-    )
-    .await
-    {
+    match try_enqueue(&state, req).await {
         Ok(record) => (
             StatusCode::ACCEPTED,
             Json(CreateTaskResponse {
@@ -592,6 +655,9 @@ struct WorkerCtx {
     /// the next. `Some` only when `execute_python` runs locally (not in the
     /// sandbox) and the `python-repl` feature is built.
     local_python: Option<SessionReset>,
+    /// Prepares (and, with persistence, snapshots) per-conversation
+    /// workspaces. `None` when no `[workspace]` is configured.
+    workspace: Option<Arc<WorkspaceManager>>,
 }
 
 async fn worker_loop(mut rx: mpsc::Receiver<WorkerJob>, ctx: WorkerCtx, cancel: CancellationToken) {
@@ -665,20 +731,50 @@ async fn fail_task(ctx: &WorkerCtx, task_id: Uuid, reason: &str) {
 async fn run_turn(
     agent: &mut ServeAgent,
     task_id: Uuid,
+    workspace_dir: Option<std::path::PathBuf>,
     input_messages: Vec<Message>,
     cancel: &CancellationToken,
 ) -> Result<(AgentResponse, Vec<Message>), CoreError> {
     Span::current().record("agent_id", field::display(agent.id()));
-    // Seed the runtime task id so subagent conversations spawned during this
-    // run inherit it as their `parent_task_id`. The root conversation itself
-    // has no parent, so no conversation id is seeded here.
+    // Seed the runtime task id and workspace so subagent conversations
+    // spawned during this run inherit them (the task id becomes their
+    // `parent_task_id`; the workspace scopes their tool execution). The root
+    // conversation itself has no parent, so no conversation id is seeded here.
     tokio::select! {
         biased;
         () = cancel.cancelled() => Err(CoreError::Cancelled("worker shutdown".to_string())),
-        res = neuromance_agent::scope_task(
-            Some(task_id),
+        res = delegation::scope(
+            DelegationContext {
+                task_id: Some(task_id),
+                workspace_dir,
+                ..DelegationContext::default()
+            },
             agent.execute_with_history(Some(input_messages), cancel.child_token()),
         ) => res,
+    }
+}
+
+/// Prepare the conversation's workspace before the run: create + seed on
+/// first use, hand back the existing dir on continuation. A failure marks the
+/// task failed and returns `Err` — the workspace was part of what the task
+/// asked for. `Ok(None)` when no workspace is configured.
+async fn prepare_job_workspace(
+    ctx: &WorkerCtx,
+    job: &WorkerJob,
+) -> Result<Option<std::path::PathBuf>, ()> {
+    let Some(mgr) = ctx.workspace.as_ref() else {
+        return Ok(None);
+    };
+    match mgr
+        .prepare(job.conversation_id, job.workspace.as_ref())
+        .await
+    {
+        Ok(dir) => Ok(Some(dir)),
+        Err(e) => {
+            error!(error = %e, "workspace preparation failed");
+            fail_task(ctx, job.task_id, &format!("workspace: {e}")).await;
+            Err(())
+        }
     }
 }
 
@@ -713,6 +809,10 @@ async fn process_job(ctx: &WorkerCtx, job: WorkerJob, cancel: CancellationToken)
         "task starting",
     );
 
+    let Ok(workspace_dir) = prepare_job_workspace(ctx, &job).await else {
+        return JobOutcome::Failed;
+    };
+
     // Skill menu and `$mention` bodies are injected by the SkillsHook inside the
     // conversation loop, not assembled here.
     let user_msg = Message::user(job.conversation_id, &job.user);
@@ -743,7 +843,14 @@ async fn process_job(ctx: &WorkerCtx, job: WorkerJob, cancel: CancellationToken)
                     provider,
                     model, "task running on per-task provider/model override"
                 );
-                run_turn(&mut agent, job.task_id, input_messages, &cancel).await
+                run_turn(
+                    &mut agent,
+                    job.task_id,
+                    workspace_dir,
+                    input_messages,
+                    &cancel,
+                )
+                .await
             }
             Err(e) => {
                 error!(provider, model, error = %e, "failed to build agent for override");
@@ -758,12 +865,31 @@ async fn process_job(ctx: &WorkerCtx, job: WorkerJob, cancel: CancellationToken)
         }
     } else {
         let mut agent = ctx.agent.lock().await;
-        run_turn(&mut agent, job.task_id, input_messages, &cancel).await
+        run_turn(
+            &mut agent,
+            job.task_id,
+            workspace_dir,
+            input_messages,
+            &cancel,
+        )
+        .await
     };
 
     let run_ms = u64::try_from(run_start.elapsed().as_millis()).unwrap_or(u64::MAX);
     #[allow(clippy::cast_precision_loss)]
     histogram!("neuromance_task_duration_seconds").record(run_ms as f64 / 1000.0);
+    record_outcome(ctx, &job, exec_result, run_ms, queue_wait_ms).await
+}
+
+/// Record a finished run: refresh the conversation cache, write the terminal
+/// task status, and emit the outcome metric.
+async fn record_outcome(
+    ctx: &WorkerCtx,
+    job: &WorkerJob,
+    exec_result: Result<(AgentResponse, Vec<Message>), CoreError>,
+    run_ms: u64,
+    queue_wait_ms: i64,
+) -> JobOutcome {
     match exec_result {
         Ok((response, full_history)) => {
             let output_bytes = response.content.content.len();
@@ -811,6 +937,7 @@ pub async fn run(
     sandbox_client: Option<SandboxClient>,
     local_python: Option<SessionReset>,
     skills_menu: Option<Arc<str>>,
+    workspace: Option<Arc<WorkspaceManager>>,
     cancel: CancellationToken,
 ) -> Result<()> {
     // One storage instance, shared by the worker and the handlers: a conversation
@@ -838,17 +965,17 @@ pub async fn run(
             builder,
             sandbox: session_closer,
             local_python,
+            workspace,
         },
         cancel.clone(),
     ));
 
-    let provider_names: Arc<[String]> = config.providers.iter().map(|p| p.name.clone()).collect();
     let state = ServeState {
         task_store: Arc::clone(&task_store),
         work_tx,
         system_prompt,
         skills_menu,
-        provider_names,
+        config: Arc::new(config.clone()),
     };
     let app = router(state);
     let addr: std::net::SocketAddr = config
@@ -1045,6 +1172,7 @@ mod tests {
                 builder: stub_builder(),
                 sandbox: None,
                 local_python: None,
+                workspace: None,
             },
             cancel.clone(),
         ));
@@ -1057,6 +1185,7 @@ mod tests {
                 seeded: true,
                 provider: None,
                 model: None,
+                workspace: None,
             })
             .await
             .unwrap();
@@ -1075,8 +1204,55 @@ mod tests {
         assert_eq!(task.error.as_deref(), Some("cancelled"));
     }
 
+    /// A serve-shaped config with providers "primary" and "secondary" and no
+    /// `[workspace]` section. Tests that need one append it via `extra`.
+    fn test_config(extra: &str) -> Arc<RuntimeConfig> {
+        let toml_str = format!(
+            r#"
+            mode = "serve"
+            [[providers]]
+            name = "primary"
+            model = "openai:gpt-4o"
+            api_key_env = "A"
+            [[providers]]
+            name = "secondary"
+            model = "openai:gpt-4o-mini"
+            api_key_env = "B"
+            [agent]
+            id = "manager"
+            provider = "primary"
+            system_prompt = "system"
+            {extra}
+        "#
+        );
+        Arc::new(toml::from_str(&toml_str).expect("test config parses"))
+    }
+
+    /// A minimal task request; tests override fields with struct-update syntax.
+    fn req(user: &str) -> CreateTaskRequest {
+        CreateTaskRequest {
+            user: user.to_string(),
+            conversation_id: None,
+            system_prompt: None,
+            provider: None,
+            model: None,
+            workspace: None,
+        }
+    }
+
     fn fresh_state(
         capacity: usize,
+    ) -> (
+        ServeState,
+        Arc<InMemoryTaskStore>,
+        mpsc::Receiver<WorkerJob>,
+    ) {
+        fresh_state_with_config(capacity, test_config(""))
+    }
+
+    fn fresh_state_with_config(
+        capacity: usize,
+        config: Arc<RuntimeConfig>,
     ) -> (
         ServeState,
         Arc<InMemoryTaskStore>,
@@ -1090,7 +1266,7 @@ mod tests {
                 work_tx,
                 system_prompt: Arc::from("system"),
                 skills_menu: None,
-                provider_names: ["primary".to_owned(), "secondary".to_owned()].into(),
+                config,
             },
             store,
             work_rx,
@@ -1171,13 +1347,14 @@ mod tests {
             builder: stub_builder(),
             sandbox: None,
             local_python: None,
+            workspace: None,
         }
     }
 
     #[tokio::test]
     async fn test_try_enqueue_records_queue_depth_zero_when_empty() {
         let (state, store, _rx) = fresh_state(4);
-        let record = try_enqueue(&state, "hi".to_string(), None, None, None, None)
+        let record = try_enqueue(&state, req("hi"))
             .await
             .expect("enqueue should succeed");
         assert_eq!(record.queue_depth_at_enqueue, 0);
@@ -1191,7 +1368,7 @@ mod tests {
         let mut depths = Vec::new();
         for _ in 0..3 {
             depths.push(
-                try_enqueue(&state, "hi".to_string(), None, None, None, None)
+                try_enqueue(&state, req("hi"))
                     .await
                     .expect("enqueue should succeed")
                     .queue_depth_at_enqueue,
@@ -1203,14 +1380,14 @@ mod tests {
     #[tokio::test]
     async fn test_try_enqueue_returns_queue_full_at_capacity() {
         let (state, store, _rx) = fresh_state(2);
-        let first = try_enqueue(&state, "a".to_string(), None, None, None, None)
+        let first = try_enqueue(&state, req("a"))
             .await
             .expect("first should fit");
-        let second = try_enqueue(&state, "b".to_string(), None, None, None, None)
+        let second = try_enqueue(&state, req("b"))
             .await
             .expect("second should fit");
 
-        let err = try_enqueue(&state, "c".to_string(), None, None, None, None)
+        let err = try_enqueue(&state, req("c"))
             .await
             .expect_err("third should reject");
         assert!(
@@ -1233,7 +1410,7 @@ mod tests {
         let (state, store, rx) = fresh_state(4);
         drop(rx);
 
-        let err = try_enqueue(&state, "hi".to_string(), None, None, None, None)
+        let err = try_enqueue(&state, req("hi"))
             .await
             .expect_err("send should fail");
         assert!(matches!(err, EnqueueError::WorkerShutdown), "got {err:?}");
@@ -1252,7 +1429,7 @@ mod tests {
     #[tokio::test]
     async fn test_try_enqueue_seeds_fresh_conversation_with_system_prompt() {
         let (state, store, _rx) = fresh_state(4);
-        let record = try_enqueue(&state, "hi".to_string(), None, None, None, None)
+        let record = try_enqueue(&state, req("hi"))
             .await
             .expect("enqueue should succeed");
 
@@ -1272,9 +1449,15 @@ mod tests {
     #[tokio::test]
     async fn test_try_enqueue_override_seeds_custom_system_prompt() {
         let (state, store, _rx) = fresh_state(4);
-        let record = try_enqueue(&state, "hi".to_string(), None, Some("be terse"), None, None)
-            .await
-            .expect("enqueue should succeed");
+        let record = try_enqueue(
+            &state,
+            CreateTaskRequest {
+                system_prompt: Some("be terse".to_string()),
+                ..req("hi")
+            },
+        )
+        .await
+        .expect("enqueue should succeed");
 
         let messages = store
             .conversation_messages(record.conversation_id)
@@ -1287,7 +1470,7 @@ mod tests {
     #[tokio::test]
     async fn test_try_enqueue_falls_back_to_configured_prompt_when_override_omitted() {
         let (state, store, _rx) = fresh_state(4);
-        let record = try_enqueue(&state, "hi".to_string(), None, None, None, None)
+        let record = try_enqueue(&state, req("hi"))
             .await
             .expect("enqueue should succeed");
 
@@ -1300,17 +1483,17 @@ mod tests {
     #[tokio::test]
     async fn test_try_enqueue_override_on_existing_conversation_is_rejected() {
         let (state, store, _rx) = fresh_state(4);
-        let first = try_enqueue(&state, "hi".to_string(), None, None, None, None)
+        let first = try_enqueue(&state, req("hi"))
             .await
             .expect("first should succeed");
 
         let err = try_enqueue(
             &state,
-            "again".to_string(),
-            Some(first.conversation_id),
-            Some("be terse"),
-            None,
-            None,
+            CreateTaskRequest {
+                conversation_id: Some(first.conversation_id),
+                system_prompt: Some("be terse".to_string()),
+                ..req("again")
+            },
         )
         .await
         .expect_err("override on existing conversation should be rejected");
@@ -1332,9 +1515,15 @@ mod tests {
         let (state, store, _rx) = fresh_state(4);
 
         for prompt in ["", "   \n\t"] {
-            let err = try_enqueue(&state, "hi".to_string(), None, Some(prompt), None, None)
-                .await
-                .expect_err("blank override should be rejected");
+            let err = try_enqueue(
+                &state,
+                CreateTaskRequest {
+                    system_prompt: Some(prompt.to_string()),
+                    ..req("hi")
+                },
+            )
+            .await
+            .expect_err("blank override should be rejected");
             assert!(
                 matches!(err, EnqueueError::EmptySystemPrompt),
                 "got {err:?}"
@@ -1352,16 +1541,15 @@ mod tests {
     #[tokio::test]
     async fn test_try_enqueue_reuses_existing_conversation() {
         let (state, store, _rx) = fresh_state(4);
-        let first = try_enqueue(&state, "hi".to_string(), None, None, None, None)
+        let first = try_enqueue(&state, req("hi"))
             .await
             .expect("first should succeed");
         let second = try_enqueue(
             &state,
-            "again".to_string(),
-            Some(first.conversation_id),
-            None,
-            None,
-            None,
+            CreateTaskRequest {
+                conversation_id: Some(first.conversation_id),
+                ..req("again")
+            },
         )
         .await
         .expect("continuation should succeed");
@@ -1374,9 +1562,15 @@ mod tests {
     async fn test_try_enqueue_unknown_conversation_returns_not_found() {
         let (state, store, _rx) = fresh_state(4);
         let bogus = Uuid::new_v4();
-        let err = try_enqueue(&state, "hi".to_string(), Some(bogus), None, None, None)
-            .await
-            .expect_err("unknown conv id should be rejected");
+        let err = try_enqueue(
+            &state,
+            CreateTaskRequest {
+                conversation_id: Some(bogus),
+                ..req("hi")
+            },
+        )
+        .await
+        .expect_err("unknown conv id should be rejected");
         assert!(matches!(err, EnqueueError::ConversationNotFound(id) if id == bogus));
         assert_eq!(store.task_count(), 0, "rejected task must not be recorded");
         assert_eq!(
@@ -1389,7 +1583,7 @@ mod tests {
     #[tokio::test]
     async fn process_job_continues_existing_conversation() {
         let (state, store, _rx) = fresh_state(4);
-        let first = try_enqueue(&state, "hello".to_string(), None, None, None, None)
+        let first = try_enqueue(&state, req("hello"))
             .await
             .expect("first enqueue should succeed");
         let conv_id = first.conversation_id;
@@ -1405,6 +1599,7 @@ mod tests {
                 seeded: true,
                 provider: None,
                 model: None,
+                workspace: None,
             },
             CancellationToken::new(),
         )
@@ -1420,9 +1615,15 @@ mod tests {
         assert_eq!(after_first[2].content, "hi-1");
         assert_eq!(store.conversation_turn_count(conv_id), Some(1));
 
-        let second = try_enqueue(&state, "again".to_string(), Some(conv_id), None, None, None)
-            .await
-            .expect("second enqueue should succeed");
+        let second = try_enqueue(
+            &state,
+            CreateTaskRequest {
+                conversation_id: Some(conv_id),
+                ..req("again")
+            },
+        )
+        .await
+        .expect("second enqueue should succeed");
         let agent2 = boxed_agent(EchoClient::new("hi-2"));
         process_job(
             &worker_ctx(&state, agent2),
@@ -1433,6 +1634,7 @@ mod tests {
                 seeded: false,
                 provider: None,
                 model: None,
+                workspace: None,
             },
             CancellationToken::new(),
         )
@@ -1454,7 +1656,7 @@ mod tests {
     #[tokio::test]
     async fn process_job_fails_cleanly_when_conversation_record_missing() {
         let (state, store, _rx) = fresh_state(4);
-        let task = try_enqueue(&state, "hi".to_string(), None, None, None, None)
+        let task = try_enqueue(&state, req("hi"))
             .await
             .expect("enqueue should succeed");
         let conv_id = task.conversation_id;
@@ -1472,6 +1674,7 @@ mod tests {
                 seeded: true,
                 provider: None,
                 model: None,
+                workspace: None,
             },
             CancellationToken::new(),
         )
@@ -1487,11 +1690,10 @@ mod tests {
         let (state, store, _rx) = fresh_state(4);
         let err = try_enqueue(
             &state,
-            "hi".to_string(),
-            None,
-            None,
-            None,
-            Some("not-a-valid-model"),
+            CreateTaskRequest {
+                model: Some("not-a-valid-model".to_string()),
+                ..req("hi")
+            },
         )
         .await
         .expect_err("malformed model override should be rejected");
@@ -1510,9 +1712,15 @@ mod tests {
         // else is rejected at enqueue with a 400-mapped error, before a task or
         // conversation is minted.
         let (state, store, _rx) = fresh_state(4);
-        let err = try_enqueue(&state, "hi".to_string(), None, None, Some("ghost"), None)
-            .await
-            .expect_err("unknown provider override should be rejected");
+        let err = try_enqueue(
+            &state,
+            CreateTaskRequest {
+                provider: Some("ghost".to_string()),
+                ..req("hi")
+            },
+        )
+        .await
+        .expect_err("unknown provider override should be rejected");
         assert!(
             matches!(&err, EnqueueError::UnknownProvider(name) if name == "ghost"),
             "got {err:?}",
@@ -1530,11 +1738,10 @@ mod tests {
         let (state, store, _rx) = fresh_state(4);
         let record = try_enqueue(
             &state,
-            "hi".to_string(),
-            None,
-            None,
-            Some("secondary"),
-            None,
+            CreateTaskRequest {
+                provider: Some("secondary".to_string()),
+                ..req("hi")
+            },
         )
         .await
         .expect("a configured provider override should be accepted");
@@ -1556,11 +1763,10 @@ mod tests {
         let (state, store, _rx) = fresh_state(4);
         let task = try_enqueue(
             &state,
-            "hi".to_string(),
-            None,
-            None,
-            Some("secondary"),
-            None,
+            CreateTaskRequest {
+                provider: Some("secondary".to_string()),
+                ..req("hi")
+            },
         )
         .await
         .expect("enqueue should succeed");
@@ -1574,6 +1780,7 @@ mod tests {
             }),
             sandbox: None,
             local_python: None,
+            workspace: None,
         };
         process_job(
             &ctx,
@@ -1584,6 +1791,7 @@ mod tests {
                 seeded: true,
                 provider: Some("secondary".to_string()),
                 model: None,
+                workspace: None,
             },
             CancellationToken::new(),
         )
@@ -1611,7 +1819,7 @@ mod tests {
     #[tokio::test]
     async fn process_job_with_model_override_runs_built_agent() {
         let (state, store, _rx) = fresh_state(4);
-        let task = try_enqueue(&state, "hi".to_string(), None, None, None, None)
+        let task = try_enqueue(&state, req("hi"))
             .await
             .expect("enqueue should succeed");
         let conv_id = task.conversation_id;
@@ -1626,6 +1834,7 @@ mod tests {
             }),
             sandbox: None,
             local_python: None,
+            workspace: None,
         };
         process_job(
             &ctx,
@@ -1636,6 +1845,7 @@ mod tests {
                 seeded: true,
                 provider: None,
                 model: Some("anthropic:claude-haiku-4-5".to_string()),
+                workspace: None,
             },
             CancellationToken::new(),
         )
@@ -1692,7 +1902,7 @@ mod tests {
                 work_tx,
                 system_prompt: Arc::from("system"),
                 skills_menu: None,
-                provider_names: ["primary".to_owned(), "secondary".to_owned()].into(),
+                config: test_config(""),
             },
             store,
             work_rx,
@@ -1707,6 +1917,7 @@ mod tests {
             builder: stub_builder(),
             sandbox: None,
             local_python: None,
+            workspace: None,
         }
     }
 
@@ -1731,9 +1942,15 @@ mod tests {
             .await
             .expect("seed durable history");
 
-        let record = try_enqueue(&state, "again".to_string(), Some(conv_id), None, None, None)
-            .await
-            .expect("continuation against a store-only conversation should enqueue");
+        let record = try_enqueue(
+            &state,
+            CreateTaskRequest {
+                conversation_id: Some(conv_id),
+                ..req("again")
+            },
+        )
+        .await
+        .expect("continuation against a store-only conversation should enqueue");
 
         assert_eq!(record.conversation_id, conv_id);
         assert!(
@@ -1747,9 +1964,15 @@ mod tests {
     async fn resolve_unknown_id_with_store_returns_not_found(pool: PgPool) {
         let (state, _task_store, _rx) = state_with_store(4, pool);
         let bogus = Uuid::new_v4();
-        let err = try_enqueue(&state, "hi".to_string(), Some(bogus), None, None, None)
-            .await
-            .expect_err("id absent from both cache and store must 404");
+        let err = try_enqueue(
+            &state,
+            CreateTaskRequest {
+                conversation_id: Some(bogus),
+                ..req("hi")
+            },
+        )
+        .await
+        .expect_err("id absent from both cache and store must 404");
         assert!(matches!(err, EnqueueError::ConversationNotFound(id) if id == bogus));
     }
 
@@ -1812,6 +2035,7 @@ mod tests {
                 seeded: false,
                 provider: None,
                 model: None,
+                workspace: None,
             },
             CancellationToken::new(),
         )
@@ -2005,12 +2229,200 @@ mod tests {
             work_tx,
             system_prompt: Arc::from("system"),
             skills_menu: None,
-            provider_names: ["primary".to_owned()].into(),
+            config: test_config(""),
         };
 
-        let err = try_enqueue(&state, "hi".to_string(), None, None, None, None)
+        let err = try_enqueue(&state, req("hi"))
             .await
             .expect_err("a failed durable pending write must reject the enqueue");
         assert!(matches!(err, EnqueueError::Persistence), "got {err:?}");
+    }
+
+    // --- Workspace selection and preparation ---------------------------------
+
+    /// A `[workspace]` section whose only definition binds to provider
+    /// "primary".
+    const WORKSPACE_SECTION: &str = r#"
+            [workspace]
+            root = "/workspace"
+            [[workspace.definitions]]
+            name = "dev"
+            providers = ["primary"]
+    "#;
+
+    #[tokio::test]
+    async fn test_try_enqueue_rejects_unknown_workspace() {
+        let (state, store, _rx) = fresh_state_with_config(4, test_config(WORKSPACE_SECTION));
+        let err = try_enqueue(
+            &state,
+            CreateTaskRequest {
+                workspace: Some("ghost".to_string()),
+                ..req("hi")
+            },
+        )
+        .await
+        .expect_err("unknown workspace name should be rejected");
+        assert!(
+            matches!(&err, EnqueueError::UnknownWorkspace(name) if name == "ghost"),
+            "got {err:?}"
+        );
+        assert_eq!(store.task_count(), 0, "rejected task must not be recorded");
+
+        // Any workspace name is unknown when no [workspace] is configured.
+        let (state, _store, _rx) = fresh_state(4);
+        let err = try_enqueue(
+            &state,
+            CreateTaskRequest {
+                workspace: Some("dev".to_string()),
+                ..req("hi")
+            },
+        )
+        .await
+        .expect_err("workspace field without [workspace] config should be rejected");
+        assert!(
+            matches!(err, EnqueueError::UnknownWorkspace(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_try_enqueue_resolves_workspace_definition() {
+        let (state, _store, mut rx) = fresh_state_with_config(4, test_config(WORKSPACE_SECTION));
+
+        // Auto-selection: the shared agent resolves to provider "primary",
+        // which the "dev" definition binds to.
+        try_enqueue(&state, req("hi")).await.expect("enqueue");
+        let job = rx.recv().await.expect("job");
+        assert_eq!(job.workspace.as_ref().map(|d| d.name.as_str()), Some("dev"));
+
+        // A provider override that matches no definition selects nothing.
+        try_enqueue(
+            &state,
+            CreateTaskRequest {
+                provider: Some("secondary".to_string()),
+                ..req("hi")
+            },
+        )
+        .await
+        .expect("enqueue");
+        let job = rx.recv().await.expect("job");
+        assert!(job.workspace.is_none());
+
+        // An explicit request-level name wins over (absent) auto-selection.
+        try_enqueue(
+            &state,
+            CreateTaskRequest {
+                provider: Some("secondary".to_string()),
+                workspace: Some("dev".to_string()),
+                ..req("hi")
+            },
+        )
+        .await
+        .expect("enqueue");
+        let job = rx.recv().await.expect("job");
+        assert_eq!(job.workspace.as_ref().map(|d| d.name.as_str()), Some("dev"));
+    }
+
+    #[test]
+    fn test_seed_appends_workspace_note_to_system_message() {
+        let (state, store, _rx) =
+            fresh_state_with_config(4, test_config("[workspace]\nroot = \"/workspace\"\n"));
+        let id = seed_new_conversation(&state, None);
+        let messages = store.conversation_messages(id).expect("seeded");
+        assert!(
+            messages[0].content.contains(&format!("/workspace/{id}")),
+            "system message should name the workspace dir: {}",
+            messages[0].content
+        );
+    }
+
+    #[tokio::test]
+    async fn process_job_fails_task_when_workspace_prepare_fails() {
+        use crate::config::{GitSeed, WorkspaceDefinition};
+        use crate::workspace::WorkspaceManager;
+
+        let (state, store, _rx) = fresh_state(4);
+        let task = try_enqueue(&state, req("hi")).await.expect("enqueue");
+
+        let root = tempfile::TempDir::new().unwrap();
+        let mut ctx = worker_ctx(&state, boxed_agent(EchoClient::new("never-runs")));
+        ctx.workspace = Some(Arc::new(WorkspaceManager::new(
+            root.path().to_path_buf(),
+            None,
+            None,
+        )));
+
+        process_job(
+            &ctx,
+            WorkerJob {
+                task_id: task.id,
+                conversation_id: task.conversation_id,
+                user: "hi".to_string(),
+                seeded: true,
+                provider: None,
+                model: None,
+                workspace: Some(WorkspaceDefinition {
+                    name: "broken".to_string(),
+                    providers: Vec::new(),
+                    models: Vec::new(),
+                    git: vec![GitSeed {
+                        url: "file:///nonexistent/nowhere".to_string(),
+                        reference: None,
+                        dest: Some("repo".to_string()),
+                    }],
+                    objects: Vec::new(),
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let record = store.get_task(task.id).await.unwrap().expect("task record");
+        assert_eq!(record.status, TaskStatus::Failed);
+        assert!(
+            record
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("workspace:"),
+            "got error: {:?}",
+            record.error
+        );
+    }
+
+    #[tokio::test]
+    async fn process_job_prepares_workspace_and_succeeds() {
+        let (state, store, _rx) = fresh_state(4);
+        let task = try_enqueue(&state, req("hi")).await.expect("enqueue");
+
+        let root = tempfile::TempDir::new().unwrap();
+        let mut ctx = worker_ctx(&state, boxed_agent(EchoClient::new("done")));
+        ctx.workspace = Some(Arc::new(crate::workspace::WorkspaceManager::new(
+            root.path().to_path_buf(),
+            None,
+            None,
+        )));
+
+        process_job(
+            &ctx,
+            WorkerJob {
+                task_id: task.id,
+                conversation_id: task.conversation_id,
+                user: "hi".to_string(),
+                seeded: true,
+                provider: None,
+                model: None,
+                workspace: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(
+            root.path().join(task.conversation_id.to_string()).is_dir(),
+            "the conversation's workspace dir should exist"
+        );
+        let record = store.get_task(task.id).await.unwrap().expect("task record");
+        assert_eq!(record.status, TaskStatus::Succeeded);
     }
 }

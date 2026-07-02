@@ -53,28 +53,6 @@ pub use subagent::{FanoutVote, LocalSubagent, Subagent, SubagentError, SubagentT
 
 use neuromance_common::delegation::{self, DelegationContext};
 
-/// Run `fut` as the root of a delegation tree belonging to `task_id`.
-///
-/// The runtime wraps a top-level agent run in this so descendant subagent
-/// conversations inherit the task id. The root conversation itself has no
-/// parent, so no conversation id is seeded here. The propagation mechanism
-/// lives in [`neuromance_common::delegation`].
-pub async fn scope_task<F>(task_id: Option<Uuid>, fut: F) -> F::Output
-where
-    F: std::future::Future,
-{
-    delegation::scope(
-        DelegationContext {
-            conversation_id: None,
-            task_id,
-            parent_message_id: None,
-            parent_tool_call_id: None,
-        },
-        fut,
-    )
-    .await
-}
-
 // --- Agent state types (live in neuromance-common so they can be shared,
 //     surfaced here so agent consumers only need this crate) ---
 pub use neuromance_common::agents::{
@@ -225,7 +203,7 @@ impl<C: LLMClient + Send + Sync> Agent<C> {
         self.core.tool_choice = self.tool_choice.clone();
 
         // Read the enclosing delegation context (set by a parent agent's scope,
-        // or the runtime's `scope_task`). A root run sees no parent.
+        // or the runtime's root scope). A root run sees no parent.
         let enclosing = delegation::current();
         let parent_conversation_id = enclosing.conversation_id;
         let task_id = enclosing.task_id;
@@ -268,7 +246,8 @@ impl<C: LLMClient + Send + Sync> Agent<C> {
         }
 
         // Scope this agent's conversation as the parent for any subagent it
-        // delegates to during the run, inheriting the same runtime task id.
+        // delegates to during the run, inheriting the same runtime task id
+        // and workspace — one delegation tree, one workspace.
         let child_ctx = DelegationContext {
             conversation_id: Some(self.conversation_id),
             task_id,
@@ -276,6 +255,7 @@ impl<C: LLMClient + Send + Sync> Agent<C> {
             // this agent delegates; a fresh scope starts without it.
             parent_message_id: None,
             parent_tool_call_id: None,
+            workspace_dir: enclosing.workspace_dir,
         };
         let (messages, run_stats) =
             delegation::scope(child_ctx, self.core.chat_with_tool_loop(messages, cancel)).await?;

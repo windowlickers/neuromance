@@ -18,6 +18,7 @@
 
 use std::cell::RefCell;
 use std::future::Future;
+use std::path::PathBuf;
 
 use uuid::Uuid;
 
@@ -35,6 +36,10 @@ pub struct DelegationContext {
     /// Id of the specific tool call within [`Self::parent_message_id`] that
     /// spawned the subagent.
     pub parent_tool_call_id: Option<String>,
+    /// Absolute per-conversation workspace directory for tool execution,
+    /// when the runtime has one configured. Subagents inherit the parent's —
+    /// same conversation tree, same workspace.
+    pub workspace_dir: Option<PathBuf>,
 }
 
 tokio::task_local! {
@@ -104,6 +109,7 @@ mod tests {
             task_id: Some(Uuid::new_v4()),
             parent_message_id: Some(Uuid::new_v4()),
             parent_tool_call_id: Some("call_abc".to_string()),
+            workspace_dir: Some(std::path::PathBuf::from("/workspace/test")),
         };
         let observed = scope(ctx.clone(), async { current() }).await;
         assert_eq!(observed, ctx);
@@ -116,6 +122,7 @@ mod tests {
             task_id: None,
             parent_message_id: None,
             parent_tool_call_id: None,
+            workspace_dir: None,
         };
         let observed = with_thread_local(ctx.clone(), current);
         assert_eq!(observed, ctx);
@@ -130,12 +137,14 @@ mod tests {
             task_id: None,
             parent_message_id: None,
             parent_tool_call_id: None,
+            workspace_dir: None,
         };
         let inner = DelegationContext {
             conversation_id: Some(Uuid::new_v4()),
             task_id: None,
             parent_message_id: None,
             parent_tool_call_id: None,
+            workspace_dir: None,
         };
         with_thread_local(outer.clone(), || {
             let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

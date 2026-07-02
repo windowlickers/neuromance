@@ -9,8 +9,10 @@ use uuid::Uuid;
 use neuromance_agent::Agent;
 use neuromance_client::LLMClient;
 use neuromance_common::chat::Message;
+use neuromance_common::delegation::{self, DelegationContext};
 
 use crate::config::RuntimeConfig;
+use crate::workspace::WorkspaceManager;
 
 #[derive(Debug, Serialize)]
 pub struct OneshotOutput {
@@ -32,6 +34,7 @@ pub async fn run<C: LLMClient + Send + Sync>(
     config: &RuntimeConfig,
     agent: &mut Agent<C>,
     skills_menu: Option<&str>,
+    workspace: Option<&WorkspaceManager>,
     cancel: CancellationToken,
 ) -> Result<()> {
     let oneshot = config
@@ -40,20 +43,52 @@ pub async fn run<C: LLMClient + Send + Sync>(
         .context("oneshot mode requires [oneshot] section")?;
 
     let conversation_id = agent.conversation_id;
-    let system_prompt = skills_menu.map_or_else(
+
+    // Prepare the workspace before the run: oneshot has no request-level
+    // override, so the definition comes from provider/model auto-selection.
+    let workspace_dir = match workspace {
+        Some(mgr) => {
+            let (provider, model) = config
+                .resolve_provider_and_model(None, None)
+                .map_err(anyhow::Error::from)?;
+            let definition = config.select_workspace(&provider.name, model);
+            Some(
+                mgr.prepare(conversation_id, definition)
+                    .await
+                    .context("prepare workspace")?,
+            )
+        }
+        None => None,
+    };
+
+    let mut system_prompt = skills_menu.map_or_else(
         || config.agent.system_prompt.clone(),
         |menu| format!("{}\n\n{}", config.agent.system_prompt, menu),
     );
+    if let Some(dir) = &workspace_dir {
+        system_prompt = format!(
+            "{system_prompt}\n\nYour working directory is {}. Do all file work there; \
+             use absolute paths beneath it.",
+            dir.display()
+        );
+    }
     let messages = vec![
         Message::system(conversation_id, system_prompt),
         Message::user(conversation_id, &oneshot.input),
     ];
 
     info!(agent=%agent.id, conversation_id=%conversation_id, "running oneshot");
+    let scope_ctx = DelegationContext {
+        workspace_dir,
+        ..DelegationContext::default()
+    };
     let result = tokio::select! {
         biased;
         () = cancel.cancelled() => Err(anyhow::anyhow!("oneshot cancelled")),
-        res = agent.execute(Some(messages), cancel.child_token()) => res.map_err(anyhow::Error::from),
+        res = delegation::scope(
+            scope_ctx,
+            agent.execute(Some(messages), cancel.child_token()),
+        ) => res.map_err(anyhow::Error::from),
     };
 
     let output = match result {

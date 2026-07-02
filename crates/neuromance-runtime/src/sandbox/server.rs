@@ -8,13 +8,16 @@
 //! the sandbox just runs the tool and returns its result.
 
 use std::net::SocketAddr;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
 
 use neuromance_common::tools::Tool;
-use neuromance_tools::{ToolConfig, ToolExecutor, ToolExecutorError, ToolFactoryRegistry};
+use neuromance_tools::{
+    ToolConfig, ToolError, ToolExecutor, ToolExecutorError, ToolFactoryRegistry, with_default_cwd,
+};
 
 use super::proto::sandbox_tool_service_server::{SandboxToolService, SandboxToolServiceServer};
 use super::proto::{
@@ -28,6 +31,10 @@ use crate::error::RuntimeError;
 pub struct SandboxToolset {
     /// Stateless capability tools (`bash`, file tools, `grep`/`find`/`ls`).
     executor: ToolExecutor,
+    /// The sandbox's own `[workspace].root` (the shared `ConfigMap` gives
+    /// both containers the same section). A request's `workspace_root` must
+    /// sit beneath it; `None` rejects any non-empty `workspace_root`.
+    workspace_root: Option<PathBuf>,
     /// Session-scoped Python interpreters, present when `execute_python` is
     /// configured and the `python-repl` feature is enabled.
     #[cfg(feature = "python-repl")]
@@ -61,14 +68,21 @@ impl SandboxToolset {
     }
 
     /// Execute a tool by name. `session_id` scopes stateful interpreters and is
-    /// ignored by stateless tools.
+    /// ignored by stateless tools. A non-empty `workspace_root` is validated
+    /// against the sandbox's own configured root, then injected as bash's
+    /// default cwd.
     #[cfg_attr(not(feature = "python-repl"), allow(unused_variables))]
     async fn execute(
         &self,
         name: &str,
         arguments_json: &str,
         session_id: &str,
+        workspace_root: &str,
     ) -> Result<String, ToolExecutorError> {
+        let workspace = self
+            .validate_workspace(workspace_root)
+            .map_err(|message| ToolExecutorError::Tool(ToolError::InvalidArguments(message)))?;
+
         #[cfg(feature = "python-repl")]
         if name == EXECUTE_PYTHON
             && let Some(py) = &self.python
@@ -78,7 +92,49 @@ impl SandboxToolset {
             })?;
             return session.execute_named(name, arguments_json).await;
         }
-        self.executor.execute_named(name, arguments_json).await
+
+        // Inject the workspace as bash's default cwd. Malformed argument JSON
+        // passes through untouched so the executor reports its usual error.
+        let arguments_json = workspace.as_ref().map_or_else(
+            || arguments_json.to_string(),
+            |dir| {
+                serde_json::from_str::<serde_json::Value>(arguments_json).map_or_else(
+                    |_| arguments_json.to_string(),
+                    |args| with_default_cwd(name, args, dir).to_string(),
+                )
+            },
+        );
+        self.executor.execute_named(name, &arguments_json).await
+    }
+
+    /// Check a request's `workspace_root`: empty means "no workspace"; a
+    /// non-empty value must be absolute, `..`-free, and beneath the sandbox's
+    /// own configured root. The orchestrator constructs these paths, so a
+    /// violation indicates misconfiguration (or a compromised orchestrator) —
+    /// reject rather than guess.
+    fn validate_workspace(&self, requested: &str) -> Result<Option<PathBuf>, String> {
+        if requested.is_empty() {
+            return Ok(None);
+        }
+        let Some(root) = &self.workspace_root else {
+            return Err(
+                "request carries a workspace_root but the sandbox has no [workspace] configured"
+                    .to_string(),
+            );
+        };
+        let path = Path::new(requested);
+        if !path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
+            return Err(format!(
+                "workspace_root '{requested}' must be an absolute path without '..'"
+            ));
+        }
+        if !path.starts_with(root) {
+            return Err(format!(
+                "workspace_root '{requested}' is outside the configured workspace root '{}'",
+                root.display()
+            ));
+        }
+        Ok(Some(path.to_path_buf()))
     }
 }
 
@@ -90,7 +146,10 @@ impl SandboxToolset {
 /// # Errors
 /// Returns [`RuntimeError`] if a tool factory fails, or if `execute_python` is
 /// configured without the `python-repl` feature.
-pub fn build_sandbox_toolset(tools: &[ToolConfig]) -> Result<SandboxToolset, RuntimeError> {
+pub fn build_sandbox_toolset(
+    tools: &[ToolConfig],
+    workspace_root: Option<PathBuf>,
+) -> Result<SandboxToolset, RuntimeError> {
     let stateless: Vec<ToolConfig> = tools
         .iter()
         .filter(|t| t.name != EXECUTE_PYTHON)
@@ -108,6 +167,7 @@ pub fn build_sandbox_toolset(tools: &[ToolConfig]) -> Result<SandboxToolset, Run
 
     Ok(SandboxToolset {
         executor,
+        workspace_root,
         #[cfg(feature = "python-repl")]
         python: python::PythonSessions::from_config(tools)?,
     })
@@ -160,7 +220,12 @@ impl SandboxToolService for SandboxToolServer {
         // loop turns a ToolError into a tool message for the LLM.
         let response = match self
             .toolset
-            .execute(&req.name, &req.arguments_json, &req.session_id)
+            .execute(
+                &req.name,
+                &req.arguments_json,
+                &req.session_id,
+                &req.workspace_root,
+            )
             .await
         {
             Ok(content) => ExecuteToolResponse {
@@ -334,7 +399,7 @@ mod tests {
     }
 
     fn server_with(tools: &[ToolConfig]) -> SandboxToolServer {
-        let toolset = build_sandbox_toolset(tools).unwrap();
+        let toolset = build_sandbox_toolset(tools, None).unwrap();
         SandboxToolServer::new(Arc::new(toolset))
     }
 
@@ -374,6 +439,7 @@ mod tests {
                 name: "bash".to_string(),
                 arguments_json: json!({ "command": "echo sandbox-ok" }).to_string(),
                 session_id: String::new(),
+                workspace_root: String::new(),
             }))
             .await
             .unwrap()
@@ -393,6 +459,7 @@ mod tests {
                 name: "does-not-exist".to_string(),
                 arguments_json: "{}".to_string(),
                 session_id: String::new(),
+                workspace_root: String::new(),
             }))
             .await
             .unwrap()
@@ -400,6 +467,77 @@ mod tests {
 
         assert!(resp.is_error);
         assert!(resp.content.contains("does-not-exist"), "{}", resp.content);
+    }
+
+    /// A request-level workspace under the configured root becomes bash's
+    /// default cwd.
+    #[tokio::test]
+    async fn test_execute_tool_runs_bash_in_workspace() {
+        let root = tempfile::TempDir::new().unwrap();
+        let conv_dir = root.path().join("11111111-2222-3333-4444-555555555555");
+        std::fs::create_dir_all(&conv_dir).unwrap();
+
+        let toolset =
+            build_sandbox_toolset(&[tool("bash")], Some(root.path().to_path_buf())).unwrap();
+        let server = SandboxToolServer::new(Arc::new(toolset));
+        let resp = server
+            .execute_tool(Request::new(ExecuteToolRequest {
+                name: "bash".to_string(),
+                arguments_json: json!({ "command": "pwd -P" }).to_string(),
+                session_id: String::new(),
+                workspace_root: conv_dir.display().to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(!resp.is_error, "got error: {}", resp.content);
+        let expected = conv_dir.canonicalize().unwrap();
+        assert!(
+            resp.content.contains(&expected.display().to_string()),
+            "bash should run in the requested workspace; got: {}",
+            resp.content
+        );
+    }
+
+    /// A workspace outside the sandbox's configured root is rejected as a
+    /// result-level error, and any workspace at all is rejected when the
+    /// sandbox has no [workspace] configured.
+    #[tokio::test]
+    async fn test_execute_tool_rejects_foreign_workspace() {
+        let toolset = build_sandbox_toolset(
+            &[tool("bash")],
+            Some(std::path::PathBuf::from("/workspace")),
+        )
+        .unwrap();
+        let server = SandboxToolServer::new(Arc::new(toolset));
+        for bad in ["/etc", "relative/dir", "/workspace/../etc"] {
+            let resp = server
+                .execute_tool(Request::new(ExecuteToolRequest {
+                    name: "bash".to_string(),
+                    arguments_json: json!({ "command": "pwd" }).to_string(),
+                    session_id: String::new(),
+                    workspace_root: bad.to_string(),
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert!(resp.is_error, "'{bad}' must be rejected: {}", resp.content);
+        }
+
+        let server = server_with(&[tool("bash")]); // no workspace root configured
+        let resp = server
+            .execute_tool(Request::new(ExecuteToolRequest {
+                name: "bash".to_string(),
+                arguments_json: json!({ "command": "pwd" }).to_string(),
+                session_id: String::new(),
+                workspace_root: "/workspace/some-conv".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.is_error, "{}", resp.content);
+        assert!(resp.content.contains("no [workspace]"), "{}", resp.content);
     }
 
     #[cfg(feature = "python-repl")]

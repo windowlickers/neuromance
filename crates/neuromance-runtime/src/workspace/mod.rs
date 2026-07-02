@@ -12,6 +12,7 @@
 
 pub mod archive;
 mod seed;
+pub mod tool;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

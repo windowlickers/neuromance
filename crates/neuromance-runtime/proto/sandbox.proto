@@ -48,6 +48,12 @@ message ExecuteToolRequest {
   // Stateful-interpreter session key. Empty for stateless tools; set per agent
   // run for execute_python so interpreter state never bleeds across runs.
   string session_id = 3;
+  // Absolute per-conversation workspace directory, empty when no workspace is
+  // configured. The sandbox validates it sits under its own [workspace].root
+  // (defense-in-depth against a compromised orchestrator) and injects it as
+  // bash's default cwd. Proto3-additive: an old peer on either side degrades
+  // to "no workspace".
+  string workspace_root = 4;
 }
 
 message ExecuteToolResponse {

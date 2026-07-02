@@ -115,7 +115,7 @@
 //! The [`ToolRegistry`] uses `DashMap` for concurrent access, making it safe to use
 //! from multiple async tasks without additional synchronization.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -174,6 +174,26 @@ pub(crate) fn resolve_search_path(raw: Option<&str>) -> Result<PathBuf, ToolErro
         }
         None => std::env::current_dir()
             .map_err(|e| ToolError::execution(format!("cannot determine current directory: {e}"))),
+    }
+}
+
+/// Injects `workspace_root` as the default `cwd` for a `bash` tool call.
+///
+/// Any other tool, an explicit caller-supplied `cwd`, and non-object
+/// arguments pass through unchanged — injection is only ever a default,
+/// never an override.
+#[must_use]
+pub fn with_default_cwd(name: &str, args: Value, workspace_root: &Path) -> Value {
+    if name != "bash" {
+        return args;
+    }
+    match args {
+        Value::Object(mut map) => {
+            map.entry("cwd")
+                .or_insert_with(|| Value::String(workspace_root.display().to_string()));
+            Value::Object(map)
+        }
+        other => other,
     }
 }
 

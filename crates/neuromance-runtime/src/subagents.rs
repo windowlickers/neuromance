@@ -257,10 +257,24 @@ fn assemble_toolset(
     #[cfg(not(feature = "python-repl"))]
     let reset = None;
 
+    // With a workspace configured and tools running in-process, wrap bash so
+    // its cwd defaults to the ambient workspace dir. The sandbox path injects
+    // the default server-side instead (see sandbox/server.rs).
+    let wrap_bash = config.workspace.is_some() && remote_capabilities.is_none();
     let tools = staged
         .tool_names()
         .into_iter()
-        .filter_map(|name| staged.get(&name))
+        .filter_map(|name| {
+            let tool = staged.get(&name)?;
+            if wrap_bash && name == "bash" {
+                Some(
+                    Arc::new(crate::workspace::tool::WorkspaceCwdTool::new(tool))
+                        as Arc<dyn ToolImplementation>,
+                )
+            } else {
+                Some(tool)
+            }
+        })
         .collect();
     Ok((tools, reset))
 }

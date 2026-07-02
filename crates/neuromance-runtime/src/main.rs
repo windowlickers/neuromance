@@ -25,6 +25,7 @@ use neuromance_runtime::{
     proxy::build_provider_config,
     rules, sandbox, serve, skills,
     telemetry::{self, BoxedLayer},
+    workspace::WorkspaceManager,
 };
 
 /// Process role. Defaults to the orchestrator when no subcommand is given, so
@@ -110,6 +111,17 @@ async fn run_orchestrator(config: &RuntimeConfig, cancel: CancellationToken) -> 
         .await
         .context("initialize database store")?;
 
+    // Workspace manager: resolves storage credentials and the git sealed
+    // token at startup, so a misconfiguration fails the boot, not the first
+    // task. `None` when no `[workspace]` is configured.
+    let workspace = config
+        .workspace
+        .as_ref()
+        .map(WorkspaceManager::from_config)
+        .transpose()
+        .context("initialize workspace manager")?
+        .map(Arc::new);
+
     // One sandbox client, shared by tool execution and (in serve mode) per-task
     // session cleanup. The channel connects lazily, so this never blocks on a
     // not-yet-ready sandbox.
@@ -158,7 +170,16 @@ async fn run_orchestrator(config: &RuntimeConfig, cancel: CancellationToken) -> 
     let skills_menu = skills.as_ref().and_then(|s| s.menu());
 
     let result = match config.mode {
-        Mode::Oneshot => run_oneshot(config, agent, skills_menu.as_deref(), cancel.clone()).await,
+        Mode::Oneshot => {
+            run_oneshot(
+                config,
+                agent,
+                skills_menu.as_deref(),
+                workspace,
+                cancel.clone(),
+            )
+            .await
+        }
         Mode::Serve => {
             run_serve(
                 config,
@@ -168,6 +189,7 @@ async fn run_orchestrator(config: &RuntimeConfig, cancel: CancellationToken) -> 
                 sandbox_client,
                 local_python,
                 skills_menu.map(Arc::from),
+                workspace,
                 cancel.clone(),
             )
             .await
@@ -206,7 +228,10 @@ async fn run_sandbox(config: &RuntimeConfig, cancel: CancellationToken) -> Resul
     // invisible to tools running in the sandbox. Best-effort; never fails startup.
     bootstrap::run(&config.bootstrap).await;
 
-    let toolset = Arc::new(sandbox::server::build_sandbox_toolset(&config.tools)?);
+    let toolset = Arc::new(sandbox::server::build_sandbox_toolset(
+        &config.tools,
+        config.workspace.as_ref().map(|w| w.root.clone()),
+    )?);
     info!(%addr, tools = config.tools.len(), "neuromance-runtime sandbox starting");
 
     sandbox::server::serve(toolset, addr, cancel)
@@ -488,9 +513,17 @@ async fn run_oneshot(
     config: &RuntimeConfig,
     mut agent: Agent<Box<dyn LLMClient>>,
     skills_menu: Option<&str>,
+    workspace: Option<Arc<WorkspaceManager>>,
     cancel: CancellationToken,
 ) -> Result<()> {
-    oneshot::run(config, &mut agent, skills_menu, cancel).await
+    oneshot::run(
+        config,
+        &mut agent,
+        skills_menu,
+        workspace.as_deref(),
+        cancel,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -502,6 +535,7 @@ async fn run_serve(
     sandbox_client: Option<sandbox::SandboxClient>,
     local_python: Option<SessionReset>,
     skills_menu: Option<Arc<str>>,
+    workspace: Option<Arc<WorkspaceManager>>,
     cancel: CancellationToken,
 ) -> Result<()> {
     serve::run(
@@ -512,6 +546,7 @@ async fn run_serve(
         sandbox_client,
         local_python,
         skills_menu,
+        workspace,
         cancel,
     )
     .await

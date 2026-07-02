@@ -33,6 +33,17 @@ fn run_session_id() -> String {
         .unwrap_or_default()
 }
 
+/// The ambient workspace directory for the current agent run, or empty when
+/// none is scoped. Serve mode seeds it per task alongside the task id; the
+/// sandbox validates it against its own configured root and injects it as
+/// bash's default cwd.
+fn run_workspace_root() -> String {
+    delegation::current()
+        .workspace_dir
+        .map(|dir| dir.display().to_string())
+        .unwrap_or_default()
+}
+
 /// A sandbox-hosted tool, executed remotely over gRPC.
 pub struct RemoteToolAdapter {
     client: SandboxClient,
@@ -83,7 +94,12 @@ impl ToolImplementation for RemoteToolAdapter {
         // a tool error so the loop feeds it back to the LLM rather than crashing.
         let response = self
             .client
-            .execute_tool(name.clone(), arguments_json, run_session_id())
+            .execute_tool(
+                name.clone(),
+                arguments_json,
+                run_session_id(),
+                run_workspace_root(),
+            )
             .await
             .map_err(|status| {
                 tracing::warn!(tool = %name, %status, "sandbox transport error");
@@ -178,7 +194,7 @@ mod tests {
     /// Spawn a sandbox server on a loopback port and return a connected client
     /// plus a cancel handle. Retries the first RPC until the server is ready.
     async fn spawn_sandbox(tools: &[ToolConfig]) -> (SandboxClient, CancellationToken) {
-        let toolset = Arc::new(build_sandbox_toolset(tools).unwrap());
+        let toolset = Arc::new(build_sandbox_toolset(tools, None).unwrap());
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr: SocketAddr = listener.local_addr().unwrap();
         drop(listener);

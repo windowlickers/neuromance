@@ -677,20 +677,6 @@ async fn execute_publishes_conversation_id_as_delegation_parent() {
     );
 }
 
-/// `scope_task` seeds only the runtime task id; the root conversation it wraps
-/// has no parent conversation of its own.
-#[tokio::test]
-async fn scope_task_seeds_task_id_without_parent_conversation() {
-    let task_id = Uuid::new_v4();
-    let observed = crate::scope_task(Some(task_id), async {
-        let ctx = neuromance_common::delegation::current();
-        (ctx.conversation_id, ctx.task_id)
-    })
-    .await;
-
-    assert_eq!(observed, (None, Some(task_id)));
-}
-
 // -- CacheMetrics total_output_tokens --
 
 #[test]

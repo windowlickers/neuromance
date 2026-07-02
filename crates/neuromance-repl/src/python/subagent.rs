@@ -613,6 +613,7 @@ results = spawn_agents([Agent('a', 'first'), Agent('b', 'second'), Agent('c', 't
             task_id: Some(uuid::Uuid::new_v4()),
             parent_message_id: Some(uuid::Uuid::new_v4()),
             parent_tool_call_id: Some("call_probe".to_string()),
+            workspace_dir: Some(std::path::PathBuf::from("/workspace/probe")),
         };
 
         let result = delegation::scope(
