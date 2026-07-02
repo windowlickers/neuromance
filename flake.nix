@@ -65,7 +65,14 @@
           inherit src;
           pname = "neuromance";
           inherit version;
-          buildInputs = [ pkgs.openssl pythonEnv ];
+          # zlib serves the git2 crate's vendored libgit2 (vendored because
+          # libgit2-sys pins a minimum system libgit2 that nixpkgs
+          # periodically trails; the C sources ship in the crate).
+          buildInputs = [
+            pkgs.openssl
+            pkgs.zlib
+            pythonEnv
+          ];
           nativeBuildInputs = [
             pkgs.pkg-config
             pkgs.mold

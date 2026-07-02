@@ -15,7 +15,14 @@ description = "Tool execution framework for Neuromance LLM library"
 [lints]
 workspace = true
 
+[features]
+git = ["dep:git2"]
+
 [dependencies]
+# vendored-libgit2 builds the bundled C sources: hermetic under the nix
+# sandbox and immune to nixpkgs/libgit2-sys version skew (libgit2-sys pins a
+# minimum system libgit2 that nixpkgs periodically trails).
+git2 = { workspace = true, optional = true, features = ["vendored-libgit2"] }
 anyhow.workspace = true
 async-trait.workspace = true
 chrono.workspace = true

@@ -130,6 +130,8 @@ mod error;
 pub mod factory;
 mod find_tool;
 pub mod generic;
+#[cfg(feature = "git")]
+pub mod git;
 mod grep_tool;
 mod ls_tool;
 pub mod mcp;
