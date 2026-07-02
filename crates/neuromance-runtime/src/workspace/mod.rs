@@ -19,7 +19,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::Utc;
-use dashmap::DashMap;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
@@ -115,11 +114,17 @@ pub struct WorkspaceManager {
     git_proxy: Option<GitProxyAuth>,
     storage: Option<Arc<dyn ObjectStore>>,
     persistence: Option<PersistenceRuntime>,
-    /// Per-conversation guard so concurrent prepares/snapshots of the same
-    /// workspace serialize. The worker is serial today; this is cheap
-    /// insurance for when it stops being so.
-    locks: DashMap<Uuid, Arc<Mutex<()>>>,
+    /// Striped guards so concurrent prepares/snapshots of the same workspace
+    /// serialize. The worker is serial today; this is cheap insurance for when
+    /// it stops being so. A conversation always maps to the same stripe, so
+    /// same-workspace operations serialize; distinct conversations may share a
+    /// stripe and serialize needlessly (harmless), which keeps the pool a fixed
+    /// size instead of growing one entry per conversation forever.
+    locks: [Mutex<()>; LOCK_STRIPES],
 }
+
+/// Number of stripes in [`WorkspaceManager`]'s lock pool.
+const LOCK_STRIPES: usize = 64;
 
 impl WorkspaceManager {
     /// Build a manager from resolved parts. Prefer [`Self::from_config`]
@@ -135,8 +140,14 @@ impl WorkspaceManager {
             git_proxy,
             storage,
             persistence: None,
-            locks: DashMap::new(),
+            locks: std::array::from_fn(|_| Mutex::new(())),
         }
+    }
+
+    /// The stripe guarding a conversation's prepare/snapshot.
+    const fn lock_for(&self, conversation_id: Uuid) -> &Mutex<()> {
+        let idx = (conversation_id.as_u128() % LOCK_STRIPES as u128) as usize;
+        &self.locks[idx]
     }
 
     /// Enable snapshot/restore against the manager's storage. `exclude` is
@@ -234,8 +245,7 @@ impl WorkspaceManager {
         conversation_id: Uuid,
         definition: Option<&WorkspaceDefinition>,
     ) -> Result<PathBuf, WorkspaceError> {
-        let lock = self.locks.entry(conversation_id).or_default().clone();
-        let _guard = lock.lock().await;
+        let _guard = self.lock_for(conversation_id).lock().await;
 
         let dir = self.dir_for(conversation_id);
         let exists = tokio::fs::try_exists(&dir).await.unwrap_or(false);
@@ -284,8 +294,7 @@ impl WorkspaceManager {
             return Ok(());
         };
         let storage = self.storage()?;
-        let lock = self.locks.entry(conversation_id).or_default().clone();
-        let _guard = lock.lock().await;
+        let _guard = self.lock_for(conversation_id).lock().await;
 
         let dir = self.dir_for(conversation_id);
         if !tokio::fs::try_exists(&dir).await.unwrap_or(false) {
