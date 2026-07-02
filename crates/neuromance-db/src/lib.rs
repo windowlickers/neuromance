@@ -64,4 +64,6 @@ mod store;
 pub use error::DbError;
 pub use hook::PersistenceHook;
 pub use sink::ConversationSink;
-pub use store::{ConversationSummary, PgConversationStore, StoredTask, TaskStatusUpdate};
+pub use store::{
+    ConversationSummary, PgConversationStore, StoredTask, TaskStatusUpdate, WorkspaceSnapshotRecord,
+};

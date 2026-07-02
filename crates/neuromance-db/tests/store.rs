@@ -704,3 +704,52 @@ async fn test_list_child_conversations(pool: PgPool) {
         "a conversation with no children returns nothing"
     );
 }
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires postgres via DATABASE_URL"]
+async fn test_workspace_snapshot_ref_upserts_and_round_trips(pool: PgPool) {
+    use neuromance_db::WorkspaceSnapshotRecord;
+
+    let store = PgConversationStore::new(pool);
+    let conversation_id = Uuid::new_v4();
+
+    // No ref recorded yet.
+    assert!(
+        store
+            .get_workspace_snapshot(conversation_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // First record works without a pre-existing conversation row (the upsert
+    // pre-inserts it for FK self-sufficiency).
+    let first = WorkspaceSnapshotRecord {
+        conversation_id,
+        object_key: format!("snapshots/{conversation_id}.tar.zst"),
+        etag: Some("etag-v1".to_string()),
+        size_bytes: 1024,
+        snapshotted_at: Utc::now().trunc_subsecs(6),
+    };
+    store.upsert_workspace_snapshot(&first).await.unwrap();
+    assert_eq!(
+        store.get_workspace_snapshot(conversation_id).await.unwrap(),
+        Some(first.clone())
+    );
+
+    // Re-recording updates in place: one row per conversation.
+    let second = WorkspaceSnapshotRecord {
+        etag: Some("etag-v2".to_string()),
+        size_bytes: 2048,
+        snapshotted_at: Utc::now().trunc_subsecs(6),
+        ..first
+    };
+    store.upsert_workspace_snapshot(&second).await.unwrap();
+    let read = store
+        .get_workspace_snapshot(conversation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read.etag.as_deref(), Some("etag-v2"));
+    assert_eq!(read.size_bytes, 2048);
+}

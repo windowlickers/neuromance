@@ -91,6 +91,14 @@ pub async fn run<C: LLMClient + Send + Sync>(
         ) => res.map_err(anyhow::Error::from),
     };
 
+    // Best-effort final snapshot so a follow-up conversation on another pod
+    // can pick the files up. No-op when persistence is off.
+    if let Some(mgr) = workspace
+        && let Err(e) = mgr.snapshot(conversation_id).await
+    {
+        error!(conversation_id = %conversation_id, error = %e, "workspace snapshot failed");
+    }
+
     let output = match result {
         Ok(response) => OneshotOutput {
             agent_id: agent.id.clone(),

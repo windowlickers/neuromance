@@ -69,6 +69,24 @@ pub struct StoredTask {
     pub updated_at: DateTime<Utc>,
 }
 
+/// The latest workspace snapshot recorded for a conversation.
+///
+/// Advisory for restore — the object store is authoritative via `ETag`
+/// comparison — and load-bearing for audit and external retention sweeps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceSnapshotRecord {
+    /// Conversation whose workspace was snapshotted.
+    pub conversation_id: Uuid,
+    /// Object key of the snapshot archive within the workspace bucket.
+    pub object_key: String,
+    /// `ETag` the object store returned for the upload, when it did.
+    pub etag: Option<String>,
+    /// Archive size in bytes.
+    pub size_bytes: i64,
+    /// When the snapshot was recorded.
+    pub snapshotted_at: DateTime<Utc>,
+}
+
 /// The status fields written through to the durable task row at enqueue,
 /// dequeue, and terminal. Bundled so [`PgConversationStore::record_task_status`]
 /// stays within the positional-argument budget.
@@ -446,6 +464,76 @@ impl PgConversationStore {
         .await
         .op("insert task provenance")?;
         Ok(())
+    }
+
+    /// Upserts the workspace snapshot ref for a conversation.
+    ///
+    /// One row per conversation, updated in place on every snapshot. The
+    /// conversation row is pre-inserted (`ON CONFLICT DO NOTHING`) so this
+    /// write is self-sufficient against the foreign key even when the
+    /// conversation row write is still in flight.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::Sqlx`] if the write fails.
+    pub async fn upsert_workspace_snapshot(
+        &self,
+        snapshot: &WorkspaceSnapshotRecord,
+    ) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await.op("begin transaction")?;
+        sqlx::query!(
+            "INSERT INTO conversations (id) VALUES ($1) ON CONFLICT (id) DO NOTHING",
+            snapshot.conversation_id,
+        )
+        .execute(&mut *tx)
+        .await
+        .op("pre-insert conversation for workspace snapshot")?;
+        sqlx::query!(
+            r#"
+            INSERT INTO workspace_snapshots
+                (conversation_id, object_key, etag, size_bytes, snapshotted_at)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (conversation_id) DO UPDATE
+                SET object_key = EXCLUDED.object_key,
+                    etag = EXCLUDED.etag,
+                    size_bytes = EXCLUDED.size_bytes,
+                    snapshotted_at = EXCLUDED.snapshotted_at
+            "#,
+            snapshot.conversation_id,
+            snapshot.object_key,
+            snapshot.etag,
+            snapshot.size_bytes,
+            snapshot.snapshotted_at,
+        )
+        .execute(&mut *tx)
+        .await
+        .op("upsert workspace snapshot")?;
+        tx.commit().await.op("commit workspace snapshot")?;
+        Ok(())
+    }
+
+    /// The workspace snapshot ref recorded for a conversation, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::Sqlx`] if the query fails.
+    pub async fn get_workspace_snapshot(
+        &self,
+        conversation_id: Uuid,
+    ) -> Result<Option<WorkspaceSnapshotRecord>, DbError> {
+        let row = sqlx::query_as!(
+            WorkspaceSnapshotRecord,
+            r#"
+            SELECT conversation_id, object_key, etag, size_bytes, snapshotted_at
+            FROM workspace_snapshots
+            WHERE conversation_id = $1
+            "#,
+            conversation_id,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .op("select workspace snapshot")?;
+        Ok(row)
     }
 
     /// Upserts a task's status, output, error and queue depth, keyed by id.

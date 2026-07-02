@@ -878,7 +878,18 @@ async fn process_job(ctx: &WorkerCtx, job: WorkerJob, cancel: CancellationToken)
     let run_ms = u64::try_from(run_start.elapsed().as_millis()).unwrap_or(u64::MAX);
     #[allow(clippy::cast_precision_loss)]
     histogram!("neuromance_task_duration_seconds").record(run_ms as f64 / 1000.0);
-    record_outcome(ctx, &job, exec_result, run_ms, queue_wait_ms).await
+    let outcome = record_outcome(ctx, &job, exec_result, run_ms, queue_wait_ms).await;
+
+    // Snapshot after every outcome — including Cancelled, which is what makes
+    // the SIGTERM drain durable: the worker finishes this job (worker.await in
+    // `run`) before shutdown proceeds. Best-effort, same policy as `mark_*`;
+    // a no-op when persistence is off.
+    if let Some(mgr) = ctx.workspace.as_ref()
+        && let Err(e) = mgr.snapshot(job.conversation_id).await
+    {
+        warn!(conversation_id = %job.conversation_id, error = %e, "workspace snapshot failed");
+    }
+    outcome
 }
 
 /// Record a finished run: refresh the conversation cache, write the terminal

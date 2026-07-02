@@ -221,11 +221,73 @@ endpoint = "http://127.0.0.1:50051"
 
 The orchestrator fetches the sandbox's tool definitions once at startup (retrying while the sandbox container comes up) and mirrors each tool's auto-approval requirement, so the startup approval gate behaves exactly as it does for local tools. Approval is always decided by the orchestrator before a call crosses the boundary; the sandbox only executes. A tool that runs but fails is returned as a normal tool error; a transport failure degrades to a failed tool call rather than crashing the orchestrator.
 
-The channel is loopback-only within the pod (Istio mesh covers transport; the channel construction is left pluggable for future SPIFFE/SPIRE identities). The **workspace volume mounts into the sandbox container only** — the orchestrator never touches the workspace and holds no credentials reachable from tool code.
+The channel is loopback-only within the pod (Istio mesh covers transport; the channel construction is left pluggable for future SPIFFE/SPIRE identities). With `[workspace]` configured, the workspace volume is an `emptyDir` shared by both containers: the sandbox executes tools inside it, while the orchestrator — which holds the storage and git credentials — seeds and snapshots it. Tool code still has no reachable credentials.
 
 The gRPC build needs `protoc` (provided by the Nix dev shell and build inputs).
 
 **Limitation (this release):** the Python `run_subagent`/`spawn_agents` bridge cannot cross the sandbox boundary — it needs the interpreter and the subagent tower in one process. A config that sets `sandbox.endpoint` together with both `[[subagents]]` and an `execute_python` tool is rejected at startup. Subagents (delegation) and a standalone `execute_python` each work under the sandbox individually.
+
+## Workspaces
+
+Each conversation gets a working directory at `<root>/<conversation_id>`, created when its first task runs and reused by continuations. The directory is announced in the seed system message and injected as `bash`'s default `cwd` (an explicit `cwd` in a tool call always wins), on both the in-process and sandbox execution paths. Subagents inherit the parent's workspace.
+
+```toml
+[workspace]
+# Absolute root under which per-conversation directories are created.
+# In k8s this is an emptyDir mounted at the same path in the orchestrator
+# and sandbox containers.
+root = "/workspace"
+
+# S3-compatible object storage (garage). Required by object seeds and
+# persistence; credentials come from the environment, never this file.
+[workspace.storage]
+endpoint = "http://garage.storage.svc.cluster.local:3900"
+bucket = "workspaces"
+# region defaults to "garage"
+access_key_id_env = "GARAGE_KEY_ID"
+secret_access_key_env = "GARAGE_SECRET"
+
+# Snapshot/restore across replicas. Optional — omit for pod-local
+# workspaces only.
+[workspace.persistence]
+# Object key prefix; a conversation's snapshot lives at
+# <prefix><conversation_id>.tar.zst. Defaults to "snapshots/".
+prefix = "snapshots/"
+# Globs excluded from snapshots, relative to the workspace dir.
+exclude = ["target/**", "**/node_modules/**", "**/__pycache__/**"]
+
+# Tokenizer-proxy auth for git seeds, shaped like [providers.proxy].
+# Omit for anonymous clones. Remotes must be http:// so the proxy can
+# read the sealed header (it upgrades to TLS upstream).
+[workspace.git_proxy]
+base_url = "http://tokenizer-proxy.windowlickers.svc.cluster.local:8080"
+token_file = "/var/run/neuromance/tokens/git"
+
+# Named seed definitions. Selected per task: an explicit `workspace` field
+# on POST /tasks/new wins; otherwise the first definition listing the
+# task's resolved provider or model is used. Seeding runs exactly once,
+# when the conversation's workspace is first created.
+[[workspace.definitions]]
+name = "org-dev"
+providers = ["anthropic"]
+models = []                       # exact resolved model strings
+
+# Repositories pre-cloned into the workspace.
+[[workspace.definitions.git]]
+url = "http://git.windowlicke.rs/windowlickers/neuromance.git"
+ref = "main"                      # branch, tag, or SHA; optional
+# dest defaults to the repo basename ("neuromance")
+
+# tar.zst archives from workspace.storage, unpacked into the workspace —
+# scratch files and other goodies.
+[[workspace.definitions.objects]]
+key = "seeds/scratch.tar.zst"
+dest = "scratch"                  # optional; defaults to the workspace dir
+```
+
+With persistence on, the worker snapshots the workspace after every run (success, failure, or drain cancellation) and restores the latest snapshot before a continuation that lands on a different replica — a marker file carrying the snapshot's ETag lets a task that lands on the replica which produced the snapshot skip the restore. Snapshot refs are written through to postgres when `[database]` is configured (the `workspace_snapshots` table), for audit and retention sweeps; the object store stays authoritative for restore. A restored workspace is never re-seeded, and a continuation naming a different `workspace` keeps the one it was seeded with (logged, not an error).
+
+Retention is expiry-based and external: point a garage lifecycle rule at the snapshot prefix rather than deleting from the runtime. Size the pod's `terminationGracePeriodSeconds` above `runtime.shutdown_grace_seconds` plus the time to pack and upload a snapshot of your workspace's working set — the drain-time snapshot runs inside that window.
 
 ## Tool bootstrap
 

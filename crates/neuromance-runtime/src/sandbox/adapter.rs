@@ -312,6 +312,7 @@ mod tests {
                 task_id: Some(task),
                 parent_message_id: None,
                 parent_tool_call_id: None,
+                workspace_dir: None,
             };
             let out = delegation::scope(ctx, python.execute(&json!({ "code": code })))
                 .await

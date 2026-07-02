@@ -113,11 +113,12 @@ async fn run_orchestrator(config: &RuntimeConfig, cancel: CancellationToken) -> 
 
     // Workspace manager: resolves storage credentials and the git sealed
     // token at startup, so a misconfiguration fails the boot, not the first
-    // task. `None` when no `[workspace]` is configured.
+    // task. `None` when no `[workspace]` is configured. Snapshot refs write
+    // through to postgres when a database is configured.
     let workspace = config
         .workspace
         .as_ref()
-        .map(WorkspaceManager::from_config)
+        .map(|settings| WorkspaceManager::from_config(settings, store.as_ref()))
         .transpose()
         .context("initialize workspace manager")?
         .map(Arc::new);

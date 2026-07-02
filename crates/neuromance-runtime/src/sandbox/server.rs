@@ -547,6 +547,7 @@ mod tests {
                 name: "execute_python".to_string(),
                 arguments_json: json!({ "code": code }).to_string(),
                 session_id: session.to_string(),
+                workspace_root: String::new(),
             }))
             .await
             .unwrap()
