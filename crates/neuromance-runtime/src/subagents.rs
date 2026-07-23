@@ -81,6 +81,12 @@ pub fn build_parent_toolset(
     cancel: &CancellationToken,
     remote_capabilities: Option<&[Arc<dyn ToolImplementation>]>,
 ) -> Result<Toolset, RuntimeError> {
+    // Inject the synthesized self-delegation subagent (if `runtime.self_delegation`
+    // is set) so the whole tower, `SubagentTool` registration, and Python bridge
+    // treat it exactly like a configured `[[subagents]]` entry.
+    let effective = config.with_self_delegation();
+    let config: &RuntimeConfig = &effective;
+
     let children = if config.subagents.is_empty() {
         HashMap::new()
     } else {
@@ -585,6 +591,26 @@ mod tests {
             "exactly one execute_python tool expected, got: {names:?}"
         );
         assert!(names.contains(&"worker".to_string()));
+    }
+
+    /// With `runtime.self_delegation` set, the effective config gains a
+    /// synthesized `task` subagent, so assembling its toolset over the matching
+    /// child registers a `task` delegate tool alongside the capability tools —
+    /// no `[[subagents]]` entry required.
+    #[test]
+    fn test_self_delegation_adds_task_delegate() {
+        let mut config = config_with_subagents(vec![]);
+        config.tools = vec![read_tool()];
+        config.runtime.self_delegation = true;
+
+        let effective = config.with_self_delegation();
+        let children = mock_children(&[crate::config::SELF_DELEGATION_ID]);
+        let (tools, _reset) =
+            assemble_toolset(&effective, &children, &CancellationToken::new(), None).unwrap();
+        let mut names = tool_names(&tools);
+        names.sort();
+
+        assert_eq!(names, vec!["read".to_string(), "task".to_string()]);
     }
 
     /// A subagent id that collides with a configured tool name is rejected when

@@ -17,6 +17,7 @@
 //!
 //! Exactly one of these paths must be configured per provider.
 
+use std::borrow::Cow;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -422,10 +423,18 @@ pub struct RuntimeSettings {
     /// but those subagents hold no delegate tools; at `2` a subagent may
     /// delegate one further hop, and so on. The deepest subagents are still
     /// fully tool-capable — they just cannot delegate. Bounds both startup cost
-    /// and runaway delegation fan-out. Ignored when no `[[subagents]]` are
-    /// configured.
+    /// and runaway delegation fan-out. Ignored when no delegation is configured
+    /// (no `[[subagents]]` and `self_delegation` off).
     #[serde(default = "default_max_delegation_depth")]
     pub max_delegation_depth: u32,
+    /// Give the main agent a `task` delegate tool that runs a fresh copy of
+    /// itself — the same system prompt, provider, model, and turn budget — on a
+    /// delegated subtask. A zero-boilerplate form of `[[subagents]]`: the
+    /// synthesized subagent joins the same `max_delegation_depth`-bounded tower
+    /// and, when an `execute_python` tool is configured, the same
+    /// `run_subagent`/`spawn_agents` bridge. Off by default.
+    #[serde(default)]
+    pub self_delegation: bool,
 }
 
 impl Default for RuntimeSettings {
@@ -436,9 +445,14 @@ impl Default for RuntimeSettings {
             shutdown_grace_seconds: default_shutdown_grace(),
             max_queue_depth: default_max_queue_depth(),
             max_delegation_depth: default_max_delegation_depth(),
+            self_delegation: false,
         }
     }
 }
+
+/// Reserved id and delegate-tool name for the synthesized self-delegation
+/// subagent (`runtime.self_delegation`).
+pub const SELF_DELEGATION_ID: &str = "task";
 
 fn default_listen_addr() -> String {
     "127.0.0.1:8080".to_string()
@@ -681,6 +695,53 @@ impl RuntimeConfig {
             .map_err(|e| RuntimeError::Config(format!("[oneshot].output_schema: {e}")))
     }
 
+    /// Whether any delegation tower must be built: either explicit
+    /// `[[subagents]]` or the synthesized self-delegation subagent.
+    #[must_use]
+    pub const fn has_delegation(&self) -> bool {
+        !self.subagents.is_empty() || self.runtime.self_delegation
+    }
+
+    /// The synthesized self-delegation subagent, when `runtime.self_delegation`
+    /// is set: a fresh copy of the main agent (same system prompt, and — via the
+    /// inherit-when-`None` resolution — the same provider, model, and turn
+    /// budget), exposed as the [`SELF_DELEGATION_ID`] delegate tool.
+    #[must_use]
+    pub fn self_delegation_subagent(&self) -> Option<SubagentConfig> {
+        self.runtime.self_delegation.then(|| SubagentConfig {
+            id: SELF_DELEGATION_ID.to_string(),
+            system_prompt: self.agent.system_prompt.clone(),
+            description: Some(
+                "Delegate a self-contained subtask to a fresh instance of yourself — same \
+                 instructions, model, and tools. The subagent runs autonomously and returns \
+                 only its final result. Use it for well-scoped or parallelizable work; give it \
+                 all the context it needs, since it does not see this conversation."
+                    .to_string(),
+            ),
+            // Inherit the parent's provider/model through the existing
+            // resolution (see `subagents.rs`); mirror its turn budget so a
+            // self-delegated run behaves like a continuation of this agent.
+            provider: None,
+            model: None,
+            max_turns: self.agent.max_turns,
+        })
+    }
+
+    /// This config with the synthesized self-delegation subagent appended when
+    /// `runtime.self_delegation` is set; borrowed unchanged otherwise. Injecting
+    /// it into `subagents` lets the whole delegation tower, `SubagentTool`
+    /// registration, and Python bridge treat self-delegation exactly like a
+    /// configured `[[subagents]]` entry.
+    #[must_use]
+    pub fn with_self_delegation(&self) -> Cow<'_, Self> {
+        self.self_delegation_subagent()
+            .map_or(Cow::Borrowed(self), |sub| {
+                let mut cfg = self.clone();
+                cfg.subagents.push(sub);
+                Cow::Owned(cfg)
+            })
+    }
+
     /// Resolve a task's provider and model from optional per-task overrides.
     ///
     /// Mirrors subagent resolution (see `subagents.rs`): the named provider
@@ -825,12 +886,13 @@ impl RuntimeConfig {
             }
         }
 
-        if !self.subagents.is_empty() {
+        if self.has_delegation() {
             let depth = self.runtime.max_delegation_depth;
             if !(1..=MAX_DELEGATION_DEPTH_CEILING).contains(&depth) {
                 return Err(RuntimeError::Config(format!(
                     "runtime.max_delegation_depth must be between 1 and \
-                     {MAX_DELEGATION_DEPTH_CEILING} when [[subagents]] are configured (got {depth})"
+                     {MAX_DELEGATION_DEPTH_CEILING} when subagents or self_delegation are \
+                     configured (got {depth})"
                 )));
             }
         }
@@ -891,6 +953,14 @@ impl RuntimeConfig {
                 )));
             }
         }
+        if self.runtime.self_delegation
+            && self.subagents.iter().any(|s| s.id == SELF_DELEGATION_ID)
+        {
+            return Err(RuntimeError::Config(format!(
+                "subagent id '{SELF_DELEGATION_ID}' is reserved for runtime.self_delegation; \
+                 rename the [[subagents]] entry or disable self_delegation"
+            )));
+        }
         Ok(())
     }
 
@@ -920,13 +990,15 @@ impl RuntimeConfig {
             validate_http_url(endpoint, "sandbox.endpoint")?;
             // The Python run_subagent/spawn_agents bridge needs the interpreter
             // and the subagent tower in one process; it cannot cross the gRPC
-            // boundary in this release.
-            if !self.subagents.is_empty() && self.tools.iter().any(|t| t.name == EXECUTE_PYTHON) {
+            // boundary in this release. self_delegation builds the same bridge,
+            // so it is rejected on the same terms.
+            if self.has_delegation() && self.tools.iter().any(|t| t.name == EXECUTE_PYTHON) {
                 return Err(RuntimeError::Config(
-                    "sandbox.endpoint with both [[subagents]] and an execute_python tool is \
-                     not yet supported: the Python run_subagent/spawn_agents bridge requires \
-                     the interpreter and the subagent tower in the same process. Remove the \
-                     execute_python tool or [[subagents]], or unset sandbox.endpoint."
+                    "sandbox.endpoint with delegation ([[subagents]] or self_delegation) and an \
+                     execute_python tool is not yet supported: the Python \
+                     run_subagent/spawn_agents bridge requires the interpreter and the subagent \
+                     tower in the same process. Remove the execute_python tool or the delegation \
+                     config, or unset sandbox.endpoint."
                         .to_string(),
                 ));
             }
@@ -2293,6 +2365,102 @@ mod tests {
         "#,
         );
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn test_self_delegation_defaults_off() {
+        let config = serve_config("");
+        assert!(!config.runtime.self_delegation);
+        assert!(!config.has_delegation());
+        assert!(config.self_delegation_subagent().is_none());
+        // Off means the effective config is the config unchanged.
+        assert!(config.with_self_delegation().subagents.is_empty());
+    }
+
+    #[test]
+    fn test_self_delegation_synthesizes_self_subagent() {
+        let config = serve_config(
+            r"
+            [runtime]
+            self_delegation = true
+        ",
+        );
+        config.validate().unwrap();
+        assert!(config.has_delegation());
+
+        let sub = config
+            .self_delegation_subagent()
+            .expect("synthesized when self_delegation is on");
+        assert_eq!(sub.id, SELF_DELEGATION_ID);
+        assert_eq!(sub.system_prompt, config.agent.system_prompt);
+        // Provider/model are inherited through resolution, not copied by name.
+        assert!(sub.provider.is_none());
+        assert!(sub.model.is_none());
+        assert_eq!(sub.max_turns, config.agent.max_turns);
+        assert!(sub.description.is_some());
+
+        // The effective config injects exactly the synthesized subagent so the
+        // tower treats it like a configured `[[subagents]]` entry.
+        let effective = config.with_self_delegation();
+        assert_eq!(effective.subagents.len(), 1);
+        assert_eq!(effective.subagents[0].id, SELF_DELEGATION_ID);
+    }
+
+    #[test]
+    fn test_self_delegation_with_zero_depth_fails() {
+        let config = serve_config(
+            r"
+            [runtime]
+            self_delegation = true
+            max_delegation_depth = 0
+        ",
+        );
+        let err = config
+            .validate()
+            .expect_err("depth 0 is invalid once self_delegation enables the tower");
+        assert!(format!("{err}").contains("max_delegation_depth"));
+    }
+
+    #[test]
+    fn test_self_delegation_reserved_id_collision_fails() {
+        let config = serve_config(
+            r#"
+            [runtime]
+            self_delegation = true
+
+            [[subagents]]
+            id = "task"
+            system_prompt = "you are a worker"
+        "#,
+        );
+        let err = config
+            .validate()
+            .expect_err("an explicit subagent named `task` collides with self_delegation");
+        assert!(
+            matches!(err, RuntimeError::Config(ref m) if m.contains("reserved")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_sandbox_endpoint_rejects_self_delegation_python_bridge() {
+        let config = serve_config(
+            r#"
+            [runtime]
+            self_delegation = true
+
+            [[tools]]
+            name = "execute_python"
+
+            [sandbox]
+            endpoint = "http://127.0.0.1:50051"
+        "#,
+        );
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::Config(ref m) if m.contains("not yet supported")),
+            "{err}"
+        );
     }
 
     /// A full `[workspace]` section: storage, persistence, git proxy, and one

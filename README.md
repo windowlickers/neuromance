@@ -163,6 +163,8 @@ A `[[subagents]]` section declares subagents the main agent can delegate to. A s
 
 A subagent is provisioned with the **same toolset as the main agent** — the capability tools from `[[tools]]`, the `execute_python` bridge, and the delegate tools — so it can both use tools and delegate further. Subagent tool calls auto-approve inside the pod: they run autonomously within a single parent delegation, with no interactive approver in the loop, so the pod boundary (e.g. kata containers) is the isolation, the same way the whole agent pod is already sandboxed.
 
+**Self-delegation.** Setting `runtime.self_delegation = true` gives the main agent a `task` delegate tool that runs a fresh copy of *itself* — the same system prompt, provider, model, and turn budget — on a scoped subtask, with no `[[subagents]]` entry to write. It is exactly a synthesized subagent named `task`, so it joins the same `max_delegation_depth` tower, gets the same shared toolset, and (when `execute_python` is configured) the same `run_subagent`/`spawn_agents` bridge. `task` is reserved while this is on: an explicit subagent or tool of that name is rejected at startup. Combine it with `[[subagents]]` freely — the `task` self-clone is added alongside any named subagents.
+
 Nested delegation is bounded by `runtime.max_delegation_depth`, which counts subagent hops from the main agent (depth 0). At `1` the main agent reaches subagents but those subagents carry no delegate tools; at `2` (the default) a subagent may delegate one further hop, and so on. The deepest subagents are still fully tool-capable — they simply cannot delegate. The bound is enforced structurally (a finite tower of subagent instances built at startup), so it cannot run away; it is capped at 5.
 
 Every configured subagent is reachable two ways:
@@ -225,7 +227,7 @@ The channel is loopback-only within the pod (Istio mesh covers transport; the ch
 
 The gRPC build needs `protoc` (provided by the Nix dev shell and build inputs).
 
-**Limitation (this release):** the Python `run_subagent`/`spawn_agents` bridge cannot cross the sandbox boundary — it needs the interpreter and the subagent tower in one process. A config that sets `sandbox.endpoint` together with both `[[subagents]]` and an `execute_python` tool is rejected at startup. Subagents (delegation) and a standalone `execute_python` each work under the sandbox individually.
+**Limitation (this release):** the Python `run_subagent`/`spawn_agents` bridge cannot cross the sandbox boundary — it needs the interpreter and the subagent tower in one process. A config that sets `sandbox.endpoint` together with an `execute_python` tool and any delegation (`[[subagents]]` or `runtime.self_delegation`) is rejected at startup. Delegation and a standalone `execute_python` each work under the sandbox individually.
 
 ## Workspaces
 
