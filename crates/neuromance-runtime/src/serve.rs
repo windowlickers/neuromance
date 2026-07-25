@@ -128,6 +128,32 @@ pub struct CreateTaskResponse {
     pub queue_depth_at_enqueue: usize,
 }
 
+/// Discovery response for `GET /providers`: the configured `[[providers]]`
+/// entries and the agent's defaults, so a caller can pick a valid `provider`
+/// override and see each provider's default model.
+#[derive(Debug, Serialize)]
+pub struct ProvidersResponse {
+    /// The agent's default provider — used when a task sets no `provider`.
+    pub default_provider: String,
+    /// The agent's effective default model, when one is resolvable. Individual
+    /// tasks may still override the model with any `provider:model` string.
+    pub default_model: Option<String>,
+    pub providers: Vec<ProviderInfo>,
+}
+
+/// One configured provider, with credential plumbing (`api_key_env`, `proxy`)
+/// deliberately omitted.
+#[derive(Debug, Serialize)]
+pub struct ProviderInfo {
+    pub name: String,
+    /// The provider's default model; `None` when the provider sets none.
+    pub model: Option<String>,
+    /// Upstream LLM endpoint, when configured.
+    pub base_url: Option<String>,
+    /// Whether this is the agent's default provider.
+    pub default: bool,
+}
+
 #[derive(Debug)]
 enum EnqueueError {
     QueueFull {
@@ -300,6 +326,7 @@ pub fn router(state: ServeState) -> Router {
         .route("/tasks", get(list_tasks))
         .route("/tasks/new", post(create_task))
         .route("/tasks/{id}", get(get_task))
+        .route("/providers", get(list_providers))
         .route("/conversations", get(list_conversations))
         .route("/conversations/{id}", get(get_conversation))
         .route(
@@ -520,6 +547,30 @@ async fn create_task(
         )
             .into_response(),
         Err(err) => err.into_response(),
+    }
+}
+
+async fn list_providers(State(state): State<ServeState>) -> impl IntoResponse {
+    Json(providers_response(&state.config))
+}
+
+/// Build the `GET /providers` payload from the runtime config, dropping
+/// credential plumbing (`api_key_env`, `proxy`) that must not leave the pod.
+fn providers_response(config: &RuntimeConfig) -> ProvidersResponse {
+    let providers = config
+        .providers
+        .iter()
+        .map(|p| ProviderInfo {
+            name: p.name.clone(),
+            model: p.model.clone(),
+            base_url: p.base_url.clone(),
+            default: p.name == config.agent.provider,
+        })
+        .collect();
+    ProvidersResponse {
+        default_provider: config.agent.provider.clone(),
+        default_model: config.agent_model().map(str::to_owned),
+        providers,
     }
 }
 
@@ -1292,6 +1343,27 @@ mod tests {
         assert!(messages[0].content.starts_with("system"));
         assert!(messages[0].content.contains("<skills_instructions>"));
         assert!(messages[0].content.contains("file: /tmp/x/SKILL.md"));
+    }
+
+    #[test]
+    fn test_providers_response_lists_all_and_marks_default() {
+        // `test_config` defines two providers; `agent.provider = "primary"`.
+        let config = test_config("");
+        let body = providers_response(&config);
+
+        assert_eq!(body.default_provider, "primary");
+        assert_eq!(body.default_model.as_deref(), Some("openai:gpt-4o"));
+
+        let names: Vec<&str> = body.providers.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["primary", "secondary"]);
+
+        let primary = &body.providers[0];
+        assert!(primary.default);
+        assert_eq!(primary.model.as_deref(), Some("openai:gpt-4o"));
+
+        let secondary = &body.providers[1];
+        assert!(!secondary.default);
+        assert_eq!(secondary.model.as_deref(), Some("openai:gpt-4o-mini"));
     }
 
     #[test]
