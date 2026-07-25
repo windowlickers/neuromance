@@ -263,14 +263,12 @@ exclude = ["target/**", "**/node_modules/**", "**/__pycache__/**"]
 base_url = "http://tokenizer-proxy.windowlickers.svc.cluster.local:8080"
 token_file = "/var/run/neuromance/tokens/git"
 
-# Named seed definitions. Selected per task: an explicit `workspace` field
-# on POST /tasks/new wins; otherwise the first definition listing the
-# task's resolved provider or model is used. Seeding runs exactly once,
-# when the conversation's workspace is first created.
+# Named seed definitions. Selected per task by the `workspace` field on
+# POST /tasks/new (or `[oneshot].workspace`); with no field, the sole
+# definition is used when exactly one is configured. Seeding runs exactly
+# once, when the conversation's workspace is first created.
 [[workspace.definitions]]
 name = "org-dev"
-providers = ["anthropic"]
-models = []                       # exact resolved model strings
 
 # Repositories pre-cloned into the workspace.
 [[workspace.definitions.git]]

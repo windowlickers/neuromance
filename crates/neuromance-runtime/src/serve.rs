@@ -110,8 +110,9 @@ pub struct CreateTaskRequest {
     #[serde(default)]
     pub model: Option<String>,
     /// Select a named `[[workspace.definitions]]` entry to seed this task's
-    /// workspace, winning over provider/model auto-selection. Only applied
-    /// when the conversation's workspace is first created — a continuation
+    /// workspace. With no name, the sole definition seeds it when exactly one
+    /// is configured. Only applied when the conversation's workspace is first
+    /// created — a continuation
     /// keeps the workspace it was seeded with, and a differing name is
     /// ignored with a warning. An unknown name (or any value when no
     /// `[workspace]` section is configured) is rejected with 400.
@@ -233,10 +234,10 @@ struct WorkerJob {
     /// trust it parses. When both this and `provider` are `None`, the shared
     /// agent runs the task.
     model: Option<String>,
-    /// Workspace definition resolved at enqueue time (request override first,
-    /// then provider/model auto-selection). Only consulted when the
-    /// conversation's workspace is first created; `None` prepares an unseeded
-    /// workspace.
+    /// Workspace definition resolved at enqueue time (the request's `workspace`
+    /// name, or the sole definition when exactly one is configured). Only
+    /// consulted when the conversation's workspace is first created; `None`
+    /// prepares an unseeded workspace.
     workspace: Option<WorkspaceDefinition>,
 }
 
@@ -254,8 +255,7 @@ pub struct ServeState {
     skills_menu: Option<Arc<str>>,
     /// The runtime config, used at enqueue time to reject unknown
     /// provider/workspace overrides with a 400 (rather than failing the task
-    /// mid-run) and to auto-select a workspace definition from the task's
-    /// resolved provider and model.
+    /// mid-run) and to resolve the workspace definition a task seeds from.
     config: Arc<RuntimeConfig>,
 }
 
@@ -393,14 +393,12 @@ async fn resolve_conversation(
 }
 
 /// Resolve the workspace definition a task will seed with: the request-level
-/// override when named (unknown names reject with 400), otherwise the first
-/// definition bound to the task's resolved provider/model. `None` when no
-/// `[workspace]` is configured or nothing matches.
+/// name when given (unknown names reject with 400), otherwise the sole
+/// definition when exactly one is configured. `None` when no `[workspace]` is
+/// configured or no unambiguous default exists.
 fn resolve_workspace_definition(
     config: &RuntimeConfig,
     requested: Option<&str>,
-    provider: Option<&str>,
-    model: Option<&str>,
 ) -> Result<Option<WorkspaceDefinition>, EnqueueError> {
     if let Some(name) = requested {
         return config
@@ -409,17 +407,9 @@ fn resolve_workspace_definition(
             .map(Some)
             .ok_or_else(|| EnqueueError::UnknownWorkspace(name.to_owned()));
     }
-    if config.workspace.is_none() {
-        return Ok(None);
-    }
-    // Auto-selection matches against the *resolved* provider and model. The
-    // overrides were already validated, and a validated config always yields
-    // an effective model, so resolution failing here is a config regression —
-    // surface it rather than silently skipping the workspace.
-    let (provider, model) = config
-        .resolve_provider_and_model(provider, model)
-        .map_err(|e| EnqueueError::InvalidModel(e.to_string()))?;
-    Ok(config.select_workspace(&provider.name, model).cloned())
+    // No explicit name: seed from the sole definition when exactly one is
+    // configured, otherwise leave the workspace unseeded.
+    Ok(config.sole_workspace_definition().cloned())
 }
 
 async fn try_enqueue(
@@ -443,8 +433,7 @@ async fn try_enqueue(
     {
         return Err(EnqueueError::InvalidModel(format!("{model}: {e}")));
     }
-    let workspace =
-        resolve_workspace_definition(&state.config, req.workspace.as_deref(), provider, model)?;
+    let workspace = resolve_workspace_definition(&state.config, req.workspace.as_deref())?;
     let (conversation_id, seeded) =
         resolve_conversation(state, req.conversation_id, req.system_prompt.as_deref()).await?;
     let task_id = Uuid::new_v4();
@@ -2258,7 +2247,6 @@ mod tests {
             root = "/workspace"
             [[workspace.definitions]]
             name = "dev"
-            providers = ["primary"]
     "#;
 
     #[tokio::test]
@@ -2300,30 +2288,15 @@ mod tests {
     async fn test_try_enqueue_resolves_workspace_definition() {
         let (state, _store, mut rx) = fresh_state_with_config(4, test_config(WORKSPACE_SECTION));
 
-        // Auto-selection: the shared agent resolves to provider "primary",
-        // which the "dev" definition binds to.
+        // No workspace named: the sole definition is the default seed.
         try_enqueue(&state, req("hi")).await.expect("enqueue");
         let job = rx.recv().await.expect("job");
         assert_eq!(job.workspace.as_ref().map(|d| d.name.as_str()), Some("dev"));
 
-        // A provider override that matches no definition selects nothing.
+        // An explicit name resolves to that definition.
         try_enqueue(
             &state,
             CreateTaskRequest {
-                provider: Some("secondary".to_string()),
-                ..req("hi")
-            },
-        )
-        .await
-        .expect("enqueue");
-        let job = rx.recv().await.expect("job");
-        assert!(job.workspace.is_none());
-
-        // An explicit request-level name wins over (absent) auto-selection.
-        try_enqueue(
-            &state,
-            CreateTaskRequest {
-                provider: Some("secondary".to_string()),
                 workspace: Some("dev".to_string()),
                 ..req("hi")
             },
@@ -2332,6 +2305,21 @@ mod tests {
         .expect("enqueue");
         let job = rx.recv().await.expect("job");
         assert_eq!(job.workspace.as_ref().map(|d| d.name.as_str()), Some("dev"));
+
+        // An unknown name is rejected before a task is minted.
+        let err = try_enqueue(
+            &state,
+            CreateTaskRequest {
+                workspace: Some("ghost".to_string()),
+                ..req("hi")
+            },
+        )
+        .await
+        .expect_err("unknown workspace rejected");
+        assert!(
+            matches!(err, EnqueueError::UnknownWorkspace(_)),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -2374,8 +2362,6 @@ mod tests {
                 model: None,
                 workspace: Some(WorkspaceDefinition {
                     name: "broken".to_string(),
-                    providers: Vec::new(),
-                    models: Vec::new(),
                     git: vec![GitSeed {
                         url: "file:///nonexistent/nowhere".to_string(),
                         reference: None,

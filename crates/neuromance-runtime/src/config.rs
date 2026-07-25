@@ -477,6 +477,11 @@ pub struct OneshotConfig {
     pub input: String,
     #[serde(default)]
     pub output_path: Option<PathBuf>,
+    /// Names a `[[workspace.definitions]]` entry to seed the workspace from.
+    /// With no name the sole definition (when exactly one is configured) is
+    /// used; otherwise the workspace starts empty.
+    #[serde(default)]
+    pub workspace: Option<String>,
 }
 
 /// Per-conversation workspace settings.
@@ -491,8 +496,9 @@ pub struct WorkspaceSettings {
     /// created, e.g. the `emptyDir` mount `/workspace`.
     pub root: PathBuf,
     /// Named seed definitions (`[[workspace.definitions]]`). A task selects
-    /// one by request override or by provider/model auto-selection; seeding
-    /// runs once, when the conversation's workspace is first created.
+    /// one by its `workspace` field; with no field, the sole definition (when
+    /// exactly one is configured) is used. Seeding runs once, when the
+    /// conversation's workspace is first created.
     #[serde(default)]
     pub definitions: Vec<WorkspaceDefinition>,
     /// S3-compatible object storage (garage) used by object seeds and
@@ -512,17 +518,10 @@ pub struct WorkspaceSettings {
 /// A named workspace definition selecting seed content for new workspaces.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WorkspaceDefinition {
-    /// Unique name, referenced by the task request's `workspace` field.
+    /// Unique name, referenced by the task request's `workspace` field (serve)
+    /// or `[oneshot].workspace`. When no name is given and exactly one
+    /// definition is configured, that sole definition is used.
     pub name: String,
-    /// Auto-select this definition when the task's *resolved* provider name
-    /// is listed here. A request-level `workspace` override wins.
-    #[serde(default)]
-    pub providers: Vec<String>,
-    /// Auto-select this definition when the task's *resolved* model string
-    /// (e.g. `anthropic:claude-opus-4-8`) is listed here. Exact match, no
-    /// normalization.
-    #[serde(default)]
-    pub models: Vec<String>,
     /// Git repositories cloned into the workspace on first creation.
     #[serde(default)]
     pub git: Vec<GitSeed>,
@@ -699,14 +698,17 @@ impl RuntimeConfig {
         Ok((provider, model))
     }
 
-    /// The first workspace definition bound to `provider` or `model`, in
-    /// config order. Request-level overrides bypass this — see
+    /// The single workspace definition, when exactly one is configured — the
+    /// default seed for a task that names no `workspace`. With zero or several
+    /// definitions there is no unambiguous default and the workspace starts
+    /// empty; a task then picks one explicitly by name via
     /// [`Self::workspace_definition`].
     #[must_use]
-    pub fn select_workspace(&self, provider: &str, model: &str) -> Option<&WorkspaceDefinition> {
-        self.workspace.as_ref()?.definitions.iter().find(|def| {
-            def.providers.iter().any(|p| p == provider) || def.models.iter().any(|m| m == model)
-        })
+    pub fn sole_workspace_definition(&self) -> Option<&WorkspaceDefinition> {
+        match self.workspace.as_ref()?.definitions.as_slice() {
+            [only] => Some(only),
+            _ => None,
+        }
     }
 
     /// Look up a workspace definition by name.
@@ -2234,8 +2236,6 @@ mod tests {
 
             [[workspace.definitions]]
             name = "org-dev"
-            providers = ["default"]
-            models = ["anthropic:claude-opus-4-8"]
 
             [[workspace.definitions.git]]
             url = "http://git.example/org/repo.git"
@@ -2430,46 +2430,41 @@ mod tests {
     }
 
     #[test]
-    fn test_select_workspace_matches_provider_then_model_first_wins() {
+    fn test_sole_workspace_definition_only_with_exactly_one() {
+        // Exactly one definition: it is the default seed.
         let config = serve_config(
             r#"
             [workspace]
             root = "/workspace"
             [[workspace.definitions]]
-            name = "by-provider"
-            providers = ["default"]
-            [[workspace.definitions]]
-            name = "by-model"
-            models = ["openai:gpt-4o"]
+            name = "only"
         "#,
         );
         config.validate().unwrap();
+        assert_eq!(config.sole_workspace_definition().unwrap().name, "only");
 
-        // Provider match: first definition wins even though the second also
-        // matches on model.
-        let def = config.select_workspace("default", "openai:gpt-4o").unwrap();
-        assert_eq!(def.name, "by-provider");
-
-        // Model-only match falls through to the second definition.
-        let def = config.select_workspace("other", "openai:gpt-4o").unwrap();
-        assert_eq!(def.name, "by-model");
-
-        // No match at all.
-        assert!(config.select_workspace("other", "other:model").is_none());
-
-        // Lookup by name, known and unknown.
-        assert!(config.workspace_definition("by-model").is_some());
+        // Several definitions: no unambiguous default.
+        let config = serve_config(
+            r#"
+            [workspace]
+            root = "/workspace"
+            [[workspace.definitions]]
+            name = "a"
+            [[workspace.definitions]]
+            name = "b"
+        "#,
+        );
+        config.validate().unwrap();
+        assert!(config.sole_workspace_definition().is_none());
+        // Lookup by name still resolves each, and rejects the unknown.
+        assert!(config.workspace_definition("b").is_some());
         assert!(config.workspace_definition("ghost").is_none());
     }
 
     #[test]
-    fn test_select_workspace_none_without_section() {
+    fn test_sole_workspace_definition_none_without_section() {
         let config = serve_config("");
-        assert!(
-            config
-                .select_workspace("default", "openai:gpt-4o")
-                .is_none()
-        );
+        assert!(config.sole_workspace_definition().is_none());
         assert!(config.workspace_definition("any").is_none());
     }
 }

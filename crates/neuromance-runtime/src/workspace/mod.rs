@@ -7,8 +7,9 @@
 //!
 //! [`WorkspaceManager`] is the mechanism only: it creates, seeds, and hands
 //! out directories. Policy — which definition applies to a task — lives in
-//! [`crate::config::RuntimeConfig::select_workspace`] and the request-level
-//! override, resolved by the caller.
+//! [`crate::config::RuntimeConfig::workspace_definition`] and
+//! [`crate::config::RuntimeConfig::sole_workspace_definition`], resolved by
+//! the caller from the request's `workspace` field.
 
 pub mod archive;
 mod seed;
@@ -597,8 +598,6 @@ mod tests {
     fn definition(name: &str) -> WorkspaceDefinition {
         WorkspaceDefinition {
             name: name.to_string(),
-            providers: Vec::new(),
-            models: Vec::new(),
             git: Vec::new(),
             objects: Vec::new(),
         }

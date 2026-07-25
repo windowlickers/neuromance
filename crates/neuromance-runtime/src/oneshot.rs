@@ -44,14 +44,16 @@ pub async fn run<C: LLMClient + Send + Sync>(
 
     let conversation_id = agent.conversation_id;
 
-    // Prepare the workspace before the run: oneshot has no request-level
-    // override, so the definition comes from provider/model auto-selection.
+    // Prepare the workspace before the run: seed from the definition named by
+    // `[oneshot].workspace`, or the sole definition when exactly one exists.
     let workspace_dir = match workspace {
         Some(mgr) => {
-            let (provider, model) = config
-                .resolve_provider_and_model(None, None)
-                .map_err(anyhow::Error::from)?;
-            let definition = config.select_workspace(&provider.name, model);
+            let definition = match oneshot.workspace.as_deref() {
+                Some(name) => Some(config.workspace_definition(name).with_context(|| {
+                    format!("[oneshot].workspace names no [[workspace.definitions]]: {name}")
+                })?),
+                None => config.sole_workspace_definition(),
+            };
             Some(
                 mgr.prepare(conversation_id, definition)
                     .await
