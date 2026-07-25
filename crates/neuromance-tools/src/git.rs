@@ -20,7 +20,7 @@ use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
 use git2::build::RepoBuilder;
-use git2::{CertificateCheckStatus, FetchOptions, ProxyOptions, RemoteCallbacks, Repository};
+use git2::{FetchOptions, ProxyOptions, Repository};
 use secrecy::{ExposeSecret, SecretString};
 
 /// Tokenizer-proxy auth for remote git operations.
@@ -143,13 +143,16 @@ pub fn clone_repository(
 }
 
 /// Fetch options that route through the proxy with the sealed-token header.
+///
+/// No certificate-check override is installed: the pod→proxy hop is plaintext
+/// `http://` by design (the proxy needs to read the sealed header in the
+/// clear), so there is no certificate to verify there. Should any hop actually
+/// use TLS — an `https://` proxy or remote — git2's normal verification
+/// applies rather than being silently disabled.
 fn build_fetch_options(proxy_url: &str, header: &str) -> FetchOptions<'static> {
-    let mut callbacks = RemoteCallbacks::new();
-    callbacks.certificate_check(|_, _| Ok(CertificateCheckStatus::CertificateOk));
     let mut proxy = ProxyOptions::new();
     proxy.url(proxy_url);
     let mut opts = FetchOptions::new();
-    opts.remote_callbacks(callbacks);
     opts.proxy_options(proxy);
     opts.custom_headers(&[header]);
     opts
