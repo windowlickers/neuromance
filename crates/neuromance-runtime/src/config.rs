@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use neuromance_common::client::OutputSchema;
+use neuromance_context::ContextConfig;
 use neuromance_context::compaction::CompactionStrategy;
 use neuromance_tools::ToolConfig;
 
@@ -208,6 +209,22 @@ pub struct ContextSettings {
     /// Compaction strategy: `one_shot`, `hierarchical`, or `truncate`.
     #[serde(default)]
     pub strategy: CompactionStrategy,
+}
+
+impl ContextSettings {
+    /// The `neuromance-context` config this section describes.
+    ///
+    /// [`ContextConfig`] is not `Clone` and a `CompactionHook` must not be
+    /// shared, so the main agent and every subagent run each build their own
+    /// from here rather than duplicating the builder chain.
+    #[must_use]
+    pub const fn to_context_config(&self) -> ContextConfig {
+        ContextConfig::new(self.context_window_size)
+            .with_compaction_threshold_ratio(self.compaction_threshold_ratio)
+            .with_target_ratio(self.target_ratio)
+            .with_preserve_recent_turns(self.preserve_recent_turns)
+            .with_strategy(self.strategy)
+    }
 }
 
 /// Skill discovery settings.
@@ -428,11 +445,17 @@ pub struct RuntimeSettings {
     #[serde(default = "default_max_delegation_depth")]
     pub max_delegation_depth: u32,
     /// Give the main agent a `task` delegate tool that runs a fresh copy of
-    /// itself — the same system prompt, provider, model, and turn budget — on a
-    /// delegated subtask. A zero-boilerplate form of `[[subagents]]`: the
-    /// synthesized subagent joins the same `max_delegation_depth`-bounded tower
-    /// and, when an `execute_python` tool is configured, the same
+    /// itself — the configured system prompt, and the provider, model, and turn
+    /// budget the parent is running — on a delegated subtask. A
+    /// zero-boilerplate form of `[[subagents]]`: the synthesized subagent joins
+    /// the same `max_delegation_depth`-bounded tower and, when an
+    /// `execute_python` tool is configured, the same
     /// `run_subagent`/`spawn_agents` bridge. Off by default.
+    ///
+    /// One divergence: a serve task that supplies its own `system_prompt`
+    /// overrides only the parent's seed message. The clone still carries
+    /// `agent.system_prompt`, since a subagent's prompt is fixed when the tower
+    /// is built and the per-task prompt is not known then.
     #[serde(default)]
     pub self_delegation: bool,
 }
@@ -703,9 +726,11 @@ impl RuntimeConfig {
     }
 
     /// The synthesized self-delegation subagent, when `runtime.self_delegation`
-    /// is set: a fresh copy of the main agent (same system prompt, and — via the
-    /// inherit-when-`None` resolution — the same provider, model, and turn
-    /// budget), exposed as the [`SELF_DELEGATION_ID`] delegate tool.
+    /// is set: a fresh copy of the main agent (`agent.system_prompt`, and — via
+    /// the inherit-when-`None` resolution — the provider, model, and turn budget
+    /// the parent is running for this task), exposed as the
+    /// [`SELF_DELEGATION_ID`] delegate tool. A per-task `system_prompt` override
+    /// does not reach it; see [`RuntimeSettings::self_delegation`].
     #[must_use]
     pub fn self_delegation_subagent(&self) -> Option<SubagentConfig> {
         self.runtime.self_delegation.then(|| SubagentConfig {
@@ -953,8 +978,7 @@ impl RuntimeConfig {
                 )));
             }
         }
-        if self.runtime.self_delegation
-            && self.subagents.iter().any(|s| s.id == SELF_DELEGATION_ID)
+        if self.runtime.self_delegation && self.subagents.iter().any(|s| s.id == SELF_DELEGATION_ID)
         {
             return Err(RuntimeError::Config(format!(
                 "subagent id '{SELF_DELEGATION_ID}' is reserved for runtime.self_delegation; \
@@ -1868,6 +1892,33 @@ mod tests {
         assert!((context.target_ratio - 0.5).abs() < f64::EPSILON);
         assert_eq!(context.preserve_recent_turns, 3);
         assert_eq!(context.strategy, CompactionStrategy::OneShot);
+    }
+
+    /// Every `[context]` setting reaches the `ContextConfig` the main agent and
+    /// every subagent run compact against. A field dropped here is a knob that
+    /// silently does nothing.
+    #[test]
+    fn test_to_context_config_carries_every_setting() {
+        let toml_str = serve_toml_with_context(
+            r#"
+            [context]
+            context_window_size = 64000
+            compaction_threshold_ratio = 0.7
+            target_ratio = 0.4
+            preserve_recent_turns = 5
+            strategy = "hierarchical"
+        "#,
+        );
+        let config: RuntimeConfig = toml::from_str(&toml_str).unwrap();
+        config.validate().unwrap();
+
+        let context = config.context.expect("context section").to_context_config();
+
+        assert_eq!(context.context_window_size, 64_000);
+        assert!((context.compaction_threshold_ratio - 0.7).abs() < f64::EPSILON);
+        assert!((context.target_ratio - 0.4).abs() < f64::EPSILON);
+        assert_eq!(context.preserve_recent_turns, 5);
+        assert_eq!(context.strategy, CompactionStrategy::Hierarchical);
     }
 
     #[test]

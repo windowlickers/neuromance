@@ -12,12 +12,12 @@ use neuromance::{Core, build_client};
 use neuromance_agent::Agent;
 use neuromance_client::LLMClient;
 use neuromance_common::FnReviewHook;
+use neuromance_context::CompactionHook;
 use neuromance_context::rules::RulesHook;
-use neuromance_context::{CompactionHook, ContextConfig};
 use neuromance_db::{PersistenceHook, PgConversationStore};
 use neuromance_runtime::{
     AgentBuilder, AgentOverrides, ApprovalMode, Mode, RuntimeConfig, RuntimeError, SessionReset,
-    SkillRuntime,
+    SkillRuntime, ToolsetParams,
     approval::WebhookApprover,
     bootstrap, build_parent_toolset,
     health::{ReadinessGate, router as health_router},
@@ -356,14 +356,9 @@ fn apply_context_compaction(
     };
     let compaction_client = build_client(llm_config)
         .map_err(|e| RuntimeError::Config(format!("build compaction client: {e}")))?;
-    let context_config = ContextConfig::new(ctx.context_window_size)
-        .with_compaction_threshold_ratio(ctx.compaction_threshold_ratio)
-        .with_target_ratio(ctx.target_ratio)
-        .with_preserve_recent_turns(ctx.preserve_recent_turns)
-        .with_strategy(ctx.strategy);
     let core = core.with_hook(Arc::new(CompactionHook::new(
         compaction_client,
-        &context_config,
+        &ctx.to_context_config(),
     )));
     info!(
         window = ctx.context_window_size,
@@ -413,10 +408,21 @@ async fn build_agent(
 
     // The main agent's toolset, including delegate tools for every configured
     // subagent and the delegation tower beneath them (bounded by
-    // runtime.max_delegation_depth). The store is threaded through so subagent
-    // conversations persist and record their parent link too.
-    let (tools, local_python) =
-        build_parent_toolset(config, store, cancel, remote_capabilities.as_deref())?;
+    // runtime.max_delegation_depth). The tower gets the same startup handles the
+    // main agent does, and the provider/model resolved above — so a subagent
+    // that pins neither follows this task's override too.
+    let (tools, local_python) = build_parent_toolset(
+        config,
+        &ToolsetParams {
+            store,
+            skills,
+            rules,
+            remote_capabilities: remote_capabilities.as_deref(),
+            parent_provider: provider,
+            parent_model: model,
+            cancel,
+        },
+    )?;
 
     if matches!(config.approval.mode, ApprovalMode::Auto) {
         let mut needs_approval: Vec<String> = tools

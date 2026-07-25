@@ -411,11 +411,7 @@ fn seed_new_conversation(state: &ServeState, system_prompt: Option<&str>) -> Uui
     }
     if let Some(workspace) = state.config.workspace.as_ref() {
         let dir = workspace.root.join(id.to_string());
-        content = format!(
-            "{content}\n\nYour working directory is {}. Do all file work there; \
-             use absolute paths beneath it.",
-            dir.display()
-        );
+        content = format!("{content}\n\n{}", crate::workspace::note(&dir));
     }
     let seed = Message::system(id, content);
     // The durable conversation row is created fail-closed by `record_task_status`
@@ -943,8 +939,9 @@ async fn process_job_inner(
         return JobOutcome::Failed;
     };
 
-    // Skill menu and `$mention` bodies are injected by the SkillsHook inside the
-    // conversation loop, not assembled here.
+    // The skills menu and the workspace note were folded into the seed system
+    // message at `seed_new_conversation`; only `$mention` bodies are injected
+    // in-loop, by the SkillsHook. Neither is assembled here.
     let user_msg = Message::user(job.conversation_id, &job.user);
     let input_messages = match ctx
         .task_store

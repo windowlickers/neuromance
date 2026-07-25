@@ -21,7 +21,19 @@
 //! whole toolset on every run rather than cloning a shared template, so each
 //! run — including each concurrent sibling run in a `spawn_agents` fan-out —
 //! gets its own Python interpreter. No interpreter state bleeds across runs.
+//!
+//! A subagent's `Core` is wired like the main agent's (`main.rs::build_agent`):
+//! persistence, compaction, skills, and rules attach in the same order, and a
+//! subagent that pins neither `provider` nor `model` runs whatever the parent is
+//! running for this task, per-task override included. Two things are
+//! deliberately left off:
+//!
+//! - **Streaming** — nothing consumes a subagent's token stream; a delegate tool
+//!   returns only the final content.
+//! - **Approval** — subagent tool calls auto-approve within one parent
+//!   delegation, which has no interactive approver in the loop.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -32,13 +44,19 @@ use tokio_util::sync::CancellationToken;
 use neuromance::Core;
 use neuromance_agent::{Agent, LocalSubagent, Subagent, SubagentError, SubagentTool};
 use neuromance_client::{LLMClient, build_client};
+use neuromance_common::hook::Hook;
+use neuromance_context::CompactionHook;
+use neuromance_context::rules::RulesHook;
+use neuromance_context::skills::SkillsHook;
 use neuromance_db::{PersistenceHook, PgConversationStore};
 use neuromance_tools::{ToolConfig, ToolFactoryRegistry, ToolImplementation, ToolRegistry};
 
-use crate::config::RuntimeConfig;
+use crate::config::{ProviderConfig, RuntimeConfig, SubagentConfig};
 use crate::error::RuntimeError;
 use crate::proxy::build_provider_config;
 use crate::sandbox::EXECUTE_PYTHON;
+use crate::skills::SkillRuntime;
+use crate::workspace::WorkspaceNoteSubagent;
 
 /// A per-task cleanup handle for the main agent's in-process `execute_python`
 /// interpreter. Calling it clears the interpreter's user namespace so state
@@ -53,6 +71,79 @@ pub type SessionReset = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>>
 /// in-process `execute_python` interpreter (see [`SessionReset`]).
 type Toolset = (Vec<Arc<dyn ToolImplementation>>, Option<SessionReset>);
 
+/// Everything the delegation tower needs beyond [`RuntimeConfig`]: the shared
+/// handles built at startup, plus the provider and model the parent agent is
+/// actually running for this build.
+pub struct ToolsetParams<'a> {
+    /// Conversation store wired into every subagent's `Core`, when configured,
+    /// so child conversations persist and record their parent/child lineage
+    /// just like the main agent's.
+    pub store: Option<&'a Arc<PgConversationStore>>,
+    /// Materialized skill catalog: its menu is folded into every subagent's
+    /// system prompt, and its `$mention` hook is shared with them.
+    pub skills: Option<&'a Arc<SkillRuntime>>,
+    /// The main agent's rules hook, shared verbatim with every subagent.
+    pub rules: Option<&'a Arc<RulesHook>>,
+    /// Sandbox-backed capability tools (`bash`, file tools, `execute_python`, …)
+    /// replacing the locally-built ones. Shared (cloned) across the main agent
+    /// and every subagent; delegate tools are still built locally per level.
+    pub remote_capabilities: Option<&'a [Arc<dyn ToolImplementation>]>,
+    /// The provider the parent agent runs for this task, per-task override
+    /// already applied (see `RuntimeConfig::resolve_provider_and_model`).
+    pub parent_provider: &'a ProviderConfig,
+    /// The parent agent's effective model, per-task override already applied.
+    pub parent_model: &'a str,
+    /// Cancellation token for delegate tools and subagent runs.
+    pub cancel: &'a CancellationToken,
+}
+
+/// Resolved, tower-wide inputs threaded through every level of the recursion.
+struct ChildContext<'a> {
+    store: Option<&'a Arc<PgConversationStore>>,
+    remote_capabilities: Option<&'a [Arc<dyn ToolImplementation>]>,
+    cancel: &'a CancellationToken,
+    /// `$mention`-expanding skills hook, built once for the whole tower: its
+    /// injections are keyed by conversation, so one instance serves every level
+    /// and every concurrent run. The menu rides the system prompt instead — see
+    /// [`tower_config`].
+    skills: Option<Arc<SkillsHook>>,
+    /// The parent's rules hook, shared verbatim (also conversation-keyed).
+    rules: Option<Arc<RulesHook>>,
+    parent_provider: &'a ProviderConfig,
+    parent_model: &'a str,
+}
+
+impl<'a> ChildContext<'a> {
+    fn new(params: &ToolsetParams<'a>) -> Self {
+        Self {
+            store: params.store,
+            remote_capabilities: params.remote_capabilities,
+            cancel: params.cancel,
+            skills: params.skills.map(|skills| skills.hook()),
+            rules: params.rules.map(Arc::clone),
+            parent_provider: params.parent_provider,
+            parent_model: params.parent_model,
+        }
+    }
+
+    /// The hook handles for one subagent's per-run `Core`, owned so the factory
+    /// closure can hold them past this borrow.
+    fn hooks(&self) -> ChildHooks {
+        ChildHooks {
+            store: self.store.cloned(),
+            skills: self.skills.clone(),
+            rules: self.rules.clone(),
+        }
+    }
+}
+
+/// The shared hook handles a child `Core` is built with.
+struct ChildHooks {
+    store: Option<Arc<PgConversationStore>>,
+    skills: Option<Arc<SkillsHook>>,
+    rules: Option<Arc<RulesHook>>,
+}
+
 /// Build the main agent's toolset, including delegate tools for every
 /// configured subagent and (when `execute_python` is configured) the Python
 /// delegation bridge.
@@ -62,29 +153,16 @@ type Toolset = (Vec<Arc<dyn ToolImplementation>>, Option<SessionReset>);
 /// `runtime.max_delegation_depth` and wires the main agent's delegate tools to
 /// the top of that tower.
 ///
-/// `store`, when present, is wired into every subagent's `Core` so child
-/// conversations persist (and record their parent/child lineage) just like the
-/// main agent's.
-///
-/// `remote_capabilities`, when present, are the sandbox-backed capability tools
-/// (`bash`, file tools, `execute_python`, …) that replace the locally-built
-/// ones. They are shared (cloned) across the main agent and every subagent;
-/// delegate tools are still built locally per level.
-///
 /// # Errors
 /// Returns [`RuntimeError`] if a subagent's provider/model/credentials fail to
 /// resolve, a tool factory fails, or a subagent id collides with a configured
 /// tool name.
 pub fn build_parent_toolset(
     config: &RuntimeConfig,
-    store: Option<&Arc<PgConversationStore>>,
-    cancel: &CancellationToken,
-    remote_capabilities: Option<&[Arc<dyn ToolImplementation>]>,
+    params: &ToolsetParams<'_>,
 ) -> Result<Toolset, RuntimeError> {
-    // Inject the synthesized self-delegation subagent (if `runtime.self_delegation`
-    // is set) so the whole tower, `SubagentTool` registration, and Python bridge
-    // treat it exactly like a configured `[[subagents]]` entry.
-    let effective = config.with_self_delegation();
+    let menu = params.skills.and_then(|skills| skills.menu());
+    let effective = tower_config(config, menu.as_deref());
     let config: &RuntimeConfig = &effective;
 
     let children = if config.subagents.is_empty() {
@@ -93,9 +171,42 @@ pub fn build_parent_toolset(
         // The main agent is depth 0; its children may delegate `depth - 1`
         // further hops.
         let remaining = config.runtime.max_delegation_depth.saturating_sub(1);
-        build_subagents_at_depth(config, remaining, store, cancel, remote_capabilities)?
+        build_subagents_at_depth(config, remaining, &ChildContext::new(params))?
     };
-    assemble_toolset(config, &children, cancel, remote_capabilities)
+    assemble_toolset(config, &children, params.cancel, params.remote_capabilities)
+}
+
+/// The config the whole tower is built from: the synthesized self-delegation
+/// subagent appended (when `runtime.self_delegation` is set), then `skills_menu`
+/// folded into every subagent's system prompt.
+///
+/// Injecting the self-delegation entry into `subagents` lets the tower,
+/// `SubagentTool` registration, and the Python bridge treat it exactly like a
+/// configured `[[subagents]]` entry. Appending it *before* the fold means the
+/// self-clone's prompt ends up byte-identical to the main agent's seed, menu
+/// included.
+///
+/// The menu is folded here rather than injected by the shared [`SkillsHook`]
+/// because that hook renders the menu variant instructing the model to call a
+/// `load_skill` tool, which this runtime never registers.
+/// [`SkillRuntime::menu`] renders the on-disk paths the materialized catalog
+/// actually hands out — the same text the host folds into the main agent's seed
+/// (`oneshot::run`, `serve::seed_new_conversation`).
+///
+/// Borrows `config` unchanged when neither transform applies.
+fn tower_config<'a>(
+    config: &'a RuntimeConfig,
+    skills_menu: Option<&str>,
+) -> Cow<'a, RuntimeConfig> {
+    let mut effective = config.with_self_delegation();
+    if let Some(menu) = skills_menu
+        && !effective.subagents.is_empty()
+    {
+        for sub in &mut effective.to_mut().subagents {
+            sub.system_prompt = format!("{}\n\n{menu}", sub.system_prompt);
+        }
+    }
+    effective
 }
 
 /// Build the subagent registry for one tower level.
@@ -106,14 +217,12 @@ pub fn build_parent_toolset(
 fn build_subagents_at_depth(
     config: &RuntimeConfig,
     remaining: u32,
-    store: Option<&Arc<PgConversationStore>>,
-    cancel: &CancellationToken,
-    remote_capabilities: Option<&[Arc<dyn ToolImplementation>]>,
+    ctx: &ChildContext<'_>,
 ) -> Result<HashMap<String, Arc<dyn Subagent>>, RuntimeError> {
     let children = if remaining == 0 {
         HashMap::new()
     } else {
-        build_subagents_at_depth(config, remaining - 1, store, cancel, remote_capabilities)?
+        build_subagents_at_depth(config, remaining - 1, ctx)?
     };
     // Shared across every subagent at this level and captured by each run's
     // builder. The toolset itself is *not* built here: each run reassembles it
@@ -121,32 +230,13 @@ fn build_subagents_at_depth(
     // never bleed across concurrent sibling runs.
     let children = Arc::new(children);
     let config = Arc::new(config.clone());
-    let agent_model = config.agent_model();
+    // A subagent has no seed message to carry the workspace note, so a decorator
+    // appends it per task from the ambient delegation scope.
+    let note_workspace = config.workspace.is_some();
 
     let mut registry: HashMap<String, Arc<dyn Subagent>> = HashMap::new();
     for sub in &config.subagents {
-        let provider_name = sub.provider.as_deref().unwrap_or(&config.agent.provider);
-        let provider = config.provider(provider_name).ok_or_else(|| {
-            RuntimeError::Config(format!(
-                "subagent '{}' provider '{provider_name}' does not match any [[providers]] entry",
-                sub.id
-            ))
-        })?;
-        let model = sub
-            .model
-            .as_deref()
-            .or(provider.model.as_deref())
-            .or(agent_model)
-            .ok_or_else(|| {
-                RuntimeError::Config(format!(
-                    "subagent '{}' has no model: set subagent.model, provider '{provider_name}' \
-                     model, or agent.model",
-                    sub.id
-                ))
-            })?;
-        let llm_config = build_provider_config(provider, model)?;
-
-        let client: Arc<dyn LLMClient> = build_client(llm_config)
+        let client: Arc<dyn LLMClient> = build_client(resolve_child_provider(&config, sub, ctx)?)
             .map_err(|e| RuntimeError::Config(format!("subagent '{}': build client: {e}", sub.id)))?
             .into();
 
@@ -154,13 +244,13 @@ fn build_subagents_at_depth(
         let max_turns = sub.max_turns;
         let config = Arc::clone(&config);
         let children = Arc::clone(&children);
-        let cancel = cancel.clone();
-        let store = store.cloned();
+        let cancel = ctx.cancel.clone();
+        let hooks = ctx.hooks();
         // Shared sandbox capability tools (stateless handles), cloned into each
         // run's toolset. Under the sandbox a subagent never carries
         // execute_python (rejected by config validation), so there is no
         // interpreter state to keep fresh across runs.
-        let remote_capabilities = remote_capabilities.map(<[_]>::to_vec);
+        let remote_capabilities = ctx.remote_capabilities.map(<[_]>::to_vec);
         let build_agent = move || {
             // Reassemble the toolset per run so a fresh Python interpreter is
             // built each time; nothing persists across runs of one subagent or
@@ -169,33 +259,127 @@ fn build_subagents_at_depth(
             let (tools, _reset) =
                 assemble_toolset(&config, &children, &cancel, remote_capabilities.as_deref())
                     .map_err(SubagentError::execution)?;
-            let mut core = Core::new(Arc::clone(&client));
-            if let Some(max) = max_turns {
-                core.max_turns = Some(max);
-            }
-            // Subagent tool calls run autonomously inside one parent delegation,
-            // with no interactive approver in the loop; the pod boundary (kata)
-            // is the isolation. See the README Subagents section.
-            core.auto_approve_tools = true;
-            // Persist child conversations (and their parent link) when the
-            // runtime has a store, matching the main agent.
-            if let Some(store) = &store {
-                let sink: Arc<PgConversationStore> = Arc::clone(store);
-                // Constructed inside the parent's delegation scope, so the hook
-                // captures the lineage that links this child to its parent.
-                core = core.with_hook(Arc::new(PersistenceHook::new(sink)));
-            }
+            let mut core = build_child_core(&config, Arc::clone(&client), max_turns, &hooks);
             for tool in tools {
                 core.tool_executor.add_tool_arc(tool);
             }
             Ok(Agent::new(id.clone(), core))
         };
 
-        let subagent = LocalSubagent::new(sub.id.clone(), sub.system_prompt.clone(), build_agent);
-        registry.insert(sub.id.clone(), Arc::new(subagent));
+        let local = LocalSubagent::new(sub.id.clone(), sub.system_prompt.clone(), build_agent);
+        let subagent: Arc<dyn Subagent> = if note_workspace {
+            Arc::new(WorkspaceNoteSubagent::new(Arc::new(local)))
+        } else {
+            Arc::new(local)
+        };
+        registry.insert(sub.id.clone(), subagent);
     }
 
     Ok(registry)
+}
+
+/// Resolve the LLM config one subagent runs on, credentials included.
+///
+/// # Errors
+/// Returns [`RuntimeError`] if [`resolve_child_llm`] fails or the resolved
+/// provider's credential env var is unset.
+fn resolve_child_provider(
+    config: &RuntimeConfig,
+    sub: &SubagentConfig,
+    ctx: &ChildContext<'_>,
+) -> Result<neuromance::Config, RuntimeError> {
+    let (provider, model) = resolve_child_llm(config, sub, ctx)?;
+    build_provider_config(provider, model)
+}
+
+/// Pick the provider and model one subagent runs on.
+///
+/// A subagent that pins neither `provider` nor `model` runs exactly what the
+/// parent runs for this task — per-task override included — so a self-delegated
+/// clone really is a clone. Pinning either one keeps the subagent's configured
+/// identity and ignores the task override; the pinned model then falls back to
+/// the chosen provider's default, then the agent's effective model.
+///
+/// # Errors
+/// Returns [`RuntimeError::Config`] if a pinned provider names no `[[providers]]`
+/// entry or no model can be resolved for the subagent.
+fn resolve_child_llm<'a>(
+    config: &'a RuntimeConfig,
+    sub: &'a SubagentConfig,
+    ctx: &ChildContext<'a>,
+) -> Result<(&'a ProviderConfig, &'a str), RuntimeError> {
+    if sub.provider.is_none() && sub.model.is_none() {
+        return Ok((ctx.parent_provider, ctx.parent_model));
+    }
+    let provider_name = sub.provider.as_deref().unwrap_or(&config.agent.provider);
+    let provider = config.provider(provider_name).ok_or_else(|| {
+        RuntimeError::Config(format!(
+            "subagent '{}' provider '{provider_name}' does not match any [[providers]] entry",
+            sub.id
+        ))
+    })?;
+    let model = sub
+        .model
+        .as_deref()
+        .or(provider.model.as_deref())
+        .or_else(|| config.agent_model())
+        .ok_or_else(|| {
+            RuntimeError::Config(format!(
+                "subagent '{}' has no model: set subagent.model, provider '{provider_name}' \
+                 model, or agent.model",
+                sub.id
+            ))
+        })?;
+    Ok((provider, model))
+}
+
+/// Build one subagent run's `Core` with the same lifecycle wiring the main agent
+/// gets (`main.rs::build_agent`), minus streaming and approval (see the module
+/// docs). Hooks attach in the parent's registration order — persistence,
+/// compaction, skills, rules — because hooks dispatch in registration order, so
+/// matching it keeps a subagent's start-of-conversation injections and
+/// compaction timing identical to the parent's.
+fn build_child_core(
+    config: &RuntimeConfig,
+    client: Arc<dyn LLMClient>,
+    max_turns: Option<u32>,
+    hooks: &ChildHooks,
+) -> Core<Arc<dyn LLMClient>> {
+    let mut core = Core::new(Arc::clone(&client));
+    if let Some(max) = max_turns {
+        core.max_turns = Some(max);
+    }
+    // Subagent tool calls run autonomously inside one parent delegation, with no
+    // interactive approver in the loop; the pod boundary (kata) is the
+    // isolation. See the README Subagents section.
+    core.auto_approve_tools = true;
+
+    // Persist child conversations (and their parent link) when the runtime has a
+    // store, matching the main agent. Constructed inside the parent's delegation
+    // scope, so the hook captures the lineage linking this child to its parent.
+    if let Some(store) = &hooks.store {
+        let sink: Arc<PgConversationStore> = Arc::clone(store);
+        core = core.with_hook(Arc::new(PersistenceHook::new(sink)));
+    }
+    // Compaction summarizes through the chat client rather than a second one:
+    // the parent needs a separate client only because its own was moved into
+    // `Core` as a `Box`, while a subagent holds an `Arc` that is itself an
+    // `LLMClient`. The hook is built per run by necessity — its reported-token
+    // slot is one global cell, not keyed by conversation, so a shared instance
+    // would let concurrent sibling runs drive each other's compaction.
+    if let Some(context) = &config.context {
+        core = core.with_hook(Arc::new(CompactionHook::new(
+            client,
+            &context.to_context_config(),
+        )));
+    }
+    if let Some(skills) = &hooks.skills {
+        core = core.with_hook(Arc::clone(skills) as Arc<dyn Hook>);
+    }
+    if let Some(rules) = &hooks.rules {
+        core = core.with_hook(Arc::clone(rules) as Arc<dyn Hook>);
+    }
+    core
 }
 
 /// Assemble the toolset for one agent level: the capability tools, a delegate
@@ -418,11 +602,20 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     #![allow(clippy::expect_used)]
 
+    use std::pin::Pin;
+    use std::sync::OnceLock;
+
     use async_trait::async_trait;
+    use futures::Stream;
+    use neuromance_client::ClientError;
+    use neuromance_common::client::{ChatChunk, ChatRequest, ChatResponse, Config};
     use neuromance_common::task::{Outcome, Task};
+    use neuromance_context::compaction::CompactionStrategy;
+    use neuromance_context::rules::RuleCatalog;
+    use neuromance_context::skills::SkillCatalog;
 
     use super::*;
-    use crate::config::{ProviderConfig, SubagentConfig};
+    use crate::config::{ContextSettings, ProviderConfig, SELF_DELEGATION_ID, SubagentConfig};
     use crate::{AgentConfig, ApprovalConfig, Mode, RuntimeSettings};
 
     /// A single-provider config whose `[agent]` points at provider "primary"
@@ -467,6 +660,23 @@ mod tests {
         }
     }
 
+    /// Default tower params for `config`: no store, skills, rules, or sandbox,
+    /// with the parent's provider/model resolved from `[agent]` exactly as
+    /// `build_agent` does for a task that carries no override.
+    fn params<'a>(config: &'a RuntimeConfig, cancel: &'a CancellationToken) -> ToolsetParams<'a> {
+        let (parent_provider, parent_model) =
+            config.resolve_provider_and_model(None, None).unwrap();
+        ToolsetParams {
+            store: None,
+            skills: None,
+            rules: None,
+            remote_capabilities: None,
+            parent_provider,
+            parent_model,
+            cancel,
+        }
+    }
+
     fn provider(name: &str, api_key_env: &str, model: &str) -> ProviderConfig {
         ProviderConfig {
             name: name.to_string(),
@@ -486,6 +696,117 @@ mod tests {
             model: None,
             max_turns: None,
         }
+    }
+
+    fn context_settings() -> ContextSettings {
+        ContextSettings {
+            context_window_size: 128_000,
+            compaction_threshold_ratio: 0.8,
+            target_ratio: 0.5,
+            preserve_recent_turns: 3,
+            strategy: CompactionStrategy::OneShot,
+        }
+    }
+
+    /// A stand-in LLM client, so a child `Core` can be wired without credentials
+    /// or a network. Every wiring test inspects the built `Core` rather than
+    /// running it, so the chat methods are never reached.
+    struct StubClient;
+
+    #[async_trait]
+    impl LLMClient for StubClient {
+        fn config(&self) -> &Config {
+            static CONFIG: OnceLock<Config> = OnceLock::new();
+            CONFIG.get_or_init(|| Config::new("mock", "mock-model"))
+        }
+
+        async fn chat(&self, _request: &ChatRequest) -> Result<ChatResponse, ClientError> {
+            unreachable!("child core wiring tests never chat")
+        }
+
+        async fn chat_stream(
+            &self,
+            _request: &ChatRequest,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatChunk, ClientError>> + Send>>, ClientError>
+        {
+            unreachable!("child core wiring tests never stream")
+        }
+
+        fn supports_tools(&self) -> bool {
+            true
+        }
+
+        fn supports_structured_output(&self) -> bool {
+            false
+        }
+
+        fn supports_streaming(&self) -> bool {
+            false
+        }
+    }
+
+    fn stub_client() -> Arc<dyn LLMClient> {
+        Arc::new(StubClient)
+    }
+
+    async fn rules_hook() -> Arc<RulesHook> {
+        Arc::new(RulesHook::new(
+            Arc::new(RuleCatalog::build(Vec::new()).await),
+            4096,
+        ))
+    }
+
+    async fn skills_hook() -> Arc<SkillsHook> {
+        Arc::new(SkillsHook::new(
+            Arc::new(SkillCatalog::build(Vec::new()).await),
+            4096,
+            4096,
+            true,
+            false,
+        ))
+    }
+
+    fn child_hooks(skills: Option<Arc<SkillsHook>>, rules: Option<Arc<RulesHook>>) -> ChildHooks {
+        ChildHooks {
+            store: None,
+            skills,
+            rules,
+        }
+    }
+
+    /// A tower context carrying the parent's effective provider/model and no
+    /// shared hooks — enough to exercise child provider resolution.
+    fn child_ctx<'a>(
+        cancel: &'a CancellationToken,
+        parent_provider: &'a ProviderConfig,
+        parent_model: &'a str,
+    ) -> ChildContext<'a> {
+        ChildContext {
+            store: None,
+            remote_capabilities: None,
+            cancel,
+            skills: None,
+            rules: None,
+            parent_provider,
+            parent_model,
+        }
+    }
+
+    fn hook_names(core: &Core<Arc<dyn LLMClient>>) -> Vec<&'static str> {
+        core.hooks.iter().map(|h| h.name()).collect()
+    }
+
+    /// Two providers keyed to distinct env vars, with `[agent]` on "primary" and
+    /// one inheriting subagent.
+    fn two_provider_config(subagents: Vec<SubagentConfig>) -> RuntimeConfig {
+        config_with_providers(
+            vec![
+                provider("primary", "PRIMARY_KEY", "openai:gpt-4o"),
+                provider("fast", "FAST_KEY", "openai:gpt-4o-mini"),
+            ],
+            "primary",
+            subagents,
+        )
     }
 
     fn read_tool() -> ToolConfig {
@@ -604,7 +925,7 @@ mod tests {
         config.runtime.self_delegation = true;
 
         let effective = config.with_self_delegation();
-        let children = mock_children(&[crate::config::SELF_DELEGATION_ID]);
+        let children = mock_children(&[SELF_DELEGATION_ID]);
         let (tools, _reset) =
             assemble_toolset(&effective, &children, &CancellationToken::new(), None).unwrap();
         let mut names = tool_names(&tools);
@@ -638,7 +959,7 @@ mod tests {
     #[test]
     fn test_build_surfaces_missing_credential_env() {
         let config = config_with_subagents(vec![subagent("alpha"), subagent("beta")]);
-        let err = build_parent_toolset(&config, None, &CancellationToken::new(), None)
+        let err = build_parent_toolset(&config, &params(&config, &CancellationToken::new()))
             .err()
             .expect("build should fail without the credential env var set");
         assert!(
@@ -664,7 +985,7 @@ mod tests {
         }];
 
         let (tools, reset) =
-            build_parent_toolset(&config, None, &CancellationToken::new(), None).unwrap();
+            build_parent_toolset(&config, &params(&config, &CancellationToken::new())).unwrap();
         let reset = reset.expect("a local execute_python tool must yield a reset handle");
 
         let python = tools
@@ -785,7 +1106,7 @@ mod tests {
         config.tools = vec![read_tool()];
 
         let (tools, _reset) =
-            build_parent_toolset(&config, None, &CancellationToken::new(), None).unwrap();
+            build_parent_toolset(&config, &params(&config, &CancellationToken::new())).unwrap();
         assert_eq!(tool_names(&tools), vec!["read".to_string()]);
     }
 
@@ -794,7 +1115,7 @@ mod tests {
     #[test]
     fn test_subagent_inherits_parent_provider_credential() {
         let config = config_with_subagents(vec![subagent("worker")]);
-        let err = build_parent_toolset(&config, None, &CancellationToken::new(), None)
+        let err = build_parent_toolset(&config, &params(&config, &CancellationToken::new()))
             .err()
             .expect("build should fail on the inherited provider's unset env var");
         assert!(
@@ -819,7 +1140,7 @@ mod tests {
                 ..subagent("worker")
             }],
         );
-        let err = build_parent_toolset(&config, None, &CancellationToken::new(), None)
+        let err = build_parent_toolset(&config, &params(&config, &CancellationToken::new()))
             .err()
             .expect("build should fail on the overridden provider's unset env var");
         assert!(
@@ -836,7 +1157,7 @@ mod tests {
             provider: Some("ghost".to_string()),
             ..subagent("worker")
         }]);
-        let err = build_parent_toolset(&config, None, &CancellationToken::new(), None)
+        let err = build_parent_toolset(&config, &params(&config, &CancellationToken::new()))
             .err()
             .expect("build should fail for an unknown provider");
         assert!(
@@ -844,5 +1165,233 @@ mod tests {
                 if msg.contains("provider 'ghost'") && msg.contains("worker")),
             "unexpected error: {err}",
         );
+    }
+
+    /// A subagent that pins neither `provider` nor `model` runs whatever the
+    /// parent runs for this task — the per-task override included. Without this,
+    /// a serve task that overrides the model leaves its subagents on the startup
+    /// pair, so a "self-clone" is not one.
+    #[test]
+    fn test_subagent_without_pins_follows_task_override() {
+        let config = two_provider_config(vec![subagent("worker")]);
+        let (parent_provider, parent_model) = config
+            .resolve_provider_and_model(Some("fast"), Some("openai:o3"))
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let ctx = child_ctx(&cancel, parent_provider, parent_model);
+
+        let (provider, model) = resolve_child_llm(&config, &config.subagents[0], &ctx).unwrap();
+
+        assert_eq!(provider.name, "fast");
+        assert_eq!(model, "openai:o3");
+    }
+
+    /// Pinning `model` keeps a subagent's configured identity: the task override
+    /// applies to the parent only, so a cheap reviewer stays cheap when the
+    /// parent is bumped to a larger model.
+    #[test]
+    fn test_subagent_with_pinned_model_ignores_task_override() {
+        let config = two_provider_config(vec![SubagentConfig {
+            model: Some("openai:gpt-4o-mini".to_string()),
+            ..subagent("worker")
+        }]);
+        let (parent_provider, parent_model) = config
+            .resolve_provider_and_model(Some("fast"), Some("openai:o3"))
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let ctx = child_ctx(&cancel, parent_provider, parent_model);
+
+        let (provider, model) = resolve_child_llm(&config, &config.subagents[0], &ctx).unwrap();
+
+        assert_eq!(provider.name, "primary");
+        assert_eq!(model, "openai:gpt-4o-mini");
+    }
+
+    /// The synthesized `task` subagent pins nothing, so it follows the parent's
+    /// override too — the point of `runtime.self_delegation`.
+    #[test]
+    fn test_self_delegation_follows_task_override() {
+        let mut config = two_provider_config(vec![]);
+        config.runtime.self_delegation = true;
+        let (parent_provider, parent_model) = config
+            .resolve_provider_and_model(Some("fast"), Some("openai:o3"))
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let ctx = child_ctx(&cancel, parent_provider, parent_model);
+
+        let effective = tower_config(&config, None);
+        let task = effective
+            .subagents
+            .iter()
+            .find(|s| s.id == SELF_DELEGATION_ID)
+            .expect("self_delegation must synthesize a task subagent");
+        let (provider, model) = resolve_child_llm(&effective, task, &ctx).unwrap();
+
+        assert_eq!(provider.name, "fast");
+        assert_eq!(model, "openai:o3");
+    }
+
+    /// With nothing to add, the tower builds from the config as-is rather than
+    /// deep-cloning it — including when a menu exists but there are no subagents
+    /// to fold it into.
+    #[test]
+    fn test_tower_config_borrows_when_nothing_to_add() {
+        let with_subagents = config_with_subagents(vec![subagent("worker")]);
+        assert!(matches!(
+            tower_config(&with_subagents, None),
+            Cow::Borrowed(_)
+        ));
+
+        let no_subagents = config_with_subagents(vec![]);
+        assert!(matches!(
+            tower_config(&no_subagents, Some("## Skills\n- alpha")),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    /// The skills menu is folded into every subagent's system prompt. A subagent
+    /// has no seed message for the host to fold it into, so without this it
+    /// cannot see any skill.
+    #[test]
+    fn test_tower_config_folds_menu_into_every_subagent_prompt() {
+        let config = config_with_subagents(vec![subagent("worker"), subagent("critic")]);
+
+        let effective = tower_config(&config, Some("## Skills\n- alpha"));
+
+        assert_eq!(effective.subagents.len(), 2);
+        for sub in &effective.subagents {
+            assert_eq!(sub.system_prompt, "you are a worker\n\n## Skills\n- alpha");
+        }
+    }
+
+    /// The self-delegated clone's prompt matches the main agent's seed byte for
+    /// byte, menu included — assembled the same way `oneshot::run` and
+    /// `serve::seed_new_conversation` assemble the parent's.
+    #[test]
+    fn test_tower_config_self_clone_prompt_matches_parent_seed() {
+        let mut config = config_with_subagents(vec![]);
+        config.runtime.self_delegation = true;
+        let menu = "## Skills\n- alpha";
+
+        let effective = tower_config(&config, Some(menu));
+
+        let task = effective
+            .subagents
+            .iter()
+            .find(|s| s.id == SELF_DELEGATION_ID)
+            .expect("self_delegation must synthesize a task subagent");
+        assert_eq!(
+            task.system_prompt,
+            format!("{}\n\n{menu}", config.agent.system_prompt)
+        );
+    }
+
+    /// A subagent compacts like the main agent: with `[context]` configured its
+    /// `Core` carries a compaction hook, so a long delegated run summarizes
+    /// instead of walking into the context window.
+    #[test]
+    fn test_child_core_compacts_when_context_configured() {
+        let mut config = config_with_subagents(vec![subagent("worker")]);
+        config.context = Some(context_settings());
+
+        let core = build_child_core(&config, stub_client(), None, &child_hooks(None, None));
+
+        assert_eq!(hook_names(&core), vec!["compaction"]);
+    }
+
+    /// Without `[context]` there is no window to compact against, so no hook is
+    /// attached — compaction stays opt-in for subagents exactly as for the main
+    /// agent.
+    #[test]
+    fn test_child_core_has_no_compaction_without_context() {
+        let config = config_with_subagents(vec![subagent("worker")]);
+
+        let core = build_child_core(&config, stub_client(), None, &child_hooks(None, None));
+
+        assert!(hook_names(&core).is_empty(), "{:?}", hook_names(&core));
+    }
+
+    /// Each run builds its own compaction hook. The hook's reported-token slot is
+    /// one global cell rather than keyed by conversation, so a shared instance
+    /// would let concurrent sibling runs drive each other's compaction.
+    #[test]
+    fn test_child_core_builds_a_fresh_compaction_hook_per_run() {
+        let mut config = config_with_subagents(vec![subagent("worker")]);
+        config.context = Some(context_settings());
+
+        let first = build_child_core(&config, stub_client(), None, &child_hooks(None, None));
+        let second = build_child_core(&config, stub_client(), None, &child_hooks(None, None));
+
+        assert!(!Arc::ptr_eq(&first.hooks[0], &second.hooks[0]));
+    }
+
+    /// Hooks attach in the parent's registration order, because `Core` dispatches
+    /// them in that order — a different order would change when a subagent's
+    /// start-of-conversation injections land and when it compacts. (The
+    /// persistence hook needs a live store; it is covered in `neuromance-db`.)
+    #[tokio::test]
+    async fn test_child_core_hook_order_mirrors_parent() {
+        let mut config = config_with_subagents(vec![subagent("worker")]);
+        config.context = Some(context_settings());
+        let hooks = child_hooks(Some(skills_hook().await), Some(rules_hook().await));
+
+        let core = build_child_core(&config, stub_client(), None, &hooks);
+
+        assert_eq!(hook_names(&core), vec!["compaction", "skills", "rules"]);
+    }
+
+    /// The child `Core` attaches the shared rules and skills hooks it is handed
+    /// rather than rebuilding them per run — safe because both key their state by
+    /// conversation, unlike the compaction hook above.
+    #[tokio::test]
+    async fn test_child_core_attaches_the_shared_rules_and_skills_hooks() {
+        let config = config_with_subagents(vec![subagent("worker")]);
+        let skills = skills_hook().await;
+        let rules = rules_hook().await;
+        let hooks = child_hooks(Some(Arc::clone(&skills)), Some(Arc::clone(&rules)));
+
+        let core = build_child_core(&config, stub_client(), None, &hooks);
+
+        let attached = |name: &str| core.hooks.iter().find(|h| h.name() == name).cloned();
+        assert_eq!(
+            attached("skills").map(|h| Arc::ptr_eq(&h, &(skills as Arc<dyn Hook>))),
+            Some(true)
+        );
+        assert_eq!(
+            attached("rules").map(|h| Arc::ptr_eq(&h, &(rules as Arc<dyn Hook>))),
+            Some(true)
+        );
+    }
+
+    /// One hook instance serves the whole tower: `ChildContext` builds it once
+    /// and every level's `hooks()` hands out that same instance, instead of one
+    /// per subagent per level per run.
+    #[tokio::test]
+    async fn test_child_context_shares_hooks_across_levels() {
+        let cancel = CancellationToken::new();
+        let parent_provider = provider("primary", "PRIMARY_KEY", "openai:gpt-4o");
+        let ctx = ChildContext {
+            skills: Some(skills_hook().await),
+            rules: Some(rules_hook().await),
+            ..child_ctx(&cancel, &parent_provider, "openai:gpt-4o")
+        };
+
+        let first = ctx.hooks();
+        let second = ctx.hooks();
+
+        assert!(Arc::ptr_eq(&first.skills.unwrap(), &second.skills.unwrap()));
+        assert!(Arc::ptr_eq(&first.rules.unwrap(), &second.rules.unwrap()));
+    }
+
+    /// A subagent's tool calls auto-approve: it runs inside one parent delegation
+    /// with no interactive approver in the loop.
+    #[test]
+    fn test_child_core_auto_approves_tools() {
+        let config = config_with_subagents(vec![subagent("worker")]);
+
+        let core = build_child_core(&config, stub_client(), Some(7), &child_hooks(None, None));
+
+        assert!(core.auto_approve_tools);
+        assert_eq!(core.max_turns, Some(7));
     }
 }

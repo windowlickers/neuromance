@@ -14,7 +14,7 @@ use neuromance_common::chat::Message;
 use neuromance_common::delegation::{self, DelegationContext};
 
 use crate::config::RuntimeConfig;
-use crate::workspace::WorkspaceManager;
+use crate::workspace::{self, WorkspaceManager};
 
 #[derive(Debug, Serialize)]
 pub struct OneshotOutput {
@@ -73,11 +73,7 @@ pub async fn run<C: LLMClient + Send + Sync>(
         |menu| format!("{}\n\n{}", config.agent.system_prompt, menu),
     );
     if let Some(dir) = &workspace_dir {
-        system_prompt = format!(
-            "{system_prompt}\n\nYour working directory is {}. Do all file work there; \
-             use absolute paths beneath it.",
-            dir.display()
-        );
+        system_prompt = format!("{system_prompt}\n\n{}", workspace::note(dir));
     }
     let messages = vec![
         Message::system(conversation_id, system_prompt),

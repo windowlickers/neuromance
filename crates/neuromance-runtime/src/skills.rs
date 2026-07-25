@@ -47,8 +47,16 @@ impl SkillRuntime {
         self.catalog.menu_filesystem(self.menu_budget)
     }
 
-    /// Build the mention-only [`SkillsHook`]. The menu is folded into the system
-    /// prompt by the caller, so the hook never injects it (`inject_menu = false`).
+    /// Build the mention-only [`SkillsHook`], shared by the main agent and every
+    /// subagent (its state is keyed by conversation).
+    ///
+    /// The hook never injects the menu (`inject_menu = false`) — and must not.
+    /// [`SkillsHook`]'s own menu instructs the model to call a `load_skill`
+    /// tool, which this runtime does not register; the materialized catalog
+    /// hands out on-disk paths instead, which is what [`menu`](Self::menu)
+    /// renders. Callers fold that menu into the system prompt: the host does it
+    /// for the main agent's seed, and `subagents::build_parent_toolset` does it
+    /// for each subagent's configured prompt.
     #[must_use]
     pub fn hook(&self) -> Arc<SkillsHook> {
         Arc::new(SkillsHook::new(

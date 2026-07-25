@@ -159,11 +159,13 @@ Migrations are embedded in `neuromance-db` and applied automatically at startup.
 
 ## Subagents
 
-A `[[subagents]]` section declares subagents the main agent can delegate to. A subagent inherits the parent agent's provider (and so its endpoint, credential, and effective model) automatically; it only needs an `id` and `system_prompt`. It may optionally set its own `provider` and/or `model`: the effective model is the subagent's `model`, then the chosen provider's default `model`, then the agent's effective model.
+A `[[subagents]]` section declares subagents the main agent can delegate to. A subagent that pins neither `provider` nor `model` runs whatever the main agent runs for that task — a serve task's per-task `provider`/`model` override included — so it only needs an `id` and `system_prompt`. Pinning either one keeps the subagent's own identity and ignores the per-task override: the effective model is then the subagent's `model`, then the chosen provider's default `model`, then the agent's configured model.
 
-A subagent is provisioned with the **same toolset as the main agent** — the capability tools from `[[tools]]`, the `execute_python` bridge, and the delegate tools — so it can both use tools and delegate further. Subagent tool calls auto-approve inside the pod: they run autonomously within a single parent delegation, with no interactive approver in the loop, so the pod boundary (e.g. kata containers) is the isolation, the same way the whole agent pod is already sandboxed.
+A subagent is provisioned with the **same toolset as the main agent** — the capability tools from `[[tools]]`, the `execute_python` bridge, and the delegate tools — so it can both use tools and delegate further. Its conversation loop is wired the same way too: it persists through `[database]`, compacts under `[context]`, carries the `[skills]` menu in its system prompt with `$mention` expansion in-loop, receives `[rules]`, and is told its `[workspace]` directory. Two things are deliberately left off. Subagents never stream — a delegate tool returns only the final content. And subagent tool calls auto-approve inside the pod: they run autonomously within a single parent delegation, with no interactive approver in the loop, so the pod boundary (e.g. kata containers) is the isolation, the same way the whole agent pod is already sandboxed.
 
 **Self-delegation.** Setting `runtime.self_delegation = true` gives the main agent a `task` delegate tool that runs a fresh copy of *itself* — the same system prompt, provider, model, and turn budget — on a scoped subtask, with no `[[subagents]]` entry to write. It is exactly a synthesized subagent named `task`, so it joins the same `max_delegation_depth` tower, gets the same shared toolset, and (when `execute_python` is configured) the same `run_subagent`/`spawn_agents` bridge. `task` is reserved while this is on: an explicit subagent or tool of that name is rejected at startup. Combine it with `[[subagents]]` freely — the `task` self-clone is added alongside any named subagents.
+
+One divergence: a serve task that supplies its own `system_prompt` overrides the main agent's seed message only. The `task` clone still carries `agent.system_prompt`, because a subagent's prompt is fixed when the delegation tower is built and the per-task prompt is not known then.
 
 Nested delegation is bounded by `runtime.max_delegation_depth`, which counts subagent hops from the main agent (depth 0). At `1` the main agent reaches subagents but those subagents carry no delegate tools; at `2` (the default) a subagent may delegate one further hop, and so on. The deepest subagents are still fully tool-capable — they simply cannot delegate. The bound is enforced structurally (a finite tower of subagent instances built at startup), so it cannot run away; it is capped at 5.
 
@@ -231,7 +233,7 @@ The gRPC build needs `protoc` (provided by the Nix dev shell and build inputs).
 
 ## Workspaces
 
-Each conversation gets a working directory at `<root>/<conversation_id>`, created when its first task runs and reused by continuations. The directory is announced in the seed system message and injected as `bash`'s default `cwd` (an explicit `cwd` in a tool call always wins), on both the in-process and sandbox execution paths. Subagents inherit the parent's workspace.
+Each conversation gets a working directory at `<root>/<conversation_id>`, created when its first task runs and reused by continuations. The directory is announced in the seed system message and injected as `bash`'s default `cwd` (an explicit `cwd` in a tool call always wins), on both the in-process and sandbox execution paths. Subagents inherit the parent's workspace, and each delegated task carries the same directory note — a subagent's system prompt is fixed at startup, before any conversation has a workspace, so the note is attached to the task instead.
 
 ```toml
 [workspace]
@@ -369,6 +371,8 @@ An optional `[context]` section enables automatic conversation compaction in the
 
 Conversation size is measured from the provider-reported usage of the most recent response, so no tokenizer is downloaded at startup. One known lag: the first request of a resumed conversation is sent uncompacted because no usage exists yet in that run — compaction at the end of the previous run keeps stored histories under target.
 
+Subagents compact too, on the same settings and against their own conversations. Each subagent run gets its own compactor, so concurrent runs in a `spawn_agents` fan-out never influence each other's decisions. Long delegated runs therefore summarize instead of walking into the context window, at the cost of the summarization calls that implies.
+
 ```toml
 [context]
 # Model context window in tokens. Required; everything else is optional.
@@ -390,6 +394,8 @@ An optional `[skills]` section gives the agent **skills** — directories contai
 Skills are discovered from on-host directory `roots` (each immediate subdirectory containing a `SKILL.md` is a skill) and/or a corpus-shaped HTTP `endpoint` (`GET /skills` for the menu, `GET /skills/{id}` for a body). On-host roots take precedence over the endpoint when a skill name appears in both.
 
 At startup the runtime **materializes** every discovered skill to a local temp directory and rebuilds the catalog over it, so the corpus is only a boot-time dependency. The menu then lists each skill's on-disk path, and the agent loads a skill by **reading that file** with its `read` tool — no fetch at reasoning time. In addition, when `mention` is enabled a `$name`, `skill://id`, or `[text](skill://id)` link in user input (for example a `/thing-skill` slash command) injects the body inline as a message; common shell variables (`$PATH`, `$HOME`, …) are ignored.
+
+Subagents see the same catalog. The menu is appended to each subagent's configured `system_prompt` (a subagent has no seed message to fold it into), and `$mention` expansion works inside a delegated run the same way it does for the main agent.
 
 ```toml
 [skills]
@@ -413,6 +419,8 @@ An optional `[rules]` section gives the agent **rule files** — Markdown files 
 Recognized frontmatter keys are `globs` (a YAML sequence or a comma-separated scalar; `paths` is accepted as an alias), `always_apply` (`alwaysApply` is also accepted), and `description`. A file with no frontmatter is a body-only rule with no globs. Glob patterns follow gitignore-style semantics and are matched workspace-relative, so `*.rs` matches a Rust file in any directory and `src/**/*.rs` matches only under `src/`.
 
 Rules are discovered from on-host directory `roots` (walked recursively; a rule's id is its path relative to the root) and/or a corpus-shaped HTTP `endpoint` (`GET /rules` for the listing, `GET /rules/{id}` for a body). On-host roots take precedence over the endpoint when a rule id appears in both.
+
+Subagents receive rules from the same catalog on the same terms: always-apply rules at the start of a delegated run, glob-matched rules the first time the subagent's own tool calls touch a matching path.
 
 ```toml
 [rules]

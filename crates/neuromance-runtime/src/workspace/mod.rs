@@ -12,6 +12,7 @@
 //! the caller from the request's `workspace` field.
 
 pub mod archive;
+pub mod note;
 mod seed;
 mod store;
 pub mod tool;
@@ -34,6 +35,7 @@ use crate::config::{WorkspaceDefinition, WorkspaceSettings, WorkspaceStorageSett
 use crate::error::RuntimeError;
 
 pub use archive::ArchiveError;
+pub use note::{WorkspaceNoteSubagent, note};
 pub use store::{InMemorySnapshotRefs, PgSnapshotRefs, SnapshotRef, SnapshotRefStore};
 
 /// Name of the workspace-internal metadata directory. Holds the seed marker

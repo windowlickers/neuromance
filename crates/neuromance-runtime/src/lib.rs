@@ -47,4 +47,4 @@ pub use config::{
 pub use error::RuntimeError;
 pub use factory::{AgentBuilder, AgentOverrides};
 pub use skills::SkillRuntime;
-pub use subagents::{SessionReset, build_parent_toolset};
+pub use subagents::{SessionReset, ToolsetParams, build_parent_toolset};
