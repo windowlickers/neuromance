@@ -189,8 +189,15 @@ pub fn with_default_cwd(name: &str, args: Value, workspace_root: &Path) -> Value
     }
     match args {
         Value::Object(mut map) => {
-            map.entry("cwd")
-                .or_insert_with(|| Value::String(workspace_root.display().to_string()));
+            // An explicit `null` cwd is treated as absent: BashTool ignores a
+            // null cwd, so leaving it would drop the workspace default. A
+            // present string cwd still wins.
+            if matches!(map.get("cwd"), None | Some(Value::Null)) {
+                map.insert(
+                    "cwd".to_string(),
+                    Value::String(workspace_root.display().to_string()),
+                );
+            }
             Value::Object(map)
         }
         other => other,
@@ -438,6 +445,38 @@ mod tests {
     #[test]
     fn test_parse_arguments_boolean_string() {
         assert_eq!(ToolExecutor::parse_arguments("true"), json!(true));
+    }
+
+    #[test]
+    fn test_with_default_cwd_injects_when_absent() {
+        let out = with_default_cwd("bash", json!({"command": "ls"}), Path::new("/ws"));
+        assert_eq!(out, json!({"command": "ls", "cwd": "/ws"}));
+    }
+
+    #[test]
+    fn test_with_default_cwd_injects_over_explicit_null() {
+        let out = with_default_cwd(
+            "bash",
+            json!({"command": "ls", "cwd": null}),
+            Path::new("/ws"),
+        );
+        assert_eq!(out, json!({"command": "ls", "cwd": "/ws"}));
+    }
+
+    #[test]
+    fn test_with_default_cwd_preserves_explicit_cwd() {
+        let out = with_default_cwd(
+            "bash",
+            json!({"command": "ls", "cwd": "/elsewhere"}),
+            Path::new("/ws"),
+        );
+        assert_eq!(out, json!({"command": "ls", "cwd": "/elsewhere"}));
+    }
+
+    #[test]
+    fn test_with_default_cwd_ignores_non_bash_tool() {
+        let out = with_default_cwd("read", json!({"path": "/f"}), Path::new("/ws"));
+        assert_eq!(out, json!({"path": "/f"}));
     }
 
     /// A tool that echoes the `value` argument back so dispatch can be observed.
