@@ -8,4 +8,4 @@
 
 mod sse;
 
-pub use sse::{StreamingProvider, run_sse_stream};
+pub use sse::{ChatChunkStream, StreamingProvider, run_sse_stream};

@@ -15,9 +15,11 @@ use tracing::{debug, info, info_span, trace};
 /// single turn is in flight. Keeps long completions visible without flooding.
 const STREAM_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 
-use neuromance_client::LLMClient;
+use neuromance_client::{ChatChunkStream, ClientError, LLMClient};
 use neuromance_common::chat::{Conversation, Message, MessageRole};
-use neuromance_common::client::{ChatRequest, ChatResponse, ToolChoice, Usage};
+use neuromance_common::client::{
+    ChatChunk, ChatRequest, ChatResponse, RetryConfig, ToolChoice, Usage,
+};
 use neuromance_common::context::{ContextLedger, EditSource};
 use neuromance_common::features::ThinkingMode;
 use neuromance_common::hook::{CompactionStats, Hook, HookContext};
@@ -112,6 +114,21 @@ impl<C: LLMClient> Core<C> {
         self
     }
 
+    /// Compute the backoff delay before retry `attempt` (0-based).
+    ///
+    /// A provider-supplied `Retry-After` wins outright — it is authoritative and
+    /// the exponential schedule is only a guess in its absence. Otherwise the
+    /// delay grows as `initial_delay * multiplier^attempt`, capped at `max_delay`.
+    fn retry_delay(config: &RetryConfig, attempt: u32, error: &ClientError) -> Duration {
+        if let Some(retry_after) = error.retry_after() {
+            return retry_after.min(config.max_delay);
+        }
+        let growth = config
+            .backoff_multiplier
+            .powi(i32::try_from(attempt).unwrap_or(i32::MAX));
+        config.initial_delay.mul_f64(growth).min(config.max_delay)
+    }
+
     /// Send a chat request with retry logic for transient failures.
     async fn chat_with_retry(&self, request: &ChatRequest) -> Result<ChatResponse, CoreError> {
         let mut last_error = None;
@@ -122,14 +139,16 @@ impl<C: LLMClient> Core<C> {
                 Ok(response) => return Ok(response),
                 Err(e) => {
                     if attempt < config.retry_config.max_retries && e.is_retryable() {
-                        debug!(
-                            "Request failed (attempt {}), retrying in {:?}: {}",
-                            attempt + 1,
-                            config.retry_config.initial_delay,
-                            e
+                        let delay = Self::retry_delay(&config.retry_config, attempt, &e);
+                        info!(
+                            attempt = attempt + 1,
+                            max_retries = config.retry_config.max_retries,
+                            delay_ms = delay.as_millis(),
+                            error = %e,
+                            "chat request failed with a retryable error; retrying",
                         );
                         last_error = Some(e);
-                        tokio::time::sleep(config.retry_config.initial_delay).await;
+                        tokio::time::sleep(delay).await;
                         continue;
                     }
                     last_error = Some(e);
@@ -140,6 +159,87 @@ impl<C: LLMClient> Core<C> {
 
         Err(last_error.map_or_else(
             || CoreError::NoResponse("No response received after retries".to_string()),
+            CoreError::Client,
+        ))
+    }
+
+    /// Open a streaming chat turn, retrying transient failures until the first
+    /// chunk is in hand.
+    ///
+    /// Retries have to span both stream establishment *and* the first chunk:
+    /// providers surface an HTTP 429 or 5xx as the stream's first item, not as
+    /// an error from [`LLMClient::chat_stream`] itself, so retrying only the
+    /// former would miss the common case.
+    ///
+    /// The retry window closes once a chunk is in hand. Past that point the
+    /// caller has begun emitting [`CoreEvent::Delta`]s to its consumer, and
+    /// replaying the request would duplicate visible output — so mid-stream
+    /// failures stay terminal.
+    ///
+    /// Returns the live stream together with its first chunk, or `None` for a
+    /// stream that closed without yielding anything.
+    async fn stream_with_retry(
+        &self,
+        request: &ChatRequest,
+        cancel: &CancellationToken,
+    ) -> Result<(ChatChunkStream, Option<ChatChunk>), CoreError> {
+        let config = self.client.config();
+        let max_retries = config.retry_config.max_retries;
+        let mut last_error = None;
+
+        for attempt in 0..=max_retries {
+            if cancel.is_cancelled() {
+                return Err(CoreError::Cancelled("stream open".to_string()));
+            }
+
+            // Establishing the stream and pulling its first item are one
+            // retryable unit; `?` here would skip the backoff below.
+            let outcome = match self.client.chat_stream(request).await {
+                Ok(mut stream) => {
+                    let first: Result<_, CoreError> = tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => Err(CoreError::Cancelled("first chunk".to_string())),
+                        next = stream.next() => Ok(next),
+                    };
+                    match first? {
+                        None => Ok((stream, None)),
+                        Some(Ok(chunk)) => Ok((stream, Some(chunk))),
+                        Some(Err(e)) => Err(e),
+                    }
+                }
+                Err(e) => Err(e),
+            };
+
+            let error = match outcome {
+                Ok(opened) => return Ok(opened),
+                Err(e) => e,
+            };
+
+            if attempt >= max_retries || !error.is_retryable() {
+                last_error = Some(error);
+                break;
+            }
+
+            let delay = Self::retry_delay(&config.retry_config, attempt, &error);
+            info!(
+                attempt = attempt + 1,
+                max_retries,
+                delay_ms = delay.as_millis(),
+                error = %error,
+                "stream failed before the first chunk with a retryable error; retrying",
+            );
+            counter!("neuromance_stream_retries_total").increment(1);
+            last_error = Some(error);
+
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => return Err(CoreError::Cancelled("retry backoff".to_string())),
+                () = tokio::time::sleep(delay) => {}
+            }
+        }
+
+        Err(last_error.map_or_else(
+            || CoreError::NoResponse("Stream produced no response after retries".to_string()),
             CoreError::Client,
         ))
     }
@@ -383,7 +483,10 @@ impl<C: LLMClient> Core<C> {
                 }
 
                 let response = if self.streaming {
-                    let mut inner = self.client.chat_stream(&request).await?;
+                    // Retries live inside `stream_with_retry` and end with the
+                    // first chunk, which it hands back for the loop to fold in.
+                    let (mut inner, mut pending_first) =
+                        self.stream_with_retry(&request, &cancel).await?;
                     let mut accumulated_content = String::with_capacity(1024);
                     let mut response_metadata = None;
                     let mut role = None;
@@ -397,13 +500,17 @@ impl<C: LLMClient> Core<C> {
                     let mut chunks_seen: u32 = 0;
 
                     loop {
-                        let next_chunk: Result<_, CoreError> = tokio::select! {
-                            biased;
-                            () = cancel.cancelled() => Err(CoreError::Cancelled("stream chunk".to_string())),
-                            next = inner.next() => Ok(next),
+                        let chunk = if let Some(chunk) = pending_first.take() {
+                            chunk
+                        } else {
+                            let next_chunk: Result<_, CoreError> = tokio::select! {
+                                biased;
+                                () = cancel.cancelled() => Err(CoreError::Cancelled("stream chunk".to_string())),
+                                next = inner.next() => Ok(next),
+                            };
+                            let Some(chunk_result) = next_chunk? else { break };
+                            chunk_result?
                         };
-                        let Some(chunk_result) = next_chunk? else { break };
-                        let chunk = chunk_result?;
                         chunks_seen = chunks_seen.saturating_add(1);
 
                         if first_chunk_at.is_none() {
@@ -913,6 +1020,10 @@ async fn run_hook<T>(
 mod tests {
     #![allow(clippy::unwrap_used)]
     #![allow(clippy::expect_used)]
+    #![allow(clippy::panic)]
+    // Stream items are `Result<ChatChunk, ClientError>` by `ChatChunkStream`'s
+    // definition; the mock cannot box the error without changing that type.
+    #![allow(clippy::result_large_err)]
 
     use super::*;
     use async_trait::async_trait;
@@ -1373,5 +1484,356 @@ mod tests {
         let err = result.unwrap_err();
         assert!(matches!(err, CoreError::Hook { .. }));
         assert!(err.to_string().contains("boom"));
+    }
+
+    /// Scripted streaming client for the retry tests.
+    ///
+    /// Each entry in `script` is one `chat_stream` attempt, described as the
+    /// sequence of items that attempt's stream yields. Attempts are consumed in
+    /// order and the count is recorded so tests can assert how many upstream
+    /// calls a failure actually cost.
+    struct ScriptedStreamClient {
+        config: Config,
+        script: std::sync::Mutex<std::collections::VecDeque<Vec<StreamItem>>>,
+        attempts: std::sync::atomic::AtomicU32,
+    }
+
+    /// One item a scripted stream yields: a content chunk, or a failure.
+    enum StreamItem {
+        Chunk(&'static str),
+        Fail(fn() -> neuromance_client::ClientError),
+    }
+
+    fn rate_limited() -> neuromance_client::ClientError {
+        neuromance_client::ClientError::RateLimitError {
+            message: "Provider returned error".to_string(),
+            retry_after: None,
+        }
+    }
+
+    fn bad_request() -> neuromance_client::ClientError {
+        neuromance_client::ClientError::RequestError("bad tool schema".to_string())
+    }
+
+    impl ScriptedStreamClient {
+        /// Build a client whose retries are instant, so tests don't sleep.
+        fn new(script: Vec<Vec<StreamItem>>) -> Self {
+            let retry_config = RetryConfig {
+                max_retries: 3,
+                initial_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(5),
+                backoff_multiplier: 2.0,
+                jitter: false,
+            };
+            Self {
+                config: Config::new("mock", "mock-model").with_retry_config(retry_config),
+                script: std::sync::Mutex::new(script.into_iter().collect()),
+                attempts: std::sync::atomic::AtomicU32::new(0),
+            }
+        }
+
+        fn attempts(&self) -> u32 {
+            self.attempts.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    fn content_chunk(text: &str, last: bool) -> neuromance_common::client::ChatChunk {
+        neuromance_common::client::ChatChunk {
+            model: "mock-model".to_string(),
+            delta_content: Some(text.to_string()),
+            delta_reasoning_content: None,
+            delta_role: None,
+            delta_tool_calls: None,
+            finish_reason: last.then_some(neuromance_common::client::FinishReason::Stop),
+            usage: None,
+            response_id: None,
+            created_at: chrono::Utc::now(),
+            metadata: std::collections::HashMap::new(),
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LLMClient for ScriptedStreamClient {
+        fn config(&self) -> &Config {
+            &self.config
+        }
+
+        async fn chat(
+            &self,
+            _request: &ChatRequest,
+        ) -> Result<ChatResponse, neuromance_client::ClientError> {
+            panic!("the retry tests exercise the streaming path only")
+        }
+
+        async fn chat_stream(
+            &self,
+            _request: &ChatRequest,
+        ) -> Result<ChatChunkStream, neuromance_client::ClientError> {
+            self.attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let attempt = self
+                .script
+                .lock()
+                .expect("script lock")
+                .pop_front()
+                .expect("more chat_stream attempts than the script allows");
+
+            let len = attempt.len();
+            let items: Vec<_> = attempt
+                .into_iter()
+                .enumerate()
+                .map(|(i, item)| match item {
+                    StreamItem::Chunk(text) => Ok(content_chunk(text, i + 1 == len)),
+                    StreamItem::Fail(make) => Err(make()),
+                })
+                .collect();
+            Ok(Box::pin(futures::stream::iter(items)))
+        }
+
+        fn supports_tools(&self) -> bool {
+            false
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+    }
+
+    fn streaming_core(client: ScriptedStreamClient) -> Core<ScriptedStreamClient> {
+        let mut core = Core::new(client);
+        core.streaming = true;
+        core
+    }
+
+    /// The regression this whole path exists for: a 429 before the first chunk
+    /// is retried, and the turn goes on to succeed.
+    #[tokio::test]
+    async fn test_stream_retries_rate_limit_before_first_chunk() {
+        let core = streaming_core(ScriptedStreamClient::new(vec![
+            vec![StreamItem::Fail(rate_limited)],
+            vec![StreamItem::Fail(rate_limited)],
+            vec![StreamItem::Chunk("recovered")],
+        ]));
+
+        let conv_id = uuid::Uuid::new_v4();
+        let request = ChatRequest::from((
+            core.client.config(),
+            seeded_ledger(conv_id, vec![Message::user(conv_id, "hi")]).snapshot(),
+        ));
+
+        let Ok((_stream, first)) = core
+            .stream_with_retry(&request, &CancellationToken::new())
+            .await
+        else {
+            panic!("retries should recover from a pre-first-chunk 429");
+        };
+
+        assert_eq!(
+            first.expect("a chunk").delta_content.as_deref(),
+            Some("recovered")
+        );
+        assert_eq!(core.client.attempts(), 3, "two retries then success");
+    }
+
+    /// Retries stop at `max_retries`; the last error is what the caller sees.
+    #[tokio::test]
+    async fn test_stream_gives_up_after_max_retries() {
+        let core = streaming_core(ScriptedStreamClient::new(vec![
+            vec![StreamItem::Fail(rate_limited)],
+            vec![StreamItem::Fail(rate_limited)],
+            vec![StreamItem::Fail(rate_limited)],
+            vec![StreamItem::Fail(rate_limited)],
+        ]));
+
+        let conv_id = uuid::Uuid::new_v4();
+        let request = ChatRequest::from((
+            core.client.config(),
+            seeded_ledger(conv_id, vec![Message::user(conv_id, "hi")]).snapshot(),
+        ));
+
+        // `ChatChunkStream` is not `Debug`, so unwrap the Err by hand.
+        let Err(err) = core
+            .stream_with_retry(&request, &CancellationToken::new())
+            .await
+        else {
+            panic!("four 429s should exhaust the budget");
+        };
+
+        assert!(matches!(
+            err,
+            CoreError::Client(neuromance_client::ClientError::RateLimitError { .. })
+        ));
+        assert_eq!(
+            core.client.attempts(),
+            4,
+            "one initial attempt plus max_retries"
+        );
+    }
+
+    /// A non-retryable status must not burn the retry budget.
+    #[tokio::test]
+    async fn test_stream_does_not_retry_non_retryable_error() {
+        let core = streaming_core(ScriptedStreamClient::new(vec![vec![StreamItem::Fail(
+            bad_request,
+        )]]));
+
+        let conv_id = uuid::Uuid::new_v4();
+        let request = ChatRequest::from((
+            core.client.config(),
+            seeded_ledger(conv_id, vec![Message::user(conv_id, "hi")]).snapshot(),
+        ));
+
+        let Err(err) = core
+            .stream_with_retry(&request, &CancellationToken::new())
+            .await
+        else {
+            panic!("a 400 is terminal");
+        };
+
+        assert!(matches!(
+            err,
+            CoreError::Client(neuromance_client::ClientError::RequestError(_))
+        ));
+        assert_eq!(core.client.attempts(), 1, "no retry on a terminal error");
+    }
+
+    /// Once a chunk has been emitted, replaying the request would duplicate
+    /// visible output — so a mid-stream 429 stays fatal.
+    #[tokio::test]
+    async fn test_stream_does_not_retry_after_first_chunk() {
+        let core = streaming_core(ScriptedStreamClient::new(vec![vec![
+            StreamItem::Chunk("partial"),
+            StreamItem::Fail(rate_limited),
+        ]]));
+
+        let conv_id = uuid::Uuid::new_v4();
+        let messages = vec![Message::user(conv_id, "hi")];
+
+        let mut core = core;
+        let mut stream = Box::pin(core.run(messages, CancellationToken::new()));
+
+        let mut deltas = Vec::new();
+        let mut error = None;
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(CoreEvent::Delta(text)) => deltas.push(text),
+                Ok(_) => {}
+                Err(e) => {
+                    error = Some(e);
+                    break;
+                }
+            }
+        }
+        drop(stream);
+
+        assert_eq!(deltas, vec!["partial".to_string()]);
+        assert!(
+            matches!(
+                error,
+                Some(CoreError::Client(
+                    neuromance_client::ClientError::RateLimitError { .. }
+                ))
+            ),
+            "mid-stream failure must surface, not retry"
+        );
+        assert_eq!(core.client.attempts(), 1, "no replay after a visible delta");
+    }
+
+    /// The pre-fetched first chunk must be folded into the response, not dropped.
+    #[tokio::test]
+    async fn test_run_streams_every_chunk_including_the_first() {
+        let mut core = streaming_core(ScriptedStreamClient::new(vec![
+            vec![StreamItem::Fail(rate_limited)],
+            vec![StreamItem::Chunk("hello "), StreamItem::Chunk("world")],
+        ]));
+
+        let conv_id = uuid::Uuid::new_v4();
+        let messages = vec![Message::user(conv_id, "hi")];
+
+        let mut stream = Box::pin(core.run(messages, CancellationToken::new()));
+        let mut deltas = Vec::new();
+        let mut completed: Option<Vec<Message>> = None;
+        while let Some(event) = stream.next().await {
+            match event.expect("run should not error") {
+                CoreEvent::Delta(text) => deltas.push(text),
+                CoreEvent::Completed(msgs) => completed = Some(msgs),
+                _ => {}
+            }
+        }
+        drop(stream);
+
+        assert_eq!(deltas.concat(), "hello world");
+        let messages = completed.expect("stream must complete");
+        let last = messages.last().expect("a reply");
+        assert_eq!(last.content, "hello world");
+        assert_eq!(core.client.attempts(), 2);
+    }
+
+    /// `Retry-After` is authoritative when the provider sends one.
+    #[test]
+    fn test_retry_delay_prefers_retry_after() {
+        let config = RetryConfig {
+            max_retries: 3,
+            initial_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(30),
+            backoff_multiplier: 2.0,
+            jitter: false,
+        };
+        let err = neuromance_client::ClientError::RateLimitError {
+            message: "slow down".to_string(),
+            retry_after: Some(Duration::from_secs(7)),
+        };
+        assert_eq!(
+            Core::<ScriptedStreamClient>::retry_delay(&config, 0, &err),
+            Duration::from_secs(7)
+        );
+    }
+
+    /// Without `Retry-After` the delay doubles per attempt and stops at `max_delay`.
+    #[test]
+    fn test_retry_delay_backs_off_exponentially_and_caps() {
+        let config = RetryConfig {
+            max_retries: 8,
+            initial_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(10),
+            backoff_multiplier: 2.0,
+            jitter: false,
+        };
+        let err = rate_limited();
+        let delays: Vec<_> = (0..6)
+            .map(|attempt| Core::<ScriptedStreamClient>::retry_delay(&config, attempt, &err))
+            .collect();
+
+        assert_eq!(
+            delays,
+            vec![
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(8),
+                Duration::from_secs(10),
+                Duration::from_secs(10),
+            ]
+        );
+    }
+
+    /// A `Retry-After` longer than `max_delay` is clamped rather than obeyed.
+    #[test]
+    fn test_retry_delay_clamps_retry_after_to_max_delay() {
+        let config = RetryConfig {
+            max_retries: 3,
+            initial_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(30),
+            backoff_multiplier: 2.0,
+            jitter: false,
+        };
+        let err = neuromance_client::ClientError::RateLimitError {
+            message: "come back tomorrow".to_string(),
+            retry_after: Some(Duration::from_hours(1)),
+        };
+        assert_eq!(
+            Core::<ScriptedStreamClient>::retry_delay(&config, 0, &err),
+            Duration::from_secs(30)
+        );
     }
 }

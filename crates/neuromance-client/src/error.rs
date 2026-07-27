@@ -62,9 +62,16 @@ pub enum ClientError {
     /// Rate limit exceeded (HTTP 429).
     ///
     /// Too many requests sent in a given time period. Wait and retry.
-    #[error("Rate limit exceeded: {retry_after:?}")]
+    ///
+    /// `message` carries the provider's own explanation verbatim — a 429 can mean
+    /// an exhausted credit balance, a per-key request rate, or upstream provider
+    /// capacity, and only the body distinguishes them.
+    #[error("Rate limit exceeded: {message} (retry after {retry_after:?})")]
     RateLimitError {
-        /// Suggested wait time before retrying, if provided by the API.
+        /// The provider's error message, or an `HTTP {status}` fallback when the
+        /// response body is empty.
+        message: String,
+        /// Suggested wait time before retrying, from the `Retry-After` header.
         retry_after: Option<Duration>,
     },
 
@@ -199,7 +206,7 @@ impl ClientError {
     /// Returns the suggested wait time before retrying the request.
     pub const fn retry_after(&self) -> Option<Duration> {
         match self {
-            Self::RateLimitError { retry_after } => *retry_after,
+            Self::RateLimitError { retry_after, .. } => *retry_after,
             _ => None,
         }
     }

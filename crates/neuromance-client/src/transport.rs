@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use neuromance_common::client::ProxyConfig;
 use secrecy::{ExposeSecret, SecretString};
 use serde::de::DeserializeOwned;
@@ -46,15 +48,33 @@ pub fn add_proxy_headers<B: WithHeader>(
     }
 }
 
-/// Map an HTTP error response (status + body) to a typed [`ClientError`].
+/// Parse a `Retry-After` header into a [`Duration`].
+///
+/// Only the delta-seconds form (RFC 9110 §10.2.3) is recognised; the HTTP-date
+/// form yields `None` rather than a misleading zero.
+#[must_use]
+pub fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+}
+
+/// Map an HTTP error response (status + headers + body) to a typed [`ClientError`].
 ///
 /// Tries to parse `body` as a structured [`ErrorResponse`], falling back to the
 /// raw body text, then to `HTTP {status}` when the body is empty. The status
-/// code selects the variant. This is the single canonical mapping shared by the
-/// streaming ([`crate::streaming`]) and non-streaming ([`send_json`]) paths, so
-/// both agree that any `5xx` is a retryable [`ClientError::ServiceUnavailable`].
+/// code selects the variant. `headers` supplies `Retry-After` for the 429 arm.
+/// This is the single canonical mapping shared by the streaming
+/// ([`crate::streaming`]) and non-streaming ([`send_json`]) paths, so both agree
+/// that any `5xx` is a retryable [`ClientError::ServiceUnavailable`].
 #[must_use]
-pub fn map_http_error(status: reqwest::StatusCode, body: &str) -> ClientError {
+pub fn map_http_error(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    body: &str,
+) -> ClientError {
     let message = match serde_json::from_str::<ErrorResponse>(body) {
         Ok(parsed) => parsed.error.message,
         Err(_) if body.is_empty() => format!("HTTP {status}"),
@@ -63,7 +83,10 @@ pub fn map_http_error(status: reqwest::StatusCode, body: &str) -> ClientError {
 
     match status.as_u16() {
         401 => ClientError::AuthenticationError(message),
-        429 => ClientError::RateLimitError { retry_after: None },
+        429 => ClientError::RateLimitError {
+            message,
+            retry_after: parse_retry_after(headers),
+        },
         500..=599 => ClientError::ServiceUnavailable(message),
         _ => ClientError::RequestError(message),
     }
@@ -90,11 +113,12 @@ pub async fn send_json<T: DeserializeOwned>(
 
     if !response.status().is_success() {
         let status = response.status();
+        let headers = response.headers().clone();
         let error_text = response.text().await.map_err(|e| {
             warn!("Failed to read error response body: {e}");
             ClientError::NetworkError(e)
         })?;
-        let error = map_http_error(status, &error_text);
+        let error = map_http_error(status, &headers, &error_text);
         error!(
             "API request failed with status {}: {error}",
             status.as_u16()
@@ -111,14 +135,30 @@ pub async fn send_json<T: DeserializeOwned>(
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used)]
+    #![allow(clippy::panic)]
 
     use super::*;
     use reqwest::StatusCode;
+    use reqwest::header::{HeaderMap, HeaderValue};
+
+    fn no_headers() -> HeaderMap {
+        HeaderMap::new()
+    }
+
+    fn retry_after(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            HeaderValue::from_str(value).expect("valid header value"),
+        );
+        headers
+    }
 
     #[test]
     fn structured_body_uses_error_message() {
         let err = map_http_error(
             StatusCode::BAD_REQUEST,
+            &no_headers(),
             r#"{"error":{"message":"bad tool schema"}}"#,
         );
         assert!(matches!(err, ClientError::RequestError(m) if m == "bad tool schema"));
@@ -126,36 +166,87 @@ mod tests {
 
     #[test]
     fn non_json_body_is_used_verbatim() {
-        let err = map_http_error(StatusCode::BAD_REQUEST, "upstream exploded");
+        let err = map_http_error(StatusCode::BAD_REQUEST, &no_headers(), "upstream exploded");
         assert!(matches!(err, ClientError::RequestError(m) if m == "upstream exploded"));
     }
 
     #[test]
     fn empty_body_falls_back_to_status_line() {
-        let err = map_http_error(StatusCode::BAD_REQUEST, "");
+        let err = map_http_error(StatusCode::BAD_REQUEST, &no_headers(), "");
         assert!(matches!(err, ClientError::RequestError(m) if m == "HTTP 400 Bad Request"));
     }
 
     #[test]
     fn maps_401_to_authentication_error() {
-        let err = map_http_error(StatusCode::UNAUTHORIZED, "");
+        let err = map_http_error(StatusCode::UNAUTHORIZED, &no_headers(), "");
         assert!(matches!(err, ClientError::AuthenticationError(_)));
     }
 
     #[test]
     fn maps_429_to_rate_limit_error() {
-        let err = map_http_error(StatusCode::TOO_MANY_REQUESTS, "");
+        let err = map_http_error(StatusCode::TOO_MANY_REQUESTS, &no_headers(), "");
         assert!(matches!(
             err,
-            ClientError::RateLimitError { retry_after: None }
+            ClientError::RateLimitError {
+                retry_after: None,
+                ..
+            }
         ));
+    }
+
+    #[test]
+    fn rate_limit_error_keeps_the_provider_message() {
+        let err = map_http_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            &no_headers(),
+            r#"{"error":{"message":"Provider returned error"}}"#,
+        );
+        match err {
+            ClientError::RateLimitError { message, .. } => {
+                assert_eq!(message, "Provider returned error");
+            }
+            other => panic!("expected RateLimitError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rate_limit_error_falls_back_to_status_line_on_empty_body() {
+        let err = map_http_error(StatusCode::TOO_MANY_REQUESTS, &no_headers(), "");
+        match err {
+            ClientError::RateLimitError { message, .. } => {
+                assert_eq!(message, "HTTP 429 Too Many Requests");
+            }
+            other => panic!("expected RateLimitError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rate_limit_error_reads_retry_after_seconds() {
+        let err = map_http_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            &retry_after("12"),
+            "slow down",
+        );
+        assert_eq!(err.retry_after(), Some(Duration::from_secs(12)));
+    }
+
+    #[test]
+    fn retry_after_http_date_form_is_ignored() {
+        let headers = retry_after("Wed, 21 Oct 2026 07:28:00 GMT");
+        assert_eq!(parse_retry_after(&headers), None);
+    }
+
+    #[test]
+    fn retry_after_is_only_read_for_rate_limits() {
+        let err = map_http_error(StatusCode::SERVICE_UNAVAILABLE, &retry_after("5"), "down");
+        assert_eq!(err.retry_after(), None);
     }
 
     #[test]
     fn maps_all_5xx_to_service_unavailable() {
         for code in [500u16, 503, 529, 599] {
             let status = StatusCode::from_u16(code).expect("valid status");
-            let err = map_http_error(status, "overloaded");
+            let err = map_http_error(status, &no_headers(), "overloaded");
             assert!(
                 matches!(err, ClientError::ServiceUnavailable(_)),
                 "status {code} should map to ServiceUnavailable"
@@ -168,7 +259,7 @@ mod tests {
     fn maps_other_4xx_to_request_error() {
         for code in [400u16, 403, 418] {
             let status = StatusCode::from_u16(code).expect("valid status");
-            let err = map_http_error(status, "nope");
+            let err = map_http_error(status, &no_headers(), "nope");
             assert!(
                 matches!(err, ClientError::RequestError(_)),
                 "status {code} should map to RequestError"

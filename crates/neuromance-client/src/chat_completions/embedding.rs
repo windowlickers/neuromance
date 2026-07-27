@@ -335,12 +335,7 @@ impl OpenAIEmbedding {
             let status = response.status();
 
             // Extract Retry-After header before consuming the response body
-            let retry_after = response
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-                .map(Duration::from_secs);
+            let retry_after = crate::transport::parse_retry_after(response.headers());
 
             let error_text = response.text().await.map_err(|e| {
                 warn!("Failed to read error response body: {e}");
@@ -367,7 +362,10 @@ impl OpenAIEmbedding {
 
             return Err(match status.as_u16() {
                 401 => ClientError::AuthenticationError(error_message),
-                429 => ClientError::RateLimitError { retry_after },
+                429 => ClientError::RateLimitError {
+                    message: error_message,
+                    retry_after,
+                },
                 400 => ClientError::EmbeddingError(error_message),
                 _ if status.is_server_error() => ClientError::ServiceUnavailable(error_message),
                 _ => ClientError::EmbeddingError(error_message),

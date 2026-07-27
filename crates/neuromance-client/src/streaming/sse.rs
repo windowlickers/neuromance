@@ -180,8 +180,9 @@ async fn extract_error_from_response(
     status: reqwest::StatusCode,
     response: reqwest::Response,
 ) -> ClientError {
+    let headers = response.headers().clone();
     let error_text = response.text().await.unwrap_or_default();
-    crate::transport::map_http_error(status, &error_text)
+    crate::transport::map_http_error(status, &headers, &error_text)
 }
 
 #[cfg(test)]

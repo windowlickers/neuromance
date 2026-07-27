@@ -40,6 +40,7 @@ pub use embedding::{
 };
 pub use error::ClientError;
 pub use responses::ResponsesClient;
+pub use streaming::ChatChunkStream;
 
 /// Shared resources produced by client constructor logic.
 ///
