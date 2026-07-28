@@ -211,3 +211,168 @@ impl ClientError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+
+    /// Every variant of [`ClientError`], paired with whether a caller should
+    /// retry it.
+    ///
+    /// Retryability is what drives `Core::stream_with_retry` and the transport
+    /// middleware, so a variant landing on the wrong side of this line either
+    /// hammers a provider that will never succeed or gives up on one that would.
+    fn retryability_table(network_error: reqwest::Error) -> Vec<(ClientError, bool)> {
+        let bad_json = serde_json::from_str::<i32>("nope").expect_err("not an integer");
+        vec![
+            (ClientError::NetworkError(network_error), true),
+            (
+                ClientError::MiddlewareError(reqwest_middleware::Error::Middleware(
+                    anyhow::anyhow!("middleware blew up"),
+                )),
+                true,
+            ),
+            (ClientError::TimeoutError, true),
+            (
+                ClientError::RateLimitError {
+                    message: "slow down".to_string(),
+                    retry_after: Some(Duration::from_secs(3)),
+                },
+                true,
+            ),
+            (ClientError::ServiceUnavailable("busy".to_string()), true),
+            (ClientError::SerializationError(bad_json), false),
+            (
+                ClientError::AuthenticationError("bad key".to_string()),
+                false,
+            ),
+            (
+                ClientError::EventSourceError(reqwest_eventsource::Error::InvalidLastEventId(
+                    "\n".to_string(),
+                )),
+                false,
+            ),
+            (ClientError::RequestError("bad tool".to_string()), false),
+            (ClientError::ConfigurationError("no key".to_string()), false),
+            (
+                ClientError::InvalidRequest("no messages".to_string()),
+                false,
+            ),
+            (ClientError::InvalidResponse("not SSE".to_string()), false),
+            (ClientError::ToolsNotSupported, false),
+            (ClientError::StreamingNotSupported, false),
+            (
+                ClientError::ContextLengthExceeded {
+                    current_tokens: 9,
+                    max_tokens: 8,
+                },
+                false,
+            ),
+            (
+                ClientError::ContentFiltered {
+                    reason: "violence".to_string(),
+                },
+                false,
+            ),
+            (ClientError::InvalidTemperature, false),
+            (ClientError::InvalidTopP, false),
+            (ClientError::InvalidFrequencyPenalty, false),
+            (ClientError::EmbeddingError("bad base64".to_string()), false),
+            (ClientError::EmbeddingsNotSupported, false),
+        ]
+    }
+
+    /// Fails to compile when a variant is added without a retryability decision.
+    ///
+    /// `#[non_exhaustive]` does not apply inside the defining crate, so this
+    /// match really is exhaustive — the census is the thing that keeps
+    /// [`retryability_table`] from silently going out of date.
+    #[expect(
+        clippy::match_same_arms,
+        reason = "one arm per variant is the point; collapsing them defeats the census"
+    )]
+    fn assert_variant_is_in_the_table(error: &ClientError) {
+        match error {
+            ClientError::NetworkError(_) => (),
+            ClientError::MiddlewareError(_) => (),
+            ClientError::SerializationError(_) => (),
+            ClientError::AuthenticationError(_) => (),
+            ClientError::EventSourceError(_) => (),
+            ClientError::RateLimitError { .. } => (),
+            ClientError::RequestError(_) => (),
+            ClientError::ConfigurationError(_) => (),
+            ClientError::TimeoutError => (),
+            ClientError::InvalidRequest(_) => (),
+            ClientError::InvalidResponse(_) => (),
+            ClientError::ToolsNotSupported => (),
+            ClientError::StreamingNotSupported => (),
+            ClientError::ContextLengthExceeded { .. } => (),
+            ClientError::ContentFiltered { .. } => (),
+            ClientError::ServiceUnavailable(_) => (),
+            ClientError::InvalidTemperature => (),
+            ClientError::InvalidTopP => (),
+            ClientError::InvalidFrequencyPenalty => (),
+            ClientError::EmbeddingError(_) => (),
+            ClientError::EmbeddingsNotSupported => (),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_every_variant_has_the_expected_retryability() {
+        let table = retryability_table(connection_refused().await);
+        assert_eq!(
+            table.len(),
+            21,
+            "a variant was added or removed without updating the table"
+        );
+
+        for (error, expected) in table {
+            assert_variant_is_in_the_table(&error);
+            assert_eq!(
+                error.is_retryable(),
+                expected,
+                "{error:?} should{} be retryable",
+                if expected { "" } else { " not" }
+            );
+        }
+    }
+
+    #[test]
+    fn test_retry_after_is_only_carried_by_rate_limits() {
+        let rate_limited = ClientError::RateLimitError {
+            message: "slow down".to_string(),
+            retry_after: Some(Duration::from_secs(7)),
+        };
+        assert_eq!(rate_limited.retry_after(), Some(Duration::from_secs(7)));
+        assert!(rate_limited.is_rate_limit_error());
+
+        // A 503 is just as retryable but carries no schedule, so callers must
+        // fall back to their own backoff rather than waiting forever.
+        let unavailable = ClientError::ServiceUnavailable("busy".to_string());
+        assert_eq!(unavailable.retry_after(), None);
+        assert!(!unavailable.is_rate_limit_error());
+    }
+
+    #[test]
+    fn test_only_authentication_errors_report_as_such() {
+        assert!(ClientError::AuthenticationError("bad key".to_string()).is_authentication_error());
+        assert!(!ClientError::RequestError("bad key".to_string()).is_authentication_error());
+    }
+
+    /// Produce a real `reqwest::Error` by dialing a port nothing is listening on.
+    async fn connection_refused() -> reqwest::Error {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        drop(listener);
+
+        reqwest::Client::new()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect_err("nothing is listening on a closed port")
+    }
+}
