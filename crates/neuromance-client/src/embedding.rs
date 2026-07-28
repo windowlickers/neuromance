@@ -30,7 +30,7 @@ use crate::error::ClientError;
 use serde::{Deserialize, Serialize};
 use typed_builder::TypedBuilder;
 
-use neuromance_common::client::{Config, RetryConfig};
+use neuromance_common::client::{Config, ProxyConfig, RetryConfig};
 
 /// `OpenAI` embedding model identifiers.
 ///
@@ -92,6 +92,12 @@ pub struct EmbeddingConfig {
     pub retry_config: RetryConfig,
     /// Optional request timeout in seconds.
     pub timeout_seconds: Option<u64>,
+    /// Optional tokenizer-proxy configuration.
+    ///
+    /// When set, `api_key` holds a sealed token rather than the provider
+    /// credential, and requests route through the proxy for injection — the
+    /// same contract as [`Config::proxy`].
+    pub proxy: Option<ProxyConfig>,
 }
 
 // Custom Debug to avoid exposing API key
@@ -104,6 +110,7 @@ impl std::fmt::Debug for EmbeddingConfig {
             .field("dimensions", &self.dimensions)
             .field("retry_config", &self.retry_config)
             .field("timeout_seconds", &self.timeout_seconds)
+            .field("proxy", &self.proxy)
             .finish()
     }
 }
@@ -123,6 +130,7 @@ impl EmbeddingConfig {
             dimensions: None,
             retry_config: RetryConfig::default(),
             timeout_seconds: None,
+            proxy: None,
         }
     }
 
@@ -210,6 +218,19 @@ impl EmbeddingConfig {
         self.timeout_seconds = Some(timeout_seconds);
         self
     }
+
+    /// Route requests through a tokenizer proxy.
+    ///
+    /// `api_key` must then hold the sealed token, not the provider credential.
+    ///
+    /// # Arguments
+    ///
+    /// * `proxy` - The proxy URL and sealed-token header name
+    #[must_use]
+    pub fn with_proxy(mut self, proxy: ProxyConfig) -> Self {
+        self.proxy = Some(proxy);
+        self
+    }
 }
 
 impl From<&Config> for EmbeddingConfig {
@@ -249,6 +270,7 @@ impl From<&Config> for EmbeddingConfig {
             dimensions: None,
             retry_config: config.retry_config.clone(),
             timeout_seconds: config.timeout_seconds,
+            proxy: config.proxy.clone(),
         }
     }
 }
@@ -282,7 +304,7 @@ impl EncodingFormat {
 /// Input for embedding generation.
 ///
 /// Supports both single text inputs and batch inputs.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum EmbeddingInput {
     /// A single text string to embed.
@@ -373,7 +395,7 @@ impl EmbeddingRequest {
 }
 
 /// A single embedding vector.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Embedding {
     /// The index of this embedding in the request.
     pub index: u32,
@@ -382,7 +404,7 @@ pub struct Embedding {
 }
 
 /// Token usage statistics for an embedding request.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct EmbeddingUsage {
     /// Number of tokens in the input.
     pub prompt_tokens: u32,
@@ -394,7 +416,7 @@ pub struct EmbeddingUsage {
 }
 
 /// Response from an embedding generation request.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct EmbeddingResponse {
     /// The generated embeddings.
     pub embeddings: Vec<Embedding>,

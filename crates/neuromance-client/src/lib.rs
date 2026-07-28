@@ -58,19 +58,101 @@ pub(crate) struct ClientResources {
     pub proxy_config: Option<ProxyConfig>,
 }
 
+/// Resolve the base URL a client should send to, given its proxy setting.
+///
+/// Without a proxy the URL is used as-is. In proxy mode the scheme is rewritten
+/// to plaintext HTTP: reqwest tunnels HTTPS proxies via `CONNECT`, which hides
+/// the request from the proxy and prevents token injection, so the upstream URL
+/// must travel in cleartext absolute-form (RFC 7230 §5.3.2). The proxy upgrades
+/// to TLS itself when dialing the real upstream.
+///
+/// # Errors
+///
+/// Returns [`ClientError::ConfigurationError`] if the URL is unparseable or its
+/// scheme cannot be rewritten.
+pub(crate) fn normalize_base_url(
+    base_url: String,
+    proxy: Option<&ProxyConfig>,
+) -> Result<String, ClientError> {
+    if proxy.is_none() {
+        return Ok(base_url);
+    }
+
+    let mut url = url::Url::parse(&base_url).map_err(|e| {
+        ClientError::ConfigurationError(format!("invalid base URL '{base_url}': {e}"))
+    })?;
+    url.set_scheme("http").map_err(|()| {
+        ClientError::ConfigurationError(format!(
+            "cannot rewrite base URL '{base_url}' to http scheme",
+        ))
+    })?;
+
+    let mut as_str = url.to_string();
+    // url::Url always preserves the trailing slash on the path; trim it so
+    // callers building `{base_url}/{endpoint}` don't double-slash.
+    if as_str.ends_with('/') && url.path() == "/" {
+        as_str.pop();
+    }
+    Ok(as_str)
+}
+
+/// Build the retry-aware middleware client and the raw client it wraps.
+///
+/// Both come back because streaming needs the raw [`reqwest::Client`]:
+/// `reqwest-eventsource` accepts only a `reqwest::RequestBuilder`, so the
+/// middleware stack cannot carry a stream. They share one connection pool.
+///
+/// # Errors
+///
+/// Returns [`ClientError::ConfigurationError`] if the proxy URL cannot be
+/// parsed, or [`ClientError::NetworkError`] if the client cannot be built.
+pub(crate) fn build_http_clients(
+    retry_config: &neuromance_common::client::RetryConfig,
+    timeout_seconds: Option<u64>,
+    proxy: Option<&ProxyConfig>,
+) -> Result<(ClientWithMiddleware, reqwest::Client), ClientError> {
+    let retry_policy = ExponentialBackoff::builder()
+        .retry_bounds(retry_config.initial_delay, retry_config.max_delay)
+        .build_with_max_retries(retry_config.max_retries);
+
+    let mut client_builder = reqwest::Client::builder();
+    if let Some(timeout) = timeout_seconds {
+        client_builder = client_builder.timeout(Duration::from_secs(timeout));
+    }
+    if let Some(proxy) = proxy {
+        let parsed = reqwest::Proxy::http(&proxy.proxy_url).map_err(|e| {
+            ClientError::ConfigurationError(format!("invalid proxy URL '{}': {e}", proxy.proxy_url))
+        })?;
+        client_builder = client_builder.proxy(parsed);
+    }
+    let reqwest_client = client_builder.build().map_err(ClientError::NetworkError)?;
+
+    // RetryAfterMiddleware is added before RetryTransientMiddleware so that
+    // Retry-After headers are respected before falling back to exponential
+    // backoff. RetryLoggingMiddleware is registered last so it is the innermost
+    // middleware: RetryTransientMiddleware re-invokes the chain below it on
+    // every retry, so the logging middleware observes each attempt (including
+    // the original).
+    let client = reqwest_middleware::ClientBuilder::new(reqwest_client.clone())
+        .with(RetryAfterMiddleware::new())
+        .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+        .with(retry_logging::RetryLoggingMiddleware)
+        .build();
+
+    Ok((client, reqwest_client))
+}
+
 /// Build the shared HTTP client resources from a [`Config`].
 ///
-/// Extracts the API key, resolves the base URL, builds the retry policy, and
-/// constructs both the middleware-wrapped and raw reqwest clients.
+/// Extracts the API key, resolves the base URL via [`normalize_base_url`], and
+/// constructs the clients via [`build_http_clients`]. `OpenAIEmbedding` shares
+/// those two helpers, so chat and embedding traffic route identically.
 ///
 /// When a [`ProxyConfig`] is set, the reqwest client is configured as an HTTP
-/// forward proxy client: the base URL's scheme is rewritten to `http://` so
-/// reqwest emits absolute-form requests in cleartext to the proxy (RFC 7230
-/// §5.3.2), and the proxy is attached via [`reqwest::Proxy::http`]. The proxy
-/// then terminates the connection, validates the sealed token, and originates
-/// a fresh upstream connection (scheme controlled by the proxy / its token)
-/// to the real provider. The original upstream authority and path are carried
-/// in the request URL, so no `X-Target-Host` side-band header is needed.
+/// forward proxy client: the proxy terminates the connection, validates the
+/// sealed token, and originates a fresh upstream connection to the real
+/// provider. The original upstream authority and path are carried in the
+/// request URL, so no `X-Target-Host` side-band header is needed.
 ///
 /// # Errors
 ///
@@ -85,76 +167,48 @@ pub(crate) fn build_client_resources(
         .clone()
         .ok_or_else(|| ClientError::ConfigurationError("API key is required".to_string()))?;
 
-    let original_url = config
-        .base_url
-        .clone()
-        .unwrap_or_else(|| default_base_url.to_string());
+    let proxy_config = config.proxy.clone();
+    let base_url = normalize_base_url(
+        config
+            .base_url
+            .clone()
+            .unwrap_or_else(|| default_base_url.to_string()),
+        proxy_config.as_ref(),
+    )?;
 
-    // In proxy mode, rewrite the base URL scheme to plaintext HTTP. reqwest
-    // tunnels HTTPS proxies via CONNECT — that hides the request from the
-    // proxy and prevents token injection — so the upstream URL must travel
-    // in cleartext absolute-form. The proxy upgrades to TLS itself when
-    // dialing the real upstream.
-    let (base_url, proxy_config) = match config.proxy.as_ref() {
-        Some(proxy) => {
-            let mut url = url::Url::parse(&original_url).map_err(|e| {
-                ClientError::ConfigurationError(format!("invalid base URL '{original_url}': {e}"))
-            })?;
-            url.set_scheme("http").map_err(|()| {
-                ClientError::ConfigurationError(format!(
-                    "cannot rewrite base URL '{original_url}' to http scheme",
-                ))
-            })?;
-            let mut as_str = url.to_string();
-            // url::Url always preserves the trailing slash on the path; trim
-            // it so callers building `{base_url}/{endpoint}` don't double-slash.
-            if as_str.ends_with('/') && url.path() == "/" {
-                as_str.pop();
-            }
-            (as_str, Some(proxy.clone()))
-        }
-        None => (original_url, None),
-    };
-
-    let retry_policy = ExponentialBackoff::builder()
-        .retry_bounds(
-            config.retry_config.initial_delay,
-            config.retry_config.max_delay,
-        )
-        .build_with_max_retries(config.retry_config.max_retries);
-
-    let mut client_builder = reqwest::Client::builder();
-    if let Some(timeout) = config.timeout_seconds {
-        client_builder = client_builder.timeout(Duration::from_secs(timeout));
-    }
-    if let Some(ref proxy) = proxy_config {
-        let proxy = reqwest::Proxy::http(&proxy.proxy_url).map_err(|e| {
-            ClientError::ConfigurationError(format!("invalid proxy URL '{}': {e}", proxy.proxy_url))
-        })?;
-        client_builder = client_builder.proxy(proxy);
-    }
-    let reqwest_client = client_builder.build().map_err(ClientError::NetworkError)?;
-
-    // Create client with retry middleware.
-    // RetryAfterMiddleware is added before RetryTransientMiddleware
-    // so that Retry-After headers are respected before falling back to exponential backoff.
-    // RetryLoggingMiddleware is registered last so it is the innermost middleware:
-    // RetryTransientMiddleware re-invokes the chain below it on every retry, so the
-    // logging middleware observes each attempt (including the original).
-    let client = reqwest_middleware::ClientBuilder::new(reqwest_client.clone())
-        .with(RetryAfterMiddleware::new())
-        .with(RetryTransientMiddleware::new_with_policy(retry_policy))
-        .with(retry_logging::RetryLoggingMiddleware)
-        .build();
+    let (client, streaming_client) = build_http_clients(
+        &config.retry_config,
+        config.timeout_seconds,
+        proxy_config.as_ref(),
+    )?;
 
     Ok(ClientResources {
         client,
-        streaming_client: reqwest_client,
+        streaming_client,
         api_key: Arc::new(api_key),
         base_url,
         config: Arc::new(config),
         proxy_config,
     })
+}
+
+/// A [`RetryConfig`] whose backoff is short enough to run inside a test.
+///
+/// The default policy waits one second before the first retry and jitters up to
+/// thirty, so a three-attempt test spends several seconds asleep. Millisecond
+/// bounds keep the retry *behaviour* under test while removing the wall clock
+/// from it.
+///
+/// [`RetryConfig`]: neuromance_common::client::RetryConfig
+#[cfg(test)]
+pub(crate) const fn fast_retry_config() -> neuromance_common::client::RetryConfig {
+    neuromance_common::client::RetryConfig {
+        max_retries: 3,
+        initial_delay: Duration::from_millis(1),
+        max_delay: Duration::from_millis(1),
+        backoff_multiplier: 2.0,
+        jitter: false,
+    }
 }
 
 /// A retry policy for SSE streams that never retries.
@@ -721,6 +775,94 @@ mod tests {
         let err = result.err().unwrap();
         assert!(matches!(err, ClientError::ConfigurationError(_)));
         assert!(err.to_string().contains("totally-fake"));
+    }
+
+    fn proxy_at(url: &str) -> ProxyConfig {
+        ProxyConfig {
+            proxy_url: url.to_string(),
+            token_header: "X-Tokenizer-Token".to_string(),
+        }
+    }
+
+    #[test]
+    fn normalize_base_url_leaves_the_url_alone_without_a_proxy() {
+        let url = normalize_base_url("https://api.openai.com/v1".to_string(), None).unwrap();
+        assert_eq!(url, "https://api.openai.com/v1");
+    }
+
+    #[test]
+    fn normalize_base_url_downgrades_to_http_in_proxy_mode() {
+        // The proxy needs to read the absolute-form request line, which an
+        // HTTPS upstream would hide behind CONNECT.
+        let proxy = proxy_at("http://tokenizer.internal:8080");
+        let url =
+            normalize_base_url("https://api.openai.com/v1".to_string(), Some(&proxy)).unwrap();
+        assert_eq!(url, "http://api.openai.com/v1");
+    }
+
+    #[test]
+    fn normalize_base_url_trims_only_a_bare_root_slash() {
+        let proxy = proxy_at("http://tokenizer.internal:8080");
+        assert_eq!(
+            normalize_base_url("https://api.openai.com/".to_string(), Some(&proxy)).unwrap(),
+            "http://api.openai.com"
+        );
+        assert_eq!(
+            normalize_base_url("https://api.openai.com/v1/".to_string(), Some(&proxy)).unwrap(),
+            "http://api.openai.com/v1/"
+        );
+    }
+
+    #[test]
+    fn normalize_base_url_rejects_an_unparseable_url() {
+        let proxy = proxy_at("http://tokenizer.internal:8080");
+        let err = normalize_base_url("not a url".to_string(), Some(&proxy)).unwrap_err();
+        assert!(
+            matches!(&err, ClientError::ConfigurationError(m) if m.contains("not a url")),
+            "the error should name the offending URL, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn build_client_resources_rejects_a_missing_api_key() {
+        let config = Config::new("openai", "gpt-4o");
+        let err = build_client_resources(config, "https://api.openai.com/v1")
+            .err()
+            .expect("a config without an API key cannot build a client");
+        assert!(
+            matches!(&err, ClientError::ConfigurationError(m) if m.contains("API key")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn build_client_resources_rejects_an_invalid_proxy_url() {
+        let config = Config::new("openai", "gpt-4o")
+            .with_api_key("k")
+            .with_proxy(proxy_at("::::not-a-proxy"));
+        let err = build_client_resources(config, "https://api.openai.com/v1")
+            .err()
+            .expect("an unparseable proxy URL cannot build a client");
+        assert!(
+            matches!(&err, ClientError::ConfigurationError(m) if m.contains("::::not-a-proxy")),
+            "the error should name the offending proxy URL, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn build_client_resources_carries_the_proxy_and_rewritten_url() {
+        let config = Config::new("openai", "gpt-4o")
+            .with_api_key("sealed.token")
+            .with_base_url("https://api.openai.com/v1")
+            .with_proxy(proxy_at("http://tokenizer.internal:8080"));
+
+        let resources = build_client_resources(config, "https://unused.example/v1")
+            .expect("a fully specified proxy config should build");
+        assert_eq!(resources.base_url, "http://api.openai.com/v1");
+        assert_eq!(
+            resources.proxy_config.map(|p| p.proxy_url),
+            Some("http://tokenizer.internal:8080".to_string())
+        );
     }
 
     #[test]

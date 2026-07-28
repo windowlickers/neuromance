@@ -26,22 +26,22 @@
 //! ```
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::prelude::*;
 use reqwest_middleware::ClientWithMiddleware;
-use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
-use reqwest_retry_after::RetryAfterMiddleware;
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, error, warn};
 
 use crate::embedding::{
     Embedding, EmbeddingClient, EmbeddingConfig, EmbeddingInput, EmbeddingRequest,
     EmbeddingResponse, EmbeddingUsage, EncodingFormat, models,
 };
-use crate::error::{ClientError, ErrorResponse};
+use crate::error::ClientError;
+use crate::transport::{add_proxy_headers, send_json};
+
+/// Default `OpenAI` API endpoint, used when the config sets no base URL.
+const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
 /// Maximum number of inputs allowed in a single batch request.
 ///
@@ -196,7 +196,7 @@ impl OpenAIEmbedding {
     ///
     /// Returns an error if:
     /// - The HTTP client cannot be created
-    /// - The base URL is invalid
+    /// - The base URL or proxy URL is invalid
     /// - Dimensions are specified for a model that doesn't support them
     /// - Dimensions are outside the valid range for the model
     pub fn new(config: EmbeddingConfig) -> Result<Self, ClientError> {
@@ -205,10 +205,13 @@ impl OpenAIEmbedding {
             Self::validate_dimensions(&config.model, dimensions)?;
         }
 
-        let base_url = config
-            .base_url
-            .clone()
-            .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+        let base_url = crate::normalize_base_url(
+            config
+                .base_url
+                .clone()
+                .unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
+            config.proxy.as_ref(),
+        )?;
 
         // Construct and validate the embeddings URL once at initialization
         let embeddings_url = format!("{base_url}/embeddings");
@@ -216,29 +219,11 @@ impl OpenAIEmbedding {
             ClientError::ConfigurationError(format!("Invalid base URL '{base_url}': {e}"))
         })?;
 
-        // Build retry policy from config
-        let retry_policy = ExponentialBackoff::builder()
-            .retry_bounds(
-                config.retry_config.initial_delay,
-                config.retry_config.max_delay,
-            )
-            .build_with_max_retries(config.retry_config.max_retries);
-
-        // Create reqwest client with optional timeout
-        let reqwest_client = match config.timeout_seconds {
-            Some(timeout) => reqwest::Client::builder()
-                .timeout(Duration::from_secs(timeout))
-                .build()?,
-            None => reqwest::Client::builder().build()?,
-        };
-
-        // Create client with retry middleware (logging registered last, so it is the
-        // innermost middleware the retry loop re-invokes on every attempt).
-        let client = reqwest_middleware::ClientBuilder::new(reqwest_client)
-            .with(RetryAfterMiddleware::new())
-            .with(RetryTransientMiddleware::new_with_policy(retry_policy))
-            .with(crate::retry_logging::RetryLoggingMiddleware)
-            .build();
+        let (client, _streaming_client) = crate::build_http_clients(
+            &config.retry_config,
+            config.timeout_seconds,
+            config.proxy.as_ref(),
+        )?;
 
         Ok(Self {
             client,
@@ -319,7 +304,7 @@ impl OpenAIEmbedding {
             encoding_format: request.encoding_format,
         };
 
-        let response = self
+        let builder = self
             .client
             .post(&self.embeddings_url)
             .header(
@@ -327,55 +312,14 @@ impl OpenAIEmbedding {
                 format!("Bearer {}", self.config.api_key.expose_secret()),
             )
             .header("Content-Type", "application/json")
-            .body(serde_json::to_string(&openai_request).map_err(ClientError::SerializationError)?)
-            .send()
-            .await?;
+            .body(serde_json::to_string(&openai_request).map_err(ClientError::SerializationError)?);
 
-        if !response.status().is_success() {
-            let status = response.status();
-
-            // Extract Retry-After header before consuming the response body
-            let retry_after = crate::transport::parse_retry_after(response.headers());
-
-            let error_text = response.text().await.map_err(|e| {
-                warn!("Failed to read error response body: {e}");
-                ClientError::NetworkError(e)
-            })?;
-
-            // Extract error message from structured response or use raw text
-            let error_message = match serde_json::from_str::<ErrorResponse>(&error_text) {
-                Ok(parsed) => {
-                    debug!("Parsed structured error response");
-                    parsed.error.message
-                }
-                Err(parse_err) => {
-                    debug!("Failed to parse error response as JSON: {parse_err}. Using raw text.");
-                    error_text
-                }
-            };
-
-            error!(
-                "Embedding API request failed with status {}: {}",
-                status.as_u16(),
-                error_message
-            );
-
-            return Err(match status.as_u16() {
-                401 => ClientError::AuthenticationError(error_message),
-                429 => ClientError::RateLimitError {
-                    message: error_message,
-                    retry_after,
-                },
-                400 => ClientError::EmbeddingError(error_message),
-                _ if status.is_server_error() => ClientError::ServiceUnavailable(error_message),
-                _ => ClientError::EmbeddingError(error_message),
-            });
-        }
-
-        let response_text = response.text().await?;
-        debug!("Embedding API response: {}", &response_text);
-
-        serde_json::from_str(&response_text).map_err(ClientError::SerializationError)
+        send_json(add_proxy_headers(
+            builder,
+            self.config.proxy.as_ref(),
+            &self.config.api_key,
+        ))
+        .await
     }
 
     /// Get the default dimensions for a model.
@@ -442,13 +386,18 @@ impl EmbeddingClient for OpenAIEmbedding {
 mod tests {
     #![allow(clippy::unwrap_used)]
     #![allow(clippy::expect_used)]
+    #![allow(clippy::panic)]
+
+    use std::time::Duration;
 
     use super::*;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn create_test_config(base_url: &str) -> EmbeddingConfig {
-        EmbeddingConfig::openai_small("test-key").with_base_url(base_url)
+        let mut config = EmbeddingConfig::openai_small("test-key").with_base_url(base_url);
+        config.retry_config = crate::fast_retry_config();
+        config
     }
 
     #[tokio::test]
@@ -704,10 +653,114 @@ mod tests {
 
         // Use valid input - the server returns 400 for other reasons (e.g., invalid model)
         let result = client.embed("test").await;
-        assert!(result.is_err());
+        let err = result.unwrap_err();
 
-        let error_msg = result.unwrap_err().to_string();
-        assert!(error_msg.contains("Invalid model specified"));
+        assert!(err.to_string().contains("Invalid model specified"));
+        assert!(
+            matches!(err, ClientError::RequestError(_)),
+            "an HTTP 400 is a request error, not an embedding-domain error: {err:?}"
+        );
+    }
+
+    /// A provider that answers with a bare status and no body used to yield
+    /// `AuthenticationError("")`, which tells an operator nothing.
+    #[tokio::test]
+    async fn test_bodyless_error_falls_back_to_the_status_line() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(ResponseTemplate::new(401).set_body_string(""))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let client = OpenAIEmbedding::new(config).unwrap();
+
+        let err = client.embed("test").await.unwrap_err();
+        match err {
+            ClientError::AuthenticationError(msg) => {
+                assert_eq!(msg, "HTTP 401 Unauthorized");
+            }
+            other => panic!("expected AuthenticationError, got {other:?}"),
+        }
+    }
+
+    /// Embeddings must honour the tokenizer proxy the same way chat does:
+    /// the sealed token reaches the proxy in its header, and the upstream
+    /// authority and path survive in the forwarded request.
+    #[tokio::test]
+    async fn test_proxy_headers_sent() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .and(header("X-Tokenizer-Token", "sealed.abc123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{ "index": 0, "embedding": [0.1, 0.2, 0.3] }],
+                "model": "text-embedding-3-small",
+                "usage": { "prompt_tokens": 1, "total_tokens": 1 }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = EmbeddingConfig::openai_small("sealed.abc123")
+            .with_base_url("https://api.openai.com/v1")
+            .with_proxy(neuromance_common::client::ProxyConfig {
+                proxy_url: mock_server.uri(),
+                token_header: "X-Tokenizer-Token".to_string(),
+            });
+
+        let client = OpenAIEmbedding::new(config).unwrap();
+        let vector = client.embed("test").await.unwrap();
+        assert_eq!(vector.len(), 3);
+    }
+
+    /// The proxy only intercepts cleartext requests, so an `https://` upstream
+    /// has to be rewritten — otherwise the sealed token goes straight to the
+    /// provider as a bearer credential.
+    #[test]
+    fn test_proxy_mode_rewrites_base_url_to_http() {
+        let config = EmbeddingConfig::openai_small("sealed.abc123")
+            .with_base_url("https://api.openai.com/v1")
+            .with_proxy(neuromance_common::client::ProxyConfig {
+                proxy_url: "http://tokenizer.internal:8080".to_string(),
+                token_header: "X-Tokenizer-Token".to_string(),
+            });
+
+        let client = OpenAIEmbedding::new(config).unwrap();
+        assert_eq!(client.embeddings_url, "http://api.openai.com/v1/embeddings");
+    }
+
+    /// Without a proxy the URL is left alone — the rewrite is proxy-only.
+    #[test]
+    fn test_without_proxy_base_url_is_untouched() {
+        let config =
+            EmbeddingConfig::openai_small("sk-test").with_base_url("https://api.openai.com/v1");
+        let client = OpenAIEmbedding::new(config).unwrap();
+        assert_eq!(
+            client.embeddings_url,
+            "https://api.openai.com/v1/embeddings"
+        );
+    }
+
+    /// `EmbeddingConfig::from(&Config)` used to drop the proxy, so a
+    /// proxy-mode deployment silently sent sealed tokens direct to upstream.
+    #[test]
+    fn test_from_config_carries_the_proxy() {
+        let proxy = neuromance_common::client::ProxyConfig {
+            proxy_url: "http://tokenizer.internal:8080".to_string(),
+            token_header: "X-Tokenizer-Token".to_string(),
+        };
+        let config = neuromance_common::Config::new("openai", "text-embedding-3-small")
+            .with_api_key("sealed.abc123")
+            .with_proxy(proxy.clone());
+
+        let embedding_config = EmbeddingConfig::from(&config);
+        let carried = embedding_config.proxy.expect("proxy must be carried over");
+        assert_eq!(carried.proxy_url, proxy.proxy_url);
+        assert_eq!(carried.token_header, proxy.token_header);
     }
 
     #[tokio::test]
