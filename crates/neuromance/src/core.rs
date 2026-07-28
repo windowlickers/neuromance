@@ -1515,6 +1515,10 @@ mod tests {
         neuromance_client::ClientError::RequestError("bad tool schema".to_string())
     }
 
+    fn timed_out() -> neuromance_client::ClientError {
+        neuromance_client::ClientError::TimeoutError
+    }
+
     impl ScriptedStreamClient {
         /// Build a client whose retries are instant, so tests don't sleep.
         fn new(script: Vec<Vec<StreamItem>>) -> Self {
@@ -1633,6 +1637,39 @@ mod tests {
             Some("recovered")
         );
         assert_eq!(core.client.attempts(), 3, "two retries then success");
+    }
+
+    /// A transport failure while opening the stream is retried too.
+    ///
+    /// The SSE layer used to hand every transport failure back as a
+    /// non-retryable `EventSourceError`, so this loop never saw one. Now that it
+    /// classifies them as `TimeoutError`/`NetworkError`, they have to be
+    /// retryable here or the classification fix buys nothing.
+    #[tokio::test]
+    async fn test_stream_retries_a_transport_timeout() {
+        let core = streaming_core(ScriptedStreamClient::new(vec![
+            vec![StreamItem::Fail(timed_out)],
+            vec![StreamItem::Chunk("recovered")],
+        ]));
+
+        let conv_id = uuid::Uuid::new_v4();
+        let request = ChatRequest::from((
+            core.client.config(),
+            seeded_ledger(conv_id, vec![Message::user(conv_id, "hi")]).snapshot(),
+        ));
+
+        let Ok((_stream, first)) = core
+            .stream_with_retry(&request, &CancellationToken::new())
+            .await
+        else {
+            panic!("a timeout before the first chunk should be retried");
+        };
+
+        assert_eq!(
+            first.expect("a chunk").delta_content.as_deref(),
+            Some("recovered")
+        );
+        assert_eq!(core.client.attempts(), 2, "one retry then success");
     }
 
     /// Retries stop at `max_retries`; the last error is what the caller sees.

@@ -62,7 +62,7 @@ use neuromance_common::tools::{FunctionCall, ToolCall};
 use crate::error::ClientError;
 use crate::message::MessageBuilder;
 use crate::streaming::{StreamingProvider, run_sse_stream};
-use crate::transport::{add_proxy_headers, send_json};
+use crate::transport::{add_proxy_headers, classify_provider_error, send_json};
 use crate::{LLMClient, build_client_resources};
 
 use super::{
@@ -163,15 +163,6 @@ impl AnthropicClient {
         })
     }
 
-    /// Set a custom base URL for the API endpoint.
-    #[must_use]
-    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
-        let base_url = base_url.into();
-        Arc::make_mut(&mut self.config).base_url = Some(base_url.clone());
-        self.base_url = base_url;
-        self
-    }
-
     /// Set the model to use for chat completions.
     #[must_use]
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
@@ -252,18 +243,34 @@ impl AnthropicClient {
     }
 }
 
+/// The `anthropic-beta` header value a request needs, if any.
+///
+/// Derived in one place so the streaming and non-streaming paths cannot drift
+/// on which betas they enable.
+#[must_use]
+fn beta_features(request: &ChatRequest) -> Option<&'static str> {
+    request
+        .thinking
+        .is_interleaved()
+        .then_some(INTERLEAVED_THINKING_BETA)
+}
+
 /// Convert an Anthropic streaming event to our common `ChatChunk` format.
+///
+/// Returns `None` for events that carry no user-visible output (tool-call
+/// accumulation, `Ping`, `MessageStop`) and `Some(Err(..))` for in-band
+/// `error` events, which are real failures the caller must surface rather
+/// than mistake for a clean end of stream.
 #[must_use]
 #[allow(clippy::too_many_lines)]
-#[allow(clippy::implicit_hasher)]
-pub fn convert_event_to_chat_chunk(
+fn convert_event_to_chat_chunk(
     event: &StreamEvent,
     model: &str,
     response_id: &str,
     streaming_tool_calls: Option<&mut HashMap<u32, StreamingToolCall>>,
-) -> Option<ChatChunk> {
+) -> Option<Result<ChatChunk, ClientError>> {
     match event {
-        StreamEvent::MessageStart { message } => Some(ChatChunk {
+        StreamEvent::MessageStart { message } => Some(Ok(ChatChunk {
             model: message.model.clone(),
             delta_content: None,
             delta_reasoning_content: None,
@@ -274,7 +281,7 @@ pub fn convert_event_to_chat_chunk(
             response_id: Some(message.id.clone()),
             created_at: Utc::now(),
             metadata: HashMap::new(),
-        }),
+        })),
 
         StreamEvent::ContentBlockStart {
             index,
@@ -285,7 +292,7 @@ pub fn convert_event_to_chat_chunk(
                     if text.is_empty() {
                         None
                     } else {
-                        Some(ChatChunk {
+                        Some(Ok(ChatChunk {
                             model: model.to_string(),
                             delta_content: Some(text.clone()),
                             delta_reasoning_content: None,
@@ -296,14 +303,14 @@ pub fn convert_event_to_chat_chunk(
                             response_id: Some(response_id.to_string()),
                             created_at: Utc::now(),
                             metadata: HashMap::new(),
-                        })
+                        }))
                     }
                 }
                 ContentBlockStart::Thinking { thinking } => {
                     if thinking.is_empty() {
                         None
                     } else {
-                        Some(ChatChunk {
+                        Some(Ok(ChatChunk {
                             model: model.to_string(),
                             delta_content: None,
                             delta_reasoning_content: Some(thinking.clone()),
@@ -314,7 +321,7 @@ pub fn convert_event_to_chat_chunk(
                             response_id: Some(response_id.to_string()),
                             created_at: Utc::now(),
                             metadata: HashMap::new(),
-                        })
+                        }))
                     }
                 }
                 ContentBlockStart::ToolUse { id, name, .. } => {
@@ -328,7 +335,7 @@ pub fn convert_event_to_chat_chunk(
         }
 
         StreamEvent::ContentBlockDelta { index, delta } => match delta {
-            Delta::TextDelta { text } => Some(ChatChunk {
+            Delta::TextDelta { text } => Some(Ok(ChatChunk {
                 model: model.to_string(),
                 delta_content: Some(text.clone()),
                 delta_reasoning_content: None,
@@ -339,8 +346,8 @@ pub fn convert_event_to_chat_chunk(
                 response_id: Some(response_id.to_string()),
                 created_at: Utc::now(),
                 metadata: HashMap::new(),
-            }),
-            Delta::ThinkingDelta { thinking } => Some(ChatChunk {
+            })),
+            Delta::ThinkingDelta { thinking } => Some(Ok(ChatChunk {
                 model: model.to_string(),
                 delta_content: None,
                 delta_reasoning_content: Some(thinking.clone()),
@@ -351,7 +358,7 @@ pub fn convert_event_to_chat_chunk(
                 response_id: Some(response_id.to_string()),
                 created_at: Utc::now(),
                 metadata: HashMap::new(),
-            }),
+            })),
             Delta::InputJsonDelta { partial_json } => {
                 // Accumulate JSON for this tool call
                 if let Some(tool_calls) = streaming_tool_calls
@@ -374,7 +381,7 @@ pub fn convert_event_to_chat_chunk(
             {
                 match tool_call.finalize() {
                     Ok(finalized) => {
-                        return Some(ChatChunk {
+                        return Some(Ok(ChatChunk {
                             model: model.to_string(),
                             delta_content: None,
                             delta_reasoning_content: None,
@@ -385,7 +392,7 @@ pub fn convert_event_to_chat_chunk(
                             response_id: Some(response_id.to_string()),
                             created_at: Utc::now(),
                             metadata: HashMap::new(),
-                        });
+                        }));
                     }
                     Err(e) => {
                         warn!("Failed to finalize tool call: {e}");
@@ -401,7 +408,7 @@ pub fn convert_event_to_chat_chunk(
             // MessageDelta only carries output_tokens; input token data
             // (including cache stats) arrives in MessageStart.  We emit
             // a partial Usage here so consumers can merge the two.
-            Some(ChatChunk {
+            Some(Ok(ChatChunk {
                 model: model.to_string(),
                 delta_content: None,
                 delta_reasoning_content: None,
@@ -419,16 +426,25 @@ pub fn convert_event_to_chat_chunk(
                 response_id: Some(response_id.to_string()),
                 created_at: Utc::now(),
                 metadata: HashMap::new(),
-            })
+            }))
         }
 
         StreamEvent::MessageStop | StreamEvent::Ping => None,
+
+        // An `error` event is the provider reporting a failure over an
+        // otherwise-healthy stream. Dropping it would leave the consumer with
+        // a stream that ends cleanly, indistinguishable from a completed
+        // response — so classify it and surface it.
         StreamEvent::Error { error } => {
             warn!(
                 "Stream error from API: {} - {}",
                 error.error_type, error.message
             );
-            None
+            Some(Err(classify_provider_error(
+                &error.error_type,
+                None,
+                error.message.clone(),
+            )))
         }
     }
 }
@@ -453,14 +469,9 @@ impl LLMClient for AnthropicClient {
         let mut anthropic_request = CreateMessageRequest::from((request, self.config.as_ref()));
         anthropic_request.stream = Some(false);
 
-        // Determine if interleaved thinking beta should be enabled
-        let beta_features = if request.thinking.is_interleaved() {
-            Some(INTERLEAVED_THINKING_BETA)
-        } else {
-            None
-        };
-
-        let response = self.make_request(&anthropic_request, beta_features).await?;
+        let response = self
+            .make_request(&anthropic_request, beta_features(request))
+            .await?;
 
         // Get conversation_id from first message
         let conversation_id = request
@@ -508,8 +519,8 @@ impl LLMClient for AnthropicClient {
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("Content-Type", "application/json");
 
-        if request.thinking.is_interleaved() {
-            request_builder = request_builder.header("anthropic-beta", INTERLEAVED_THINKING_BETA);
+        if let Some(beta) = beta_features(request) {
+            request_builder = request_builder.header("anthropic-beta", beta);
         }
 
         request_builder =
@@ -558,7 +569,6 @@ impl StreamingProvider for AnthropicClient {
             &state.response_id,
             Some(&mut state.streaming_tool_calls),
         )
-        .map(Ok)
     }
 }
 
@@ -581,6 +591,7 @@ mod tests {
         Config::new("anthropic", "claude-sonnet-4-5-20250929")
             .with_api_key("test-key")
             .with_base_url(base_url)
+            .with_retry_config(crate::fast_retry_config())
     }
 
     fn create_test_message() -> Message {
@@ -958,6 +969,14 @@ mod tests {
     // Streaming Integration Tests
     // ========================================================================
 
+    /// Unwrap a conversion that is expected to yield a chunk rather than skip
+    /// the event or report an in-band error.
+    fn expect_chunk(converted: Option<Result<ChatChunk, ClientError>>) -> ChatChunk {
+        converted
+            .expect("event should produce a chunk")
+            .expect("event should not convert to an error")
+    }
+
     #[test]
     fn test_streaming_text_delta_conversion() {
         use crate::anthropic::{Delta, StreamEvent};
@@ -972,7 +991,7 @@ mod tests {
 
         let chunk =
             convert_event_to_chat_chunk(&event, "claude-sonnet-4-5-20250929", "resp_123", None);
-        let chunk = chunk.expect("Should produce a chunk");
+        let chunk = expect_chunk(chunk);
 
         assert_eq!(chunk.delta_content, Some("Hello, world!".to_string()));
         assert_eq!(chunk.model, "claude-sonnet-4-5-20250929");
@@ -994,7 +1013,7 @@ mod tests {
 
         let chunk =
             convert_event_to_chat_chunk(&event, "claude-sonnet-4-5-20250929", "resp_123", None);
-        let chunk = chunk.expect("Should produce a chunk");
+        let chunk = expect_chunk(chunk);
 
         assert_eq!(
             chunk.delta_reasoning_content,
@@ -1065,7 +1084,7 @@ mod tests {
             Some(&mut tool_calls),
         );
 
-        let chunk = chunk.expect("Should produce a chunk with tool call");
+        let chunk = expect_chunk(chunk);
         let tool_calls_result = chunk.delta_tool_calls.expect("Should have tool calls");
         assert_eq!(tool_calls_result.len(), 1);
 
@@ -1075,6 +1094,54 @@ mod tests {
         // Verify the JSON was parsed correctly
         let args: serde_json::Value = serde_json::from_str(&tool_call.function.arguments).unwrap();
         assert_eq!(args["location"], "San Francisco");
+    }
+
+    /// An in-band `error` event must surface as an error item. Returning `None`
+    /// would end the stream cleanly, indistinguishable from a completed
+    /// response.
+    #[test]
+    fn test_streaming_error_event_surfaces_error() {
+        use crate::anthropic::{ApiError, StreamEvent};
+
+        let event = StreamEvent::Error {
+            error: ApiError {
+                error_type: "invalid_request_error".to_string(),
+                message: "max_tokens is too large".to_string(),
+            },
+        };
+
+        let err =
+            convert_event_to_chat_chunk(&event, "claude-sonnet-4-5-20250929", "resp_123", None)
+                .expect("error event should produce an item")
+                .expect_err("error event should produce an error");
+
+        assert!(err.to_string().contains("max_tokens is too large"));
+        assert!(!err.is_retryable(), "an invalid request is terminal");
+    }
+
+    /// A transient overload delivered mid-stream must classify the same way as
+    /// the HTTP 529 that carries it before the stream opens: retryable.
+    #[test]
+    fn test_streaming_overloaded_error_is_retryable() {
+        use crate::anthropic::{ApiError, StreamEvent};
+
+        let event = StreamEvent::Error {
+            error: ApiError {
+                error_type: "overloaded_error".to_string(),
+                message: "Overloaded".to_string(),
+            },
+        };
+
+        let err =
+            convert_event_to_chat_chunk(&event, "claude-sonnet-4-5-20250929", "resp_123", None)
+                .expect("error event should produce an item")
+                .expect_err("error event should produce an error");
+
+        assert!(
+            matches!(err, ClientError::ServiceUnavailable(_)),
+            "got {err:?}"
+        );
+        assert!(err.is_retryable());
     }
 
     #[test]
@@ -1099,8 +1166,7 @@ mod tests {
             },
         };
 
-        let chunk = convert_event_to_chat_chunk(&event, "", "", None);
-        let chunk = chunk.expect("Should produce a chunk");
+        let chunk = expect_chunk(convert_event_to_chat_chunk(&event, "", "", None));
 
         assert_eq!(chunk.model, "claude-sonnet-4-5-20250929");
         assert_eq!(chunk.response_id, Some("msg_01XYZ".to_string()));

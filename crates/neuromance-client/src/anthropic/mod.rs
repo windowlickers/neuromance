@@ -748,14 +748,8 @@ impl From<&Message> for AnthropicMessage {
 
                 MessageContent::Blocks(blocks)
             }
-            _ => {
-                // Regular text content
-                if message.content.is_empty() {
-                    MessageContent::Text(String::new())
-                } else {
-                    MessageContent::Text(message.content.clone())
-                }
-            }
+            // Regular text content
+            _ => MessageContent::Text(message.content.clone()),
         };
 
         Self { role, content }

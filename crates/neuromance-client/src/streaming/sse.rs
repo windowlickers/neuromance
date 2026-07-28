@@ -88,10 +88,8 @@ pub trait StreamingProvider {
 /// - JSON parse failures yield [`ClientError::SerializationError`] but do
 ///   not terminate the stream — subsequent valid events still flow.
 /// - [`reqwest_eventsource::Error::StreamEnded`] terminates cleanly.
-/// - [`reqwest_eventsource::Error::InvalidStatusCode`] is unwrapped into a
-///   typed [`ClientError`] via the response body, then terminates.
-/// - All other event-source errors are mapped via [`ClientError::from`] and
-///   terminate the stream.
+/// - Every other event-source error is classified by
+///   [`map_event_source_error`] and terminates the stream.
 ///
 /// # Errors
 ///
@@ -144,14 +142,8 @@ pub fn run_sse_stream<P: StreamingProvider>(
                         debug!("Stream ended normally");
                         return None;
                     }
-                    Some(Err(reqwest_eventsource::Error::InvalidStatusCode(status, response))) => {
-                        let error = extract_error_from_response(status, response).await;
-                        error!("API error: {error}");
-                        s.terminated = true;
-                        return Some((Err(error), s));
-                    }
                     Some(Err(other)) => {
-                        let error = ClientError::from(other);
+                        let error = map_event_source_error(other).await;
                         error!("Stream error: {error}");
                         s.terminated = true;
                         return Some((Err(error), s));
@@ -171,18 +163,37 @@ struct StreamState<S> {
     terminated: bool,
 }
 
-/// Extract a typed [`ClientError`] from an HTTP error response.
+/// Classify an event-source failure into a typed [`ClientError`].
 ///
-/// Reads the body text and delegates the status/body-to-error mapping to
-/// [`crate::transport::map_http_error`], the single canonical mapping shared
-/// with the non-streaming request path.
-async fn extract_error_from_response(
-    status: reqwest::StatusCode,
-    response: reqwest::Response,
-) -> ClientError {
-    let headers = response.headers().clone();
-    let error_text = response.text().await.unwrap_or_default();
-    crate::transport::map_http_error(status, &headers, &error_text)
+/// Stream retry lives above this crate, in `Core::stream_with_retry`, and keys
+/// off [`ClientError::is_retryable`]. A connection reset or timeout therefore
+/// has to arrive here as [`ClientError::NetworkError`] /
+/// [`ClientError::TimeoutError`] — the same classification the non-streaming
+/// path gives it — or an identical failure gets retried when it is not
+/// streaming and dropped when it is.
+///
+/// [`reqwest_eventsource::Error::StreamEnded`] never reaches this function: it
+/// is a clean end of stream, not a failure, and the driver terminates on it.
+async fn map_event_source_error(err: reqwest_eventsource::Error) -> ClientError {
+    match err {
+        reqwest_eventsource::Error::Transport(e) => crate::transport::map_transport_error(e),
+        reqwest_eventsource::Error::InvalidStatusCode(status, response) => {
+            let headers = response.headers().clone();
+            let body = response.text().await.unwrap_or_default();
+            crate::transport::map_http_error(status, &headers, &body)
+        }
+        // A non-SSE content type means the body holds the real explanation —
+        // a proxy error page, or a provider answering 200 with a JSON error.
+        // Reading it replaces an opaque header-value message with the
+        // provider's own words.
+        reqwest_eventsource::Error::InvalidContentType(content_type, response) => {
+            let body = response.text().await.unwrap_or_default();
+            ClientError::InvalidResponse(format!(
+                "expected an SSE stream, got content-type {content_type:?}: {body}"
+            ))
+        }
+        other => ClientError::EventSourceError(other),
+    }
 }
 
 #[cfg(test)]
@@ -459,6 +470,113 @@ mod tests {
             Err(ClientError::ServiceUnavailable(msg)) => assert!(msg.contains("upstream down")),
             other => panic!("expected ServiceUnavailable, got {other:?}"),
         }
+    }
+
+    /// A stream that cannot connect must be retryable, or `Core::stream_with_retry`
+    /// silently gives up on a failure the non-streaming path recovers from.
+    #[tokio::test]
+    async fn connection_failure_is_a_retryable_network_error() {
+        // Bind then drop, so the port is known-dead rather than merely unlikely.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let request = reqwest::Client::new().post(format!("http://127.0.0.1:{port}/stream"));
+        let stream = run_sse_stream(&TestProvider, request).unwrap();
+        let results: Vec<_> = stream.collect().await;
+
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            Err(err) => {
+                assert!(
+                    matches!(err, ClientError::NetworkError(_)),
+                    "expected NetworkError, got {err:?}"
+                );
+                assert!(err.is_retryable(), "connection failure must be retryable");
+            }
+            Ok(chunk) => panic!("expected an error, got {chunk:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn request_timeout_maps_to_timeout_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/stream"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw("", "text/event-stream")
+                    .set_delay(std::time::Duration::from_secs(5)),
+            )
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(50))
+            .build()
+            .unwrap();
+        let request = client.post(format!("{}/stream", server.uri()));
+
+        let stream = run_sse_stream(&TestProvider, request).unwrap();
+        let results: Vec<_> = stream.collect().await;
+
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            Err(err) => {
+                assert!(
+                    matches!(err, ClientError::TimeoutError),
+                    "expected TimeoutError, got {err:?}"
+                );
+                assert!(err.is_retryable(), "timeout must be retryable");
+            }
+            Ok(chunk) => panic!("expected an error, got {chunk:?}"),
+        }
+    }
+
+    /// A 200 that isn't an event stream carries its explanation in the body,
+    /// which the bare `Content-Type` message throws away.
+    #[tokio::test]
+    async fn non_sse_content_type_surfaces_the_response_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/stream"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "error": { "message": "streaming is not enabled for this key" }
+            })))
+            .mount(&server)
+            .await;
+
+        let stream = run_sse_stream(&TestProvider, post_request(&server)).unwrap();
+        let results: Vec<_> = stream.collect().await;
+
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            Err(ClientError::InvalidResponse(msg)) => {
+                assert!(
+                    msg.contains("streaming is not enabled for this key"),
+                    "body should be surfaced, got {msg}"
+                );
+                assert!(msg.contains("application/json"), "got {msg}");
+            }
+            other => panic!("expected InvalidResponse, got {other:?}"),
+        }
+    }
+
+    /// Protocol-level faults stay terminal: retrying a stream the client cannot
+    /// parse just replays the same failure.
+    #[tokio::test]
+    async fn protocol_errors_stay_non_retryable() {
+        let err = map_event_source_error(reqwest_eventsource::Error::InvalidLastEventId(
+            "\n".to_string(),
+        ))
+        .await;
+        assert!(matches!(err, ClientError::EventSourceError(_)));
+        assert!(!err.is_retryable());
+
+        let utf8 = String::from_utf8(vec![0xff]).unwrap_err();
+        let err = map_event_source_error(reqwest_eventsource::Error::Utf8(utf8)).await;
+        assert!(matches!(err, ClientError::EventSourceError(_)));
+        assert!(!err.is_retryable());
     }
 
     #[tokio::test]

@@ -19,7 +19,7 @@ use neuromance_common::tools::{FunctionCall, ToolCall};
 
 use crate::error::ClientError;
 use crate::streaming::{StreamingProvider, run_sse_stream};
-use crate::transport::{add_proxy_headers, send_json};
+use crate::transport::{add_proxy_headers, classify_provider_error, send_json};
 use crate::{LLMClient, build_client_resources};
 
 use super::{
@@ -81,19 +81,6 @@ impl ResponsesClient {
             config: r.config,
             proxy_config: r.proxy_config,
         })
-    }
-
-    /// Set a custom base URL for the API endpoint.
-    ///
-    /// # Arguments
-    ///
-    /// * `base_url` - The base URL (e.g., `https://api.openai.com/v1`)
-    #[must_use]
-    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
-        let base_url = base_url.into();
-        Arc::make_mut(&mut self.config).base_url = Some(base_url.clone());
-        self.base_url = base_url;
-        self
     }
 
     /// Set the model to use for requests.
@@ -314,11 +301,12 @@ fn convert_event_to_chunk(
         }
 
         StreamEvent::ResponseFailed { response } => {
-            let error_msg = response
-                .error
-                .map_or_else(|| "Unknown error".to_string(), |e| e.message);
-            warn!("Response failed: {error_msg}");
-            Some(Err(ClientError::RequestError(error_msg)))
+            let (code, message) = response.error.map_or_else(
+                || (String::new(), "Unknown error".to_string()),
+                |e| (e.code, e.message),
+            );
+            warn!("Response failed: {message}");
+            Some(Err(classify_provider_error(&code, None, message)))
         }
 
         StreamEvent::OutputTextDelta { delta, .. } => Some(Ok(ChatChunk {
@@ -434,7 +422,11 @@ fn convert_event_to_chunk(
                 "Stream error from API: {} - {}",
                 error.error_type, error.message
             );
-            Some(Err(ClientError::RequestError(error.message)))
+            Some(Err(classify_provider_error(
+                &error.error_type,
+                error.code.as_deref(),
+                error.message,
+            )))
         }
 
         StreamEvent::ContentPartAdded { .. }
@@ -463,6 +455,7 @@ mod tests {
         Config::new("responses", "gpt-4o")
             .with_api_key("test-key")
             .with_base_url(base_url)
+            .with_retry_config(crate::fast_retry_config())
     }
 
     fn create_test_message() -> Message {
@@ -819,6 +812,11 @@ mod tests {
         let result = convert_event_to_chunk(event, &mut state);
         let err = result.unwrap().unwrap_err();
         assert!(err.to_string().contains("Internal server error"));
+        assert!(
+            matches!(err, ClientError::ServiceUnavailable(_)),
+            "a server_error code must classify as retryable, got {err:?}"
+        );
+        assert!(err.is_retryable());
     }
 
     #[tokio::test]
@@ -944,6 +942,33 @@ mod tests {
         let result = convert_event_to_chunk(event, &mut state);
         let err = result.unwrap().unwrap_err();
         assert!(err.to_string().contains("Invalid model specified"));
+        assert!(
+            !err.is_retryable(),
+            "a bad request must stay terminal, got {err:?}"
+        );
+    }
+
+    /// The same overload delivered as HTTP 429 is retryable; delivered as an
+    /// in-band event it has to be too, or streaming silently loses the retry.
+    #[tokio::test]
+    async fn test_stream_error_event_rate_limit_is_retryable() {
+        let mut state = make_state();
+
+        let event = StreamEvent::Error {
+            error: super::super::ApiError {
+                error_type: "invalid_request_error".to_string(),
+                code: Some("rate_limit_exceeded".to_string()),
+                message: "Rate limit reached for gpt-4o".to_string(),
+            },
+        };
+
+        let result = convert_event_to_chunk(event, &mut state);
+        let err = result.unwrap().unwrap_err();
+        assert!(
+            matches!(err, ClientError::RateLimitError { .. }),
+            "expected RateLimitError, got {err:?}"
+        );
+        assert!(err.is_retryable());
     }
 
     #[tokio::test]

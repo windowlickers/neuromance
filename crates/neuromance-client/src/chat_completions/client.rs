@@ -91,9 +91,18 @@
 //! The client handles various error scenarios:
 //!
 //! - **Authentication errors (401)**: Invalid or missing API keys
-//! - **Rate limiting (429)**: Automatic retry with exponential backoff
-//! - **Server errors (5xx)**: Transient failures with configurable retries
+//! - **Rate limiting (429)**: Retryable; carries the `Retry-After` delay when sent
+//! - **Server errors (5xx)**: Transient failures
 //! - **Invalid responses**: Missing or malformed response data
+//!
+//! Retries happen in two places, depending on the call. Non-streaming requests
+//! are retried inside this client by the `reqwest-retry` middleware, using
+//! [`RetryConfig`](neuromance_common::client::RetryConfig). Streaming requests
+//! are not — `reqwest-eventsource` needs a raw `reqwest::RequestBuilder` and
+//! cannot carry the middleware stack — so a stream that fails to open is
+//! retried by the caller (`Core::stream_with_retry`) on any
+//! [`ClientError::is_retryable`] error. Once chunks start arriving, neither
+//! layer retries: a partially consumed stream cannot be replayed.
 //!
 //! # Security
 //!
@@ -460,22 +469,6 @@ impl ChatCompletionsClient {
         })
     }
 
-    /// Set a custom base URL for the API endpoint.
-    ///
-    /// Useful for connecting to Chat Completions-compatible services like Azure `OpenAI`,
-    /// local models, or proxy servers.
-    ///
-    /// # Arguments
-    ///
-    /// * `base_url` - The base URL (e.g., `https://api.openai.com/v1`)
-    #[must_use]
-    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
-        let base_url = base_url.into();
-        Arc::make_mut(&mut self.config).base_url = Some(base_url.clone());
-        self.base_url = base_url;
-        self
-    }
-
     /// Set the model to use for chat completions.
     ///
     /// # Arguments
@@ -698,6 +691,8 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     #![allow(clippy::expect_used)]
 
+    use std::time::Duration;
+
     use super::*;
     use futures::StreamExt;
     use neuromance_common::chat::{Message, MessageRole};
@@ -709,6 +704,7 @@ mod tests {
         Config::new("openai", "gpt-4")
             .with_api_key("test-key")
             .with_base_url(base_url)
+            .with_retry_config(crate::fast_retry_config())
     }
 
     fn create_test_message() -> Message {
@@ -1074,6 +1070,104 @@ mod tests {
 
         let output_details = usage.output_tokens_details.unwrap();
         assert_eq!(output_details.reasoning_tokens, 3);
+    }
+
+    // ==================== Settings Plumbing Tests ====================
+
+    #[tokio::test]
+    async fn test_transient_failure_is_retried_until_it_succeeds() {
+        let mock_server = MockServer::start().await;
+
+        // Two 503s then a 200. `up_to_n_times` makes the failing mock stop
+        // matching after two hits, so the success mock takes over.
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(2)
+            .expect(2)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(create_successful_response()))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let client = ChatCompletionsClient::new(config).unwrap();
+        let request = ChatRequest::new(vec![create_test_message()]);
+
+        let response = client.chat(&request).await.unwrap();
+        assert_eq!(response.message.content, "Response via proxy");
+
+        // Assert the attempt count directly: without it, a client that never
+        // retried but happened to hit the success mock would also pass.
+        let attempts = mock_server.received_requests().await.unwrap().len();
+        assert_eq!(attempts, 3, "expected 2 failures plus 1 success");
+    }
+
+    #[tokio::test]
+    async fn test_retries_stop_at_max_retries() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let max_retries = config.retry_config.max_retries as usize;
+        let client = ChatCompletionsClient::new(config).unwrap();
+        let request = ChatRequest::new(vec![create_test_message()]);
+
+        let error = client.chat(&request).await.unwrap_err();
+        assert!(error.is_retryable(), "a 503 should stay retryable: {error}");
+
+        let attempts = mock_server.received_requests().await.unwrap().len();
+        assert_eq!(attempts, max_retries + 1, "one try plus max_retries");
+    }
+
+    #[tokio::test]
+    async fn test_timeout_seconds_is_enforced() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(create_successful_response())
+                    .set_delay(Duration::from_secs(5)),
+            )
+            .mount(&mock_server)
+            .await;
+
+        // `timeout_seconds` has one-second granularity and a timeout is
+        // transient, so retries would multiply the test's wall clock by the
+        // attempt count. Retry behaviour is covered separately.
+        let mut config = create_test_config(&mock_server.uri()).with_timeout(1);
+        config.retry_config.max_retries = 0;
+        let client = ChatCompletionsClient::new(config).unwrap();
+        let request = ChatRequest::new(vec![create_test_message()]);
+
+        let error = client.chat(&request).await.unwrap_err();
+        assert!(
+            matches!(error, ClientError::TimeoutError),
+            "expected TimeoutError, got {error:?}"
+        );
+        assert!(error.is_retryable());
+    }
+
+    #[test]
+    fn test_missing_api_key_is_a_configuration_error() {
+        let config = Config::new("openai", "gpt-4").with_base_url("http://localhost:1");
+
+        let error = ChatCompletionsClient::new(config).unwrap_err();
+        assert!(
+            matches!(&error, ClientError::ConfigurationError(msg) if msg.contains("API key")),
+            "expected a configuration error naming the API key, got {error:?}"
+        );
     }
 
     // ==================== Proxy Header Tests ====================
