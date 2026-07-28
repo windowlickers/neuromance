@@ -47,7 +47,7 @@ impl From<MessageRole> for ResponsesRole {
             other => {
                 warn!(
                     role = ?other,
-                    "unexpected role converted to ResponsesRole::User; tool messages should use InputItem::FunctionCallOutput",
+                    "Coerced unexpected role to User; tool roles need FunctionCallOutput items",
                 );
                 Self::User
             }
@@ -353,97 +353,98 @@ pub struct ResponsesRequest {
     pub metadata: Option<HashMap<String, serde_json::Value>>,
 }
 
-impl From<(&ChatRequest, &Config)> for ResponsesRequest {
-    fn from((request, config): (&ChatRequest, &Config)) -> Self {
-        let mut input_items: Vec<InputItem> = Vec::new();
-        let mut instructions: Option<String> = None;
+/// Split a conversation into Responses input items and top-level instructions.
+///
+/// The Responses API has no `system` role: system messages are hoisted out of
+/// the item list into the request's `instructions` field, joined by blank lines
+/// when a conversation carries more than one.
+fn build_input_items(messages: &[Message]) -> (Vec<InputItem>, Option<String>) {
+    let mut input_items: Vec<InputItem> = Vec::new();
+    let mut instructions: Option<String> = None;
 
-        // Convert messages to input items
-        for message in request.messages.iter() {
-            match message.role {
-                MessageRole::System => {
-                    // System messages become instructions
-                    if let Some(ref mut inst) = instructions {
-                        inst.push_str("\n\n");
-                        inst.push_str(&message.content);
-                    } else {
-                        instructions = Some(message.content.clone());
-                    }
+    for message in messages {
+        match message.role {
+            MessageRole::System => match instructions {
+                Some(ref mut existing) => {
+                    existing.push_str("\n\n");
+                    existing.push_str(&message.content);
                 }
-                MessageRole::Tool => {
-                    // Tool messages become FunctionCallOutput
-                    if let Some(call_id) = &message.tool_call_id {
-                        input_items.push(InputItem::FunctionCallOutput {
-                            call_id: call_id.clone(),
-                            output: message.content.clone(),
-                        });
-                    } else {
-                        warn!(
-                            "Tool message without tool_call_id was skipped; this likely indicates a bug in the calling code"
-                        );
-                    }
+                None => instructions = Some(message.content.clone()),
+            },
+            MessageRole::Tool => {
+                if let Some(call_id) = &message.tool_call_id {
+                    input_items.push(InputItem::FunctionCallOutput {
+                        call_id: call_id.clone(),
+                        output: message.content.clone(),
+                    });
+                } else {
+                    warn!("Skipped tool message without tool_call_id; likely a caller bug");
                 }
-                MessageRole::Assistant if !message.tool_calls.is_empty() => {
-                    // Assistant message with tool calls
-                    // First add the message content if present
-                    if !message.content.is_empty() {
-                        input_items.push(InputItem::Message {
-                            role: ResponsesRole::Assistant,
-                            content: MessageContent::Text(message.content.clone()),
-                        });
-                    }
-                    // Then add each tool call as a separate FunctionCall item
-                    for tool_call in &message.tool_calls {
-                        input_items.push(InputItem::FunctionCall {
-                            call_id: tool_call.id.clone(),
-                            name: tool_call.function.name.clone(),
-                            arguments: tool_call.function.arguments_json().to_owned(),
-                        });
-                    }
-                }
-                role => {
-                    // Regular message
+            }
+            MessageRole::Assistant if !message.tool_calls.is_empty() => {
+                // Content and tool calls are separate items: the assistant's
+                // prose (if any) first, then one FunctionCall per invocation.
+                if !message.content.is_empty() {
                     input_items.push(InputItem::Message {
-                        role: ResponsesRole::from(role),
+                        role: ResponsesRole::Assistant,
                         content: MessageContent::Text(message.content.clone()),
                     });
                 }
+                input_items.extend(message.tool_calls.iter().map(|tool_call| {
+                    InputItem::FunctionCall {
+                        call_id: tool_call.id.clone(),
+                        name: tool_call.function.name.clone(),
+                        arguments: tool_call.function.arguments_json().to_owned(),
+                    }
+                }));
             }
+            role => input_items.push(InputItem::Message {
+                role: ResponsesRole::from(role),
+                content: MessageContent::Text(message.content.clone()),
+            }),
         }
+    }
 
-        // Convert tools
+    (input_items, instructions)
+}
+
+/// Derive the reasoning block for a request, if the model should reason at all.
+///
+/// The summary verbosity is not part of [`ChatRequest`]; it rides in
+/// `metadata["reasoning_summary"]` as `"concise"` (the default), `"detailed"`,
+/// or `"none"`. An unparseable value falls back to the default rather than
+/// failing the request.
+fn reasoning_config(request: &ChatRequest) -> Option<ReasoningConfig> {
+    reasoning_level_to_effort(request.reasoning_level).map(|effort| ReasoningConfig {
+        effort,
+        summary: Some(
+            request
+                .metadata
+                .get("reasoning_summary")
+                .and_then(|v| serde_json::from_value::<ReasoningSummary>(v.clone()).ok())
+                .unwrap_or(ReasoningSummary::Concise),
+        ),
+    })
+}
+
+impl From<(&ChatRequest, &Config)> for ResponsesRequest {
+    fn from((request, config): (&ChatRequest, &Config)) -> Self {
+        let (input_items, instructions) = build_input_items(&request.messages);
+
         let tools: Option<Vec<ResponsesTool>> = request
             .tools
             .as_ref()
             .map(|t| t.iter().map(ResponsesTool::from).collect());
-
-        // Convert tool choice
         let tool_choice: Option<ResponsesToolChoice> =
             request.tool_choice.as_ref().map(ResponsesToolChoice::from);
 
-        // Convert reasoning level
-        // Reasoning summary can be configured via metadata["reasoning_summary"] with values:
-        // "concise" (default), "detailed", or "none"
-        let reasoning: Option<ReasoningConfig> = reasoning_level_to_effort(request.reasoning_level)
-            .map(|effort| {
-                let summary = request
-                    .metadata
-                    .get("reasoning_summary")
-                    .and_then(|v| serde_json::from_value::<ReasoningSummary>(v.clone()).ok())
-                    .unwrap_or(ReasoningSummary::Concise);
-                ReasoningConfig {
-                    effort,
-                    summary: Some(summary),
-                }
-            });
-
-        // Get previous_response_id from metadata if present
+        // Server-side response chaining and persistence are Responses-only
+        // knobs with no ChatRequest field, so they travel in metadata.
         let previous_response_id = request
             .metadata
             .get("previous_response_id")
             .and_then(|v| v.as_str())
             .map(String::from);
-
         let store = request
             .metadata
             .get("store")
@@ -466,7 +467,7 @@ impl From<(&ChatRequest, &Config)> for ResponsesRequest {
             .tools(tools)
             .tool_choice(tool_choice)
             .previous_response_id(previous_response_id)
-            .reasoning(reasoning)
+            .reasoning(reasoning_config(request))
             .stream(Some(request.stream))
             .build()
     }
