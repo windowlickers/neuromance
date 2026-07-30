@@ -43,11 +43,14 @@ use axum::{
 };
 use chrono::Utc;
 use metrics::{counter, gauge, histogram};
+use opentelemetry::global;
+use opentelemetry_http::HeaderExtractor;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
-use tracing::{Level, Span, error, field, info, info_span, warn};
+use tracing::{Instrument, Level, Span, error, field, info, info_span, warn};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
 use neuromance::error::CoreError;
@@ -265,6 +268,14 @@ struct WorkerJob {
     /// consulted when the conversation's workspace is first created; `None`
     /// prepares an unseeded workspace.
     workspace: Option<WorkspaceDefinition>,
+    /// Trace context of the request that enqueued this job, carried so the
+    /// `task` span continues the caller's trace.
+    ///
+    /// The job runs on the worker long after the HTTP handler returned, so the
+    /// span context cannot be inherited: without this the whole agent run —
+    /// every `chat_turn` and `tool_call` — lands in a trace disconnected from
+    /// the request that asked for it. Empty when telemetry is off.
+    otel_context: opentelemetry::Context,
 }
 
 #[derive(Clone)]
@@ -296,12 +307,23 @@ const CHILDREN_PAGE_LIMIT: u32 = 100;
 pub fn router(state: ServeState) -> Router {
     let trace_layer = TraceLayer::new_for_http()
         .make_span_with(|req: &axum::http::Request<_>| {
-            info_span!(
+            let span = info_span!(
                 "http_request",
                 method = %req.method(),
                 path = %req.uri().path(),
                 status = field::Empty,
-            )
+            );
+            // Continue the caller's trace instead of starting a new one. Without
+            // this the mesh hops (ingress gateway, sidecars) and the runtime's
+            // own spans appear as two unrelated services in the trace store.
+            // A no-op when no propagator is installed or the header is absent.
+            let parent = global::get_text_map_propagator(|propagator| {
+                propagator.extract(&HeaderExtractor(req.headers()))
+            });
+            if let Err(e) = span.set_parent(parent) {
+                tracing::debug!(error = %e, "request span keeps its own trace");
+            }
+            span
         })
         .on_response(
             |res: &axum::http::Response<_>, latency: std::time::Duration, span: &Span| {
@@ -499,6 +521,7 @@ async fn try_enqueue(
         provider: req.provider,
         model: req.model,
         workspace,
+        otel_context: Span::current().context(),
     }) {
         Ok(()) => {
             #[allow(clippy::cast_precision_loss)]
@@ -830,19 +853,36 @@ async fn prepare_job_workspace(
     }
 }
 
-#[allow(clippy::significant_drop_tightening)]
-#[tracing::instrument(
-    name = "task",
-    skip_all,
-    fields(
+/// Build the `task` span and run the job inside it.
+///
+/// The span is created here rather than by `#[tracing::instrument]` so the
+/// parent can be attached before the span is entered. `set_parent` on a span
+/// that has already started fails with `AlreadyStarted`, which would silently
+/// leave the run in a trace of its own.
+async fn process_job(ctx: &WorkerCtx, job: WorkerJob, cancel: CancellationToken) -> JobOutcome {
+    let span = info_span!(
+        "task",
         task_id = %job.task_id,
         agent_id = field::Empty,
         conversation_id = %job.conversation_id,
         reason = field::Empty,
         otel.status_code = field::Empty,
-    ),
-)]
-async fn process_job(ctx: &WorkerCtx, job: WorkerJob, cancel: CancellationToken) -> JobOutcome {
+    );
+    // Continue the trace of the request that enqueued this job. The worker runs
+    // on its own task, so nothing links the two otherwise. `Err` means telemetry
+    // is off (no OpenTelemetry layer) — the only cost is an unparented span.
+    if let Err(e) = span.set_parent(job.otel_context.clone()) {
+        tracing::debug!(error = %e, "task span keeps its own trace");
+    }
+    process_job_inner(ctx, job, cancel).instrument(span).await
+}
+
+#[allow(clippy::significant_drop_tightening)]
+async fn process_job_inner(
+    ctx: &WorkerCtx,
+    job: WorkerJob,
+    cancel: CancellationToken,
+) -> JobOutcome {
     let dequeued_at = Utc::now();
     let run_start = Instant::now();
     let (created_at, depth_at_enqueue) = ctx
@@ -1257,6 +1297,7 @@ mod tests {
                 provider: None,
                 model: None,
                 workspace: None,
+                otel_context: opentelemetry::Context::new(),
             })
             .await
             .unwrap();
@@ -1692,6 +1733,7 @@ mod tests {
                 provider: None,
                 model: None,
                 workspace: None,
+                otel_context: opentelemetry::Context::new(),
             },
             CancellationToken::new(),
         )
@@ -1727,6 +1769,7 @@ mod tests {
                 provider: None,
                 model: None,
                 workspace: None,
+                otel_context: opentelemetry::Context::new(),
             },
             CancellationToken::new(),
         )
@@ -1767,6 +1810,7 @@ mod tests {
                 provider: None,
                 model: None,
                 workspace: None,
+                otel_context: opentelemetry::Context::new(),
             },
             CancellationToken::new(),
         )
@@ -1884,6 +1928,7 @@ mod tests {
                 provider: Some("secondary".to_string()),
                 model: None,
                 workspace: None,
+                otel_context: opentelemetry::Context::new(),
             },
             CancellationToken::new(),
         )
@@ -1938,6 +1983,7 @@ mod tests {
                 provider: None,
                 model: Some("anthropic:claude-haiku-4-5".to_string()),
                 workspace: None,
+                otel_context: opentelemetry::Context::new(),
             },
             CancellationToken::new(),
         )
@@ -2128,6 +2174,7 @@ mod tests {
                 provider: None,
                 model: None,
                 workspace: None,
+                otel_context: opentelemetry::Context::new(),
             },
             CancellationToken::new(),
         )
@@ -2461,6 +2508,7 @@ mod tests {
                     }],
                     objects: Vec::new(),
                 }),
+                otel_context: opentelemetry::Context::new(),
             },
             CancellationToken::new(),
         )
@@ -2502,6 +2550,7 @@ mod tests {
                 provider: None,
                 model: None,
                 workspace: None,
+                otel_context: opentelemetry::Context::new(),
             },
             CancellationToken::new(),
         )

@@ -38,7 +38,7 @@ use crate::embedding::{
     EmbeddingResponse, EmbeddingUsage, EncodingFormat, models,
 };
 use crate::error::ClientError;
-use crate::transport::{add_proxy_headers, send_json};
+use crate::transport::{add_proxy_headers, inject_trace_context, send_json};
 
 /// Default `OpenAI` API endpoint, used when the config sets no base URL.
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
@@ -314,11 +314,11 @@ impl OpenAIEmbedding {
             .header("Content-Type", "application/json")
             .body(serde_json::to_string(&openai_request).map_err(ClientError::SerializationError)?);
 
-        send_json(add_proxy_headers(
+        send_json(inject_trace_context(add_proxy_headers(
             builder,
             self.config.proxy.as_ref(),
             &self.config.api_key,
-        ))
+        )))
         .await
     }
 

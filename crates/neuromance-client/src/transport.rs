@@ -1,9 +1,12 @@
 use std::time::Duration;
 
 use neuromance_common::client::ProxyConfig;
+use opentelemetry::global;
+use opentelemetry::propagation::Injector;
 use secrecy::{ExposeSecret, SecretString};
 use serde::de::DeserializeOwned;
 use tracing::{error, trace, warn};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::error::{ClientError, ErrorResponse};
 
@@ -46,6 +49,41 @@ pub fn add_proxy_headers<B: WithHeader>(
     } else {
         builder
     }
+}
+
+/// Collects propagator output as header name/value pairs.
+///
+/// The `OTel` [`Injector`] API writes into a carrier, but [`WithHeader`] consumes
+/// and returns the builder, so the pairs are buffered here and folded on
+/// afterwards.
+#[derive(Debug, Default)]
+struct HeaderCarrier(Vec<(String, String)>);
+
+impl Injector for HeaderCarrier {
+    fn set(&mut self, key: &str, value: String) {
+        self.0.push((key.to_string(), value));
+    }
+}
+
+/// Attach the current span's trace context to an outbound request.
+///
+/// Without this the provider hop starts a new trace, so a request that crosses
+/// a service mesh shows up as two unrelated traces rather than one.
+///
+/// Emits whatever the globally installed propagator produces — `traceparent`
+/// (and `tracestate`) for the W3C propagator the runtime installs. When no
+/// propagator is installed, or no span is active, the carrier stays empty and
+/// this is a no-op, so a library consumer without telemetry pays nothing.
+pub fn inject_trace_context<B: WithHeader>(builder: B) -> B {
+    let context = tracing::Span::current().context();
+    let mut carrier = HeaderCarrier::default();
+    global::get_text_map_propagator(|propagator| {
+        propagator.inject_context(&context, &mut carrier);
+    });
+    carrier
+        .0
+        .into_iter()
+        .fold(builder, |b, (name, value)| b.header(&name, &value))
 }
 
 /// Parse a `Retry-After` header into a [`Duration`].
@@ -262,6 +300,57 @@ mod tests {
 
     fn no_headers() -> HeaderMap {
         HeaderMap::new()
+    }
+
+    /// Read back the `traceparent` a request would carry, if any.
+    fn injected_traceparent() -> Option<String> {
+        inject_trace_context(reqwest::Client::new().get("http://example.invalid/"))
+            .build()
+            .expect("a well-formed request")
+            .headers()
+            .get("traceparent")
+            .map(|v| v.to_str().expect("ascii header").to_string())
+    }
+
+    /// Both halves live in one test because the propagator is process-global:
+    /// split across two `#[test]`s they would race on it.
+    ///
+    /// Worth testing because `inject_trace_context` fails silently — the wrong
+    /// context source adds no header at all, and the only symptom is a trace
+    /// that breaks at the provider hop on a cluster.
+    #[test]
+    fn test_trace_context_is_injected_only_under_an_instrumented_span() {
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::{propagation::TraceContextPropagator, trace::SdkTracerProvider};
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+
+        // No OpenTelemetry layer: a consumer of this library that never
+        // configured tracing sends requests unchanged.
+        assert_eq!(injected_traceparent(), None);
+
+        let provider = SdkTracerProvider::builder().build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")));
+
+        tracing::subscriber::with_default(subscriber, || {
+            // Instrumented, but outside any span: still nothing to continue.
+            assert_eq!(injected_traceparent(), None);
+
+            let span = tracing::info_span!("outbound");
+            let _entered = span.enter();
+            let header = injected_traceparent().expect("an active span must propagate");
+
+            assert!(
+                header.starts_with("00-"),
+                "expected a W3C version-00 traceparent, got {header}"
+            );
+            assert!(
+                !header.contains("00000000000000000000000000000000"),
+                "an all-zero trace id means the span context never reached the carrier: {header}"
+            );
+        });
     }
 
     fn retry_after(value: &str) -> HeaderMap {

@@ -62,7 +62,9 @@ use neuromance_common::tools::{FunctionCall, ToolCall};
 use crate::error::ClientError;
 use crate::message::MessageBuilder;
 use crate::streaming::{StreamingProvider, run_sse_stream};
-use crate::transport::{add_proxy_headers, classify_provider_error, send_json};
+use crate::transport::{
+    add_proxy_headers, classify_provider_error, inject_trace_context, send_json,
+};
 use crate::{LLMClient, build_client_resources};
 
 use super::{
@@ -200,8 +202,11 @@ impl AnthropicClient {
         }
 
         // Add proxy headers if configured
-        request_builder =
-            add_proxy_headers(request_builder, self.proxy_config.as_ref(), &self.api_key);
+        request_builder = inject_trace_context(add_proxy_headers(
+            request_builder,
+            self.proxy_config.as_ref(),
+            &self.api_key,
+        ));
 
         let request_builder = request_builder
             .body(serde_json::to_string(body).map_err(ClientError::SerializationError)?);
@@ -523,8 +528,11 @@ impl LLMClient for AnthropicClient {
             request_builder = request_builder.header("anthropic-beta", beta);
         }
 
-        request_builder =
-            add_proxy_headers(request_builder, self.proxy_config.as_ref(), &self.api_key);
+        request_builder = inject_trace_context(add_proxy_headers(
+            request_builder,
+            self.proxy_config.as_ref(),
+            &self.api_key,
+        ));
 
         let request_builder = request_builder.json(&anthropic_request);
 

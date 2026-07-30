@@ -76,6 +76,7 @@ opentelemetry-otlp = { version = "0.31", default-features = false, features = [
     "reqwest-blocking-client",
 ] }
 opentelemetry-semantic-conventions = "0.31"
+opentelemetry-http = "0.31"
 tracing-opentelemetry = "0.32"
 opentelemetry-appender-tracing = "0.31"
 axum = "0.8"
