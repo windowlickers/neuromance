@@ -9,7 +9,7 @@ use futures::{Stream, StreamExt};
 use metrics::{counter, histogram};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, info_span, trace};
+use tracing::{debug, field, info, info_span, trace, warn};
 
 /// How often to emit an info-level "still streaming" progress log while a
 /// single turn is in flight. Keeps long completions visible without flooding.
@@ -763,10 +763,19 @@ impl<C: LLMClient> Core<C> {
                 for tool_call in &tool_calls {
                     let tool_name = &tool_call.function.name;
                     let call_id = &tool_call.id;
+                    // The outcome fields start empty and are recorded on the arms
+                    // below. `otel.status_code` is set explicitly rather than
+                    // inferred: `tracing-opentelemetry` only derives an error
+                    // status from an ERROR-level event, and a failed tool call
+                    // logs at WARN because it does not abort the run.
                     let tool_span = info_span!(
                         "tool_call",
                         tool = %tool_name,
                         call_id = %call_id,
+                        outcome = field::Empty,
+                        duration_ms = field::Empty,
+                        error = field::Empty,
+                        otel.status_code = field::Empty,
                     );
                     let _tool_enter = tool_span.enter();
                     info!(tool = %tool_name, call_id = %call_id, "tool call requested");
@@ -834,6 +843,9 @@ impl<C: LLMClient> Core<C> {
                             match exec_outcome? {
                                 Ok(result) => {
                                     let bytes = result.len();
+                                    tool_span.record("outcome", "success");
+                                    tool_span.record("duration_ms", tool_duration_ms);
+                                    tool_span.record("otel.status_code", "OK");
                                     info!(
                                         tool = %tool_name,
                                         duration_ms = tool_duration_ms,
@@ -862,7 +874,11 @@ impl<C: LLMClient> Core<C> {
                                     tool_outcome = Some((result, true));
                                 }
                                 Err(e) => {
-                                    info!(
+                                    tool_span.record("outcome", "failure");
+                                    tool_span.record("duration_ms", tool_duration_ms);
+                                    tool_span.record("error", field::display(&e));
+                                    tool_span.record("otel.status_code", "ERROR");
+                                    warn!(
                                         tool = %tool_name,
                                         duration_ms = tool_duration_ms,
                                         error = %e,
@@ -893,7 +909,14 @@ impl<C: LLMClient> Core<C> {
                             }
                         }
                         ToolApproval::Denied(reason) => {
+                            tool_span.record("outcome", "denied");
                             info!(tool = %tool_name, reason = %reason, "tool call denied");
+                            counter!(
+                                "neuromance_tool_calls_total",
+                                "tool" => tool_name.clone(),
+                                "outcome" => "denied",
+                            )
+                            .increment(1);
                             let denial_message = Message::tool(
                                 conversation_id,
                                 format!("Tool execution denied: {reason}"),
