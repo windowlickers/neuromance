@@ -1,11 +1,13 @@
 //! Oneshot mode: run one task, write the result, exit.
 
 use anyhow::{Context, Result};
+use metrics::counter;
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use uuid::Uuid;
 
+use neuromance::CoreError;
 use neuromance_agent::Agent;
 use neuromance_client::LLMClient;
 use neuromance_common::chat::Message;
@@ -84,13 +86,16 @@ pub async fn run<C: LLMClient + Send + Sync>(
         workspace_dir,
         ..DelegationContext::default()
     };
-    let result = tokio::select! {
+    // Keep the typed error rather than erasing it to `anyhow` here: the outcome
+    // metric below needs `CoreError::reason()`. The conversion to `anyhow`
+    // happens at the `bail!` at the end.
+    let result: Result<_, CoreError> = tokio::select! {
         biased;
-        () = cancel.cancelled() => Err(anyhow::anyhow!("oneshot cancelled")),
+        () = cancel.cancelled() => Err(CoreError::Cancelled("oneshot cancelled".to_string())),
         res = delegation::scope(
             scope_ctx,
             agent.execute(Some(messages), cancel.child_token()),
-        ) => res.map_err(anyhow::Error::from),
+        ) => res,
     };
 
     // Best-effort final snapshot so a follow-up conversation on another pod
@@ -101,27 +106,7 @@ pub async fn run<C: LLMClient + Send + Sync>(
         error!(conversation_id = %conversation_id, error = %e, "workspace snapshot failed");
     }
 
-    let output = match result {
-        Ok(response) => OneshotOutput {
-            agent_id: agent.id.clone(),
-            conversation_id,
-            content: response.content.content,
-            tool_responses: response.tool_responses.len(),
-            success: true,
-            error: None,
-        },
-        Err(e) => {
-            error!(agent=%agent.id, error=%e, "oneshot execution failed");
-            OneshotOutput {
-                agent_id: agent.id.clone(),
-                conversation_id,
-                content: String::new(),
-                tool_responses: 0,
-                success: false,
-                error: Some(e.to_string()),
-            }
-        }
-    };
+    let output = record_outcome(&agent.id, conversation_id, result);
 
     let json = serde_json::to_string_pretty(&output)?;
 
@@ -141,4 +126,52 @@ pub async fn run<C: LLMClient + Send + Sync>(
         );
     }
     Ok(())
+}
+
+/// Turn a finished run into its output record and emit the outcome metric.
+///
+/// Oneshot reports the same `neuromance_tasks_total{outcome,reason}` series as
+/// serve mode, so a `Job` and a `Deployment` running the same agent aggregate
+/// together. `reason` comes from [`CoreError::reason`] — a fixed slug, never the
+/// error's `Display` text, which would put provider messages into a label.
+fn record_outcome(
+    agent_id: &str,
+    conversation_id: Uuid,
+    result: Result<neuromance_agent::AgentResponse, CoreError>,
+) -> OneshotOutput {
+    let failed = |error: String, outcome: &'static str, reason: &'static str| {
+        counter!("neuromance_tasks_total", "outcome" => outcome, "reason" => reason).increment(1);
+        OneshotOutput {
+            agent_id: agent_id.to_string(),
+            conversation_id,
+            content: String::new(),
+            tool_responses: 0,
+            success: false,
+            error: Some(error),
+        }
+    };
+
+    match result {
+        Ok(response) => {
+            counter!("neuromance_tasks_total", "outcome" => "succeeded", "reason" => "none")
+                .increment(1);
+            OneshotOutput {
+                agent_id: agent_id.to_string(),
+                conversation_id,
+                content: response.content.content,
+                tool_responses: response.tool_responses.len(),
+                success: true,
+                error: None,
+            }
+        }
+        Err(CoreError::Cancelled(reason)) => {
+            error!(agent = %agent_id, %reason, "oneshot cancelled");
+            failed(reason, "cancelled", "cancelled")
+        }
+        Err(e) => {
+            let reason = e.reason();
+            error!(agent = %agent_id, reason, error = %e, "oneshot execution failed");
+            failed(e.to_string(), "failed", reason)
+        }
+    }
 }

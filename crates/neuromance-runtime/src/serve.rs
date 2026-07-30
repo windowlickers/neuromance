@@ -757,12 +757,24 @@ async fn reset_local_python(local_python: Option<&SessionReset>) {
     }
 }
 
-/// Mark a task `Failed` with `reason` and emit the failure metric. Pulled out
-/// because both the early "conversation deleted" exit and the late
-/// agent-error path share this shape.
-async fn fail_task(ctx: &WorkerCtx, task_id: Uuid, reason: &str) {
-    ctx.task_store.mark_failed(task_id, reason).await;
-    counter!("neuromance_tasks_total", "outcome" => "failed").increment(1);
+/// Mark a task `Failed` and emit the failure metric. Pulled out because both the
+/// early "conversation deleted" exit and the late agent-error path share this
+/// shape.
+///
+/// The two failure descriptions are deliberately separate. `message` is the
+/// operator-facing text stored on the task and may embed error `Display` output;
+/// `reason` is a fixed slug that becomes a Prometheus label. Passing `message`
+/// as the label would put provider text, file paths, and tool names into label
+/// values and blow up cardinality.
+///
+/// `reason` also lands on the enclosing `task` span, so the counter and a
+/// concrete failing trace agree on why the run ended.
+async fn fail_task(ctx: &WorkerCtx, task_id: Uuid, message: &str, reason: &'static str) {
+    let span = Span::current();
+    span.record("reason", reason);
+    span.record("otel.status_code", "ERROR");
+    ctx.task_store.mark_failed(task_id, message).await;
+    counter!("neuromance_tasks_total", "outcome" => "failed", "reason" => reason).increment(1);
 }
 
 /// Drives one agent turn over `input_messages`, racing it against `cancel` so a
@@ -812,7 +824,7 @@ async fn prepare_job_workspace(
         Ok(dir) => Ok(Some(dir)),
         Err(e) => {
             error!(error = %e, "workspace preparation failed");
-            fail_task(ctx, job.task_id, &format!("workspace: {e}")).await;
+            fail_task(ctx, job.task_id, &format!("workspace: {e}"), "workspace").await;
             Err(())
         }
     }
@@ -826,6 +838,8 @@ async fn prepare_job_workspace(
         task_id = %job.task_id,
         agent_id = field::Empty,
         conversation_id = %job.conversation_id,
+        reason = field::Empty,
+        otel.status_code = field::Empty,
     ),
 )]
 async fn process_job(ctx: &WorkerCtx, job: WorkerJob, cancel: CancellationToken) -> JobOutcome {
@@ -865,7 +879,7 @@ async fn process_job(ctx: &WorkerCtx, job: WorkerJob, cancel: CancellationToken)
         Err(err) => {
             let reason = err.reason();
             warn!(conversation_id = %job.conversation_id, reason, "cannot build turn input");
-            fail_task(ctx, job.task_id, reason).await;
+            fail_task(ctx, job.task_id, reason, reason).await;
             return JobOutcome::Failed;
         }
     };
@@ -898,6 +912,7 @@ async fn process_job(ctx: &WorkerCtx, job: WorkerJob, cancel: CancellationToken)
                     ctx,
                     job.task_id,
                     &format!("task override (provider={provider:?}, model={model:?}): {e}"),
+                    "agent_build",
                 )
                 .await;
                 return JobOutcome::Failed;
@@ -955,7 +970,10 @@ async fn record_outcome(
             ctx.task_store
                 .mark_succeeded(job.task_id, response.content.content)
                 .await;
-            counter!("neuromance_tasks_total", "outcome" => "succeeded").increment(1);
+            // Every arm carries a `reason` so the metric has one label set. A
+            // series that sometimes omits a label is awkward to aggregate.
+            counter!("neuromance_tasks_total", "outcome" => "succeeded", "reason" => "none")
+                .increment(1);
             JobOutcome::Succeeded
         }
         Err(CoreError::Cancelled(_)) => {
@@ -963,12 +981,14 @@ async fn record_outcome(
             ctx.task_store
                 .mark_cancelled(job.task_id, "cancelled")
                 .await;
-            counter!("neuromance_tasks_total", "outcome" => "cancelled").increment(1);
+            counter!("neuromance_tasks_total", "outcome" => "cancelled", "reason" => "cancelled")
+                .increment(1);
             JobOutcome::Cancelled
         }
         Err(e) => {
-            error!(run_ms, error = %e, "task failed");
-            fail_task(ctx, job.task_id, &e.to_string()).await;
+            let reason = e.reason();
+            error!(run_ms, reason, error = %e, "task failed");
+            fail_task(ctx, job.task_id, &e.to_string(), reason).await;
             JobOutcome::Failed
         }
     }

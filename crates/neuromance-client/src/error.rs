@@ -201,6 +201,49 @@ impl ClientError {
         matches!(self, Self::RateLimitError { .. })
     }
 
+    /// A stable, low-cardinality slug naming why the request failed.
+    ///
+    /// Intended for the `reason` label on failure metrics, so the value set is
+    /// fixed and small: several variants deliberately share a slug (the three
+    /// parameter-range errors are all `invalid_parameter`). Never derive this
+    /// from an error message — the inner strings carry provider text and would
+    /// blow up label cardinality.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use neuromance_client::ClientError;
+    ///
+    /// assert_eq!(ClientError::TimeoutError.reason(), "timeout");
+    /// assert_eq!(ClientError::InvalidTopP.reason(), "invalid_parameter");
+    /// ```
+    #[must_use]
+    pub const fn reason(&self) -> &'static str {
+        match self {
+            Self::NetworkError(_) => "network",
+            Self::MiddlewareError(_) => "middleware",
+            Self::SerializationError(_) => "serialization",
+            Self::AuthenticationError(_) => "auth",
+            Self::EventSourceError(_) => "stream_aborted",
+            Self::RateLimitError { .. } => "rate_limited",
+            Self::RequestError(_) => "provider_error",
+            Self::ConfigurationError(_) => "configuration",
+            Self::TimeoutError => "timeout",
+            Self::InvalidRequest(_) => "invalid_request",
+            Self::InvalidResponse(_) => "invalid_response",
+            Self::ToolsNotSupported
+            | Self::StreamingNotSupported
+            | Self::EmbeddingsNotSupported => "unsupported",
+            Self::ContextLengthExceeded { .. } => "context_length_exceeded",
+            Self::ContentFiltered { .. } => "content_filtered",
+            Self::ServiceUnavailable(_) => "service_unavailable",
+            Self::InvalidTemperature | Self::InvalidTopP | Self::InvalidFrequencyPenalty => {
+                "invalid_parameter"
+            }
+            Self::EmbeddingError(_) => "embedding",
+        }
+    }
+
     /// Get the retry-after duration if this is a rate limit error.
     ///
     /// Returns the suggested wait time before retrying the request.
@@ -219,68 +262,107 @@ mod tests {
     use super::*;
 
     /// Every variant of [`ClientError`], paired with whether a caller should
-    /// retry it.
+    /// retry it and the metric slug it reports.
     ///
     /// Retryability is what drives `Core::stream_with_retry` and the transport
     /// middleware, so a variant landing on the wrong side of this line either
     /// hammers a provider that will never succeed or gives up on one that would.
-    fn retryability_table(network_error: reqwest::Error) -> Vec<(ClientError, bool)> {
+    ///
+    /// The slug reaches Prometheus as a label value, so it is pinned here: a
+    /// variant that starts reporting a different slug silently splits a metric
+    /// series in two.
+    fn error_table(network_error: reqwest::Error) -> Vec<(ClientError, bool, &'static str)> {
         let bad_json = serde_json::from_str::<i32>("nope").expect_err("not an integer");
         vec![
-            (ClientError::NetworkError(network_error), true),
+            (ClientError::NetworkError(network_error), true, "network"),
             (
                 ClientError::MiddlewareError(reqwest_middleware::Error::Middleware(
                     anyhow::anyhow!("middleware blew up"),
                 )),
                 true,
+                "middleware",
             ),
-            (ClientError::TimeoutError, true),
+            (ClientError::TimeoutError, true, "timeout"),
             (
                 ClientError::RateLimitError {
                     message: "slow down".to_string(),
                     retry_after: Some(Duration::from_secs(3)),
                 },
                 true,
+                "rate_limited",
             ),
-            (ClientError::ServiceUnavailable("busy".to_string()), true),
-            (ClientError::SerializationError(bad_json), false),
+            (
+                ClientError::ServiceUnavailable("busy".to_string()),
+                true,
+                "service_unavailable",
+            ),
+            (
+                ClientError::SerializationError(bad_json),
+                false,
+                "serialization",
+            ),
             (
                 ClientError::AuthenticationError("bad key".to_string()),
                 false,
+                "auth",
             ),
             (
                 ClientError::EventSourceError(reqwest_eventsource::Error::InvalidLastEventId(
                     "\n".to_string(),
                 )),
                 false,
+                "stream_aborted",
             ),
-            (ClientError::RequestError("bad tool".to_string()), false),
-            (ClientError::ConfigurationError("no key".to_string()), false),
+            (
+                ClientError::RequestError("bad tool".to_string()),
+                false,
+                "provider_error",
+            ),
+            (
+                ClientError::ConfigurationError("no key".to_string()),
+                false,
+                "configuration",
+            ),
             (
                 ClientError::InvalidRequest("no messages".to_string()),
                 false,
+                "invalid_request",
             ),
-            (ClientError::InvalidResponse("not SSE".to_string()), false),
-            (ClientError::ToolsNotSupported, false),
-            (ClientError::StreamingNotSupported, false),
+            (
+                ClientError::InvalidResponse("not SSE".to_string()),
+                false,
+                "invalid_response",
+            ),
+            (ClientError::ToolsNotSupported, false, "unsupported"),
+            (ClientError::StreamingNotSupported, false, "unsupported"),
             (
                 ClientError::ContextLengthExceeded {
                     current_tokens: 9,
                     max_tokens: 8,
                 },
                 false,
+                "context_length_exceeded",
             ),
             (
                 ClientError::ContentFiltered {
                     reason: "violence".to_string(),
                 },
                 false,
+                "content_filtered",
             ),
-            (ClientError::InvalidTemperature, false),
-            (ClientError::InvalidTopP, false),
-            (ClientError::InvalidFrequencyPenalty, false),
-            (ClientError::EmbeddingError("bad base64".to_string()), false),
-            (ClientError::EmbeddingsNotSupported, false),
+            (ClientError::InvalidTemperature, false, "invalid_parameter"),
+            (ClientError::InvalidTopP, false, "invalid_parameter"),
+            (
+                ClientError::InvalidFrequencyPenalty,
+                false,
+                "invalid_parameter",
+            ),
+            (
+                ClientError::EmbeddingError("bad base64".to_string()),
+                false,
+                "embedding",
+            ),
+            (ClientError::EmbeddingsNotSupported, false, "unsupported"),
         ]
     }
 
@@ -320,23 +402,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_every_variant_has_the_expected_retryability() {
-        let table = retryability_table(connection_refused().await);
+    async fn test_every_variant_has_the_expected_retryability_and_reason() {
+        let table = error_table(connection_refused().await);
         assert_eq!(
             table.len(),
             21,
             "a variant was added or removed without updating the table"
         );
 
-        for (error, expected) in table {
+        for (error, retryable, reason) in table {
             assert_variant_is_in_the_table(&error);
             assert_eq!(
                 error.is_retryable(),
-                expected,
+                retryable,
                 "{error:?} should{} be retryable",
-                if expected { "" } else { " not" }
+                if retryable { "" } else { " not" }
             );
+            assert_eq!(error.reason(), reason, "wrong metric slug for {error:?}");
         }
+    }
+
+    /// The slug set must stay small enough to be a Prometheus label. Distinct
+    /// variants sharing a slug is intentional; the count is the guard rail.
+    #[tokio::test]
+    async fn test_reason_slugs_stay_low_cardinality() {
+        let slugs: std::collections::BTreeSet<_> = error_table(connection_refused().await)
+            .iter()
+            .map(|(error, _, _)| error.reason())
+            .collect();
+
+        assert!(
+            slugs.len() <= 20,
+            "reason() grew to {} distinct slugs: {slugs:?}",
+            slugs.len()
+        );
+        assert!(
+            slugs.iter().all(|s| !s.is_empty()),
+            "an empty slug would produce an unlabelled metric series"
+        );
     }
 
     #[test]
