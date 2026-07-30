@@ -9,8 +9,8 @@
 //! Both directions are no-ops when no propagator is installed, so a runtime
 //! built without telemetry pays only an empty map walk.
 
-use opentelemetry::global;
 use opentelemetry::propagation::{Extractor, Injector};
+use opentelemetry::{Context, global};
 use tonic::metadata::{KeyRef, MetadataKey, MetadataMap, MetadataValue};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -63,9 +63,14 @@ pub fn request<T>(message: T) -> tonic::Request<T> {
 
 /// Attach the caller's trace context to `span`, so sandbox spans continue the
 /// orchestrator's trace instead of rooting one per RPC.
+///
+/// Extracts against an empty context rather than calling `extract`, which
+/// defaults to `Context::current()` and returns it unchanged when no
+/// `traceparent` is present — that would silently adopt whatever span is active
+/// on the serving thread instead of starting a root.
 pub fn set_parent(span: &tracing::Span, metadata: &MetadataMap) {
     let parent = global::get_text_map_propagator(|propagator| {
-        propagator.extract(&MetadataExtractor(metadata))
+        propagator.extract_with_context(&Context::new(), &MetadataExtractor(metadata))
     });
     if let Err(e) = span.set_parent(parent) {
         tracing::debug!(error = %e, "sandbox span keeps its own trace");
@@ -100,15 +105,24 @@ mod tests {
             .map(|v| v.to_str().unwrap().to_string())
     }
 
-    /// Injection is a no-op without a propagator, and emits `traceparent` with
-    /// one installed under an active span. The no-op case is what keeps a
-    /// telemetry-free deployment working.
+    /// Three properties, in one test because the propagator registry is
+    /// process-global and cannot be uninstalled — asserting the empty state
+    /// requires running before any install, which separate tests cannot order.
     ///
-    /// Serial because the propagator registry is process-global and this test
-    /// asserts on its empty state before installing one.
+    /// 1. Injection is a no-op with no propagator, so a telemetry-free
+    ///    deployment is unaffected.
+    /// 2. With one installed, an instrumented call carries a `traceparent`.
+    /// 3. Metadata *without* a `traceparent` starts a new trace rather than
+    ///    adopting the span active on this thread. `TextMapPropagator::extract`
+    ///    defaults to `Context::current()` and returns it unchanged when the
+    ///    header is absent; using it here made every RPC that arrived without
+    ///    trace context join whatever the worker was already running.
+    ///
+    /// Serial because assertion 1 reads the propagator registry before this
+    /// test installs one, so it must not run beside a test that installs.
     #[test]
     #[serial_test::serial]
-    fn test_trace_context_travels_only_with_a_propagator_installed() {
+    fn test_trace_context_crosses_only_when_a_traceparent_is_present() {
         assert_eq!(
             with_otel_layer(|| tracing::info_span!("caller").in_scope(|| traceparent(&request(())))),
             None,
@@ -116,12 +130,31 @@ mod tests {
         );
 
         global::set_text_map_propagator(TraceContextPropagator::new());
+
         let injected = with_otel_layer(|| {
             tracing::info_span!("caller").in_scope(|| traceparent(&request(())))
         });
         assert!(
             injected.is_some_and(|v| v.starts_with("00-")),
             "an instrumented call should carry a W3C traceparent"
+        );
+
+        let empty = MetadataMap::new();
+        let (active_trace, incoming_trace) = with_otel_layer(|| {
+            let active = tracing::info_span!("unrelated_work");
+            active.in_scope(|| {
+                let incoming = tracing::info_span!("incoming");
+                set_parent(&incoming, &empty);
+                (
+                    active.context().span().span_context().trace_id(),
+                    incoming.context().span().span_context().trace_id(),
+                )
+            })
+        });
+
+        assert_ne!(
+            incoming_trace, active_trace,
+            "an untraced request must start its own trace, not join the active span"
         );
     }
 

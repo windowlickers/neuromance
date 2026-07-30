@@ -316,9 +316,17 @@ pub fn router(state: ServeState) -> Router {
             // Continue the caller's trace instead of starting a new one. Without
             // this the mesh hops (ingress gateway, sidecars) and the runtime's
             // own spans appear as two unrelated services in the trace store.
-            // A no-op when no propagator is installed or the header is absent.
+            //
+            // Extract against an empty context, not `extract`: that method
+            // defaults to `Context::current()` and returns it unchanged when the
+            // header is absent, so a request arriving without a `traceparent` —
+            // a client polling `GET /tasks/{id}` — would adopt whatever span
+            // happens to be active on this worker thread.
             let parent = global::get_text_map_propagator(|propagator| {
-                propagator.extract(&HeaderExtractor(req.headers()))
+                propagator.extract_with_context(
+                    &opentelemetry::Context::new(),
+                    &HeaderExtractor(req.headers()),
+                )
             });
             if let Err(e) = span.set_parent(parent) {
                 tracing::debug!(error = %e, "request span keeps its own trace");
