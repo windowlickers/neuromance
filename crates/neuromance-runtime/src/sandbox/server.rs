@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
+use tracing::{Instrument, field, info_span};
 
 use neuromance_common::tools::Tool;
 use neuromance_tools::{
@@ -24,7 +25,7 @@ use super::proto::{
     CloseSessionRequest, CloseSessionResponse, ExecuteToolRequest, ExecuteToolResponse,
     ListToolsRequest, ListToolsResponse, ToolDefinition,
 };
-use super::{EXECUTE_PYTHON, MAX_MESSAGE_SIZE};
+use super::{EXECUTE_PYTHON, MAX_MESSAGE_SIZE, trace};
 use crate::error::RuntimeError;
 
 /// The tools the sandbox hosts and executes.
@@ -183,14 +184,61 @@ impl SandboxToolServer {
     pub const fn new(toolset: Arc<SandboxToolset>) -> Self {
         Self { toolset }
     }
+
+    /// Run the tool and record the outcome on the surrounding span.
+    ///
+    /// A tool that runs but fails is not a transport error: it is reported as a
+    /// result with `is_error` set, matching the in-process contract where the
+    /// loop turns a `ToolError` into a tool message for the LLM. The span
+    /// status is still `ERROR`, so a failed execution is findable in the trace.
+    async fn execute_instrumented(&self, req: ExecuteToolRequest) -> ExecuteToolResponse {
+        let started = std::time::Instant::now();
+        let response = match self
+            .toolset
+            .execute(
+                &req.name,
+                &req.arguments_json,
+                &req.session_id,
+                &req.workspace_root,
+            )
+            .await
+        {
+            Ok(content) => ExecuteToolResponse {
+                content,
+                is_error: false,
+            },
+            Err(e) => ExecuteToolResponse {
+                content: e.to_string(),
+                is_error: true,
+            },
+        };
+
+        let span = tracing::Span::current();
+        span.record(
+            "duration_ms",
+            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        );
+        if response.is_error {
+            span.record("outcome", "failure");
+            span.record("otel.status_code", "ERROR");
+        } else {
+            span.record("outcome", "success");
+            span.record("otel.status_code", "OK");
+        }
+        response
+    }
 }
 
 #[tonic::async_trait]
 impl SandboxToolService for SandboxToolServer {
     async fn list_tools(
         &self,
-        _request: Request<ListToolsRequest>,
+        request: Request<ListToolsRequest>,
     ) -> Result<Response<ListToolsResponse>, Status> {
+        let span = info_span!("sandbox_list_tools");
+        trace::set_parent(&span, request.metadata());
+        let _entered = span.enter();
+
         let tools = self
             .toolset
             .tool_definitions()
@@ -214,36 +262,33 @@ impl SandboxToolService for SandboxToolServer {
         &self,
         request: Request<ExecuteToolRequest>,
     ) -> Result<Response<ExecuteToolResponse>, Status> {
-        let req = request.into_inner();
-        // A tool that runs but fails is not a transport error: report it as a
-        // result with is_error set, matching the in-process contract where the
-        // loop turns a ToolError into a tool message for the LLM.
-        let response = match self
-            .toolset
-            .execute(
-                &req.name,
-                &req.arguments_json,
-                &req.session_id,
-                &req.workspace_root,
-            )
-            .await
-        {
-            Ok(content) => ExecuteToolResponse {
-                content,
-                is_error: false,
-            },
-            Err(e) => ExecuteToolResponse {
-                content: e.to_string(),
-                is_error: true,
-            },
-        };
-        Ok(Response::new(response))
+        let (metadata, _extensions, req) = request.into_parts();
+        // The outcome fields mirror the orchestrator's `tool_call` span so both
+        // sides of the hop use one vocabulary. The error *text* is recorded on
+        // the orchestrator span only — the adapter turns `is_error` back into a
+        // `ToolError`, so duplicating it here would attach the same unbounded
+        // string to two spans in the same trace.
+        let span = info_span!(
+            "sandbox_execute_tool",
+            tool = %req.name,
+            outcome = field::Empty,
+            duration_ms = field::Empty,
+            otel.status_code = field::Empty,
+        );
+        trace::set_parent(&span, &metadata);
+        Ok(Response::new(
+            self.execute_instrumented(req).instrument(span).await,
+        ))
     }
 
     async fn close_session(
         &self,
         request: Request<CloseSessionRequest>,
     ) -> Result<Response<CloseSessionResponse>, Status> {
+        let span = info_span!("sandbox_close_session");
+        trace::set_parent(&span, request.metadata());
+        let _entered = span.enter();
+
         let _session_id = request.into_inner().session_id;
         #[cfg(feature = "python-repl")]
         if let Some(py) = &self.toolset.python {

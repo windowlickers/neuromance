@@ -17,6 +17,7 @@ pub mod adapter;
 pub mod client;
 pub mod proto;
 pub mod server;
+mod trace;
 
 pub use adapter::{RemoteToolAdapter, connect_tools};
 pub use client::SandboxClient;

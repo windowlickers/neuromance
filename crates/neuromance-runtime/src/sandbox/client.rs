@@ -2,11 +2,11 @@
 
 use tonic::transport::{Channel, Endpoint};
 
-use super::MAX_MESSAGE_SIZE;
 use super::proto::sandbox_tool_service_client::SandboxToolServiceClient;
 use super::proto::{
     CloseSessionRequest, ExecuteToolRequest, ExecuteToolResponse, ListToolsRequest, ToolDefinition,
 };
+use super::{MAX_MESSAGE_SIZE, trace};
 use crate::error::RuntimeError;
 
 /// A cloneable handle to the sandbox tool service.
@@ -41,7 +41,9 @@ impl SandboxClient {
     /// Returns the gRPC [`Status`](tonic::Status) on transport or server error.
     pub async fn list_tools(&self) -> Result<Vec<ToolDefinition>, tonic::Status> {
         let mut client = self.inner.clone();
-        let response = client.list_tools(ListToolsRequest {}).await?;
+        let response = client
+            .list_tools(trace::request(ListToolsRequest {}))
+            .await?;
         Ok(response.into_inner().tools)
     }
 
@@ -60,12 +62,12 @@ impl SandboxClient {
     ) -> Result<ExecuteToolResponse, tonic::Status> {
         let mut client = self.inner.clone();
         let response = client
-            .execute_tool(ExecuteToolRequest {
+            .execute_tool(trace::request(ExecuteToolRequest {
                 name,
                 arguments_json,
                 session_id,
                 workspace_root,
-            })
+            }))
             .await?;
         Ok(response.into_inner())
     }
@@ -77,7 +79,7 @@ impl SandboxClient {
     pub async fn close_session(&self, session_id: String) -> Result<(), tonic::Status> {
         let mut client = self.inner.clone();
         client
-            .close_session(CloseSessionRequest { session_id })
+            .close_session(trace::request(CloseSessionRequest { session_id }))
             .await?;
         Ok(())
     }
