@@ -125,6 +125,9 @@
           // {
             inherit cargoArtifacts;
             cargoTestExtraArgs = "--all-features";
+            # neuromance-tools' proxied-clone test spawns the `git` CLI, the
+            # same binary the toolkit runtime image carries.
+            nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ pkgs.git ];
           }
         );
 
