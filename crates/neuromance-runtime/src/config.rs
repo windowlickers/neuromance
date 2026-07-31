@@ -982,6 +982,17 @@ impl RuntimeConfig {
                         def.name
                     )));
                 }
+                // A proxied clone needs the request in the clear so the proxy
+                // can read the sealed-token header, so the remote must be
+                // http://. Catch it here rather than at first seed.
+                if workspace.git_proxy.is_some() && !seed.url.starts_with("http://") {
+                    return Err(RuntimeError::Config(format!(
+                        "workspace definition '{}': git seed url '{}' must be http:// when \
+                         [workspace.git_proxy] is configured, so the proxy can read the \
+                         sealed-token header",
+                        def.name, seed.url
+                    )));
+                }
                 validate_seed_dest(seed.dest.as_deref(), &def.name)?;
             }
             for seed in &def.objects {
@@ -2407,6 +2418,44 @@ mod tests {
             format!("{err}").contains("workspace.git_proxy.token_file"),
             "{err}"
         );
+    }
+
+    /// A proxied clone must be http:// so the proxy can read the sealed
+    /// header. Reject it at load rather than at first seed.
+    #[test]
+    fn test_workspace_https_git_seed_with_proxy_fails() {
+        let config = serve_config(
+            r#"
+            [workspace]
+            root = "/workspace"
+            [workspace.git_proxy]
+            base_url = "http://tokenizer-proxy.svc:8080"
+            token_file = "/var/run/token"
+            [[workspace.definitions]]
+            name = "dev"
+            [[workspace.definitions.git]]
+            url = "https://git.windowlicke.rs/darkhorse/kb.git"
+        "#,
+        );
+        let err = config.validate().unwrap_err();
+        assert!(format!("{err}").contains("must be http://"), "{err}");
+    }
+
+    /// The same seed is fine without a proxy: anonymous clones go through
+    /// libgit2, which handles https itself.
+    #[test]
+    fn test_workspace_https_git_seed_without_proxy_validates() {
+        let config = serve_config(
+            r#"
+            [workspace]
+            root = "/workspace"
+            [[workspace.definitions]]
+            name = "dev"
+            [[workspace.definitions.git]]
+            url = "https://git.windowlicke.rs/darkhorse/kb.git"
+        "#,
+        );
+        config.validate().unwrap();
     }
 
     #[test]

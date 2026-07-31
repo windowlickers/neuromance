@@ -258,7 +258,13 @@ exclude = ["target/**", "**/node_modules/**", "**/__pycache__/**"]
 
 # Tokenizer-proxy auth for git seeds, shaped like [providers.proxy].
 # Omit for anonymous clones. Remotes must be http:// so the proxy can
-# read the sealed header (it upgrades to TLS upstream).
+# read the sealed header (it upgrades to TLS upstream); a non-http:// git
+# seed url is rejected at config load.
+#
+# Proxied clones run the `git` CLI, so they need a git binary on PATH:
+# use the toolkit image (`neuromance-toolkit`), which carries one. The
+# minimal image does not. Anonymous clones use libgit2 in process and
+# run on either image.
 [workspace.git_proxy]
 base_url = "http://tokenizer-proxy.windowlickers.svc.cluster.local:8080"
 token_file = "/var/run/neuromance/tokens/git"
