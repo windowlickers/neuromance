@@ -77,6 +77,11 @@
             pkgs.pkg-config
             pkgs.mold
             pkgs.protobuf
+            # neuromance-tools' proxied-clone test spawns the `git` CLI, the
+            # same binary the toolkit runtime image carries. Every
+            # buildPackage runs the suite in its checkPhase, so `git` belongs
+            # here rather than on a single check.
+            pkgs.git
           ];
           PROTOC = "${pkgs.protobuf}/bin/protoc";
           PYO3_PYTHON = "${pythonEnv}/bin/python3";
@@ -125,9 +130,6 @@
           // {
             inherit cargoArtifacts;
             cargoTestExtraArgs = "--all-features";
-            # neuromance-tools' proxied-clone test spawns the `git` CLI, the
-            # same binary the toolkit runtime image carries.
-            nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ pkgs.git ];
           }
         );
 
