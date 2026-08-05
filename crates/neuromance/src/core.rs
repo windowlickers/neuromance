@@ -50,6 +50,13 @@ pub struct Core<C: LLMClient> {
     pub hooks: Vec<Arc<dyn Hook>>,
     /// Thinking/reasoning mode configuration.
     pub thinking: ThinkingMode,
+    /// How many times an empty terminal turn (no content, no tool calls) is
+    /// silently resubmitted before the run fails with
+    /// [`CoreError::EmptyResponse`]. The empty assistant message never enters
+    /// the history, so the resubmitted request is identical to the one that
+    /// produced it. Zero fails fast on the first empty turn; a run never
+    /// completes with an empty final message.
+    pub empty_turn_retries: u32,
 }
 
 impl<C: LLMClient> Core<C> {
@@ -64,6 +71,7 @@ impl<C: LLMClient> Core<C> {
             tool_executor: ToolExecutor::new(),
             hooks: Vec::new(),
             thinking: ThinkingMode::Default,
+            empty_turn_retries: 1,
         }
     }
 
@@ -416,6 +424,7 @@ impl<C: LLMClient> Core<C> {
     ) -> impl Stream<Item = Result<CoreEvent, CoreError>> + Send + '_ {
         try_stream! {
             let mut turn_count: u32 = 0;
+            let mut empty_turn_retries_used: u32 = 0;
             // `prompt_tokens` from each turn is the whole context sent that turn,
             // so the turn-over-turn delta shows how fast the conversation grows.
             let mut prev_prompt_tokens: u32 = 0;
@@ -717,6 +726,36 @@ impl<C: LLMClient> Core<C> {
                     "model" => model_label,
                 )
                 .increment(u64::from(completion_tokens));
+                // An empty terminal turn (no content, no tool calls) is a
+                // provider fault, not a completion: resubmit the identical
+                // request up to `empty_turn_retries` times, then fail. The
+                // empty message never enters the ledger, so hooks and the
+                // final history never see it, and the retry does not consume
+                // the `max_turns` budget — `empty_turn_retries` bounds it.
+                if tool_calls.is_empty() && response.message.content.trim().is_empty() {
+                    if empty_turn_retries_used >= self.empty_turn_retries {
+                        Err(CoreError::EmptyResponse(format!(
+                            "model returned an empty terminal turn (no content, no tool \
+                             calls; finish_reason: {finish_label}) and {empty_turn_retries_used} \
+                             resubmission(s) did not produce output"
+                        )))?;
+                    }
+                    empty_turn_retries_used += 1;
+                    warn!(
+                        turn = turn_number,
+                        finish = %finish_label,
+                        retry = empty_turn_retries_used,
+                        max_retries = self.empty_turn_retries,
+                        "empty terminal turn: resubmitting the conversation"
+                    );
+                    counter!(
+                        "neuromance_empty_turn_retries_total",
+                        "model" => response.model.clone(),
+                    )
+                    .increment(1);
+                    continue;
+                }
+
                 let mut assistant_message = response.message;
                 assistant_message.model = Some(response.model);
                 assistant_message.provider = Some(self.client.config().provider.clone());
@@ -1241,6 +1280,216 @@ mod tests {
         fn supports_streaming(&self) -> bool {
             false
         }
+    }
+
+    /// Non-streaming client that replies with a scripted sequence of contents,
+    /// one per `chat` call, and records how many calls it served.
+    struct ScriptedContentClient {
+        config: Config,
+        replies: std::sync::Mutex<std::collections::VecDeque<&'static str>>,
+        calls: std::sync::atomic::AtomicU32,
+    }
+
+    impl ScriptedContentClient {
+        fn new(replies: &[&'static str]) -> Self {
+            Self {
+                config: Config::new("mock", "mock-model"),
+                replies: std::sync::Mutex::new(replies.iter().copied().collect()),
+                calls: std::sync::atomic::AtomicU32::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LLMClient for ScriptedContentClient {
+        fn config(&self) -> &Config {
+            &self.config
+        }
+
+        async fn chat(
+            &self,
+            request: &ChatRequest,
+        ) -> Result<ChatResponse, neuromance_client::ClientError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let conv_id = request
+                .messages
+                .first()
+                .map_or_else(uuid::Uuid::new_v4, |m| m.conversation_id);
+            let content = self
+                .replies
+                .lock()
+                .expect("replies lock")
+                .pop_front()
+                .expect("scripted client ran out of replies");
+            Ok(ChatResponse {
+                message: Message::assistant(conv_id, content),
+                model: "mock-model".to_string(),
+                usage: None,
+                finish_reason: Some(neuromance_common::client::FinishReason::Stop),
+                created_at: chrono::Utc::now(),
+                response_id: None,
+                metadata: std::collections::HashMap::new(),
+            })
+        }
+
+        async fn chat_stream(
+            &self,
+            _request: &ChatRequest,
+        ) -> Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<
+                            Item = Result<
+                                neuromance_common::client::ChatChunk,
+                                neuromance_client::ClientError,
+                            >,
+                        > + Send,
+                >,
+            >,
+            neuromance_client::ClientError,
+        > {
+            Ok(Box::pin(futures::stream::pending()))
+        }
+
+        fn supports_tools(&self) -> bool {
+            false
+        }
+
+        fn supports_streaming(&self) -> bool {
+            false
+        }
+    }
+
+    fn seed_messages(conv_id: uuid::Uuid) -> Vec<Message> {
+        vec![
+            Message::system(conv_id, "sys"),
+            Message::user(conv_id, "hello"),
+        ]
+    }
+
+    /// An empty terminal turn is resubmitted; the retry's reply completes the
+    /// run and the empty message never reaches the history.
+    #[tokio::test]
+    async fn test_run_resubmits_empty_terminal_turn() {
+        let mut core = Core::new(ScriptedContentClient::new(&["", "done"]));
+        let conv_id = uuid::Uuid::new_v4();
+
+        let (messages, _) = core
+            .chat_with_tool_loop(seed_messages(conv_id), CancellationToken::new())
+            .await
+            .expect("run should succeed after the resubmission");
+
+        assert_eq!(
+            core.client.calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the empty turn must cost exactly one extra provider call"
+        );
+        let assistants: Vec<&Message> = messages
+            .iter()
+            .filter(|m| m.role == MessageRole::Assistant)
+            .collect();
+        assert_eq!(
+            assistants.len(),
+            1,
+            "the empty assistant message must not enter the history"
+        );
+        assert_eq!(assistants[0].content, "done");
+    }
+
+    /// A model that stays empty exhausts the retry budget and fails with
+    /// `EmptyResponse` instead of completing.
+    #[tokio::test]
+    async fn test_run_fails_when_empty_turns_exhaust_retries() {
+        let mut core = Core::new(ScriptedContentClient::new(&["", ""]));
+
+        let result = core
+            .chat_with_tool_loop(
+                seed_messages(uuid::Uuid::new_v4()),
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(CoreError::EmptyResponse(_))),
+            "unexpected: {result:?}"
+        );
+        assert_eq!(
+            core.client.calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "default budget is one resubmission"
+        );
+    }
+
+    /// `empty_turn_retries = 0` fails fast on the first empty turn.
+    #[tokio::test]
+    async fn test_run_zero_retries_fails_on_first_empty_turn() {
+        let mut core = Core::new(ScriptedContentClient::new(&[""]));
+        core.empty_turn_retries = 0;
+
+        let result = core
+            .chat_with_tool_loop(
+                seed_messages(uuid::Uuid::new_v4()),
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(CoreError::EmptyResponse(_))),
+            "unexpected: {result:?}"
+        );
+    }
+
+    /// The streaming path hits the same guard: a stream that finishes with
+    /// `Stop` but no content deltas (the observed provider wedge) is
+    /// resubmitted, and the retry's reply completes the run.
+    #[tokio::test]
+    async fn test_run_resubmits_empty_streamed_turn() {
+        let mut core = Core::new(ScriptedStreamClient::new(vec![
+            vec![StreamItem::Chunk("")],
+            vec![StreamItem::Chunk("done")],
+        ]))
+        .with_streaming();
+
+        let (messages, _) = core
+            .chat_with_tool_loop(
+                seed_messages(uuid::Uuid::new_v4()),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("run should succeed after the resubmission");
+
+        assert_eq!(
+            core.client.attempts(),
+            2,
+            "the empty stream must cost exactly one extra provider call"
+        );
+        let assistants: Vec<&Message> = messages
+            .iter()
+            .filter(|m| m.role == MessageRole::Assistant)
+            .collect();
+        assert_eq!(
+            assistants.len(),
+            1,
+            "the empty assistant message must not enter the history"
+        );
+        assert_eq!(assistants[0].content, "done");
+    }
+
+    /// A whitespace-only reply counts as empty and is resubmitted.
+    #[tokio::test]
+    async fn test_run_treats_whitespace_reply_as_empty() {
+        let mut core = Core::new(ScriptedContentClient::new(&["  \n\t", "done"]));
+
+        let (messages, _) = core
+            .chat_with_tool_loop(
+                seed_messages(uuid::Uuid::new_v4()),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("run should succeed after the resubmission");
+
+        let last = messages.last().expect("history is non-empty");
+        assert_eq!(last.content, "done");
     }
 
     /// A hook reporting compaction surfaces as a `CoreEvent::Compaction` on the

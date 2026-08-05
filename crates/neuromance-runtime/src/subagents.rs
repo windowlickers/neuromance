@@ -443,6 +443,7 @@ mod tests {
                 system_prompt: "be helpful".to_string(),
                 max_turns: None,
                 streaming: false,
+                empty_turn_retries: 1,
             },
             runtime: RuntimeSettings::default(),
             approval: ApprovalConfig::default(),

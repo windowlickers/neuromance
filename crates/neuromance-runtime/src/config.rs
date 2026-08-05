@@ -326,6 +326,15 @@ pub struct AgentConfig {
     pub max_turns: Option<u32>,
     #[serde(default)]
     pub streaming: bool,
+    /// How many times an empty terminal turn (no content, no tool calls) is
+    /// silently resubmitted before the run fails with an `empty_response`
+    /// error. The retry does not consume the turn budget. Defaults to 1.
+    #[serde(default = "default_empty_turn_retries")]
+    pub empty_turn_retries: u32,
+}
+
+const fn default_empty_turn_retries() -> u32 {
+    1
 }
 
 /// Per-provider tokenizer-proxy settings.

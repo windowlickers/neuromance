@@ -390,6 +390,7 @@ async fn build_agent(
     if let Some(max) = config.agent.max_turns {
         core.max_turns = Some(max);
     }
+    core.empty_turn_retries = config.agent.empty_turn_retries;
     if let Some(store) = store {
         let sink: Arc<PgConversationStore> = Arc::clone(store);
         core = core.with_hook(Arc::new(PersistenceHook::new(sink)));

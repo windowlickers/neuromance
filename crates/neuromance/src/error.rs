@@ -22,6 +22,9 @@ pub enum CoreError {
     #[error("No response: {0}")]
     NoResponse(String),
 
+    #[error("Empty response: {0}")]
+    EmptyResponse(String),
+
     #[error("Invalid input: {0}")]
     InvalidInput(String),
 
@@ -71,6 +74,7 @@ impl CoreError {
             Self::UserQuit(_) => "user_quit",
             Self::Cancelled(_) => "cancelled",
             Self::NoResponse(_) => "no_response",
+            Self::EmptyResponse(_) => "empty_response",
             Self::InvalidInput(_) => "invalid_input",
             Self::Serialization(_) => "serialization",
             Self::Hook { .. } => "hook",
@@ -97,6 +101,10 @@ mod tests {
             (CoreError::UserQuit("bye".into()), "user_quit"),
             (CoreError::Cancelled("sigterm".into()), "cancelled"),
             (CoreError::NoResponse("empty".into()), "no_response"),
+            (
+                CoreError::EmptyResponse("blank final turn".into()),
+                "empty_response",
+            ),
             (
                 CoreError::InvalidInput("no messages".into()),
                 "invalid_input",
