@@ -34,8 +34,25 @@ const MAX_STREAM_LINES: usize = 2000;
 /// the shell inherit the full parent environment.
 const ENV_ALLOWLIST: &[&str] = &["PATH", "HOME", "LANG", "LC_ALL", "TERM"];
 
-/// Executes a shell command via `sh -c` and returns its exit code, stdout,
+/// Exit status of a process killed by `SIGPIPE` (128 + 13).
+///
+/// Under `set -o pipefail` this is the status of any pipeline whose reader
+/// closes early — `… | head -1`, `… | grep -q x`. The write side did nothing
+/// wrong, so the tool reports it as success; see [`normalize_exit`].
+const SIGPIPE_EXIT: i32 = 141;
+
+/// Prefix prepended to every command so a failing stage anywhere in a pipeline
+/// sets the exit status. Without it the shell reports only the *last* stage,
+/// so `cmd --bad-flag | head` looks like a success.
+const PIPEFAIL_PRELUDE: &str = "set -o pipefail\n";
+
+/// Executes a shell command via `bash -c` and returns its exit code, stdout,
 /// and stderr.
+///
+/// Commands run under `set -o pipefail`, so a failure in any pipeline stage
+/// surfaces instead of being masked by a successful final stage. `bash` must be
+/// on `PATH`; the toolkit image ships it, the minimal image ships no shell at
+/// all.
 ///
 /// Not auto-approved: arbitrary command execution requires explicit approval.
 pub struct BashTool {
@@ -93,7 +110,7 @@ impl ToolImplementation for BashTool {
         let mut properties = HashMap::new();
         properties.insert(
             "command".to_string(),
-            Property::string("Shell command to execute via `sh -c`."),
+            Property::string("Shell command to execute via `bash -c`."),
         );
         properties.insert(
             "timeout_ms".to_string(),
@@ -112,7 +129,7 @@ impl ToolImplementation for BashTool {
         Tool::builder()
             .function(Function {
                 name: "bash".to_string(),
-                description: "Execute a shell command via `sh -c` and return its exit code, \
+                description: "Execute a shell command via `bash -c` and return its exit code, \
                               stdout, and stderr. Each output stream is capped at 64 KiB."
                     .to_string(),
                 parameters: Parameters::new(properties, vec!["command".into()]).into(),
@@ -138,8 +155,8 @@ impl ToolImplementation for BashTool {
         };
         let timeout_ms = timeout_ms.clamp(1, self.max_timeout_ms);
 
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg(command);
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c").arg(format!("{PIPEFAIL_PRELUDE}{command}"));
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         cmd.kill_on_drop(true);
         if !self.inherit_env {
@@ -173,17 +190,17 @@ impl ToolImplementation for BashTool {
         }
 
         let child = cmd.spawn().map_err(|e| {
-            ToolError::execution(format!("failed to spawn shell for command: {command}: {e}"))
+            ToolError::execution(format!(
+                "failed to spawn bash for command: {command}: {e} \
+                 (the bash tool requires bash on PATH)"
+            ))
         })?;
 
         match timeout(Duration::from_millis(timeout_ms), child.wait_with_output()).await {
-            Ok(Ok(output)) => Ok(render_output(
-                output.status.code().unwrap_or(-1),
-                output.stdout,
-                output.stderr,
-                None,
-            )
-            .await),
+            Ok(Ok(output)) => {
+                let (code, note) = normalize_exit(output.status.code().unwrap_or(-1));
+                Ok(render_output(code, output.stdout, output.stderr, note).await)
+            }
             Ok(Err(e)) => Err(ToolError::execution(format!("error running command: {e}"))),
             Err(_) => Ok(render_output(
                 -1,
@@ -193,6 +210,27 @@ impl ToolImplementation for BashTool {
             )
             .await),
         }
+    }
+}
+
+/// Maps a raw shell exit status to the status reported to the caller, plus an
+/// optional note explaining the change.
+///
+/// `pipefail` makes `… | head -1` fail with [`SIGPIPE_EXIT`] once the reader
+/// closes the pipe, even though the command did what was asked. Reporting that
+/// as a failure would train agents to retry working commands, so it maps to 0.
+///
+/// The exemption is not airtight: `pipefail` reports the rightmost non-zero
+/// status, so a real failure upstream of a stage that itself dies on `SIGPIPE`
+/// is masked.
+fn normalize_exit(code: i32) -> (i32, Option<String>) {
+    if code == SIGPIPE_EXIT {
+        (
+            0,
+            Some("[a pipeline stage exited on SIGPIPE; reported as success]".to_string()),
+        )
+    } else {
+        (code, None)
     }
 }
 
@@ -391,6 +429,55 @@ mod tests {
         let tool = BashTool::default();
         let result = tool.execute(&json!({ "command": "false" })).await.unwrap();
         assert!(result.contains("exit_code: 1"));
+    }
+
+    #[tokio::test]
+    async fn test_bash_pipeline_reports_failing_stage() {
+        // Without pipefail the shell reports only `head`, which succeeds, and
+        // the failing upstream stage looks like exit 0.
+        let tool = BashTool::default();
+        let result = tool
+            .execute(&json!({ "command": "false | head -1" }))
+            .await
+            .unwrap();
+        assert!(
+            result.contains("exit_code: 1"),
+            "failing pipeline stage was masked:\n{result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bash_pipeline_success_unaffected() {
+        let tool = BashTool::default();
+        let result = tool
+            .execute(&json!({ "command": "echo hi | cat | cat" }))
+            .await
+            .unwrap();
+        assert!(result.contains("exit_code: 0"), "{result}");
+        assert!(result.contains("hi"));
+    }
+
+    #[tokio::test]
+    async fn test_bash_sigpipe_reported_as_success() {
+        // `yes` never terminates on its own, so `head -1` closing the pipe
+        // always kills it with SIGPIPE (141). That is not a command failure.
+        let tool = BashTool::default();
+        let result = tool
+            .execute(&json!({ "command": "yes | head -1" }))
+            .await
+            .unwrap();
+        assert!(result.contains("exit_code: 0"), "{result}");
+        assert!(result.contains("SIGPIPE"), "{result}");
+    }
+
+    #[test]
+    fn test_normalize_exit_passes_through_real_failures() {
+        assert_eq!(normalize_exit(0), (0, None));
+        assert_eq!(normalize_exit(2), (2, None));
+        assert_eq!(normalize_exit(-1), (-1, None));
+        let (code, note) = normalize_exit(SIGPIPE_EXIT);
+        assert_eq!(code, 0);
+        assert!(note.is_some());
     }
 
     #[tokio::test]
