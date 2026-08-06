@@ -124,6 +124,51 @@ async fn test_append_is_idempotent_and_seq_is_dense(pool: PgPool) {
 
 #[sqlx::test(migrations = "./migrations")]
 #[ignore = "requires postgres via DATABASE_URL"]
+async fn test_delete_conversation_removes_empty_row_and_cascades_tasks(pool: PgPool) {
+    let store = PgConversationStore::new(pool.clone());
+    let conversation_id = Uuid::new_v4();
+    let task_id = Uuid::new_v4();
+    // `record_task_status` is what creates the durable conversation row during
+    // enqueue, so this reproduces exactly what a rollback has to undo.
+    store
+        .record_task_status(&task_update(task_id, conversation_id, TaskStatus::Pending))
+        .await
+        .unwrap();
+
+    store.delete_conversation(conversation_id).await.unwrap();
+
+    assert!(!store.conversation_exists(conversation_id).await.unwrap());
+    assert!(
+        store.get_task(task_id).await.unwrap().is_none(),
+        "the pending task row must cascade away with its conversation"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires postgres via DATABASE_URL"]
+async fn test_delete_conversation_spares_a_conversation_with_messages(pool: PgPool) {
+    let store = PgConversationStore::new(pool.clone());
+    let conversation_id = Uuid::new_v4();
+    let history = sample_history(conversation_id);
+    store
+        .append_messages(conversation_id, &history)
+        .await
+        .unwrap();
+
+    store.delete_conversation(conversation_id).await.unwrap();
+
+    assert!(
+        store.conversation_exists(conversation_id).await.unwrap(),
+        "the NOT EXISTS guard must spare a conversation that holds messages"
+    );
+    assert_eq!(
+        stored_seqs(&pool, conversation_id).await.len(),
+        history.len()
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires postgres via DATABASE_URL"]
 async fn test_model_provider_usage_round_trip_through_store(pool: PgPool) {
     let store = PgConversationStore::new(pool.clone());
     let conversation_id = Uuid::new_v4();

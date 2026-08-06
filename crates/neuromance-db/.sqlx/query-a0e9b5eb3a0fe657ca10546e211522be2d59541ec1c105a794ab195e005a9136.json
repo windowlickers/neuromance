@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM conversations c WHERE c.id = $1 AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.conversation_id = c.id)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a0e9b5eb3a0fe657ca10546e211522be2d59541ec1c105a794ab195e005a9136"
+}

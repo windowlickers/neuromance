@@ -583,10 +583,10 @@ async fn try_enqueue(
             })
         }
         Err(mpsc::error::TrySendError::Closed(_)) => {
-            state
-                .task_store
-                .mark_failed(task_id, "worker shutting down")
-                .await;
+            // The 503 body carries no task id, so the pending row is unpollable.
+            // Roll it back like the queue-full case rather than leaving a
+            // `Failed` row the caller can never reach.
+            state.task_store.remove_task(task_id).await;
             if seeded {
                 state.task_store.remove_conversation(conversation_id).await;
             }
@@ -1674,10 +1674,11 @@ mod tests {
             .expect_err("send should fail");
         assert!(matches!(err, EnqueueError::WorkerShutdown), "got {err:?}");
 
-        let tasks = store.all_tasks();
-        assert_eq!(tasks.len(), 1, "record should exist");
-        assert_eq!(tasks[0].status, TaskStatus::Failed);
-        assert_eq!(tasks[0].error.as_deref(), Some("worker shutting down"));
+        assert_eq!(
+            store.task_count(),
+            0,
+            "unpollable task must not linger after a worker-shutdown rejection"
+        );
         assert_eq!(
             store.conversation_count(),
             0,
@@ -2243,6 +2244,30 @@ mod tests {
         .await
         .expect_err("id absent from both cache and store must 404");
         assert!(matches!(err, EnqueueError::ConversationNotFound(id) if id == bogus));
+    }
+
+    #[sqlx::test(migrations = "../neuromance-db/migrations")]
+    #[ignore = "requires postgres via DATABASE_URL"]
+    async fn queue_full_rejection_leaves_no_durable_conversation(pool: PgPool) {
+        // Capacity 1: the first enqueue fills the channel, the second is shed.
+        let (state, task_store, _rx) = state_with_store(1, pool);
+
+        let accepted = try_enqueue(&state, req("first"))
+            .await
+            .expect("first enqueue should fit");
+
+        let err = try_enqueue(&state, req("second"))
+            .await
+            .expect_err("second enqueue should be shed");
+        assert!(matches!(err, EnqueueError::QueueFull { .. }), "got {err:?}");
+
+        let durable = task_store.list_conversations().await.unwrap();
+        let ids: Vec<Uuid> = durable.iter().map(|c| c.id).collect();
+        assert_eq!(
+            ids,
+            vec![accepted.conversation_id],
+            "the shed enqueue must not leave an orphaned conversation row"
+        );
     }
 
     #[sqlx::test(migrations = "../neuromance-db/migrations")]

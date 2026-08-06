@@ -341,11 +341,15 @@ pub trait TaskStore: Send + Sync {
 
     // --- Conversation resolution / turn assembly ---
 
-    /// Insert a freshly-seeded conversation into the working set. The durable row
-    /// is created lazily (by `insert_pending`'s pending write and by Core's
-    /// message persistence), so this only establishes the in-memory record.
+    /// Insert a freshly-seeded conversation into the working set. This only
+    /// establishes the in-memory record; the durable row is written fail-closed
+    /// by the following `insert_pending`, and the seeded messages become durable
+    /// when Core persists them.
     fn seed_conversation(&self, record: ConversationRecord);
     async fn conversation_exists(&self, id: Uuid) -> Result<bool, DbError>;
+    /// Best-effort removal of a conversation (enqueue rollback): drops the
+    /// working record and, when durable, deletes the message-less row
+    /// `insert_pending` created, so a rejected enqueue leaves no orphan.
     async fn remove_conversation(&self, id: Uuid);
     async fn build_turn_input(
         &self,
@@ -696,6 +700,9 @@ impl TaskStore for PostgresTaskStore {
 
     async fn remove_conversation(&self, id: Uuid) {
         self.state.conversations.remove(&id);
+        if let Err(e) = self.store.delete_conversation(id).await {
+            warn!(conversation_id = %id, error = %e, "rollback of durable conversation row failed");
+        }
     }
 
     async fn build_turn_input(

@@ -615,6 +615,30 @@ impl PgConversationStore {
         Ok(())
     }
 
+    /// Deletes a durable conversation row that holds no messages.
+    ///
+    /// Used to roll back an enqueue that seeded a conversation but then failed
+    /// to hand the job to the worker, so a rejected request leaves no orphan in
+    /// [`Self::list_conversations`]. The `NOT EXISTS` guard makes the delete a
+    /// no-op once any message has landed, so a live conversation survives a late
+    /// or mistaken rollback. A missing row is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::Sqlx`] if the delete fails.
+    pub async fn delete_conversation(&self, conversation_id: Uuid) -> Result<(), DbError> {
+        sqlx::query!(
+            "DELETE FROM conversations c \
+             WHERE c.id = $1 \
+               AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.conversation_id = c.id)",
+            conversation_id
+        )
+        .execute(&self.pool)
+        .await
+        .op("delete conversation")?;
+        Ok(())
+    }
+
     /// Loads the durable status row for a task, or `None` if none was recorded.
     ///
     /// # Errors
