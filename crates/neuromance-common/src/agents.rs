@@ -117,6 +117,9 @@ pub struct AgentResponse {
     pub reasoning: Option<String>,
     /// Messages from tool executions that contributed to this response.
     pub tool_responses: Vec<Message>,
+    /// The response parsed as JSON, when the run carried an output schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured: Option<serde_json::Value>,
 }
 
 /// Complete state of an agent.

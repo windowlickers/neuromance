@@ -44,6 +44,10 @@ pub struct TaskRecord {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub output: Option<String>,
+    /// The output parsed as JSON, set once a task carrying an `output_schema`
+    /// succeeds. Kept apart from `output` so callers read the machine-readable
+    /// result without re-parsing the prose.
+    pub structured: Option<serde_json::Value>,
     pub error: Option<String>,
     /// Number of tasks already buffered when this task was accepted.
     /// Frozen at submit time so postmortems can answer
@@ -98,6 +102,7 @@ impl From<&TaskRecord> for StoredTask {
             conversation_id: record.conversation_id,
             status: record.status,
             output: record.output.clone(),
+            structured: record.structured.clone(),
             error: record.error.clone(),
             queue_depth_at_enqueue: i64::try_from(record.queue_depth_at_enqueue)
                 .unwrap_or(i64::MAX),
@@ -114,10 +119,23 @@ fn status_update(record: &TaskRecord) -> TaskStatusUpdate {
         conversation_id: record.conversation_id,
         status: record.status,
         output: record.output.clone(),
+        structured: record.structured.clone(),
         error: record.error.clone(),
         queue_depth_at_enqueue: i64::try_from(record.queue_depth_at_enqueue).unwrap_or(i64::MAX),
         created_at: record.created_at,
     }
+}
+
+/// What a successful run produced.
+///
+/// Bundled rather than passed positionally so adding a future output shape does not change every
+/// [`TaskStore`] implementation's signature.
+#[derive(Debug, Clone)]
+pub struct TaskOutcome {
+    /// The final assistant message's prose.
+    pub content: String,
+    /// The same message parsed as JSON, when the task carried an `output_schema`.
+    pub structured: Option<serde_json::Value>,
 }
 
 /// Timing fields the worker reads when a task starts running, to record queue
@@ -178,10 +196,11 @@ impl WorkingState {
         })
     }
 
-    fn mark_succeeded(&self, id: Uuid, output: String) {
+    fn mark_succeeded(&self, id: Uuid, outcome: TaskOutcome) {
         if let Some(mut entry) = self.tasks.get_mut(&id) {
             entry.status = TaskStatus::Succeeded;
-            entry.output = Some(output);
+            entry.output = Some(outcome.content);
+            entry.structured = outcome.structured;
             entry.updated_at = Utc::now();
         }
     }
@@ -304,7 +323,7 @@ pub trait TaskStore: Send + Sync {
     /// Transition a task to `Running`, returning its timing, or `None` if the
     /// record vanished. Writes through when durable.
     async fn mark_running(&self, id: Uuid) -> Option<TaskTiming>;
-    async fn mark_succeeded(&self, id: Uuid, output: String);
+    async fn mark_succeeded(&self, id: Uuid, outcome: TaskOutcome);
     async fn mark_failed(&self, id: Uuid, reason: &str);
     async fn mark_cancelled(&self, id: Uuid, reason: &str);
 
@@ -427,8 +446,8 @@ impl TaskStore for InMemoryTaskStore {
         self.state.mark_running(id)
     }
 
-    async fn mark_succeeded(&self, id: Uuid, output: String) {
-        self.state.mark_succeeded(id, output);
+    async fn mark_succeeded(&self, id: Uuid, outcome: TaskOutcome) {
+        self.state.mark_succeeded(id, outcome);
     }
 
     async fn mark_failed(&self, id: Uuid, reason: &str) {
@@ -601,8 +620,8 @@ impl TaskStore for PostgresTaskStore {
         timing
     }
 
-    async fn mark_succeeded(&self, id: Uuid, output: String) {
-        self.state.mark_succeeded(id, output);
+    async fn mark_succeeded(&self, id: Uuid, outcome: TaskOutcome) {
+        self.state.mark_succeeded(id, outcome);
         self.write_through(id).await;
     }
 
@@ -789,6 +808,7 @@ mod tests {
             created_at,
             updated_at: created_at,
             output: None,
+            structured: None,
             error: None,
             queue_depth_at_enqueue: 0,
         }
@@ -828,11 +848,46 @@ mod tests {
 
         let timing = store.mark_running(id).await.expect("running timing");
         assert_eq!(timing.queue_depth_at_enqueue, 0);
-        store.mark_succeeded(id, "done".to_string()).await;
+        store
+            .mark_succeeded(
+                id,
+                TaskOutcome {
+                    content: "done".to_string(),
+                    structured: None,
+                },
+            )
+            .await;
 
         let got = store.get_task(id).await.unwrap().expect("task exists");
         assert_eq!(got.status, TaskStatus::Succeeded);
         assert_eq!(got.output.as_deref(), Some("done"));
+        assert_eq!(got.structured, None);
+    }
+
+    #[tokio::test]
+    async fn test_mark_succeeded_keeps_the_structured_output() {
+        let store = InMemoryTaskStore::new();
+        let id = Uuid::new_v4();
+        store
+            .insert_pending(&task(id, TaskStatus::Pending, Utc::now()))
+            .await
+            .unwrap();
+        store.mark_running(id).await.expect("running timing");
+
+        store
+            .mark_succeeded(
+                id,
+                TaskOutcome {
+                    content: r#"{"verdict":"pass"}"#.to_string(),
+                    structured: Some(serde_json::json!({"verdict": "pass"})),
+                },
+            )
+            .await;
+
+        let got = store.get_task(id).await.unwrap().expect("task exists");
+        assert_eq!(got.structured, Some(serde_json::json!({"verdict": "pass"})));
+        // The prose stays alongside it, so a caller that ignores the schema is unaffected.
+        assert_eq!(got.output.as_deref(), Some(r#"{"verdict":"pass"}"#));
     }
 
     #[tokio::test]

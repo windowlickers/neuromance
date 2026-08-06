@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use super::config::Config;
 use super::enums::ToolChoice;
+use super::schema::OutputSchema;
 use crate::chat::Message;
 use crate::features::{ReasoningLevel, ThinkingMode};
 use crate::tools::Tool;
@@ -65,6 +66,13 @@ pub struct ChatRequest {
     pub tools: Option<Vec<Tool>>,
     /// Strategy for tool selection.
     pub tool_choice: Option<ToolChoice>,
+    /// JSON Schema the model's response must conform to.
+    ///
+    /// Enforced natively by the provider: `response_format` (Chat Completions), `text.format`
+    /// (Responses), or `output_config.format` (Anthropic). Clients that cannot enforce it reject
+    /// the request rather than dropping the constraint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<OutputSchema>,
     /// Whether to stream the response incrementally.
     pub stream: bool,
     /// End-user identifier for tracking and abuse prevention.
@@ -163,6 +171,7 @@ impl ChatRequest {
             stop: None,
             tools: None,
             tool_choice: None,
+            output_schema: None,
             stream: false,
             user: None,
             thinking: ThinkingMode::Default,
@@ -186,6 +195,7 @@ impl ChatRequest {
             stop: config.stop_sequences.clone(),
             tools: None,
             tool_choice: None,
+            output_schema: None,
             stream: false,
             user: None,
             thinking: ThinkingMode::Default,
@@ -346,6 +356,17 @@ impl ChatRequest {
     #[must_use]
     pub fn with_tool_choice(mut self, tool_choice: ToolChoice) -> Self {
         self.tool_choice = Some(tool_choice);
+        self
+    }
+
+    /// Constrains the response to a JSON Schema.
+    ///
+    /// # Arguments
+    ///
+    /// * `schema` - A validated schema built with [`OutputSchema::new`]
+    #[must_use]
+    pub fn with_output_schema(mut self, schema: OutputSchema) -> Self {
+        self.output_schema = Some(schema);
         self
     }
 

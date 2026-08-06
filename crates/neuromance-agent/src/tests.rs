@@ -26,6 +26,7 @@ use crate::Agent;
 struct MockLLMClient {
     config: Config,
     usage: Usage,
+    reply: String,
 }
 
 impl MockLLMClient {
@@ -40,6 +41,14 @@ impl MockLLMClient {
                 input_tokens_details: None,
                 output_tokens_details: None,
             },
+            reply: "Mock response".to_string(),
+        }
+    }
+
+    fn with_reply(reply: &str) -> Self {
+        Self {
+            reply: reply.to_string(),
+            ..Self::new()
         }
     }
 }
@@ -57,7 +66,7 @@ impl LLMClient for MockLLMClient {
             .map_or_else(Uuid::new_v4, |m| m.conversation_id);
 
         Ok(ChatResponse {
-            message: Message::assistant(conv_id, "Mock response"),
+            message: Message::assistant(conv_id, &self.reply),
             model: "mock-model".to_string(),
             usage: Some(self.usage.clone()),
             finish_reason: None,
@@ -76,7 +85,7 @@ impl LLMClient for MockLLMClient {
 
         let chunk = ChatChunk {
             model: "mock-model".to_string(),
-            delta_content: Some("Mock response".to_string()),
+            delta_content: Some(self.reply.clone()),
             delta_reasoning_content: None,
             delta_role: Some(MessageRole::Assistant),
             delta_tool_calls: None,
@@ -91,6 +100,10 @@ impl LLMClient for MockLLMClient {
     }
 
     fn supports_tools(&self) -> bool {
+        true
+    }
+
+    fn supports_structured_output(&self) -> bool {
         true
     }
 
@@ -615,6 +628,10 @@ impl LLMClient for ToolCallingMock {
         true
     }
 
+    fn supports_structured_output(&self) -> bool {
+        true
+    }
+
     fn supports_streaming(&self) -> bool {
         false
     }
@@ -769,4 +786,56 @@ async fn test_builder_without_skills_has_no_menu_or_tool() {
             .iter()
             .all(|m| !m.content.contains("<skills_instructions>"))
     );
+}
+
+/// A schema-carrying run parses the final message once, in Core, and hands the same value out on
+/// the response — callers never re-parse the prose.
+#[tokio::test]
+async fn test_execute_populates_structured_output() {
+    let client = MockLLMClient::with_reply(r#"{"answer": "42"}"#);
+    let mut agent = Agent::builder("test", client)
+        .output_schema(
+            neuromance_common::client::OutputSchema::new(
+                "answer",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}},
+                    "required": ["answer"],
+                    "additionalProperties": false
+                }),
+            )
+            .unwrap(),
+        )
+        .build();
+
+    let response = agent
+        .execute(
+            Some(make_messages(Uuid::new_v4())),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.structured,
+        Some(serde_json::json!({"answer": "42"}))
+    );
+}
+
+/// Without a schema there is nothing to parse, so `structured` stays empty even when the model
+/// happens to answer in JSON.
+#[tokio::test]
+async fn test_execute_leaves_structured_empty_without_a_schema() {
+    let client = MockLLMClient::with_reply(r#"{"answer": "42"}"#);
+    let mut agent = Agent::new("test".into(), Core::new(client));
+
+    let response = agent
+        .execute(
+            Some(make_messages(Uuid::new_v4())),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.structured, None);
 }

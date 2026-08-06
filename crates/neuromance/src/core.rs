@@ -18,7 +18,8 @@ const STREAM_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 use neuromance_client::{ChatChunkStream, ClientError, LLMClient};
 use neuromance_common::chat::{Conversation, Message, MessageRole};
 use neuromance_common::client::{
-    ChatChunk, ChatRequest, ChatResponse, RetryConfig, ToolChoice, Usage,
+    ChatChunk, ChatRequest, ChatResponse, FinishReason, OutputSchema, RetryConfig, ToolChoice,
+    Usage, parse_structured_response,
 };
 use neuromance_common::context::{ContextLedger, EditSource};
 use neuromance_common::features::ThinkingMode;
@@ -57,6 +58,11 @@ pub struct Core<C: LLMClient> {
     /// produced it. Zero fails fast on the first empty turn; a run never
     /// completes with an empty final message.
     pub empty_turn_retries: u32,
+    /// JSON Schema every response must conform to, enforced by the provider.
+    ///
+    /// When set, a terminal turn that is not a schema-valid JSON object fails the run — see
+    /// [`Core::check_structured_output`]. `None` leaves responses unconstrained.
+    pub output_schema: Option<OutputSchema>,
 }
 
 impl<C: LLMClient> Core<C> {
@@ -72,7 +78,37 @@ impl<C: LLMClient> Core<C> {
             hooks: Vec::new(),
             thinking: ThinkingMode::Default,
             empty_turn_retries: 1,
+            output_schema: None,
         }
+    }
+
+    /// Verify a terminal turn satisfies [`Core::output_schema`].
+    ///
+    /// The provider enforces the schema, so a valid object is the norm and every failure here is
+    /// terminal — the run fails fast rather than resubmitting.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::SchemaRefusal`] when the model declined, [`CoreError::SchemaTruncated`] when
+    /// the token limit cut the object short, and [`CoreError::SchemaViolation`] when the content
+    /// is not a JSON object.
+    // `CoreError` is the crate's one error type; boxing it here alone would make every caller
+    // unwrap a different shape.
+    #[allow(clippy::result_large_err)]
+    fn check_structured_output(response: &ChatResponse) -> Result<(), CoreError> {
+        match response.finish_reason {
+            Some(FinishReason::ContentFilter) => {
+                return Err(CoreError::SchemaRefusal(
+                    response.message.content.trim().to_string(),
+                ));
+            }
+            Some(FinishReason::Length) => return Err(CoreError::SchemaTruncated),
+            _ => {}
+        }
+
+        parse_structured_response(&response.message.content)
+            .map(|_| ())
+            .map_err(|source| CoreError::SchemaViolation { source })
     }
 
     /// Register a lifecycle [`Hook`].
@@ -465,6 +501,9 @@ impl<C: LLMClient> Core<C> {
                     .with_tools(self.tool_executor.get_all_tools())
                     .with_tool_choice(self.tool_choice.clone());
                 request = request.with_thinking_mode(self.thinking);
+                if let Some(schema) = self.output_schema.clone() {
+                    request = request.with_output_schema(schema);
+                }
 
                 let turn_number = turn_count + 1;
                 let max_turns_label = self
@@ -726,6 +765,13 @@ impl<C: LLMClient> Core<C> {
                     "model" => model_label,
                 )
                 .increment(u64::from(completion_tokens));
+                // Schema failures are checked before the empty-turn retry below: a
+                // refusal or a truncated response can arrive with empty content, and
+                // resubmitting it would only refuse or truncate again.
+                if self.output_schema.is_some() && tool_calls.is_empty() {
+                    Self::check_structured_output(&response)?;
+                }
+
                 // An empty terminal turn (no content, no tool calls) is a
                 // provider fault, not a completion: resubmit the identical
                 // request up to `empty_turn_retries` times, then fail. The
@@ -1277,6 +1323,10 @@ mod tests {
             false
         }
 
+        fn supports_structured_output(&self) -> bool {
+            true
+        }
+
         fn supports_streaming(&self) -> bool {
             false
         }
@@ -1353,6 +1403,10 @@ mod tests {
 
         fn supports_tools(&self) -> bool {
             false
+        }
+
+        fn supports_structured_output(&self) -> bool {
+            true
         }
 
         fn supports_streaming(&self) -> bool {
@@ -1870,6 +1924,10 @@ mod tests {
             false
         }
 
+        fn supports_structured_output(&self) -> bool {
+            true
+        }
+
         fn supports_streaming(&self) -> bool {
             true
         }
@@ -2143,6 +2201,258 @@ mod tests {
         assert_eq!(
             Core::<ScriptedStreamClient>::retry_delay(&config, 0, &err),
             Duration::from_secs(30)
+        );
+    }
+
+    fn answer_schema() -> neuromance_common::client::OutputSchema {
+        neuromance_common::client::OutputSchema::new(
+            "answer",
+            serde_json::json!({
+                "type": "object",
+                "properties": {"answer": {"type": "string"}},
+                "required": ["answer"],
+                "additionalProperties": false
+            }),
+        )
+        .expect("valid schema")
+    }
+
+    /// Non-streaming client that replies once with a scripted content and finish reason.
+    ///
+    /// Unlike [`ScriptedContentClient`] it controls the finish reason, which is what separates a
+    /// refusal from a truncation from a plain malformed answer.
+    struct ScriptedFinishClient {
+        config: Config,
+        content: &'static str,
+        finish_reason: neuromance_common::client::FinishReason,
+        calls: std::sync::atomic::AtomicU32,
+        saw_schema: std::sync::atomic::AtomicBool,
+    }
+
+    impl ScriptedFinishClient {
+        fn new(
+            content: &'static str,
+            finish_reason: neuromance_common::client::FinishReason,
+        ) -> Self {
+            Self {
+                config: Config::new("mock", "mock-model"),
+                content,
+                finish_reason,
+                calls: std::sync::atomic::AtomicU32::new(0),
+                saw_schema: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LLMClient for ScriptedFinishClient {
+        fn config(&self) -> &Config {
+            &self.config
+        }
+
+        async fn chat(
+            &self,
+            request: &ChatRequest,
+        ) -> Result<ChatResponse, neuromance_client::ClientError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.saw_schema.store(
+                request.output_schema.is_some(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            let conv_id = request
+                .messages
+                .first()
+                .map_or_else(uuid::Uuid::new_v4, |m| m.conversation_id);
+            Ok(ChatResponse {
+                message: Message::assistant(conv_id, self.content),
+                model: "mock-model".to_string(),
+                usage: None,
+                finish_reason: Some(self.finish_reason),
+                created_at: chrono::Utc::now(),
+                response_id: None,
+                metadata: std::collections::HashMap::new(),
+            })
+        }
+
+        async fn chat_stream(
+            &self,
+            _request: &ChatRequest,
+        ) -> Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<
+                            Item = Result<
+                                neuromance_common::client::ChatChunk,
+                                neuromance_client::ClientError,
+                            >,
+                        > + Send,
+                >,
+            >,
+            neuromance_client::ClientError,
+        > {
+            Ok(Box::pin(futures::stream::pending()))
+        }
+
+        fn supports_tools(&self) -> bool {
+            false
+        }
+
+        fn supports_structured_output(&self) -> bool {
+            true
+        }
+
+        fn supports_streaming(&self) -> bool {
+            false
+        }
+    }
+
+    async fn run_with_schema(
+        client: ScriptedFinishClient,
+    ) -> (Result<Vec<Message>, CoreError>, u32) {
+        let mut core = Core::new(client);
+        core.output_schema = Some(answer_schema());
+
+        let result = core
+            .chat_with_tool_loop(
+                seed_messages(uuid::Uuid::new_v4()),
+                CancellationToken::new(),
+            )
+            .await
+            .map(|(messages, _)| messages);
+        let calls = core.client.calls.load(std::sync::atomic::Ordering::SeqCst);
+        (result, calls)
+    }
+
+    /// The schema reaches the provider on every turn, not just the terminal one.
+    #[tokio::test]
+    async fn test_run_attaches_the_output_schema_to_the_request() {
+        let client = ScriptedFinishClient::new(
+            r#"{"answer": "42"}"#,
+            neuromance_common::client::FinishReason::Stop,
+        );
+        let mut core = Core::new(client);
+        core.output_schema = Some(answer_schema());
+
+        let (messages, _) = core
+            .chat_with_tool_loop(
+                seed_messages(uuid::Uuid::new_v4()),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("schema-valid answer completes the run");
+        assert!(
+            core.client
+                .saw_schema
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the request must carry the schema"
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .rfind(|m| m.role == MessageRole::Assistant)
+                .map(|m| m.content.as_str()),
+            Some(r#"{"answer": "42"}"#)
+        );
+    }
+
+    /// A terminal turn that is not JSON fails immediately — no resubmission.
+    #[tokio::test]
+    async fn test_run_fails_when_the_terminal_turn_is_not_json() {
+        let (result, calls) = run_with_schema(ScriptedFinishClient::new(
+            "sorry, here is prose",
+            neuromance_common::client::FinishReason::Stop,
+        ))
+        .await;
+
+        assert!(
+            matches!(result, Err(CoreError::SchemaViolation { .. })),
+            "unexpected: {result:?}"
+        );
+        assert_eq!(calls, 1, "schema failures must not be retried");
+    }
+
+    /// JSON that is not an object means the provider dropped the constraint.
+    #[tokio::test]
+    async fn test_run_fails_when_the_terminal_turn_is_not_a_json_object() {
+        let (result, _) = run_with_schema(ScriptedFinishClient::new(
+            "42",
+            neuromance_common::client::FinishReason::Stop,
+        ))
+        .await;
+
+        assert!(
+            matches!(result, Err(CoreError::SchemaViolation { .. })),
+            "unexpected: {result:?}"
+        );
+    }
+
+    /// A truncated response names the fix rather than reporting malformed JSON.
+    #[tokio::test]
+    async fn test_run_fails_when_the_terminal_turn_is_truncated() {
+        let (result, calls) = run_with_schema(ScriptedFinishClient::new(
+            r#"{"answer": "4"#,
+            neuromance_common::client::FinishReason::Length,
+        ))
+        .await;
+
+        assert!(
+            matches!(result, Err(CoreError::SchemaTruncated)),
+            "unexpected: {result:?}"
+        );
+        assert_eq!(calls, 1, "an identical resubmit truncates identically");
+    }
+
+    /// Anthropic and the Responses API report a refusal with no content at all. The schema check
+    /// runs before the empty-turn retry, so the run reports the refusal, not `EmptyResponse`.
+    #[tokio::test]
+    async fn test_run_reports_a_refusal_that_carries_no_content() {
+        let (result, calls) = run_with_schema(ScriptedFinishClient::new(
+            "",
+            neuromance_common::client::FinishReason::ContentFilter,
+        ))
+        .await;
+
+        assert!(
+            matches!(result, Err(CoreError::SchemaRefusal(_))),
+            "unexpected: {result:?}"
+        );
+        assert_eq!(calls, 1, "a refusal must not be resubmitted");
+    }
+
+    /// Chat Completions carries the refusal prose in the content, which the error must keep.
+    #[tokio::test]
+    async fn test_run_refusal_keeps_the_provider_explanation() {
+        let (result, _) = run_with_schema(ScriptedFinishClient::new(
+            "I can't help with that",
+            neuromance_common::client::FinishReason::ContentFilter,
+        ))
+        .await;
+
+        let Err(CoreError::SchemaRefusal(reason)) = result else {
+            panic!("unexpected: {result:?}");
+        };
+        assert_eq!(reason, "I can't help with that");
+    }
+
+    /// Without a schema an unparseable answer is a perfectly good answer.
+    #[tokio::test]
+    async fn test_run_without_a_schema_accepts_prose() {
+        let mut core = Core::new(ScriptedContentClient::new(&["just prose"]));
+
+        let (messages, _) = core
+            .chat_with_tool_loop(
+                seed_messages(uuid::Uuid::new_v4()),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("prose completes an unconstrained run");
+
+        assert_eq!(
+            messages
+                .iter()
+                .rfind(|m| m.role == MessageRole::Assistant)
+                .map(|m| m.content.as_str()),
+            Some("just prose")
         );
     }
 }

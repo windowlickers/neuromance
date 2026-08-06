@@ -414,6 +414,10 @@ mod tests {
             false
         }
 
+        fn supports_structured_output(&self) -> bool {
+            true
+        }
+
         fn supports_streaming(&self) -> bool {
             false
         }

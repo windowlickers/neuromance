@@ -119,6 +119,13 @@ pub enum ClientError {
     #[error("Streaming not supported")]
     StreamingNotSupported,
 
+    /// An output schema was requested but the client cannot enforce one.
+    ///
+    /// Rejecting is deliberate: dropping the schema would return unconstrained text to a caller
+    /// that is about to parse it as JSON.
+    #[error("Structured output not supported")]
+    StructuredOutputNotSupported,
+
     /// Token limit exceeded for this model.
     ///
     /// The input plus requested output exceeds the model's context window.
@@ -233,6 +240,7 @@ impl ClientError {
             Self::InvalidResponse(_) => "invalid_response",
             Self::ToolsNotSupported
             | Self::StreamingNotSupported
+            | Self::StructuredOutputNotSupported
             | Self::EmbeddingsNotSupported => "unsupported",
             Self::ContextLengthExceeded { .. } => "context_length_exceeded",
             Self::ContentFiltered { .. } => "content_filtered",
@@ -336,6 +344,11 @@ mod tests {
             (ClientError::ToolsNotSupported, false, "unsupported"),
             (ClientError::StreamingNotSupported, false, "unsupported"),
             (
+                ClientError::StructuredOutputNotSupported,
+                false,
+                "unsupported",
+            ),
+            (
                 ClientError::ContextLengthExceeded {
                     current_tokens: 9,
                     max_tokens: 8,
@@ -390,6 +403,7 @@ mod tests {
             ClientError::InvalidResponse(_) => (),
             ClientError::ToolsNotSupported => (),
             ClientError::StreamingNotSupported => (),
+            ClientError::StructuredOutputNotSupported => (),
             ClientError::ContextLengthExceeded { .. } => (),
             ClientError::ContentFiltered { .. } => (),
             ClientError::ServiceUnavailable(_) => (),
@@ -406,7 +420,7 @@ mod tests {
         let table = error_table(connection_refused().await);
         assert_eq!(
             table.len(),
-            21,
+            22,
             "a variant was added or removed without updating the table"
         );
 

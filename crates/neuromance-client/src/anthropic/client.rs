@@ -468,6 +468,10 @@ impl LLMClient for AnthropicClient {
         true
     }
 
+    fn supports_structured_output(&self) -> bool {
+        true
+    }
+
     async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, ClientError> {
         self.validate_request(request)?;
 
@@ -802,6 +806,9 @@ mod tests {
             ("max_tokens", FinishReason::Length),
             ("stop_sequence", FinishReason::Stop),
             ("tool_use", FinishReason::ToolCalls),
+            // A refusal must not read as a normal answer: Core turns ContentFilter into
+            // `schema_refusal` rather than trying to parse the text against the schema.
+            ("refusal", FinishReason::ContentFilter),
         ];
 
         for (stop_reason_str, expected_finish_reason) in test_cases {
@@ -1783,5 +1790,73 @@ mod tests {
 
         let response = client.chat(&request).await.unwrap();
         assert_eq!(response.message.content, "Response via proxy");
+    }
+
+    fn structured_output_schema() -> neuromance_common::client::OutputSchema {
+        neuromance_common::client::OutputSchema::new(
+            "answer",
+            serde_json::json!({
+                "type": "object",
+                "properties": {"answer": {"type": "string"}},
+                "required": ["answer"],
+                "additionalProperties": false
+            }),
+        )
+        .unwrap()
+    }
+
+    fn structured_output_tool() -> neuromance_common::tools::Tool {
+        neuromance_common::tools::Tool::builder()
+            .function(neuromance_common::tools::Function {
+                name: "lookup".to_string(),
+                description: "look something up".to_string(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            })
+            .build()
+    }
+
+    #[test]
+    fn test_output_schema_serializes_as_output_config() {
+        let request = ChatRequest::new(vec![create_test_message()])
+            .with_output_schema(structured_output_schema());
+        let wire = crate::anthropic::CreateMessageRequest::from((
+            &request,
+            &create_test_config("http://localhost"),
+        ));
+
+        let value = serde_json::to_value(&wire).unwrap();
+        let format = &value["output_config"]["format"];
+        assert_eq!(format["type"], "json_schema");
+        assert_eq!(format["schema"]["additionalProperties"], false);
+        // Anthropic rejects the OpenAI-only knobs; emitting them would 400 the request.
+        assert!(format.get("name").is_none());
+        assert!(format.get("strict").is_none());
+    }
+
+    #[test]
+    fn test_output_schema_and_tools_serialize_together() {
+        let request = ChatRequest::new(vec![create_test_message()])
+            .with_tools(vec![structured_output_tool()])
+            .with_output_schema(structured_output_schema());
+        let wire = crate::anthropic::CreateMessageRequest::from((
+            &request,
+            &create_test_config("http://localhost"),
+        ));
+
+        let value = serde_json::to_value(&wire).unwrap();
+        assert_eq!(value["output_config"]["format"]["type"], "json_schema");
+        assert_eq!(value["tools"][0]["name"], "lookup");
+    }
+
+    #[test]
+    fn test_request_without_output_schema_omits_output_config() {
+        let request = ChatRequest::new(vec![create_test_message()]);
+        let wire = crate::anthropic::CreateMessageRequest::from((
+            &request,
+            &create_test_config("http://localhost"),
+        ));
+
+        let value = serde_json::to_value(&wire).unwrap();
+        assert!(value.get("output_config").is_none());
     }
 }

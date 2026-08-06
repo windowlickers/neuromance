@@ -10,7 +10,7 @@ use tracing::warn;
 use typed_builder::TypedBuilder;
 
 use neuromance_common::chat::{Message, MessageRole};
-use neuromance_common::client::{ChatRequest, Config, Usage};
+use neuromance_common::client::{ChatRequest, Config, OutputSchema, Usage};
 use neuromance_common::features::ReasoningLevel;
 use neuromance_common::tools::{FunctionCall, Tool, ToolCall};
 
@@ -194,7 +194,10 @@ pub struct FunctionDefinition {
     pub description: String,
     /// JSON Schema for the function parameters.
     pub parameters: serde_json::Value,
-    /// Whether the function can run without approval.
+    /// Whether the model must produce arguments that match `parameters` exactly.
+    ///
+    /// Left unset: strict tool calling is a separate guarantee from structured output and
+    /// requires every parameter schema to close itself to extra properties.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub strict: Option<bool>,
 }
@@ -351,6 +354,44 @@ pub struct ResponsesRequest {
     #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<HashMap<String, serde_json::Value>>,
+    /// Text output configuration, carrying the structured-output schema.
+    #[builder(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<TextConfig>,
+}
+
+/// Text output configuration for the Responses API.
+#[derive(Debug, Clone, Serialize)]
+pub struct TextConfig {
+    /// How the response text must be shaped.
+    pub format: TextFormat,
+}
+
+/// The `text.format` payload, the Responses form of structured outputs.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TextFormat {
+    /// Constrain the response to a JSON Schema.
+    JsonSchema {
+        /// Name identifying the schema.
+        name: String,
+        /// Whether the model must adhere to the schema exactly.
+        strict: bool,
+        /// The JSON Schema itself.
+        schema: serde_json::Value,
+    },
+}
+
+impl From<&OutputSchema> for TextConfig {
+    fn from(schema: &OutputSchema) -> Self {
+        Self {
+            format: TextFormat::JsonSchema {
+                name: schema.name.clone(),
+                strict: schema.strict,
+                schema: schema.schema.clone(),
+            },
+        }
+    }
 }
 
 /// Split a conversation into Responses input items and top-level instructions.
@@ -469,6 +510,7 @@ impl From<(&ChatRequest, &Config)> for ResponsesRequest {
             .previous_response_id(previous_response_id)
             .reasoning(reasoning_config(request))
             .stream(Some(request.stream))
+            .text(request.output_schema.as_ref().map(TextConfig::from))
             .build()
     }
 }
@@ -610,9 +652,39 @@ pub struct ResponseError {
     pub message: String,
 }
 
+/// Derive a `FinishReason` for a complete Responses payload.
+///
+/// A refusal block outranks the status. The API reports `completed` when the model declines, so
+/// without this check a refusal reaches callers as a normal answer — and a caller expecting
+/// structured output would parse the refusal prose as JSON.
+#[must_use]
+pub fn finish_reason_for_response(
+    response: &ResponsesResponse,
+    has_tool_calls: bool,
+) -> Option<neuromance_common::client::FinishReason> {
+    if response_has_refusal(response) {
+        return Some(neuromance_common::client::FinishReason::ContentFilter);
+    }
+
+    finish_reason_from_status(
+        &response.status,
+        response.incomplete_details.as_ref(),
+        has_tool_calls,
+    )
+}
+
+fn response_has_refusal(response: &ResponsesResponse) -> bool {
+    response.output.iter().any(|item| match item {
+        OutputItem::Message { content, .. } => content
+            .iter()
+            .any(|block| matches!(block, OutputContentBlock::Refusal { .. })),
+        _ => false,
+    })
+}
+
 /// Derive a `FinishReason` from the response status and incomplete details.
 #[must_use]
-pub const fn finish_reason_from_status(
+const fn finish_reason_from_status(
     status: &ResponseStatus,
     incomplete_details: Option<&IncompleteDetails>,
     has_tool_calls: bool,

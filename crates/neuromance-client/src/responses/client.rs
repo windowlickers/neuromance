@@ -144,6 +144,10 @@ impl LLMClient for ResponsesClient {
         true
     }
 
+    fn supports_structured_output(&self) -> bool {
+        true
+    }
+
     async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, ClientError> {
         self.validate_request(request)?;
 
@@ -165,11 +169,7 @@ impl LLMClient for ResponsesClient {
         let message = convert_response_to_message(&response, conversation_id);
 
         let has_tool_calls = !message.tool_calls.is_empty();
-        let finish_reason = super::finish_reason_from_status(
-            &response.status,
-            response.incomplete_details.as_ref(),
-            has_tool_calls,
-        );
+        let finish_reason = super::finish_reason_for_response(&response, has_tool_calls);
 
         let usage = response.usage.map(Usage::from);
 
@@ -286,11 +286,7 @@ fn convert_event_to_chunk(
                 .output
                 .iter()
                 .any(|item| matches!(item, OutputItem::FunctionCall { .. }));
-            let finish_reason = super::finish_reason_from_status(
-                &response.status,
-                response.incomplete_details.as_ref(),
-                has_tool_calls,
-            );
+            let finish_reason = super::finish_reason_for_response(&response, has_tool_calls);
             let usage = response.usage.map(Usage::from);
 
             Some(Ok(ChatChunk {
@@ -1314,5 +1310,102 @@ mod tests {
             ChatRequest::new(vec![user_msg]).with_reasoning_level(ReasoningLevel::Default);
         let responses_req = super::super::ResponsesRequest::from((&request, &config));
         assert!(responses_req.reasoning.is_none());
+    }
+
+    /// The status stays `completed` on a refusal, so the status alone would report a refusal as a
+    /// successful answer.
+    #[tokio::test]
+    async fn test_refusal_becomes_content_filter() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp_refusal",
+                "object": "response",
+                "created_at": 1_677_652_288,
+                "model": "gpt-4o",
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "refusal",
+                        "refusal": "I can't help with that"
+                    }]
+                }],
+                "status": "completed"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let client = ResponsesClient::new(config).unwrap();
+        let request = ChatRequest::new(vec![create_test_message()]);
+
+        let response = client.chat(&request).await.unwrap();
+
+        assert_eq!(
+            response.finish_reason,
+            Some(neuromance_common::client::FinishReason::ContentFilter)
+        );
+        assert_eq!(response.message.content, "I can't help with that");
+    }
+
+    fn structured_output_schema() -> neuromance_common::client::OutputSchema {
+        neuromance_common::client::OutputSchema::new(
+            "answer",
+            serde_json::json!({
+                "type": "object",
+                "properties": {"answer": {"type": "string"}},
+                "required": ["answer"],
+                "additionalProperties": false
+            }),
+        )
+        .unwrap()
+    }
+
+    fn structured_output_tool() -> neuromance_common::tools::Tool {
+        neuromance_common::tools::Tool::builder()
+            .function(neuromance_common::tools::Function {
+                name: "lookup".to_string(),
+                description: "look something up".to_string(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            })
+            .build()
+    }
+
+    #[test]
+    fn test_output_schema_serializes_as_text_format() {
+        let request = ChatRequest::new(vec![make_message(MessageRole::User, "Hello")])
+            .with_output_schema(structured_output_schema());
+        let wire = crate::responses::ResponsesRequest::from((&request, &default_config()));
+
+        let value = serde_json::to_value(&wire).unwrap();
+        let format = &value["text"]["format"];
+        assert_eq!(format["type"], "json_schema");
+        assert_eq!(format["name"], "answer");
+        assert_eq!(format["strict"], true);
+        assert_eq!(format["schema"]["additionalProperties"], false);
+    }
+
+    #[test]
+    fn test_output_schema_and_tools_serialize_together() {
+        let request = ChatRequest::new(vec![make_message(MessageRole::User, "Hello")])
+            .with_tools(vec![structured_output_tool()])
+            .with_output_schema(structured_output_schema());
+        let wire = crate::responses::ResponsesRequest::from((&request, &default_config()));
+
+        let value = serde_json::to_value(&wire).unwrap();
+        assert_eq!(value["text"]["format"]["type"], "json_schema");
+        assert_eq!(value["tools"][0]["name"], "lookup");
+    }
+
+    #[test]
+    fn test_request_without_output_schema_omits_text() {
+        let request = ChatRequest::new(vec![make_message(MessageRole::User, "Hello")]);
+        let wire = crate::responses::ResponsesRequest::from((&request, &default_config()));
+
+        let value = serde_json::to_value(&wire).unwrap();
+        assert!(value.get("text").is_none());
     }
 }

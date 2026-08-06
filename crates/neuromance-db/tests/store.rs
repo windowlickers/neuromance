@@ -30,6 +30,7 @@ fn task_update(id: Uuid, conversation_id: Uuid, status: TaskStatus) -> TaskStatu
         conversation_id,
         status,
         output: None,
+        structured: None,
         error: None,
         queue_depth_at_enqueue: 0,
         created_at: Utc::now(),
@@ -423,6 +424,7 @@ async fn test_record_task_status_round_trips_and_preserves_created_at(pool: PgPo
             conversation_id,
             status: TaskStatus::Pending,
             output: None,
+            structured: None,
             error: None,
             queue_depth_at_enqueue: 7,
             created_at: created,
@@ -444,6 +446,7 @@ async fn test_record_task_status_round_trips_and_preserves_created_at(pool: PgPo
             conversation_id,
             status: TaskStatus::Succeeded,
             output: Some("done".to_string()),
+            structured: None,
             error: None,
             queue_depth_at_enqueue: 7,
             created_at: Utc::now(),
@@ -462,6 +465,61 @@ async fn test_record_task_status_round_trips_and_preserves_created_at(pool: PgPo
         "created_at preserved across updates"
     );
     assert!(done.updated_at >= pending.updated_at);
+}
+
+/// A task submitted with an `output_schema` stores its parsed result in the
+/// `structured` JSONB column, separate from the prose in `output`.
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires postgres via DATABASE_URL"]
+async fn test_record_task_status_round_trips_structured_output(pool: PgPool) {
+    let store = PgConversationStore::new(pool);
+    let conversation_id = Uuid::new_v4();
+    let task_id = Uuid::new_v4();
+    let verdict = serde_json::json!({"score": 7, "summary": "solid"});
+
+    store
+        .record_task_status(&TaskStatusUpdate {
+            id: task_id,
+            conversation_id,
+            status: TaskStatus::Succeeded,
+            output: Some(verdict.to_string()),
+            structured: Some(verdict.clone()),
+            error: None,
+            queue_depth_at_enqueue: 0,
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    let stored = store.get_task(task_id).await.unwrap().expect("task row");
+    assert_eq!(stored.structured, Some(verdict.clone()));
+    assert_eq!(stored.output.as_deref(), Some(verdict.to_string().as_str()));
+}
+
+/// A task with no schema leaves `structured` NULL rather than storing `null`.
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires postgres via DATABASE_URL"]
+async fn test_record_task_status_leaves_structured_null_without_a_schema(pool: PgPool) {
+    let store = PgConversationStore::new(pool);
+    let conversation_id = Uuid::new_v4();
+    let task_id = Uuid::new_v4();
+
+    store
+        .record_task_status(&TaskStatusUpdate {
+            id: task_id,
+            conversation_id,
+            status: TaskStatus::Succeeded,
+            output: Some("plain prose".to_string()),
+            structured: None,
+            error: None,
+            queue_depth_at_enqueue: 0,
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    let stored = store.get_task(task_id).await.unwrap().expect("task row");
+    assert_eq!(stored.structured, None);
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -560,6 +618,7 @@ async fn test_list_active_tasks_returns_pending_and_running_ordered(pool: PgPool
                 conversation_id,
                 status,
                 output: None,
+                structured: None,
                 error: None,
                 queue_depth_at_enqueue: 0,
                 created_at: now - Duration::seconds(age),

@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use neuromance_common::client::OutputSchema;
 use neuromance_context::compaction::CompactionStrategy;
 use neuromance_tools::ToolConfig;
 
@@ -491,6 +492,13 @@ pub struct OneshotConfig {
     /// used; otherwise the workspace starts empty.
     #[serde(default)]
     pub workspace: Option<String>,
+    /// Constrain the run's responses to this inline JSON Schema, enforced by the provider. The
+    /// parsed object is written to the output file's `structured` field.
+    ///
+    /// The root must be `type: "object"` and every object node must set
+    /// `additionalProperties: false`; anything else fails startup validation.
+    #[serde(default)]
+    pub output_schema: Option<serde_json::Value>,
 }
 
 /// Per-conversation workspace settings.
@@ -658,6 +666,25 @@ impl RuntimeConfig {
         self.provider(&self.agent.provider)?.model.as_deref()
     }
 
+    /// Validate and build the schema from `[oneshot].output_schema`.
+    ///
+    /// The schema's `title` names it for providers that want one, defaulting to `output`.
+    ///
+    /// # Errors
+    /// Returns [`RuntimeError::Config`] when the schema is not one the providers can enforce.
+    pub fn oneshot_output_schema(&self) -> Result<Option<OutputSchema>, RuntimeError> {
+        let Some(schema) = self.oneshot.as_ref().and_then(|o| o.output_schema.as_ref()) else {
+            return Ok(None);
+        };
+        let name = schema
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("output");
+        OutputSchema::new(name, schema.clone())
+            .map(Some)
+            .map_err(|e| RuntimeError::Config(format!("[oneshot].output_schema: {e}")))
+    }
+
     /// Resolve a task's provider and model from optional per-task overrides.
     ///
     /// Mirrors subagent resolution (see `subagents.rs`): the named provider
@@ -744,6 +771,7 @@ impl RuntimeConfig {
     /// - `agent.provider` (or a `subagent.provider`) names no provider
     /// - the agent has no effective model (`agent.model` and the provider's
     ///   `model` are both unset)
+    /// - `[oneshot].output_schema` is not an enforceable JSON Schema
     /// - a `[[bootstrap]]` entry has an empty `name` or `command`
     pub fn validate(&self) -> Result<(), RuntimeError> {
         if matches!(self.mode, Mode::Oneshot) && self.oneshot.is_none() {
@@ -751,6 +779,7 @@ impl RuntimeConfig {
                 "oneshot mode requires [oneshot] section".to_string(),
             ));
         }
+        self.oneshot_output_schema()?;
         if matches!(self.approval.mode, ApprovalMode::Async) && self.approval.webhook_url.is_none()
         {
             return Err(RuntimeError::Config(
@@ -1204,6 +1233,41 @@ mod tests {
 
     fn serve_config(extra: &str) -> RuntimeConfig {
         toml::from_str(&format!("{SERVE_PREAMBLE}{extra}")).unwrap()
+    }
+
+    /// An unenforceable schema fails startup, not the first run.
+    #[test]
+    fn test_validate_rejects_an_open_oneshot_output_schema() {
+        let mut config: RuntimeConfig = toml::from_str(minimal_oneshot_toml()).unwrap();
+        config.oneshot.as_mut().unwrap().output_schema = Some(serde_json::json!({
+            "type": "object",
+            "properties": {"ok": {"type": "boolean"}}
+        }));
+
+        let err = config
+            .validate()
+            .expect_err("open object is not enforceable");
+
+        assert!(
+            err.to_string().contains("[oneshot].output_schema"),
+            "error must name the setting: {err}"
+        );
+    }
+
+    #[test]
+    fn test_oneshot_output_schema_takes_its_name_from_title() {
+        let mut config: RuntimeConfig = toml::from_str(minimal_oneshot_toml()).unwrap();
+        config.oneshot.as_mut().unwrap().output_schema = Some(serde_json::json!({
+            "title": "verdict",
+            "type": "object",
+            "properties": {"ok": {"type": "boolean"}},
+            "required": ["ok"],
+            "additionalProperties": false
+        }));
+
+        let schema = config.oneshot_output_schema().unwrap().unwrap();
+
+        assert_eq!(schema.name, "verdict");
     }
 
     #[test]

@@ -301,6 +301,13 @@ pub trait LLMClient: Send + Sync {
     /// Check if the client supports streaming responses.
     fn supports_streaming(&self) -> bool;
 
+    /// Check if the client can enforce a JSON Schema on the response.
+    ///
+    /// A client that returns `false` rejects any request carrying an
+    /// [`OutputSchema`](neuromance_common::client::OutputSchema) rather than dropping the
+    /// constraint silently.
+    fn supports_structured_output(&self) -> bool;
+
     /// Validate a configuration object.
     ///
     /// Checks parameter ranges: `temperature` (0.0-2.0), `top_p` (0.0-1.0), `frequency_penalty` (-2.0-2.0).
@@ -350,6 +357,10 @@ pub trait LLMClient: Send + Sync {
             return Err(ClientError::StreamingNotSupported);
         }
 
+        if !self.supports_structured_output() && request.output_schema.is_some() {
+            return Err(ClientError::StructuredOutputNotSupported);
+        }
+
         Ok(())
     }
 }
@@ -381,6 +392,10 @@ impl<T: LLMClient + ?Sized> LLMClient for Box<T> {
     fn supports_streaming(&self) -> bool {
         (**self).supports_streaming()
     }
+
+    fn supports_structured_output(&self) -> bool {
+        (**self).supports_structured_output()
+    }
 }
 
 /// Blanket impl mirroring the [`Box`] one, but for `Arc`. Lets a single client
@@ -411,6 +426,10 @@ impl<T: LLMClient + ?Sized> LLMClient for std::sync::Arc<T> {
     fn supports_streaming(&self) -> bool {
         (**self).supports_streaming()
     }
+
+    fn supports_structured_output(&self) -> bool {
+        (**self).supports_structured_output()
+    }
 }
 
 #[cfg(test)]
@@ -431,6 +450,7 @@ mod tests {
         config: Config,
         supports_tools: bool,
         supports_streaming: bool,
+        supports_structured_output: bool,
     }
 
     impl MockLLMClient {
@@ -439,22 +459,28 @@ mod tests {
                 config: Config::new("mock", "mock-model"),
                 supports_tools: true,
                 supports_streaming: true,
+                supports_structured_output: true,
             }
         }
 
         fn without_tools() -> Self {
             Self {
-                config: Config::new("mock", "mock-model"),
                 supports_tools: false,
-                supports_streaming: true,
+                ..Self::new()
             }
         }
 
         fn without_streaming() -> Self {
             Self {
-                config: Config::new("mock", "mock-model"),
-                supports_tools: true,
                 supports_streaming: false,
+                ..Self::new()
+            }
+        }
+
+        fn without_structured_output() -> Self {
+            Self {
+                supports_structured_output: false,
+                ..Self::new()
             }
         }
     }
@@ -507,6 +533,10 @@ mod tests {
         fn supports_streaming(&self) -> bool {
             self.supports_streaming
         }
+
+        fn supports_structured_output(&self) -> bool {
+            self.supports_structured_output
+        }
     }
 
     fn create_test_message() -> Message {
@@ -538,6 +568,7 @@ mod tests {
             messages: vec![].into(),
             tools: None,
             tool_choice: None,
+            output_schema: None,
             temperature: None,
             max_tokens: None,
             max_completion_tokens: None,
@@ -566,6 +597,7 @@ mod tests {
             messages: vec![create_test_message()].into(),
             tools: None,
             tool_choice: None,
+            output_schema: None,
             temperature: None,
             max_tokens: None,
             max_completion_tokens: None,
@@ -592,6 +624,7 @@ mod tests {
             messages: vec![create_test_message()].into(),
             tools: Some(vec![create_test_tool()]),
             tool_choice: None,
+            output_schema: None,
             temperature: None,
             max_tokens: None,
             max_completion_tokens: None,
@@ -620,6 +653,7 @@ mod tests {
             messages: vec![create_test_message()].into(),
             tools: Some(vec![create_test_tool()]),
             tool_choice: Some(ToolChoice::Auto),
+            output_schema: None,
             temperature: None,
             max_tokens: None,
             max_completion_tokens: None,
@@ -646,6 +680,7 @@ mod tests {
             messages: vec![create_test_message()].into(),
             tools: None,
             tool_choice: None,
+            output_schema: None,
             temperature: None,
             max_tokens: None,
             max_completion_tokens: None,
@@ -666,6 +701,49 @@ mod tests {
         assert!(matches!(error, ClientError::StreamingNotSupported));
     }
 
+    fn test_output_schema() -> neuromance_common::client::OutputSchema {
+        neuromance_common::client::OutputSchema::new(
+            "verdict",
+            serde_json::json!({
+                "type": "object",
+                "properties": {"ok": {"type": "boolean"}},
+                "required": ["ok"],
+                "additionalProperties": false,
+            }),
+        )
+        .expect("test schema is valid")
+    }
+
+    #[test]
+    fn test_validate_request_structured_output_not_supported() {
+        let client = MockLLMClient::without_structured_output();
+        let request =
+            ChatRequest::new(vec![create_test_message()]).with_output_schema(test_output_schema());
+
+        let error = client
+            .validate_request(&request)
+            .expect_err("client cannot enforce a schema");
+
+        assert!(matches!(error, ClientError::StructuredOutputNotSupported));
+    }
+
+    #[test]
+    fn test_validate_request_structured_output_supported() {
+        let client = MockLLMClient::new();
+        let request =
+            ChatRequest::new(vec![create_test_message()]).with_output_schema(test_output_schema());
+
+        assert!(client.validate_request(&request).is_ok());
+    }
+
+    #[test]
+    fn test_validate_request_without_schema_ignores_capability() {
+        let client = MockLLMClient::without_structured_output();
+        let request = ChatRequest::new(vec![create_test_message()]);
+
+        assert!(client.validate_request(&request).is_ok());
+    }
+
     #[test]
     fn test_validate_request_streaming_supported() {
         let client = MockLLMClient::new();
@@ -674,6 +752,7 @@ mod tests {
             messages: vec![create_test_message()].into(),
             tools: None,
             tool_choice: None,
+            output_schema: None,
             temperature: None,
             max_tokens: None,
             max_completion_tokens: None,
@@ -726,6 +805,7 @@ mod tests {
             messages: vec![create_test_message()].into(),
             tools: None,
             tool_choice: None,
+            output_schema: None,
             temperature: None,
             max_tokens: None,
             max_completion_tokens: None,

@@ -21,6 +21,9 @@ pub struct OneshotOutput {
     pub agent_id: String,
     pub conversation_id: Uuid,
     pub content: String,
+    /// The response parsed as JSON when `[oneshot].output_schema` is set; omitted otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub structured: Option<serde_json::Value>,
     pub tool_responses: usize,
     pub success: bool,
     pub error: Option<String>,
@@ -145,6 +148,7 @@ fn record_outcome(
             agent_id: agent_id.to_string(),
             conversation_id,
             content: String::new(),
+            structured: None,
             tool_responses: 0,
             success: false,
             error: Some(error),
@@ -159,6 +163,7 @@ fn record_outcome(
                 agent_id: agent_id.to_string(),
                 conversation_id,
                 content: response.content.content,
+                structured: response.structured,
                 tool_responses: response.tool_responses.len(),
                 success: true,
                 error: None,

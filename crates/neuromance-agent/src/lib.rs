@@ -32,7 +32,7 @@
 use std::time::Instant;
 
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use neuromance::Core;
@@ -40,7 +40,7 @@ use neuromance::RunStats;
 use neuromance::error::CoreError;
 use neuromance_client::LLMClient;
 use neuromance_common::chat::{Message, MessageRole};
-use neuromance_common::client::ToolChoice;
+use neuromance_common::client::{ToolChoice, parse_structured_response};
 
 pub mod builder;
 pub mod subagent;
@@ -277,10 +277,19 @@ impl<C: LLMClient + Send + Sync> Agent<C> {
             .cloned()
             .collect();
 
+        // Core already rejected a terminal turn that failed to parse, so a schema-carrying run
+        // always reaches here with a JSON object.
+        let structured = self.core.output_schema.as_ref().and_then(|_| {
+            parse_structured_response(&content.content)
+                .inspect_err(|e| warn!(error = %e, "final message is not JSON despite a schema"))
+                .ok()
+        });
+
         let response = AgentResponse {
             content,
             reasoning: None,
             tool_responses,
+            structured,
         };
 
         let user_content = messages

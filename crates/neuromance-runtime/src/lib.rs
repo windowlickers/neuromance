@@ -45,6 +45,6 @@ pub use config::{
     WorkspacePersistenceSettings, WorkspaceSettings, WorkspaceStorageSettings,
 };
 pub use error::RuntimeError;
-pub use factory::AgentBuilder;
+pub use factory::{AgentBuilder, AgentOverrides};
 pub use skills::SkillRuntime;
 pub use subagents::{SessionReset, build_parent_toolset};

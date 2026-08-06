@@ -11,19 +11,36 @@
 use async_trait::async_trait;
 use neuromance_agent::Agent;
 use neuromance_client::LLMClient;
+use neuromance_common::client::OutputSchema;
 
 use crate::{RuntimeError, SessionReset};
 
-/// Builds an [`Agent`] on demand, optionally overriding the configured provider
-/// and/or model.
+/// Per-task overrides applied to a freshly built [`Agent`].
 ///
-/// `provider_override` names a configured `[[providers]]` entry whose credential
-/// and endpoint the agent uses; `None` keeps the configured `agent.provider`.
-/// `model_override` is a raw `provider:model` string (e.g.
-/// `anthropic:claude-opus-4-8`); `None` resolves the selected provider's default
-/// (then the agent's effective model). The selected provider always supplies the
-/// credential — so a model override must name a model that credential covers,
-/// unless paired with a provider override that does.
+/// Every field is validated at enqueue time, so `build` can trust that the provider names a
+/// configured entry and the model string parses.
+#[derive(Debug, Clone, Default)]
+pub struct AgentOverrides {
+    /// Names a configured `[[providers]]` entry whose credential and endpoint the agent uses;
+    /// `None` keeps the configured `agent.provider`.
+    pub provider: Option<String>,
+    /// A raw `provider:model` string (e.g. `anthropic:claude-opus-4-8`); `None` resolves the
+    /// selected provider's default. The selected provider always supplies the credential, so a
+    /// model override must name a model that credential covers.
+    pub model: Option<String>,
+    /// JSON Schema the agent's responses must satisfy; `None` leaves them unconstrained.
+    pub output_schema: Option<OutputSchema>,
+}
+
+impl AgentOverrides {
+    /// Whether any override is set, i.e. whether the task needs its own agent.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.provider.is_none() && self.model.is_none() && self.output_schema.is_none()
+    }
+}
+
+/// Builds an [`Agent`] on demand, applying per-task [`AgentOverrides`].
 #[async_trait]
 pub trait AgentBuilder: Send + Sync {
     /// Construct a fresh agent, returning it alongside the in-process Python
@@ -35,7 +52,6 @@ pub trait AgentBuilder: Send + Sync {
     /// toolset cannot be assembled.
     async fn build(
         &self,
-        provider_override: Option<&str>,
-        model_override: Option<&str>,
+        overrides: &AgentOverrides,
     ) -> Result<(Agent<Box<dyn LLMClient>>, Option<SessionReset>), RuntimeError>;
 }

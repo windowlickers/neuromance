@@ -7,7 +7,7 @@ use neuromance::Core;
 use neuromance_client::LLMClient;
 use neuromance_common::agents::AgentState;
 use neuromance_common::chat::Message;
-use neuromance_common::client::ToolChoice;
+use neuromance_common::client::{OutputSchema, ToolChoice};
 use neuromance_common::hook::{FnReviewHook, Hook};
 use neuromance_common::tools::{ToolApproval, ToolCall};
 use neuromance_context::skills::{SkillCatalog, SkillsHook};
@@ -116,6 +116,16 @@ impl<C: LLMClient> AgentBuilder<C> {
     #[must_use]
     pub const fn auto_approve_tools(mut self, auto_approve: bool) -> Self {
         self.core.auto_approve_tools = auto_approve;
+        self
+    }
+
+    /// Constrain every response to a JSON Schema, enforced by the provider.
+    ///
+    /// # Arguments
+    /// * `schema` - The schema the model's output must satisfy
+    #[must_use]
+    pub fn output_schema(mut self, schema: OutputSchema) -> Self {
+        self.core.output_schema = Some(schema);
         self
     }
 

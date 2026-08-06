@@ -59,6 +59,9 @@ pub struct StoredTask {
     pub status: TaskStatus,
     /// Final assistant output, present once the task succeeds.
     pub output: Option<String>,
+    /// The output parsed as JSON, present once a task submitted with an
+    /// `output_schema` succeeds.
+    pub structured: Option<serde_json::Value>,
     /// Failure or cancellation reason, present on a non-success terminal state.
     pub error: Option<String>,
     /// Tasks already buffered when this task was accepted, frozen at submit time.
@@ -100,6 +103,8 @@ pub struct TaskStatusUpdate {
     pub status: TaskStatus,
     /// Output to write, if any.
     pub output: Option<String>,
+    /// Parsed structured output to write, if any.
+    pub structured: Option<serde_json::Value>,
     /// Error to write, if any.
     pub error: Option<String>,
     /// Queue depth at enqueue, frozen at submit time.
@@ -565,12 +570,13 @@ impl PgConversationStore {
         sqlx::query!(
             r#"
             INSERT INTO tasks
-                (id, conversation_id, status, output, error,
+                (id, conversation_id, status, output, structured, error,
                  queue_depth_at_enqueue, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
             ON CONFLICT (id) DO UPDATE SET
                 status                 = EXCLUDED.status,
                 output                 = EXCLUDED.output,
+                structured             = EXCLUDED.structured,
                 error                  = EXCLUDED.error,
                 queue_depth_at_enqueue = EXCLUDED.queue_depth_at_enqueue,
                 updated_at             = now()
@@ -579,6 +585,7 @@ impl PgConversationStore {
             update.conversation_id,
             status,
             update.output,
+            update.structured,
             update.error,
             update.queue_depth_at_enqueue,
             update.created_at,
@@ -616,7 +623,7 @@ impl PgConversationStore {
     pub async fn get_task(&self, task_id: Uuid) -> Result<Option<StoredTask>, DbError> {
         let Some(row) = sqlx::query!(
             r#"
-            SELECT id, conversation_id, status, output, error,
+            SELECT id, conversation_id, status, output, structured, error,
                    queue_depth_at_enqueue, created_at, updated_at
             FROM tasks WHERE id = $1
             "#,
@@ -633,6 +640,7 @@ impl PgConversationStore {
             conversation_id: row.conversation_id,
             status: task_status_from_str(&row.status, row.id)?,
             output: row.output,
+            structured: row.structured,
             error: row.error,
             queue_depth_at_enqueue: row.queue_depth_at_enqueue,
             created_at: row.created_at,
@@ -651,7 +659,7 @@ impl PgConversationStore {
     pub async fn list_active_tasks(&self) -> Result<Vec<StoredTask>, DbError> {
         let rows = sqlx::query!(
             r#"
-            SELECT id, conversation_id, status, output, error,
+            SELECT id, conversation_id, status, output, structured, error,
                    queue_depth_at_enqueue, created_at, updated_at
             FROM tasks
             WHERE status IN ('pending', 'running')
@@ -669,6 +677,7 @@ impl PgConversationStore {
                     conversation_id: row.conversation_id,
                     status: task_status_from_str(&row.status, row.id)?,
                     output: row.output,
+                    structured: row.structured,
                     error: row.error,
                     queue_depth_at_enqueue: row.queue_depth_at_enqueue,
                     created_at: row.created_at,

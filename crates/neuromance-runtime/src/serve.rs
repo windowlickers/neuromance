@@ -57,18 +57,18 @@ use neuromance::error::CoreError;
 use neuromance_agent::{Agent, AgentResponse};
 use neuromance_client::LLMClient;
 use neuromance_common::chat::{Message, TaskStatus};
-use neuromance_common::client::Config;
+use neuromance_common::client::{Config, OutputSchema, SchemaError};
 use neuromance_common::delegation::{self, DelegationContext};
 use neuromance_db::PgConversationStore;
 
-use crate::AgentBuilder;
 use crate::SessionReset;
 use crate::config::{RuntimeConfig, WorkspaceDefinition};
 use crate::sandbox::{EXECUTE_PYTHON, SandboxClient};
 use crate::task_store::{
-    ConversationRecord, InMemoryTaskStore, PostgresTaskStore, TaskRecord, TaskStore,
+    ConversationRecord, InMemoryTaskStore, PostgresTaskStore, TaskOutcome, TaskRecord, TaskStore,
 };
 use crate::workspace::WorkspaceManager;
+use crate::{AgentBuilder, AgentOverrides};
 
 /// The agent type the worker drives. Serve always boots a boxed client, and a
 /// per-task override produces the same type, so both run paths share it.
@@ -121,6 +121,14 @@ pub struct CreateTaskRequest {
     /// `[workspace]` section is configured) is rejected with 400.
     #[serde(default)]
     pub workspace: Option<String>,
+    /// Constrain the agent's responses to an inline JSON Schema, enforced by the provider. The
+    /// parsed object is returned as the task's `structured` field alongside the prose `output`.
+    ///
+    /// The root must be `type: "object"` and every object node must set
+    /// `additionalProperties: false`; anything else is rejected with 400. The schema's `title`
+    /// names it for providers that want one, defaulting to `output`.
+    #[serde(default)]
+    pub output_schema: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -171,6 +179,8 @@ enum EnqueueError {
     UnknownProvider(String),
     /// The `model` override could not be parsed as a `provider:model` string.
     InvalidModel(String),
+    /// The `output_schema` is not a JSON Schema the providers can enforce.
+    InvalidSchema(SchemaError),
     /// The `workspace` override names no `[[workspace.definitions]]` entry,
     /// or no `[workspace]` section is configured at all.
     UnknownWorkspace(String),
@@ -228,6 +238,13 @@ impl IntoResponse for EnqueueError {
                     "detail": detail,
                 }),
             ),
+            Self::InvalidSchema(e) => (
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({
+                    "error": "invalid output_schema",
+                    "detail": e.to_string(),
+                }),
+            ),
             Self::UnknownWorkspace(name) => (
                 StatusCode::BAD_REQUEST,
                 serde_json::json!({
@@ -263,6 +280,9 @@ struct WorkerJob {
     /// trust it parses. When both this and `provider` are `None`, the shared
     /// agent runs the task.
     model: Option<String>,
+    /// Per-task output schema, validated at enqueue time. `Some` forces a
+    /// throwaway agent: the shared agent leaves responses unconstrained.
+    output_schema: Option<OutputSchema>,
     /// Workspace definition resolved at enqueue time (the request's `workspace`
     /// name, or the sole definition when exactly one is configured). Only
     /// consulted when the conversation's workspace is first created; `None`
@@ -490,6 +510,19 @@ async fn try_enqueue(
     {
         return Err(EnqueueError::InvalidModel(format!("{model}: {e}")));
     }
+    // Reject a schema the providers would 400 on before minting a task.
+    let output_schema = req
+        .output_schema
+        .map(|schema| {
+            let name = schema
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("output")
+                .to_owned();
+            OutputSchema::new(name, schema)
+        })
+        .transpose()
+        .map_err(EnqueueError::InvalidSchema)?;
     let workspace = resolve_workspace_definition(&state.config, req.workspace.as_deref())?;
     let (conversation_id, seeded) =
         resolve_conversation(state, req.conversation_id, req.system_prompt.as_deref()).await?;
@@ -503,6 +536,7 @@ async fn try_enqueue(
         created_at: now,
         updated_at: now,
         output: None,
+        structured: None,
         error: None,
         queue_depth_at_enqueue: depth,
     };
@@ -528,6 +562,7 @@ async fn try_enqueue(
         seeded,
         provider: req.provider,
         model: req.model,
+        output_schema,
         workspace,
         otel_context: Span::current().context(),
     }) {
@@ -936,10 +971,25 @@ async fn process_job_inner(
     // built for it and dropped after the turn; everything else reuses the shared
     // agent. The override values were validated at enqueue, but the build can
     // still fail (e.g. a missing provider credential), which fails just this task.
-    let exec_result = if job.provider.is_some() || job.model.is_some() {
+    let overrides = AgentOverrides {
+        provider: job.provider.clone(),
+        model: job.model.clone(),
+        output_schema: job.output_schema.clone(),
+    };
+    let exec_result = if overrides.is_empty() {
+        let mut agent = ctx.agent.lock().await;
+        run_turn(
+            &mut agent,
+            job.task_id,
+            workspace_dir,
+            input_messages,
+            &cancel,
+        )
+        .await
+    } else {
         let provider = job.provider.as_deref();
         let model = job.model.as_deref();
-        match ctx.builder.build(provider, model).await {
+        match ctx.builder.build(&overrides).await {
             Ok((mut agent, _local_python)) => {
                 info!(
                     provider,
@@ -966,16 +1016,6 @@ async fn process_job_inner(
                 return JobOutcome::Failed;
             }
         }
-    } else {
-        let mut agent = ctx.agent.lock().await;
-        run_turn(
-            &mut agent,
-            job.task_id,
-            workspace_dir,
-            input_messages,
-            &cancel,
-        )
-        .await
     };
 
     let run_ms = u64::try_from(run_start.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -1016,7 +1056,13 @@ async fn record_outcome(
                 .refresh_conversation(job.conversation_id, full_history)
                 .await;
             ctx.task_store
-                .mark_succeeded(job.task_id, response.content.content)
+                .mark_succeeded(
+                    job.task_id,
+                    TaskOutcome {
+                        content: response.content.content,
+                        structured: response.structured,
+                    },
+                )
                 .await;
             // Every arm carries a `reason` so the metric has one label set. A
             // series that sometimes omits a label is awkward to aggregate.
@@ -1190,6 +1236,10 @@ mod tests {
             true
         }
 
+        fn supports_structured_output(&self) -> bool {
+            true
+        }
+
         fn supports_streaming(&self) -> bool {
             true
         }
@@ -1245,6 +1295,10 @@ mod tests {
             true
         }
 
+        fn supports_structured_output(&self) -> bool {
+            true
+        }
+
         fn supports_streaming(&self) -> bool {
             false
         }
@@ -1264,6 +1318,7 @@ mod tests {
                 created_at: now,
                 updated_at: now,
                 output: None,
+                structured: None,
                 error: None,
                 queue_depth_at_enqueue: 0,
             })
@@ -1305,6 +1360,7 @@ mod tests {
                 provider: None,
                 model: None,
                 workspace: None,
+                output_schema: None,
                 otel_context: opentelemetry::Context::new(),
             })
             .await
@@ -1357,6 +1413,7 @@ mod tests {
             provider: None,
             model: None,
             workspace: None,
+            output_schema: None,
         }
     }
 
@@ -1465,8 +1522,7 @@ mod tests {
     impl AgentBuilder for TestBuilder {
         async fn build(
             &self,
-            _provider_override: Option<&str>,
-            _model_override: Option<&str>,
+            _overrides: &AgentOverrides,
         ) -> Result<(ServeAgent, Option<SessionReset>), crate::RuntimeError> {
             let core = Core::new(Box::new(EchoClient::new(&self.reply)) as Box<dyn LLMClient>);
             Ok((Agent::new("override-agent".into(), core), None))
@@ -1490,6 +1546,68 @@ mod tests {
             local_python: None,
             workspace: None,
         }
+    }
+
+    #[tokio::test]
+    async fn test_try_enqueue_accepts_a_closed_object_schema() {
+        let (state, _store, mut rx) = fresh_state(4);
+        let request = CreateTaskRequest {
+            output_schema: Some(serde_json::json!({
+                "title": "verdict",
+                "type": "object",
+                "properties": {"ok": {"type": "boolean"}},
+                "required": ["ok"],
+                "additionalProperties": false
+            })),
+            ..req("hi")
+        };
+
+        try_enqueue(&state, request).await.expect("valid schema");
+
+        let job = rx.try_recv().expect("job queued");
+        let schema = job.output_schema.expect("schema reaches the worker");
+        assert_eq!(schema.name, "verdict", "`title` names the schema");
+        assert!(schema.strict);
+    }
+
+    /// The schema is rejected at submit, so the caller learns at 400 rather than mid-run.
+    #[tokio::test]
+    async fn test_try_enqueue_rejects_an_open_object_schema() {
+        let (state, store, _rx) = fresh_state(4);
+        let request = CreateTaskRequest {
+            output_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": {"ok": {"type": "boolean"}}
+            })),
+            ..req("hi")
+        };
+
+        let result = try_enqueue(&state, request).await;
+
+        assert!(
+            matches!(result, Err(EnqueueError::InvalidSchema(_))),
+            "unexpected: {result:?}"
+        );
+        assert!(
+            store.list_active_tasks().await.unwrap().is_empty(),
+            "a rejected schema must not mint a task"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_try_enqueue_rejects_a_non_object_schema() {
+        let (state, _store, _rx) = fresh_state(4);
+        let request = CreateTaskRequest {
+            output_schema: Some(serde_json::json!({"type": "string"})),
+            ..req("hi")
+        };
+
+        let result = try_enqueue(&state, request).await;
+
+        assert!(
+            matches!(result, Err(EnqueueError::InvalidSchema(_))),
+            "unexpected: {result:?}"
+        );
     }
 
     #[tokio::test]
@@ -1741,6 +1859,7 @@ mod tests {
                 provider: None,
                 model: None,
                 workspace: None,
+                output_schema: None,
                 otel_context: opentelemetry::Context::new(),
             },
             CancellationToken::new(),
@@ -1777,6 +1896,7 @@ mod tests {
                 provider: None,
                 model: None,
                 workspace: None,
+                output_schema: None,
                 otel_context: opentelemetry::Context::new(),
             },
             CancellationToken::new(),
@@ -1818,6 +1938,7 @@ mod tests {
                 provider: None,
                 model: None,
                 workspace: None,
+                output_schema: None,
                 otel_context: opentelemetry::Context::new(),
             },
             CancellationToken::new(),
@@ -1936,6 +2057,7 @@ mod tests {
                 provider: Some("secondary".to_string()),
                 model: None,
                 workspace: None,
+                output_schema: None,
                 otel_context: opentelemetry::Context::new(),
             },
             CancellationToken::new(),
@@ -1991,6 +2113,7 @@ mod tests {
                 provider: None,
                 model: Some("anthropic:claude-haiku-4-5".to_string()),
                 workspace: None,
+                output_schema: None,
                 otel_context: opentelemetry::Context::new(),
             },
             CancellationToken::new(),
@@ -2167,6 +2290,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             output: None,
+            structured: None,
             error: None,
             queue_depth_at_enqueue: 0,
         });
@@ -2182,6 +2306,7 @@ mod tests {
                 provider: None,
                 model: None,
                 workspace: None,
+                output_schema: None,
                 otel_context: opentelemetry::Context::new(),
             },
             CancellationToken::new(),
@@ -2283,8 +2408,8 @@ mod tests {
         async fn mark_running(&self, id: Uuid) -> Option<crate::task_store::TaskTiming> {
             self.inner.mark_running(id).await
         }
-        async fn mark_succeeded(&self, id: Uuid, output: String) {
-            self.inner.mark_succeeded(id, output).await;
+        async fn mark_succeeded(&self, id: Uuid, outcome: crate::task_store::TaskOutcome) {
+            self.inner.mark_succeeded(id, outcome).await;
         }
         async fn mark_failed(&self, id: Uuid, reason: &str) {
             self.inner.mark_failed(id, reason).await;
@@ -2507,6 +2632,7 @@ mod tests {
                 seeded: true,
                 provider: None,
                 model: None,
+                output_schema: None,
                 workspace: Some(WorkspaceDefinition {
                     name: "broken".to_string(),
                     git: vec![GitSeed {
@@ -2558,6 +2684,7 @@ mod tests {
                 provider: None,
                 model: None,
                 workspace: None,
+                output_schema: None,
                 otel_context: opentelemetry::Context::new(),
             },
             CancellationToken::new(),

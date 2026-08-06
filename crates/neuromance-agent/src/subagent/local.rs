@@ -161,6 +161,10 @@ mod tests {
             true
         }
 
+        fn supports_structured_output(&self) -> bool {
+            true
+        }
+
         fn supports_streaming(&self) -> bool {
             false
         }
@@ -192,6 +196,10 @@ mod tests {
         }
 
         fn supports_tools(&self) -> bool {
+            true
+        }
+
+        fn supports_structured_output(&self) -> bool {
             true
         }
 

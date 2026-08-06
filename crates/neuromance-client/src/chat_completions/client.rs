@@ -125,7 +125,9 @@ use std::sync::Arc;
 use tracing::{error, warn};
 
 use neuromance_common::chat::Message;
-use neuromance_common::client::{ChatChunk, ChatRequest, ChatResponse, Config, ProxyConfig, Usage};
+use neuromance_common::client::{
+    ChatChunk, ChatRequest, ChatResponse, Config, FinishReason, ProxyConfig, Usage,
+};
 use neuromance_common::tools::{FunctionCall, ToolCall};
 
 use crate::chat_completions::{
@@ -341,7 +343,10 @@ impl std::fmt::Debug for ChatCompletionsClient {
 pub fn convert_chunk_to_chat_chunk(chunk: &ChatCompletionChunk) -> ChatChunk {
     let choice = chunk.choices.first();
 
-    let delta_content = choice.and_then(|c| c.delta.content.clone());
+    // A refusal streams in place of content. Surfacing it as content keeps the reason visible;
+    // `ChatCompletionsClient::process_event` separately marks the stream as filtered.
+    let delta_content =
+        choice.and_then(|c| c.delta.content.clone().or_else(|| c.delta.refusal.clone()));
     let delta_reasoning_content = choice.and_then(|c| c.delta.reasoning_content.clone());
     let delta_role = choice.and_then(|c| c.delta.role);
     let finish_reason = choice
@@ -540,6 +545,11 @@ impl ChatCompletionsClient {
         if let Some(content) = msg.content.as_deref() {
             builder.set_content(content.to_string());
         }
+        // A refusal arrives instead of content, never alongside it. Carrying it as content keeps
+        // the reason visible to callers, which an otherwise empty message would lose.
+        if let Some(refusal) = msg.refusal.as_deref() {
+            builder.append_content(refusal);
+        }
         if let Some(tcs) = msg.tool_calls.as_ref() {
             for tc in tcs {
                 builder.push_tool_call(ToolCall {
@@ -580,6 +590,10 @@ impl LLMClient for ChatCompletionsClient {
         true
     }
 
+    fn supports_structured_output(&self) -> bool {
+        true
+    }
+
     async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, ClientError> {
         self.validate_request(request)?;
 
@@ -610,10 +624,16 @@ impl LLMClient for ChatCompletionsClient {
 
         let message = Self::convert_message(&choice.message, conversation_id);
 
-        let finish_reason = choice
-            .finish_reason
-            .as_ref()
-            .and_then(|reason| reason.parse().ok());
+        // A refusal outranks the reported reason. The API sends `finish_reason: "stop"` when the
+        // model declines, so without this the refusal prose reaches callers as a real answer.
+        let finish_reason = if choice.message.refusal.is_some() {
+            Some(FinishReason::ContentFilter)
+        } else {
+            choice
+                .finish_reason
+                .as_ref()
+                .and_then(|reason| reason.parse().ok())
+        };
 
         let usage = response.usage.map(|u| Usage {
             prompt_tokens: u.prompt_tokens,
@@ -674,21 +694,49 @@ impl LLMClient for ChatCompletionsClient {
     }
 }
 
+/// Streaming state for [`ChatCompletionsClient`].
+///
+/// Refusal deltas and the terminating `finish_reason` arrive in different chunks, so detecting a
+/// refusal needs memory across the stream.
+#[derive(Debug, Default)]
+#[doc(hidden)]
+pub struct ChatCompletionsStreamState {
+    saw_refusal: bool,
+}
+
 impl StreamingProvider for ChatCompletionsClient {
     type Event = ChatCompletionChunk;
-    type State = ();
+    type State = ChatCompletionsStreamState;
 
-    fn initial_state(&self) -> Self::State {}
+    fn initial_state(&self) -> Self::State {
+        ChatCompletionsStreamState::default()
+    }
 
     fn is_stream_end(data: &str) -> bool {
         data == "[DONE]"
     }
 
     fn process_event(
-        _state: &mut Self::State,
+        state: &mut Self::State,
         event: Self::Event,
     ) -> Option<Result<ChatChunk, ClientError>> {
-        Some(Ok(convert_chunk_to_chat_chunk(&event)))
+        if event
+            .choices
+            .first()
+            .is_some_and(|choice| choice.delta.refusal.is_some())
+        {
+            state.saw_refusal = true;
+        }
+
+        let mut chunk = convert_chunk_to_chat_chunk(&event);
+
+        // The API reports `finish_reason: "stop"` even when the model refused. Rewriting the
+        // terminal chunk is what lets callers tell a refusal from a real answer.
+        if state.saw_refusal && chunk.finish_reason.is_some() {
+            chunk.finish_reason = Some(FinishReason::ContentFilter);
+        }
+
+        Some(Ok(chunk))
     }
 }
 
@@ -1553,6 +1601,167 @@ mod tests {
         );
         assert_eq!(by_id["call_a"].function.name, "read");
         assert_eq!(by_id["call_b"].function.name, "bash");
+    }
+
+    /// The API reports `finish_reason: "stop"` on a refusal, so the reported reason alone would
+    /// pass a refusal off as a real answer.
+    #[tokio::test]
+    async fn test_refusal_becomes_content_filter() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "chatcmpl-refusal",
+                "object": "chat.completion",
+                "created": 1_677_652_288,
+                "model": "gpt-4",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "refusal": "I can't help with that"
+                    },
+                    "finish_reason": "stop"
+                }]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = create_test_config(&mock_server.uri());
+        let client = ChatCompletionsClient::new(config).unwrap();
+        let request = ChatRequest::new(vec![create_test_message()]);
+
+        let response = client.chat(&request).await.unwrap();
+
+        assert_eq!(response.finish_reason, Some(FinishReason::ContentFilter));
+        assert_eq!(
+            response.message.content, "I can't help with that",
+            "the refusal text must survive: an empty message would trip Core's empty-turn retry"
+        );
+    }
+
+    fn refusal_chunk(refusal: Option<&str>, finish_reason: Option<&str>) -> ChatCompletionChunk {
+        serde_json::from_value(serde_json::json!({
+            "id": "chatcmpl-stream",
+            "object": "chat.completion.chunk",
+            "created": 1_677_652_288,
+            "model": "gpt-4",
+            "choices": [{
+                "index": 0,
+                "delta": {"refusal": refusal},
+                "finish_reason": finish_reason
+            }]
+        }))
+        .unwrap()
+    }
+
+    /// The refusal delta and the terminating `finish_reason` arrive in separate chunks, so the
+    /// stream state has to remember the refusal to rewrite the last one.
+    #[test]
+    fn test_streamed_refusal_rewrites_the_terminal_finish_reason() {
+        let mut state = ChatCompletionsStreamState::default();
+
+        let first = ChatCompletionsClient::process_event(
+            &mut state,
+            refusal_chunk(Some("I can't help with that"), None),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            first.delta_content.as_deref(),
+            Some("I can't help with that")
+        );
+        assert_eq!(first.finish_reason, None);
+
+        let last =
+            ChatCompletionsClient::process_event(&mut state, refusal_chunk(None, Some("stop")))
+                .unwrap()
+                .unwrap();
+        assert_eq!(last.finish_reason, Some(FinishReason::ContentFilter));
+    }
+
+    /// A stream with no refusal keeps the reported reason.
+    #[test]
+    fn test_streamed_answer_keeps_its_finish_reason() {
+        let mut state = ChatCompletionsStreamState::default();
+
+        let last =
+            ChatCompletionsClient::process_event(&mut state, refusal_chunk(None, Some("stop")))
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(last.finish_reason, Some(FinishReason::Stop));
+    }
+
+    fn structured_output_schema() -> neuromance_common::client::OutputSchema {
+        neuromance_common::client::OutputSchema::new(
+            "answer",
+            serde_json::json!({
+                "type": "object",
+                "properties": {"answer": {"type": "string"}},
+                "required": ["answer"],
+                "additionalProperties": false
+            }),
+        )
+        .unwrap()
+    }
+
+    fn structured_output_tool() -> neuromance_common::tools::Tool {
+        neuromance_common::tools::Tool::builder()
+            .function(neuromance_common::tools::Function {
+                name: "lookup".to_string(),
+                description: "look something up".to_string(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            })
+            .build()
+    }
+
+    #[test]
+    fn test_output_schema_serializes_as_response_format() {
+        let request = ChatRequest::new(vec![create_test_message()])
+            .with_output_schema(structured_output_schema());
+        let wire = crate::chat_completions::ChatCompletionRequest::from((
+            &request,
+            &create_test_config("http://localhost"),
+        ));
+
+        let value = serde_json::to_value(&wire).unwrap();
+        assert_eq!(value["response_format"]["type"], "json_schema");
+        assert_eq!(value["response_format"]["json_schema"]["name"], "answer");
+        assert_eq!(value["response_format"]["json_schema"]["strict"], true);
+        assert_eq!(
+            value["response_format"]["json_schema"]["schema"]["additionalProperties"],
+            false
+        );
+    }
+
+    #[test]
+    fn test_output_schema_and_tools_serialize_together() {
+        let request = ChatRequest::new(vec![create_test_message()])
+            .with_tools(vec![structured_output_tool()])
+            .with_output_schema(structured_output_schema());
+        let wire = crate::chat_completions::ChatCompletionRequest::from((
+            &request,
+            &create_test_config("http://localhost"),
+        ));
+
+        let value = serde_json::to_value(&wire).unwrap();
+        assert_eq!(value["response_format"]["type"], "json_schema");
+        assert_eq!(value["tools"][0]["function"]["name"], "lookup");
+    }
+
+    #[test]
+    fn test_request_without_output_schema_omits_response_format() {
+        let request = ChatRequest::new(vec![create_test_message()]);
+        let wire = crate::chat_completions::ChatCompletionRequest::from((
+            &request,
+            &create_test_config("http://localhost"),
+        ));
+
+        let value = serde_json::to_value(&wire).unwrap();
+        assert!(value.get("response_format").is_none());
     }
 }
 

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use typed_builder::TypedBuilder;
 
 use neuromance_common::chat::{Message, MessageRole};
-use neuromance_common::client::{ChatRequest, Config, InputTokensDetails, Usage};
+use neuromance_common::client::{ChatRequest, Config, InputTokensDetails, OutputSchema, Usage};
 use neuromance_common::tools::{FunctionCall, Tool, ToolCall};
 
 pub mod client;
@@ -390,6 +390,46 @@ pub struct CreateMessageRequest {
     #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingConfig>,
+    /// Output shaping configuration.
+    #[builder(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<OutputConfig>,
+}
+
+/// Anthropic's output shaping container.
+///
+/// Anthropic groups several response-shaping knobs here (`effort` and `task_budget` alongside
+/// `format`), so this is a struct with optional fields rather than a newtype over the format.
+#[derive(Debug, Clone, Serialize, TypedBuilder)]
+pub struct OutputConfig {
+    /// JSON Schema the response must conform to.
+    #[builder(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<OutputFormat>,
+}
+
+/// Response format constraint.
+///
+/// Unlike the `OpenAI` shape, the format object carries the schema alone — Anthropic accepts no
+/// `name` and no `strict` flag, and enforces the schema unconditionally.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum OutputFormat {
+    /// Constrain the response to a JSON Schema.
+    JsonSchema {
+        /// The JSON Schema itself.
+        schema: serde_json::Value,
+    },
+}
+
+impl From<&OutputSchema> for OutputConfig {
+    fn from(schema: &OutputSchema) -> Self {
+        Self {
+            format: Some(OutputFormat::JsonSchema {
+                schema: schema.schema.clone(),
+            }),
+        }
+    }
 }
 
 // ============================================================================
@@ -854,6 +894,7 @@ impl From<(&ChatRequest, &Config)> for CreateMessageRequest {
             .tools(tools)
             .tool_choice(tool_choice)
             .thinking(thinking)
+            .output_config(request.output_schema.as_ref().map(OutputConfig::from))
             .build()
     }
 }

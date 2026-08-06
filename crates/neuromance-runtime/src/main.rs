@@ -16,7 +16,8 @@ use neuromance_context::rules::RulesHook;
 use neuromance_context::{CompactionHook, ContextConfig};
 use neuromance_db::{PersistenceHook, PgConversationStore};
 use neuromance_runtime::{
-    AgentBuilder, ApprovalMode, Mode, RuntimeConfig, RuntimeError, SessionReset, SkillRuntime,
+    AgentBuilder, AgentOverrides, ApprovalMode, Mode, RuntimeConfig, RuntimeError, SessionReset,
+    SkillRuntime,
     approval::WebhookApprover,
     bootstrap, build_parent_toolset,
     health::{ReadinessGate, router as health_router},
@@ -148,8 +149,14 @@ async fn run_orchestrator(config: &RuntimeConfig, cancel: CancellationToken) -> 
         rules: rules.clone(),
         cancel: cancel.clone(),
     });
+    // A oneshot `output_schema` constrains the single run, so it is applied when the shared
+    // agent is built; serve mode carries the schema per task instead.
+    let initial_overrides = AgentOverrides {
+        output_schema: config.oneshot_output_schema()?,
+        ..AgentOverrides::default()
+    };
     let (agent, local_python) = factory
-        .build(None, None)
+        .build(&initial_overrides)
         .await
         .map_err(anyhow::Error::from)?;
 
@@ -367,7 +374,6 @@ fn apply_context_compaction(
     Ok(core)
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn build_agent(
     config: &RuntimeConfig,
     store: Option<&Arc<PgConversationStore>>,
@@ -375,10 +381,10 @@ async fn build_agent(
     skills: Option<&Arc<SkillRuntime>>,
     rules: Option<&Arc<RulesHook>>,
     cancel: &CancellationToken,
-    provider_override: Option<&str>,
-    model_override: Option<&str>,
+    overrides: &AgentOverrides,
 ) -> Result<(Agent<Box<dyn LLMClient>>, Option<SessionReset>), RuntimeError> {
-    let (provider, model) = config.resolve_provider_and_model(provider_override, model_override)?;
+    let (provider, model) = config
+        .resolve_provider_and_model(overrides.provider.as_deref(), overrides.model.as_deref())?;
     let llm_config = build_provider_config(provider, model)?;
     let client = build_client(llm_config.clone())
         .map_err(|e| RuntimeError::Config(format!("build client: {e}")))?;
@@ -391,6 +397,7 @@ async fn build_agent(
         core.max_turns = Some(max);
     }
     core.empty_turn_retries = config.agent.empty_turn_retries;
+    core.output_schema = overrides.output_schema.clone();
     if let Some(store) = store {
         let sink: Arc<PgConversationStore> = Arc::clone(store);
         core = core.with_hook(Arc::new(PersistenceHook::new(sink)));
@@ -494,8 +501,7 @@ struct AgentFactory {
 impl AgentBuilder for AgentFactory {
     async fn build(
         &self,
-        provider_override: Option<&str>,
-        model_override: Option<&str>,
+        overrides: &AgentOverrides,
     ) -> Result<(Agent<Box<dyn LLMClient>>, Option<SessionReset>), RuntimeError> {
         build_agent(
             &self.config,
@@ -504,8 +510,7 @@ impl AgentBuilder for AgentFactory {
             self.skills.as_ref(),
             self.rules.as_ref(),
             &self.cancel,
-            provider_override,
-            model_override,
+            overrides,
         )
         .await
     }

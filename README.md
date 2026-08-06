@@ -293,6 +293,49 @@ With persistence on, the worker snapshots the workspace after every run (success
 
 Retention is expiry-based and external: point a garage lifecycle rule at the snapshot prefix rather than deleting from the runtime. Size the pod's `terminationGracePeriodSeconds` above `runtime.shutdown_grace_seconds` plus the time to pack and upload a snapshot of your workspace's working set — the drain-time snapshot runs inside that window.
 
+## Structured outputs
+
+A task can require the agent's final answer to be a JSON object matching a schema. The schema is
+enforced by the provider, not by a prompt: the runtime passes it through to the model's native
+structured-output parameter (`response_format` on Chat Completions, `text.format` on the Responses
+API, `output_config.format` on Anthropic). A provider that does not support it fails the run rather
+than answering unconstrained.
+
+In `serve` mode the schema is per task, in the `POST /tasks/new` body:
+
+```json
+{
+  "task": "Rate the pull request in the workspace.",
+  "output_schema": {
+    "title": "verdict",
+    "type": "object",
+    "properties": {
+      "score": { "type": "integer" },
+      "summary": { "type": "string" }
+    },
+    "required": ["score", "summary"],
+    "additionalProperties": false
+  }
+}
+```
+
+In `oneshot` mode it is config, under `[oneshot].output_schema`, with the same shape.
+
+The schema must be a closed JSON object: the root declares `"type": "object"`, and every object
+subschema — including those under `properties`, `$defs`, `items`, and `anyOf` — sets
+`"additionalProperties": false`. Both are checked locally, so an unenforceable schema is rejected
+at intake (`400`, before a task is minted) or at startup validation rather than mid-run, and the
+error names the path of the offending subschema. OpenAI strict mode additionally requires every
+property to appear in `required`; that one is enforced by the provider, not here. The optional
+`title` names the schema on the wire; it defaults to `output`.
+
+A successful task returns the parsed object in a `structured` field alongside the prose `output`,
+on `GET /tasks/{id}` and in the `oneshot` JSON. With `[database]` configured it is stored in the
+`tasks.structured` JSONB column. A run whose final turn is not a schema-valid object fails with
+`schema_violation`; a refusal fails with `schema_refusal` and a response cut off at the token limit
+fails with `schema_truncated`. None of the three are retried — the provider already enforced the
+schema, so a retry would only repeat the failure.
+
 ## Tool bootstrap
 
 Some tools cache their credentials to disk rather than reading them from the environment on each call. The agent pod has no persistent storage, so those tools must be logged in at container start. Each `[[bootstrap]]` entry names a command the runtime runs once before tasks begin; failures are logged but never fatal — a tool that can't be set up just isn't available, the same as any other tool error.

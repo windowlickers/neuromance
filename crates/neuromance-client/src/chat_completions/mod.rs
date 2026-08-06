@@ -11,7 +11,7 @@ use smallvec::SmallVec;
 use typed_builder::TypedBuilder;
 
 use neuromance_common::chat::{Message, MessageRole};
-use neuromance_common::client::{ChatRequest, Config, Usage};
+use neuromance_common::client::{ChatRequest, Config, OutputSchema, Usage};
 use neuromance_common::features::ReasoningLevel;
 use neuromance_common::tools::{FunctionCall, Tool, ToolCall};
 
@@ -263,6 +263,44 @@ pub struct ChatCompletionRequest {
     #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_options: Option<serde_json::Value>,
+    /// Schema the response must conform to (optional).
+    #[builder(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<ResponseFormat>,
+}
+
+/// Response format constraint, the Chat Completions form of structured outputs.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResponseFormat {
+    /// Constrain the response to a JSON Schema.
+    JsonSchema {
+        /// The schema and its enforcement mode.
+        json_schema: JsonSchemaSpec,
+    },
+}
+
+/// The `json_schema` payload of a [`ResponseFormat::JsonSchema`].
+#[derive(Debug, Clone, Serialize)]
+pub struct JsonSchemaSpec {
+    /// Name identifying the schema.
+    pub name: String,
+    /// Whether the model must adhere to the schema exactly.
+    pub strict: bool,
+    /// The JSON Schema itself.
+    pub schema: serde_json::Value,
+}
+
+impl From<&OutputSchema> for ResponseFormat {
+    fn from(schema: &OutputSchema) -> Self {
+        Self::JsonSchema {
+            json_schema: JsonSchemaSpec {
+                name: schema.name.clone(),
+                strict: schema.strict,
+                schema: schema.schema.clone(),
+            },
+        }
+    }
 }
 
 /// Conversion from a generic `ChatRequest` to the Chat Completions format.
@@ -314,6 +352,7 @@ impl From<(&ChatRequest, &Config)> for ChatCompletionRequest {
             .tools(tools)
             .tool_choice(request.tool_choice.as_ref().map(|tc| tc.clone().into()))
             .enable_thinking(enable_thinking)
+            .response_format(request.output_schema.as_ref().map(ResponseFormat::from))
             .build()
     }
 }
@@ -395,6 +434,9 @@ pub struct ChatCompletionsMessageDelta {
     /// Reasoning content delta (for streaming from thinking models).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// Refusal delta, sent instead of `content` when the model declines to answer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
 }
 
 /// Delta representing incremental changes to a tool call.

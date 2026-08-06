@@ -96,7 +96,8 @@ pub use chat::{
 };
 pub use client::{
     CacheMetrics, ChatRequest, ChatResponse, Config, FinishReason, InputTokensDetails,
-    OutputTokensDetails, Provider, ProxyConfig, ReasoningEffort, RetryConfig, ToolChoice, Usage,
+    OutputSchema, OutputTokensDetails, Provider, ProxyConfig, ReasoningEffort, RetryConfig,
+    SchemaError, ToolChoice, Usage, parse_structured_response,
 };
 pub use context::{ContextLedger, ContextMetadata, EditRecord, EditSource, Operation};
 pub use delegation::DelegationContext;

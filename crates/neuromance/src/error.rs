@@ -42,6 +42,22 @@ pub enum CoreError {
 
     #[error("Context compaction error: {0}")]
     CompactionError(String),
+
+    /// The model declined to answer under the requested output schema.
+    #[error("Model refused to produce the requested output schema: {0}")]
+    SchemaRefusal(String),
+
+    /// The response hit the token limit before the schema-valid object closed.
+    #[error("Structured output truncated at the token limit; raise `max_tokens`")]
+    SchemaTruncated,
+
+    /// The response was not a JSON object, so the provider did not enforce the schema.
+    #[error("Structured output is not a JSON object: {source}")]
+    SchemaViolation {
+        /// The parse failure.
+        #[source]
+        source: serde_json::Error,
+    },
 }
 
 impl CoreError {
@@ -79,12 +95,17 @@ impl CoreError {
             Self::Serialization(_) => "serialization",
             Self::Hook { .. } => "hook",
             Self::CompactionError(_) => "compaction",
+            Self::SchemaRefusal(_) => "schema_refusal",
+            Self::SchemaTruncated => "schema_truncated",
+            Self::SchemaViolation { .. } => "schema_violation",
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
+
     use super::*;
 
     /// One arm per variant, so adding a variant without a slug fails to compile.
@@ -117,6 +138,17 @@ mod tests {
                 "hook",
             ),
             (CoreError::CompactionError("too big".into()), "compaction"),
+            (
+                CoreError::SchemaRefusal("I can't help with that".into()),
+                "schema_refusal",
+            ),
+            (CoreError::SchemaTruncated, "schema_truncated"),
+            (
+                CoreError::SchemaViolation {
+                    source: serde_json::from_str::<serde_json::Value>("{").unwrap_err(),
+                },
+                "schema_violation",
+            ),
         ];
 
         for (error, expected) in table {
