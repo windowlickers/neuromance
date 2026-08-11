@@ -236,6 +236,19 @@ fn describe_type(schema: &Value) -> String {
     )
 }
 
+/// Whether a `type` keyword declares an object schema.
+///
+/// JSON Schema allows an array of types, and strict mode uses `["object", "null"]` for a nullable
+/// object. Matching only the bare string would let a nullable open object past the check and into
+/// a provider `400`.
+fn declares_object(declared: Option<&Value>) -> bool {
+    match declared {
+        Some(Value::String(name)) => name == "object",
+        Some(Value::Array(names)) => names.iter().any(|n| n.as_str() == Some("object")),
+        _ => false,
+    }
+}
+
 fn validate_node(node: &Value, path: &str, depth: usize) -> Result<(), SchemaError> {
     if depth > MAX_SCHEMA_DEPTH {
         return Err(SchemaError::TooDeep {
@@ -247,7 +260,7 @@ fn validate_node(node: &Value, path: &str, depth: usize) -> Result<(), SchemaErr
         return Ok(());
     };
 
-    if map.get("type").and_then(Value::as_str) == Some("object")
+    if declares_object(map.get("type"))
         && map.get("additionalProperties") != Some(&Value::Bool(false))
     {
         return Err(SchemaError::OpenObject {
@@ -406,6 +419,34 @@ mod tests {
         let error = OutputSchema::new("defs", schema).unwrap_err();
 
         assert_eq!(open_path(&error), Some("$.node"));
+    }
+
+    /// Strict mode spells a nullable object `["object", "null"]`. Matching only the bare string
+    /// would wave an open one through to a provider 400.
+    #[test]
+    fn test_open_nullable_object_is_rejected() {
+        let error = OutputSchema::new(
+            "nullable",
+            closed_object(&json!({
+                "inner": {"type": ["object", "null"], "properties": {}}
+            })),
+        )
+        .unwrap_err();
+
+        assert_eq!(open_path(&error), Some("$.inner"));
+    }
+
+    #[test]
+    fn test_closed_nullable_object_is_accepted() {
+        let schema = closed_object(&json!({
+            "inner": {
+                "type": ["object", "null"],
+                "properties": {},
+                "additionalProperties": false,
+            }
+        }));
+
+        assert!(OutputSchema::new("nullable", schema).is_ok());
     }
 
     #[test]
