@@ -278,12 +278,16 @@ impl<C: LLMClient + Send + Sync> Agent<C> {
             .collect();
 
         // Core already rejected a terminal turn that failed to parse, so a schema-carrying run
-        // always reaches here with a JSON object.
-        let structured = self.core.output_schema.as_ref().and_then(|_| {
-            parse_structured_response(&content.content)
-                .inspect_err(|e| warn!(error = %e, "final message is not JSON despite a schema"))
-                .ok()
-        });
+        // always reaches here with a JSON object. Fail the run if it ever does not: returning
+        // `structured: None` on a successful response would tell the caller the model answered
+        // without a schema, which is the one thing that cannot have happened.
+        let structured = self
+            .core
+            .output_schema
+            .as_ref()
+            .map(|_| parse_structured_response(&content.content))
+            .transpose()
+            .map_err(|source| CoreError::SchemaViolation { source })?;
 
         let response = AgentResponse {
             content,
