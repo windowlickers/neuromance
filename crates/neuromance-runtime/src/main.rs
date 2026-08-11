@@ -28,6 +28,7 @@ use neuromance_runtime::{
     telemetry::{self, BoxedLayer},
     workspace::WorkspaceManager,
 };
+use neuromance_tools::ToolImplementation;
 
 /// Process role. Defaults to the orchestrator when no subcommand is given, so
 /// existing no-argument invocations keep working.
@@ -424,36 +425,82 @@ async fn build_agent(
         },
     )?;
 
-    if matches!(config.approval.mode, ApprovalMode::Auto) {
-        let mut needs_approval: Vec<String> = tools
-            .iter()
-            .filter(|tool| !tool.is_auto_approved())
-            .map(|tool| tool.get_definition().function.name)
-            .collect();
-        if !needs_approval.is_empty() {
-            needs_approval.sort();
-            if config.approval.allow_unsafe_tools {
-                warn!(
-                    tools = %needs_approval.join(", "),
-                    "approval.allow_unsafe_tools is set: auto-approving tools that would \
-                     otherwise require explicit approval, bypassing the startup safety check"
-                );
-            } else {
-                return Err(RuntimeError::Config(format!(
-                    "approval.mode = \"auto\" but the following tools require explicit approval: \
-                     [{}]. Either remove them from [[tools]], set approval.mode = \"async\" with \
-                     an approval.webhook_url, or set approval.allow_unsafe_tools = true to opt out \
-                     of this safety check.",
-                    needs_approval.join(", ")
-                )));
-            }
-        }
-    }
+    reject_unapproved_tools_under_auto_mode(config, &tools)?;
 
     for tool in tools {
         core.tool_executor.add_tool_arc(tool);
     }
 
+    core = apply_approval(core, config)?;
+    core = apply_context_compaction(core, config, llm_config)?;
+
+    // The skills menu is folded into the system prompt at seed time; the hook
+    // only expands `$mention`ed bodies from the latest user message in-loop.
+    if let Some(skills) = skills {
+        core = core.with_hook(skills.hook() as Arc<dyn neuromance_common::hook::Hook>);
+    }
+
+    // Rules inject always-apply guidance at conversation start and glob-matched
+    // guidance after a tool touches a matching path, entirely inside the loop.
+    if let Some(rules) = rules {
+        core = core.with_hook(Arc::clone(rules) as Arc<dyn neuromance_common::hook::Hook>);
+    }
+
+    Ok((Agent::new(config.agent.id.clone(), core), local_python))
+}
+
+/// Fail startup when `approval.mode = "auto"` would silently auto-approve tools
+/// that ask for explicit approval.
+///
+/// The check runs before any tool is added to the executor, so an unsafe
+/// combination never reaches a run. `approval.allow_unsafe_tools` downgrades it
+/// to a warning for operators who accept the tradeoff.
+///
+/// # Errors
+/// Returns [`RuntimeError::Config`] naming every offending tool and the ways out.
+fn reject_unapproved_tools_under_auto_mode(
+    config: &RuntimeConfig,
+    tools: &[Arc<dyn ToolImplementation>],
+) -> Result<(), RuntimeError> {
+    if !matches!(config.approval.mode, ApprovalMode::Auto) {
+        return Ok(());
+    }
+    let mut needs_approval: Vec<String> = tools
+        .iter()
+        .filter(|tool| !tool.is_auto_approved())
+        .map(|tool| tool.get_definition().function.name)
+        .collect();
+    if needs_approval.is_empty() {
+        return Ok(());
+    }
+    needs_approval.sort();
+    if config.approval.allow_unsafe_tools {
+        warn!(
+            tools = %needs_approval.join(", "),
+            "approval.allow_unsafe_tools is set: auto-approving tools that would \
+             otherwise require explicit approval, bypassing the startup safety check"
+        );
+        return Ok(());
+    }
+    Err(RuntimeError::Config(format!(
+        "approval.mode = \"auto\" but the following tools require explicit approval: [{}]. \
+         Either remove them from [[tools]], set approval.mode = \"async\" with an \
+         approval.webhook_url, or set approval.allow_unsafe_tools = true to opt out of this \
+         safety check.",
+        needs_approval.join(", ")
+    )))
+}
+
+/// Wire the agent's tool-approval policy: blanket auto-approval, or a webhook
+/// approver consulted per tool call.
+///
+/// # Errors
+/// Returns [`RuntimeError::Config`] if `async` mode has no `webhook_url`, or if
+/// the approver rejects the configured URL or timeout.
+fn apply_approval(
+    mut core: Core<Box<dyn LLMClient>>,
+    config: &RuntimeConfig,
+) -> Result<Core<Box<dyn LLMClient>>, RuntimeError> {
     match config.approval.mode {
         ApprovalMode::Auto => {
             core.auto_approve_tools = true;
@@ -472,22 +519,7 @@ async fn build_agent(
             core = core.with_hook(Arc::new(FnReviewHook::new(move |tc| approver.approve(tc))));
         }
     }
-
-    core = apply_context_compaction(core, config, llm_config)?;
-
-    // The skills menu is folded into the system prompt at seed time; the hook
-    // only expands `$mention`ed bodies from the latest user message in-loop.
-    if let Some(skills) = skills {
-        core = core.with_hook(skills.hook() as Arc<dyn neuromance_common::hook::Hook>);
-    }
-
-    // Rules inject always-apply guidance at conversation start and glob-matched
-    // guidance after a tool touches a matching path, entirely inside the loop.
-    if let Some(rules) = rules {
-        core = core.with_hook(Arc::clone(rules) as Arc<dyn neuromance_common::hook::Hook>);
-    }
-
-    Ok((Agent::new(config.agent.id.clone(), core), local_python))
+    Ok(core)
 }
 
 /// Owns the startup inputs `build_agent` needs so the serve worker can build a
