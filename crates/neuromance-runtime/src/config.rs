@@ -988,6 +988,18 @@ impl RuntimeConfig {
                  rename the [[subagents]] entry or disable self_delegation"
             )));
         }
+        // The synthesized clone takes `agent.system_prompt` verbatim and is
+        // appended after this loop runs, so it never reaches the non-empty check
+        // above. Without this, the same config written as an explicit
+        // [[subagents]] entry is rejected while the synthesized one boots an
+        // uninstructed agent holding the parent's whole toolset.
+        if self.runtime.self_delegation && self.agent.system_prompt.trim().is_empty() {
+            return Err(RuntimeError::Config(format!(
+                "agent.system_prompt must not be empty when runtime.self_delegation is set: the \
+                 synthesized '{SELF_DELEGATION_ID}' subagent runs on it. Set agent.system_prompt \
+                 or disable self_delegation."
+            )));
+        }
         Ok(())
     }
 
@@ -2458,6 +2470,39 @@ mod tests {
         let effective = config.with_self_delegation();
         assert_eq!(effective.subagents.len(), 1);
         assert_eq!(effective.subagents[0].id, SELF_DELEGATION_ID);
+    }
+
+    /// The synthesized clone runs on `agent.system_prompt`, so an empty one is
+    /// rejected exactly as the equivalent explicit `[[subagents]]` entry is.
+    /// Otherwise `self_delegation` boots an uninstructed agent holding the
+    /// parent's whole auto-approved toolset.
+    #[test]
+    fn test_self_delegation_with_empty_agent_prompt_fails() {
+        let mut config = serve_config(
+            r"
+            [runtime]
+            self_delegation = true
+        ",
+        );
+        config.agent.system_prompt = "   ".to_string();
+
+        let err = config
+            .validate()
+            .expect_err("an uninstructed self-clone must not boot");
+
+        let msg = format!("{err}");
+        assert!(msg.contains("agent.system_prompt"), "{msg}");
+        assert!(msg.contains("self_delegation"), "{msg}");
+    }
+
+    /// The same empty prompt is fine without self-delegation: nothing
+    /// synthesizes a subagent from it.
+    #[test]
+    fn test_empty_agent_prompt_is_allowed_without_self_delegation() {
+        let mut config = serve_config("");
+        config.agent.system_prompt = String::new();
+
+        config.validate().unwrap();
     }
 
     #[test]
