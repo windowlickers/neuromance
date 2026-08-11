@@ -15,6 +15,9 @@ use tracing::{debug, field, info, info_span, trace, warn};
 /// single turn is in flight. Keeps long completions visible without flooding.
 const STREAM_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Stands in for the refusal prose when the provider declines without explaining why.
+const NO_REFUSAL_REASON: &str = "the provider gave no reason";
+
 use neuromance_client::{ChatChunkStream, ClientError, LLMClient};
 use neuromance_common::chat::{Conversation, Message, MessageRole};
 use neuromance_common::client::{
@@ -98,9 +101,14 @@ impl<C: LLMClient> Core<C> {
     fn check_structured_output(response: &ChatResponse) -> Result<(), CoreError> {
         match response.finish_reason {
             Some(FinishReason::ContentFilter) => {
-                return Err(CoreError::SchemaRefusal(
-                    response.message.content.trim().to_string(),
-                ));
+                // Anthropic and the Responses API can report a refusal with no prose at all, and
+                // an error trailing off after the colon reads like a truncated message.
+                let reason = response.message.content.trim();
+                return Err(CoreError::SchemaRefusal(if reason.is_empty() {
+                    NO_REFUSAL_REASON.to_owned()
+                } else {
+                    reason.to_owned()
+                }));
             }
             Some(FinishReason::Length) => return Err(CoreError::SchemaTruncated),
             _ => {}
@@ -2413,7 +2421,7 @@ mod tests {
         .await;
 
         assert!(
-            matches!(result, Err(CoreError::SchemaRefusal(_))),
+            matches!(&result, Err(CoreError::SchemaRefusal(reason)) if reason == NO_REFUSAL_REASON),
             "unexpected: {result:?}"
         );
         assert_eq!(calls, 1, "a refusal must not be resubmitted");
