@@ -287,11 +287,14 @@ fn convert_event_to_chunk(
                 .iter()
                 .any(|item| matches!(item, OutputItem::FunctionCall { .. }));
             let finish_reason = super::finish_reason_for_response(&response, has_tool_calls);
+            // A refusal never arrives as a text delta, so the terminal chunk is the only place it
+            // can reach the caller — otherwise ContentFilter lands on an empty message.
+            let refusal = super::refusal_text(&response);
             let usage = response.usage.map(Usage::from);
 
             Some(Ok(ChatChunk {
                 model: response.model,
-                delta_content: None,
+                delta_content: refusal,
                 delta_reasoning_content: None,
                 delta_role: None,
                 delta_tool_calls: None,
@@ -758,6 +761,41 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 10);
         assert_eq!(usage.completion_tokens, 20);
         assert_eq!(usage.total_tokens, 30);
+    }
+
+    /// A refusal has no text deltas, so the terminal chunk is the only carrier for its prose. Drop
+    /// it and a structured-output caller gets `ContentFilter` with an empty reason.
+    #[tokio::test]
+    async fn test_stream_response_completed_carries_refusal_text() {
+        let mut state = make_state();
+
+        let response = super::super::ResponsesResponse {
+            id: "resp_refusal".to_string(),
+            object: "response".to_string(),
+            created_at: 1_700_000_000,
+            model: "gpt-4o".to_string(),
+            status: super::super::ResponseStatus::Completed,
+            output: vec![super::super::OutputItem::Message {
+                role: "assistant".to_string(),
+                content: vec![super::super::OutputContentBlock::Refusal {
+                    refusal: "I can't help with that".to_string(),
+                }],
+            }],
+            error: None,
+            incomplete_details: None,
+            usage: None,
+            metadata: HashMap::new(),
+        };
+
+        let event = StreamEvent::ResponseCompleted { response };
+
+        let chunk = convert_event_to_chunk(event, &mut state).unwrap().unwrap();
+
+        assert_eq!(chunk.finish_reason, Some(FinishReason::ContentFilter));
+        assert_eq!(
+            chunk.delta_content.as_deref(),
+            Some("I can't help with that")
+        );
     }
 
     #[tokio::test]

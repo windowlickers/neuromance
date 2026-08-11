@@ -662,7 +662,7 @@ pub fn finish_reason_for_response(
     response: &ResponsesResponse,
     has_tool_calls: bool,
 ) -> Option<neuromance_common::client::FinishReason> {
-    if response_has_refusal(response) {
+    if refusal_text(response).is_some() {
         return Some(neuromance_common::client::FinishReason::ContentFilter);
     }
 
@@ -673,13 +673,27 @@ pub fn finish_reason_for_response(
     )
 }
 
-fn response_has_refusal(response: &ResponsesResponse) -> bool {
-    response.output.iter().any(|item| match item {
-        OutputItem::Message { content, .. } => content
-            .iter()
-            .any(|block| matches!(block, OutputContentBlock::Refusal { .. })),
-        _ => false,
-    })
+/// The model's refusal prose, or `None` when the response carries no refusal block.
+///
+/// Streaming needs the text, not just the fact of a refusal: the refusal arrives inside the
+/// terminal payload rather than as text deltas, so without this the caller sees a
+/// `ContentFilter` finish reason attached to an empty message.
+#[must_use]
+pub fn refusal_text(response: &ResponsesResponse) -> Option<String> {
+    let blocks = response.output.iter().filter_map(|item| match item {
+        OutputItem::Message { content, .. } => Some(content),
+        _ => None,
+    });
+
+    let joined = blocks
+        .flatten()
+        .filter_map(|block| match block {
+            OutputContentBlock::Refusal { refusal } => Some(refusal.as_str()),
+            OutputContentBlock::OutputText { .. } => None,
+        })
+        .collect::<Vec<_>>();
+
+    (!joined.is_empty()).then(|| joined.join("\n"))
 }
 
 /// Derive a `FinishReason` from the response status and incomplete details.
