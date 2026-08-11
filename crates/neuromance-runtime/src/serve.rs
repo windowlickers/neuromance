@@ -513,14 +513,7 @@ async fn try_enqueue(
     // Reject a schema the providers would 400 on before minting a task.
     let output_schema = req
         .output_schema
-        .map(|schema| {
-            let name = schema
-                .get("title")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("output")
-                .to_owned();
-            OutputSchema::new(name, schema)
-        })
+        .map(OutputSchema::from_value)
         .transpose()
         .map_err(EnqueueError::InvalidSchema)?;
     let workspace = resolve_workspace_definition(&state.config, req.workspace.as_deref())?;

@@ -16,9 +16,12 @@ use thiserror::Error;
 
 /// A schema the model's response must conform to.
 ///
-/// Construct with [`OutputSchema::new`], which validates the schema. The fields are public for
-/// reading, but building one directly bypasses validation, so prefer the constructor.
+/// Construct with [`OutputSchema::new`] or [`OutputSchema::from_value`]. Deserialization routes
+/// through the same validation, so an `OutputSchema` that exists is always one the providers
+/// accept. The fields are public for reading; building one with a struct literal is the only way
+/// to skip the checks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawOutputSchema")]
 pub struct OutputSchema {
     /// Name identifying the schema. Sent to `OpenAI`; Anthropic has no field for it.
     pub name: String,
@@ -52,6 +55,46 @@ pub enum SchemaError {
         /// Dotted path to the offending subschema, rooted at `$`.
         path: String,
     },
+    /// The schema name is not one `OpenAI` accepts.
+    #[error(
+        "output schema name `{name}` must be 1-{MAX_NAME_LEN} characters of \
+         `a-z`, `A-Z`, `0-9`, `_` or `-`"
+    )]
+    InvalidName {
+        /// The rejected name.
+        name: String,
+    },
+    /// The schema nests deeper than [`MAX_SCHEMA_DEPTH`].
+    #[error("output schema nests deeper than {MAX_SCHEMA_DEPTH} levels at `{path}`")]
+    TooDeep {
+        /// Dotted path to the subschema that exceeded the limit, rooted at `$`.
+        path: String,
+    },
+}
+
+/// Longest schema name `OpenAI` accepts in `response_format.json_schema.name`.
+pub const MAX_NAME_LEN: usize = 64;
+
+/// Deepest subschema nesting [`OutputSchema::new`] will validate.
+///
+/// The recursive walk needs a bound of its own: today every untrusted schema arrives through
+/// `serde_json`'s 128-level parse limit, but [`OutputSchema::new`] is public and a caller can
+/// build a `Value` programmatically. 64 levels is far beyond any real structured-output schema.
+pub const MAX_SCHEMA_DEPTH: usize = 64;
+
+/// The wire shape of an [`OutputSchema`], before validation.
+#[derive(Deserialize)]
+struct RawOutputSchema {
+    name: String,
+    schema: Value,
+}
+
+impl TryFrom<RawOutputSchema> for OutputSchema {
+    type Error = SchemaError;
+
+    fn try_from(raw: RawOutputSchema) -> Result<Self, Self::Error> {
+        Self::new(raw.name, raw.schema)
+    }
 }
 
 impl OutputSchema {
@@ -64,8 +107,11 @@ impl OutputSchema {
     ///
     /// # Errors
     ///
-    /// Returns [`SchemaError::NonObjectRoot`] if the root is not `type: "object"`, or
-    /// [`SchemaError::OpenObject`] if any object subschema omits `additionalProperties: false`.
+    /// Returns [`SchemaError::InvalidName`] if `name` is empty, longer than [`MAX_NAME_LEN`], or
+    /// holds a character outside `[A-Za-z0-9_-]`; [`SchemaError::NonObjectRoot`] if the root is
+    /// not `type: "object"`; [`SchemaError::OpenObject`] if any object subschema omits
+    /// `additionalProperties: false`; and [`SchemaError::TooDeep`] past [`MAX_SCHEMA_DEPTH`]
+    /// levels of nesting.
     ///
     /// # Examples
     ///
@@ -86,17 +132,74 @@ impl OutputSchema {
     /// # Ok::<(), neuromance_common::client::SchemaError>(())
     /// ```
     pub fn new(name: impl Into<String>, schema: Value) -> Result<Self, SchemaError> {
+        let name = name.into();
+        validate_name(&name)?;
         if schema.get("type").and_then(Value::as_str) != Some("object") {
             return Err(SchemaError::NonObjectRoot {
                 found: describe_type(&schema),
             });
         }
-        validate_node(&schema, "$")?;
+        validate_node(&schema, "$", 0)?;
 
         Ok(Self {
-            name: name.into(),
+            name,
             schema,
             strict: true,
+        })
+    }
+
+    /// Validates a JSON Schema, naming it from its own `title` key.
+    ///
+    /// The name defaults to `output` when the schema declares no string `title`. This is the
+    /// entry point for schemas that arrive as loose JSON — a request body or a config file — where
+    /// the name is not carried separately.
+    ///
+    /// # Arguments
+    ///
+    /// * `schema` - The JSON Schema; its root must be an object schema
+    ///
+    /// # Errors
+    ///
+    /// The same errors as [`OutputSchema::new`], including [`SchemaError::InvalidName`] when the
+    /// schema's own `title` is not a name the providers accept.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use neuromance_common::client::OutputSchema;
+    /// use serde_json::json;
+    ///
+    /// let schema = OutputSchema::from_value(json!({
+    ///     "title": "verdict",
+    ///     "type": "object",
+    ///     "properties": {"ok": {"type": "boolean"}},
+    ///     "additionalProperties": false,
+    /// }))?;
+    /// assert_eq!(schema.name, "verdict");
+    /// # Ok::<(), neuromance_common::client::SchemaError>(())
+    /// ```
+    pub fn from_value(schema: Value) -> Result<Self, SchemaError> {
+        let name = schema
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("output")
+            .to_owned();
+        Self::new(name, schema)
+    }
+}
+
+/// Rejects names `OpenAI` will bounce with a `400` after the task has already consumed a worker.
+fn validate_name(name: &str) -> Result<(), SchemaError> {
+    let acceptable = (1..=MAX_NAME_LEN).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+
+    if acceptable {
+        Ok(())
+    } else {
+        Err(SchemaError::InvalidName {
+            name: name.to_owned(),
         })
     }
 }
@@ -133,7 +236,13 @@ fn describe_type(schema: &Value) -> String {
     )
 }
 
-fn validate_node(node: &Value, path: &str) -> Result<(), SchemaError> {
+fn validate_node(node: &Value, path: &str, depth: usize) -> Result<(), SchemaError> {
+    if depth > MAX_SCHEMA_DEPTH {
+        return Err(SchemaError::TooDeep {
+            path: path.to_owned(),
+        });
+    }
+
     let Some(map) = node.as_object() else {
         return Ok(());
     };
@@ -146,37 +255,37 @@ fn validate_node(node: &Value, path: &str) -> Result<(), SchemaError> {
         });
     }
 
-    validate_named_children(node, path)?;
-    validate_indexed_children(node, path)?;
+    validate_named_children(node, path, depth)?;
+    validate_indexed_children(node, path, depth)?;
 
     if let Some(items) = map.get("items") {
-        validate_node(items, &format!("{path}[]"))?;
+        validate_node(items, &format!("{path}[]"), depth + 1)?;
     }
 
     Ok(())
 }
 
 /// Recurses into subschemas keyed by name: `properties`, `$defs`, `definitions`.
-fn validate_named_children(node: &Value, path: &str) -> Result<(), SchemaError> {
+fn validate_named_children(node: &Value, path: &str, depth: usize) -> Result<(), SchemaError> {
     for key in ["properties", "$defs", "definitions"] {
         let Some(children) = node.get(key).and_then(Value::as_object) else {
             continue;
         };
         for (name, child) in children {
-            validate_node(child, &format!("{path}.{name}"))?;
+            validate_node(child, &format!("{path}.{name}"), depth + 1)?;
         }
     }
     Ok(())
 }
 
 /// Recurses into subschemas held in arrays: `anyOf`, `allOf`, `oneOf`, `prefixItems`.
-fn validate_indexed_children(node: &Value, path: &str) -> Result<(), SchemaError> {
+fn validate_indexed_children(node: &Value, path: &str, depth: usize) -> Result<(), SchemaError> {
     for key in ["anyOf", "allOf", "oneOf", "prefixItems"] {
         let Some(children) = node.get(key).and_then(Value::as_array) else {
             continue;
         };
         for (index, child) in children.iter().enumerate() {
-            validate_node(child, &format!("{path}.{key}[{index}]"))?;
+            validate_node(child, &format!("{path}.{key}[{index}]"), depth + 1)?;
         }
     }
     Ok(())
@@ -201,8 +310,17 @@ mod tests {
     fn open_path(error: &SchemaError) -> Option<&str> {
         match error {
             SchemaError::OpenObject { path } => Some(path.as_str()),
-            SchemaError::NonObjectRoot { .. } => None,
+            SchemaError::NonObjectRoot { .. }
+            | SchemaError::InvalidName { .. }
+            | SchemaError::TooDeep { .. } => None,
         }
+    }
+
+    /// Builds a closed object schema nested `depth` levels below the root.
+    fn nested_to_depth(depth: usize) -> Value {
+        (0..depth).fold(closed_object(&json!({})), |inner, _| {
+            closed_object(&json!({"inner": inner}))
+        })
     }
 
     #[test]
@@ -286,5 +404,104 @@ mod tests {
         let error = OutputSchema::new("defs", schema).unwrap_err();
 
         assert_eq!(open_path(&error), Some("$.node"));
+    }
+
+    #[test]
+    fn test_name_with_spaces_is_rejected() {
+        let error = OutputSchema::new("my verdict", closed_object(&json!({}))).unwrap_err();
+
+        assert!(matches!(error, SchemaError::InvalidName { .. }));
+        assert!(error.to_string().contains("my verdict"));
+    }
+
+    #[test]
+    fn test_empty_name_is_rejected() {
+        let error = OutputSchema::new("", closed_object(&json!({}))).unwrap_err();
+
+        assert!(matches!(error, SchemaError::InvalidName { .. }));
+    }
+
+    #[test]
+    fn test_name_longer_than_the_provider_limit_is_rejected() {
+        let error =
+            OutputSchema::new("n".repeat(MAX_NAME_LEN + 1), closed_object(&json!({}))).unwrap_err();
+
+        assert!(matches!(error, SchemaError::InvalidName { .. }));
+    }
+
+    #[test]
+    fn test_name_at_the_provider_limit_is_accepted() {
+        let name = "n".repeat(MAX_NAME_LEN);
+
+        let schema = OutputSchema::new(name.clone(), closed_object(&json!({}))).unwrap();
+
+        assert_eq!(schema.name, name);
+    }
+
+    #[test]
+    fn test_schema_nested_past_the_depth_limit_is_rejected() {
+        let error = OutputSchema::new("deep", nested_to_depth(MAX_SCHEMA_DEPTH + 1)).unwrap_err();
+
+        assert!(matches!(error, SchemaError::TooDeep { .. }));
+    }
+
+    #[test]
+    fn test_schema_at_the_depth_limit_is_accepted() {
+        assert!(OutputSchema::new("deep", nested_to_depth(MAX_SCHEMA_DEPTH)).is_ok());
+    }
+
+    #[test]
+    fn test_from_value_takes_its_name_from_the_title() {
+        let mut schema = closed_object(&json!({}));
+        schema["title"] = json!("verdict");
+
+        assert_eq!(OutputSchema::from_value(schema).unwrap().name, "verdict");
+    }
+
+    #[test]
+    fn test_from_value_without_a_title_defaults_the_name() {
+        let schema = OutputSchema::from_value(closed_object(&json!({}))).unwrap();
+
+        assert_eq!(schema.name, "output");
+    }
+
+    #[test]
+    fn test_deserialize_rejects_a_schema_new_would_reject() {
+        let wire = json!({
+            "name": "open",
+            "schema": {"type": "object", "properties": {}},
+            "strict": true,
+        });
+
+        let error = serde_json::from_value::<OutputSchema>(wire).unwrap_err();
+
+        assert!(error.to_string().contains("additionalProperties"));
+    }
+
+    #[test]
+    fn test_deserialize_cannot_forge_a_non_strict_schema() {
+        let wire = json!({
+            "name": "verdict",
+            "schema": closed_object(&json!({})),
+            "strict": false,
+        });
+
+        let schema = serde_json::from_value::<OutputSchema>(wire).unwrap();
+
+        assert!(schema.strict);
+    }
+
+    #[test]
+    fn test_serialize_round_trips_through_validation() {
+        let original = OutputSchema::new(
+            "verdict",
+            closed_object(&json!({"ok": {"type": "boolean"}})),
+        )
+        .unwrap();
+
+        let encoded = serde_json::to_string(&original).unwrap();
+        let decoded: OutputSchema = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(decoded, original);
     }
 }

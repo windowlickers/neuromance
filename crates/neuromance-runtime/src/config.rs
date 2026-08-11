@@ -676,11 +676,7 @@ impl RuntimeConfig {
         let Some(schema) = self.oneshot.as_ref().and_then(|o| o.output_schema.as_ref()) else {
             return Ok(None);
         };
-        let name = schema
-            .get("title")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("output");
-        OutputSchema::new(name, schema.clone())
+        OutputSchema::from_value(schema.clone())
             .map(Some)
             .map_err(|e| RuntimeError::Config(format!("[oneshot].output_schema: {e}")))
     }

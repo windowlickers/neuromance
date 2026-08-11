@@ -326,8 +326,13 @@ subschema — including those under `properties`, `$defs`, `items`, and `anyOf` 
 `"additionalProperties": false`. Both are checked locally, so an unenforceable schema is rejected
 at intake (`400`, before a task is minted) or at startup validation rather than mid-run, and the
 error names the path of the offending subschema. OpenAI strict mode additionally requires every
-property to appear in `required`; that one is enforced by the provider, not here. The optional
-`title` names the schema on the wire; it defaults to `output`.
+property to appear in `required`; that one is enforced by the provider, not here. Nesting deeper
+than 64 levels is rejected too. The optional `title` names the schema on the wire; it defaults to
+`output` and must be 1–64 characters of `a-z`, `A-Z`, `0-9`, `_` or `-`, the range OpenAI accepts.
+
+Conformance beyond that is the provider's job. The runtime checks that the final turn parses as a
+JSON object; it does not re-validate the object against the schema, so a provider that ignores the
+constraint returns a `structured` field that satisfies no more than "is an object".
 
 A successful task returns the parsed object in a `structured` field alongside the prose `output`,
 on `GET /tasks/{id}` and in the `oneshot` JSON. With `[database]` configured it is stored in the
