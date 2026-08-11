@@ -62,7 +62,7 @@ use neuromance_common::delegation::{self, DelegationContext};
 use neuromance_db::PgConversationStore;
 
 use crate::SessionReset;
-use crate::config::{RuntimeConfig, WorkspaceDefinition};
+use crate::config::{RuntimeConfig, SELF_DELEGATION_ID, WorkspaceDefinition};
 use crate::sandbox::{EXECUTE_PYTHON, SandboxClient};
 use crate::task_store::{
     ConversationRecord, InMemoryTaskStore, PostgresTaskStore, TaskOutcome, TaskRecord, TaskStore,
@@ -447,6 +447,19 @@ async fn resolve_conversation(
         return Err(EnqueueError::EmptySystemPrompt);
     }
     let Some(id) = requested else {
+        // The per-task prompt replaces the seed message only. A subagent's
+        // prompt is fixed when the delegation tower is built, so the `task`
+        // self-clone still runs `agent.system_prompt` — say so, because a
+        // caller narrowing the agent for one task would otherwise assume the
+        // narrowing reached everything the task can reach.
+        if system_prompt.is_some() && state.config.runtime.self_delegation {
+            warn!(
+                "per-task system_prompt does not reach the '{}' self-delegation subagent, which \
+                 runs agent.system_prompt; instructions meant to constrain this task do not \
+                 constrain what it delegates",
+                SELF_DELEGATION_ID
+            );
+        }
         return Ok((seed_new_conversation(state, system_prompt), true));
     };
     if system_prompt.is_some() {
