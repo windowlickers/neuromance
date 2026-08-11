@@ -123,8 +123,16 @@ pub enum ClientError {
     ///
     /// Rejecting is deliberate: dropping the schema would return unconstrained text to a caller
     /// that is about to parse it as JSON.
-    #[error("Structured output not supported")]
-    StructuredOutputNotSupported,
+    ///
+    /// Unlike the sibling `*NotSupported` variants, this one is triggered per request rather than
+    /// by how the binary is wired, so it names the model the caller must change.
+    #[error(
+        "Model '{model}' does not support structured output — drop `output_schema` or pick a model that does"
+    )]
+    StructuredOutputNotSupported {
+        /// The model that cannot enforce a schema.
+        model: String,
+    },
 
     /// Token limit exceeded for this model.
     ///
@@ -240,7 +248,7 @@ impl ClientError {
             Self::InvalidResponse(_) => "invalid_response",
             Self::ToolsNotSupported
             | Self::StreamingNotSupported
-            | Self::StructuredOutputNotSupported
+            | Self::StructuredOutputNotSupported { .. }
             | Self::EmbeddingsNotSupported => "unsupported",
             Self::ContextLengthExceeded { .. } => "context_length_exceeded",
             Self::ContentFiltered { .. } => "content_filtered",
@@ -344,7 +352,9 @@ mod tests {
             (ClientError::ToolsNotSupported, false, "unsupported"),
             (ClientError::StreamingNotSupported, false, "unsupported"),
             (
-                ClientError::StructuredOutputNotSupported,
+                ClientError::StructuredOutputNotSupported {
+                    model: "gpt-3.5-turbo".to_string(),
+                },
                 false,
                 "unsupported",
             ),
@@ -403,7 +413,7 @@ mod tests {
             ClientError::InvalidResponse(_) => (),
             ClientError::ToolsNotSupported => (),
             ClientError::StreamingNotSupported => (),
-            ClientError::StructuredOutputNotSupported => (),
+            ClientError::StructuredOutputNotSupported { .. } => (),
             ClientError::ContextLengthExceeded { .. } => (),
             ClientError::ContentFiltered { .. } => (),
             ClientError::ServiceUnavailable(_) => (),

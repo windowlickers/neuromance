@@ -358,7 +358,9 @@ pub trait LLMClient: Send + Sync {
         }
 
         if !self.supports_structured_output() && request.output_schema.is_some() {
-            return Err(ClientError::StructuredOutputNotSupported);
+            return Err(ClientError::StructuredOutputNotSupported {
+                model: self.config().model.clone(),
+            });
         }
 
         Ok(())
@@ -724,7 +726,10 @@ mod tests {
             .validate_request(&request)
             .expect_err("client cannot enforce a schema");
 
-        assert!(matches!(error, ClientError::StructuredOutputNotSupported));
+        assert!(matches!(
+            error,
+            ClientError::StructuredOutputNotSupported { .. }
+        ));
     }
 
     #[test]
