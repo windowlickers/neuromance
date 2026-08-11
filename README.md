@@ -167,7 +167,9 @@ A subagent is provisioned with the **same toolset as the main agent** — the ca
 
 One divergence: a serve task that supplies its own `system_prompt` overrides the main agent's seed message only. The `task` clone still carries `agent.system_prompt`, because a subagent's prompt is fixed when the delegation tower is built and the per-task prompt is not known then.
 
-Nested delegation is bounded by `runtime.max_delegation_depth`, which counts subagent hops from the main agent (depth 0). At `1` the main agent reaches subagents but those subagents carry no delegate tools; at `2` (the default) a subagent may delegate one further hop, and so on. The deepest subagents are still fully tool-capable — they simply cannot delegate. The bound is enforced structurally (a finite tower of subagent instances built at startup), so it cannot run away; it is capped at 5.
+Nested delegation is bounded by `runtime.max_delegation_depth`, which counts subagent hops from the main agent (depth 0). At `1` the main agent reaches subagents but those subagents carry no delegate tools; at `2` (the default) a subagent may delegate one further hop, and so on. The deepest subagents are still fully tool-capable — they simply cannot delegate. The bound is enforced structurally (a finite tower of subagent instances built at startup), so the chain depth cannot run away; it is capped at 5.
+
+The bound is on depth alone. Each delegated run carries its own `agent.max_turns` budget rather than drawing down the parent's, so within the depth limit an agent may still delegate many times — and `spawn_agents` runs a batch concurrently. Set a finite `agent.max_turns` to bound the work a single task can generate, especially with `self_delegation` on, where the clone inherits the same instructions that told the parent to delegate.
 
 Every configured subagent is reachable two ways:
 

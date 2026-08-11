@@ -439,9 +439,12 @@ pub struct RuntimeSettings {
     /// main agent (which is depth 0). At `1` the main agent reaches subagents
     /// but those subagents hold no delegate tools; at `2` a subagent may
     /// delegate one further hop, and so on. The deepest subagents are still
-    /// fully tool-capable — they just cannot delegate. Bounds both startup cost
-    /// and runaway delegation fan-out. Ignored when no delegation is configured
-    /// (no `[[subagents]]` and `self_delegation` off).
+    /// fully tool-capable — they just cannot delegate. Bounds startup cost and
+    /// the *depth* of a delegation chain. It does not bound how many runs a
+    /// chain produces: each delegated run carries its own `max_turns` budget, so
+    /// an agent that delegates repeatedly can still fan out widely within the
+    /// depth limit. Ignored when no delegation is configured (no `[[subagents]]`
+    /// and `self_delegation` off).
     #[serde(default = "default_max_delegation_depth")]
     pub max_delegation_depth: u32,
     /// Give the main agent a `task` delegate tool that runs a fresh copy of
