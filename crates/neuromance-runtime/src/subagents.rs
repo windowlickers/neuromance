@@ -51,7 +51,7 @@ use neuromance_context::skills::SkillsHook;
 use neuromance_db::{PersistenceHook, PgConversationStore};
 use neuromance_tools::{ToolConfig, ToolFactoryRegistry, ToolImplementation, ToolRegistry};
 
-use crate::config::{ProviderConfig, RuntimeConfig, SubagentConfig};
+use crate::config::{ProviderConfig, RuntimeConfig, SELF_DELEGATION_ID, SubagentConfig};
 use crate::error::RuntimeError;
 use crate::proxy::build_provider_config;
 use crate::sandbox::EXECUTE_PYTHON;
@@ -492,7 +492,9 @@ fn register_child_delegates(
         };
         if staged.contains(&sub.id) {
             return Err(RuntimeError::Config(format!(
-                "subagent id '{}' collides with a configured tool of the same name",
+                "subagent id '{}' collides with a configured tool of the same name; rename \
+                 whichever you control (the id is synthesized when it is \
+                 '{SELF_DELEGATION_ID}' and runtime.self_delegation is set)",
                 sub.id
             )));
         }
