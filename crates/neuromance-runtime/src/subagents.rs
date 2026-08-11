@@ -349,6 +349,11 @@ fn build_child_core(
     if let Some(max) = max_turns {
         core.max_turns = Some(max);
     }
+    // An empty terminal turn is a provider hiccup, not a property of who is
+    // asking, so a subagent retries on the same budget as the main agent
+    // (`main.rs::build_agent`). Leaving this unset silently pinned every
+    // subagent to `Core`'s default and dropped the operator's setting.
+    core.empty_turn_retries = config.agent.empty_turn_retries;
     // Subagent tool calls run autonomously inside one parent delegation, with no
     // interactive approver in the loop; the pod boundary (kata) is the
     // isolation. See the README Subagents section.
@@ -1393,5 +1398,18 @@ mod tests {
 
         assert!(core.auto_approve_tools);
         assert_eq!(core.max_turns, Some(7));
+    }
+
+    /// A subagent retries an empty terminal turn on the operator's configured
+    /// budget, not `Core`'s default. The two agree by default, so only a
+    /// non-default value proves the setting is carried across.
+    #[test]
+    fn test_child_core_carries_configured_empty_turn_retries() {
+        let mut config = config_with_subagents(vec![subagent("worker")]);
+        config.agent.empty_turn_retries = 4;
+
+        let core = build_child_core(&config, stub_client(), None, &child_hooks(None, None));
+
+        assert_eq!(core.empty_turn_retries, 4);
     }
 }
