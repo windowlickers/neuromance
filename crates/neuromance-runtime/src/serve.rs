@@ -64,6 +64,7 @@ use neuromance_db::PgConversationStore;
 use crate::SessionReset;
 use crate::config::{RuntimeConfig, SELF_DELEGATION_ID, WorkspaceDefinition};
 use crate::sandbox::{EXECUTE_PYTHON, SandboxClient};
+use crate::skills::fold_menu;
 use crate::task_store::{
     ConversationRecord, InMemoryTaskStore, PostgresTaskStore, TaskOutcome, TaskRecord, TaskStore,
 };
@@ -404,11 +405,7 @@ fn seed_new_conversation(state: &ServeState, system_prompt: Option<&str>) -> Uui
     // The workspace note rides the same message: it persists with the
     // conversation, so continuations see their working directory without
     // recomputation on any replica.
-    let mut content = prompt.to_string();
-    if let Some(menu) = state.skills_menu.as_ref() {
-        content.push_str("\n\n");
-        content.push_str(menu);
-    }
+    let mut content = fold_menu(prompt, state.skills_menu.as_deref());
     if let Some(workspace) = state.config.workspace.as_ref() {
         let dir = workspace.root.join(id.to_string());
         content = format!("{content}\n\n{}", crate::workspace::note(&dir));

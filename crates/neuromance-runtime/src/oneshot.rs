@@ -14,6 +14,7 @@ use neuromance_common::chat::Message;
 use neuromance_common::delegation::{self, DelegationContext};
 
 use crate::config::RuntimeConfig;
+use crate::skills::fold_menu;
 use crate::workspace::{self, WorkspaceManager};
 
 #[derive(Debug, Serialize)]
@@ -68,10 +69,7 @@ pub async fn run<C: LLMClient + Send + Sync>(
         None => None,
     };
 
-    let mut system_prompt = skills_menu.map_or_else(
-        || config.agent.system_prompt.clone(),
-        |menu| format!("{}\n\n{}", config.agent.system_prompt, menu),
-    );
+    let mut system_prompt = fold_menu(&config.agent.system_prompt, skills_menu);
     if let Some(dir) = &workspace_dir {
         system_prompt = format!("{system_prompt}\n\n{}", workspace::note(dir));
     }

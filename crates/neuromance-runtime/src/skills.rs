@@ -40,6 +40,19 @@ pub struct SkillRuntime {
     tempdir: TempDir,
 }
 
+/// Append a skills menu to a system prompt, or return the prompt unchanged when
+/// there is no menu.
+///
+/// The separator lives here alone. The self-delegation clone's prompt is built
+/// from `agent.system_prompt` down a different path than the main agent's seed,
+/// yet the two must come out byte-identical, so every caller — `oneshot::run`,
+/// `serve::seed_new_conversation`, and `subagents::tower_config` — joins through
+/// this one function.
+#[must_use]
+pub fn fold_menu(prompt: &str, menu: Option<&str>) -> String {
+    menu.map_or_else(|| prompt.to_string(), |menu| format!("{prompt}\n\n{menu}"))
+}
+
 impl SkillRuntime {
     /// The file-oriented menu to fold into the system prompt, if non-empty.
     #[must_use]

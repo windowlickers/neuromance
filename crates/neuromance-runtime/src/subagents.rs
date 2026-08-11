@@ -55,7 +55,7 @@ use crate::config::{ProviderConfig, RuntimeConfig, SELF_DELEGATION_ID, SubagentC
 use crate::error::RuntimeError;
 use crate::proxy::build_provider_config;
 use crate::sandbox::EXECUTE_PYTHON;
-use crate::skills::SkillRuntime;
+use crate::skills::{SkillRuntime, fold_menu};
 use crate::workspace::WorkspaceNoteSubagent;
 
 /// A per-task cleanup handle for the main agent's in-process `execute_python`
@@ -203,7 +203,7 @@ fn tower_config<'a>(
         && !effective.subagents.is_empty()
     {
         for sub in &mut effective.to_mut().subagents {
-            sub.system_prompt = format!("{}\n\n{menu}", sub.system_prompt);
+            sub.system_prompt = fold_menu(&sub.system_prompt, Some(menu));
         }
     }
     effective
