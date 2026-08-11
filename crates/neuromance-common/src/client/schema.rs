@@ -295,6 +295,8 @@ fn validate_indexed_children(node: &Value, path: &str, depth: usize) -> Result<(
 mod tests {
     #![allow(clippy::unwrap_used)]
 
+    use proptest::prelude::*;
+
     use super::*;
     use serde_json::json;
 
@@ -489,6 +491,104 @@ mod tests {
         let schema = serde_json::from_value::<OutputSchema>(wire).unwrap();
 
         assert!(schema.strict);
+    }
+
+    /// The container key each recursion path in `validate_node` follows, and how to nest a
+    /// subschema under it.
+    fn nest_under(key: &str, child: &Value) -> Value {
+        match key {
+            "items" => json!({"type": "array", "items": child}),
+            "properties" | "$defs" | "definitions" => json!({key: {"child": child}}),
+            _ => json!({key: [child]}),
+        }
+    }
+
+    /// Every container the validator claims to recurse into must actually catch an open object.
+    /// A missed path is the failure mode that matters: the schema ships, and the provider 400s.
+    #[test]
+    fn test_every_recursion_path_catches_an_open_object() {
+        let open = json!({"type": "object", "properties": {}});
+
+        for key in [
+            "properties",
+            "$defs",
+            "definitions",
+            "items",
+            "anyOf",
+            "allOf",
+            "oneOf",
+            "prefixItems",
+        ] {
+            let mut schema = closed_object(&json!({"field": nest_under(key, &open)}));
+            schema["additionalProperties"] = json!(false);
+
+            let error = OutputSchema::new("probe", schema).unwrap_err();
+
+            assert!(
+                open_path(&error).is_some(),
+                "`{key}` did not reach the open object: {error}"
+            );
+        }
+    }
+
+    proptest! {
+        /// Any JSON object survives a serialize/parse round trip through the structured-output
+        /// parser — it narrows the type without altering the value.
+        #[test]
+        fn parse_structured_response_round_trips_objects(
+            keys in prop::collection::vec("[a-z]{1,8}", 0..8),
+            values in prop::collection::vec(any::<i64>(), 0..8),
+        ) {
+            let object: serde_json::Map<String, Value> = keys
+                .into_iter()
+                .zip(values)
+                .map(|(k, v)| (k, Value::from(v)))
+                .collect();
+            let encoded = serde_json::to_string(&object).unwrap();
+
+            let parsed = parse_structured_response(&encoded).unwrap();
+
+            prop_assert_eq!(parsed, Value::Object(object));
+        }
+
+        /// Surrounding whitespace is not part of the value.
+        #[test]
+        fn parse_structured_response_ignores_surrounding_whitespace(
+            pad in "[ \t\r\n]{0,8}",
+        ) {
+            let parsed = parse_structured_response(&format!("{pad}{{\"ok\":true}}{pad}")).unwrap();
+
+            prop_assert_eq!(parsed, json!({"ok": true}));
+        }
+
+        /// The parser exists to reject the non-objects `from_str::<Value>` would accept.
+        #[test]
+        fn parse_structured_response_rejects_non_objects(
+            scalar in prop_oneof![
+                any::<i64>().prop_map(|n| n.to_string()),
+                any::<bool>().prop_map(|b| b.to_string()),
+                Just("null".to_owned()),
+                Just("[1, 2]".to_owned()),
+                "\"[a-z]{0,8}\"",
+            ],
+        ) {
+            prop_assert!(parse_structured_response(&scalar).is_err());
+        }
+
+        /// Validation is a pure inspection: an accepted schema comes back byte-identical, and
+        /// re-validating it accepts again.
+        #[test]
+        fn validation_preserves_the_schema_and_is_idempotent(
+            field in "[a-z]{1,8}",
+            depth in 0usize..8,
+        ) {
+            let source = closed_object(&json!({field: nested_to_depth(depth)}));
+
+            let schema = OutputSchema::new("probe", source.clone()).unwrap();
+
+            prop_assert_eq!(&schema.schema, &source);
+            prop_assert!(OutputSchema::new("probe", schema.schema).is_ok());
+        }
     }
 
     #[test]
