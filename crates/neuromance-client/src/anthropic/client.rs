@@ -53,7 +53,7 @@ use secrecy::{ExposeSecret, SecretString};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
-use tracing::{Instrument as _, error, warn};
+use tracing::{error, warn};
 
 use neuromance_common::chat::{Message, MessageRole};
 use neuromance_common::client::{ChatChunk, ChatRequest, ChatResponse, Config, ProxyConfig, Usage};
@@ -478,17 +478,9 @@ impl LLMClient for AnthropicClient {
         // GenAI operation and get no span.
         self.validate_request(request)?;
 
-        let op = GenAiOp::chat(&self.config, request);
-        match self.send_chat(request).instrument(op.span().clone()).await {
-            Ok(response) => {
-                op.finish_response(&response);
-                Ok(response)
-            }
-            Err(error) => {
-                op.finish_error(&error, None);
-                Err(error)
-            }
-        }
+        GenAiOp::chat(&self.config, request)
+            .run_chat(self.send_chat(request))
+            .await
     }
 
     async fn chat_stream(

@@ -15,9 +15,10 @@ mod stream;
 #[cfg(test)]
 mod tests;
 
+use std::future::Future;
 use std::time::Instant;
 
-use tracing::{Span, field, info_span};
+use tracing::{Instrument as _, Span, field, info_span};
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 use neuromance_common::client::{ChatRequest, ChatResponse, Config, FinishReason, Usage};
@@ -87,6 +88,27 @@ impl GenAiOp {
     /// The span, for entering or for instrumenting a future.
     pub const fn span(&self) -> &Span {
         &self.span
+    }
+
+    /// Run a non-streaming chat inside this operation's span and close it.
+    ///
+    /// Every client's `LLMClient::chat` is this same instrument-then-finish
+    /// wiring around its own `send_chat`, so it lives here with the rest of the
+    /// span handling rather than being repeated per provider.
+    pub async fn run_chat(
+        self,
+        request: impl Future<Output = Result<ChatResponse, ClientError>>,
+    ) -> Result<ChatResponse, ClientError> {
+        match request.instrument(self.span().clone()).await {
+            Ok(response) => {
+                self.finish_response(&response);
+                Ok(response)
+            }
+            Err(error) => {
+                self.finish_error(&error, None);
+                Err(error)
+            }
+        }
     }
 
     /// Close a successful non-streaming operation.

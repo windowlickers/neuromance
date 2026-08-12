@@ -122,7 +122,7 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
-use tracing::{Instrument as _, error, warn};
+use tracing::{error, warn};
 
 use neuromance_common::chat::Message;
 use neuromance_common::client::{
@@ -600,17 +600,9 @@ impl LLMClient for ChatCompletionsClient {
         // GenAI operation and get no span.
         self.validate_request(request)?;
 
-        let op = GenAiOp::chat(&self.config, request);
-        match self.send_chat(request).instrument(op.span().clone()).await {
-            Ok(response) => {
-                op.finish_response(&response);
-                Ok(response)
-            }
-            Err(error) => {
-                op.finish_error(&error, None);
-                Err(error)
-            }
-        }
+        GenAiOp::chat(&self.config, request)
+            .run_chat(self.send_chat(request))
+            .await
     }
 
     async fn chat_stream(
