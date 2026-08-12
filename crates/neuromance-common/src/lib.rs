@@ -90,6 +90,9 @@ pub mod subagent;
 /// Task and outcome types for subagent delegation.
 pub mod task;
 
+/// OpenTelemetry GenAI semantic-convention keys and the content-capture gate.
+pub mod telemetry;
+
 pub use agents::{AgentContext, AgentMemory, AgentMessage, AgentResponse, AgentState, AgentStats};
 pub use chat::{
     Conversation, ConversationStatus, Message, MessageRole, ReasoningContent, TaskStatus,
