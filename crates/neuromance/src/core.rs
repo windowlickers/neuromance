@@ -27,6 +27,7 @@ use neuromance_common::client::{
 use neuromance_common::context::{ContextLedger, EditSource};
 use neuromance_common::features::ThinkingMode;
 use neuromance_common::hook::{CompactionStats, Hook, HookContext};
+use neuromance_common::telemetry::genai;
 use neuromance_common::tools::{ToolApproval, ToolCall};
 use neuromance_tools::{ToolExecutor, ToolExecutorError};
 
@@ -524,6 +525,11 @@ impl<C: LLMClient> Core<C> {
                     max_turns = %max_turns_label,
                     model = tracing::field::Empty,
                     finish_reason = tracing::field::Empty,
+                    // Not a GenAI operation — one iteration of the orchestration
+                    // loop, spanning both the model call and the tool executions
+                    // that follow. The conversation id is a GenAI attribute
+                    // regardless, and it makes the whole subtree filterable.
+                    { genai::CONVERSATION_ID } = %conversation_id,
                 );
                 let _turn_enter = turn_span.enter();
                 info!(turn = turn_number, max_turns = %max_turns_label, "executing chat turn");
@@ -846,14 +852,29 @@ impl<C: LLMClient> Core<C> {
                     // inferred: `tracing-opentelemetry` only derives an error
                     // status from an ERROR-level event, and a failed tool call
                     // logs at WARN because it does not abort the run.
+                    //
+                    // Core owns this span rather than `ToolExecutor`: only here
+                    // are the call id, the approval decision, and the result all
+                    // in scope, and `execute_named` is also called by the sandbox
+                    // process, where a second span would duplicate this one.
+                    //
+                    // `gen_ai.tool.type` is `function` for every tool today.
+                    // MCP-backed tools should report `extension`, which needs
+                    // `ToolExecutor` to expose where a name came from.
                     let tool_span = info_span!(
-                        "tool_call",
+                        "execute_tool",
+                        otel.name = %format!("{} {tool_name}", genai::op::EXECUTE_TOOL),
                         tool = %tool_name,
                         call_id = %call_id,
                         outcome = field::Empty,
                         duration_ms = field::Empty,
                         error = field::Empty,
                         otel.status_code = field::Empty,
+                        { genai::OPERATION_NAME } = genai::op::EXECUTE_TOOL,
+                        { genai::TOOL_NAME } = %tool_name,
+                        { genai::TOOL_CALL_ID } = %call_id,
+                        { genai::TOOL_TYPE } = genai::tool_type::FUNCTION,
+                        { genai::ERROR_TYPE } = field::Empty,
                     );
                     let _tool_enter = tool_span.enter();
                     info!(tool = %tool_name, call_id = %call_id, "tool call requested");
@@ -922,7 +943,7 @@ impl<C: LLMClient> Core<C> {
                                 Ok(result) => {
                                     let bytes = result.len();
                                     tool_span.record("outcome", "success");
-                                    tool_span.record("duration_ms", tool_duration_ms);
+                                    tool_span.record("duration_ms", i64::try_from(tool_duration_ms).unwrap_or(i64::MAX));
                                     tool_span.record("otel.status_code", "OK");
                                     info!(
                                         tool = %tool_name,
@@ -953,8 +974,9 @@ impl<C: LLMClient> Core<C> {
                                 }
                                 Err(e) => {
                                     tool_span.record("outcome", "failure");
-                                    tool_span.record("duration_ms", tool_duration_ms);
+                                    tool_span.record("duration_ms", i64::try_from(tool_duration_ms).unwrap_or(i64::MAX));
                                     tool_span.record("error", field::display(&e));
+                                    tool_span.record(genai::ERROR_TYPE, e.reason());
                                     tool_span.record("otel.status_code", "ERROR");
                                     warn!(
                                         tool = %tool_name,
@@ -988,6 +1010,7 @@ impl<C: LLMClient> Core<C> {
                         }
                         ToolApproval::Denied(reason) => {
                             tool_span.record("outcome", "denied");
+                            tool_span.record(genai::ERROR_TYPE, "denied");
                             info!(tool = %tool_name, reason = %reason, "tool call denied");
                             counter!(
                                 "neuromance_tool_calls_total",
@@ -2446,6 +2469,306 @@ mod tests {
                 .rfind(|m| m.role == MessageRole::Assistant)
                 .map(|m| m.content.as_str()),
             Some("just prose")
+        );
+    }
+}
+
+#[cfg(test)]
+mod span_tests {
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::expect_used)]
+
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+    use neuromance_client::{ClientError, LLMClient};
+    use neuromance_common::chat::Message;
+    use neuromance_common::client::{ChatChunk, ChatRequest, ChatResponse, Config};
+    use neuromance_common::telemetry::genai;
+    use neuromance_common::tools::{Function, FunctionCall, Tool, ToolCall};
+    use neuromance_tools::{ToolError, ToolImplementation};
+    use tokio_util::sync::CancellationToken;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    use crate::Core;
+
+    /// A closed span's name and the stringified fields it carried.
+    type ClosedSpan = (String, HashMap<String, String>);
+
+    /// Collects the fields recorded on every closed span.
+    #[derive(Clone, Default)]
+    struct SpanCapture(Arc<Mutex<Vec<ClosedSpan>>>);
+
+    impl SpanCapture {
+        fn fields_for(&self, name: &str) -> Option<HashMap<String, String>> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(span, _)| span == name)
+                .map(|(_, fields)| fields.clone())
+        }
+    }
+
+    struct FieldVisitor<'a>(&'a mut HashMap<String, String>);
+
+    impl tracing::field::Visit for FieldVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for SpanCapture
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            id: &tracing::span::Id,
+            ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = HashMap::new();
+            attrs.record(&mut FieldVisitor(&mut fields));
+            if let Some(span) = ctx.span(id) {
+                span.extensions_mut().insert(fields);
+            }
+        }
+
+        fn on_record(
+            &self,
+            id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if let Some(span) = ctx.span(id)
+                && let Some(fields) = span.extensions_mut().get_mut::<HashMap<String, String>>()
+            {
+                values.record(&mut FieldVisitor(fields));
+            }
+        }
+
+        fn on_close(&self, id: tracing::span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+            if let Some(span) = ctx.span(&id) {
+                let fields = span
+                    .extensions()
+                    .get::<HashMap<String, String>>()
+                    .cloned()
+                    .unwrap_or_default();
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((span.name().to_string(), fields));
+            }
+        }
+    }
+
+    /// Answers with one tool call, then with plain text so the loop ends.
+    struct ToolThenTextClient {
+        config: Config,
+        calls: std::sync::atomic::AtomicU32,
+    }
+
+    impl ToolThenTextClient {
+        fn new() -> Self {
+            Self {
+                config: Config::new("mock", "mock-model"),
+                calls: std::sync::atomic::AtomicU32::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LLMClient for ToolThenTextClient {
+        fn config(&self) -> &Config {
+            &self.config
+        }
+
+        async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, ClientError> {
+            let conv_id = request
+                .messages
+                .first()
+                .map_or_else(uuid::Uuid::new_v4, |m| m.conversation_id);
+            let first = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+
+            let mut message = Message::assistant(conv_id, if first { "" } else { "done" });
+            if first {
+                message.tool_calls.push(ToolCall {
+                    id: "call_42".to_string(),
+                    function: FunctionCall {
+                        name: "echo".to_string(),
+                        arguments: r#"{"text":"hi"}"#.to_string(),
+                    },
+                    call_type: "function".to_string(),
+                    index: Some(0),
+                });
+            }
+
+            Ok(ChatResponse {
+                message,
+                model: "mock-model".to_string(),
+                usage: None,
+                finish_reason: None,
+                created_at: chrono::Utc::now(),
+                response_id: None,
+                metadata: HashMap::new(),
+            })
+        }
+
+        async fn chat_stream(
+            &self,
+            _request: &ChatRequest,
+        ) -> Result<
+            std::pin::Pin<Box<dyn futures::Stream<Item = Result<ChatChunk, ClientError>> + Send>>,
+            ClientError,
+        > {
+            Ok(Box::pin(futures::stream::pending()))
+        }
+
+        fn supports_tools(&self) -> bool {
+            true
+        }
+
+        fn supports_streaming(&self) -> bool {
+            false
+        }
+
+        fn supports_structured_output(&self) -> bool {
+            false
+        }
+    }
+
+    /// A tool whose `execute` either succeeds or fails, as configured.
+    struct EchoTool {
+        fails: bool,
+    }
+
+    #[async_trait]
+    impl ToolImplementation for EchoTool {
+        fn get_definition(&self) -> Tool {
+            Tool {
+                r#type: "function".to_string(),
+                function: Function {
+                    name: "echo".to_string(),
+                    description: "echoes its input".to_string(),
+                    parameters: serde_json::json!({"type": "object", "properties": {}}),
+                },
+            }
+        }
+
+        async fn execute(&self, _args: &serde_json::Value) -> Result<String, ToolError> {
+            if self.fails {
+                Err(ToolError::execution("the tool blew up"))
+            } else {
+                Ok("hi".to_string())
+            }
+        }
+
+        fn is_auto_approved(&self) -> bool {
+            true
+        }
+    }
+
+    /// Drive one tool-using run and return the fields of every closed span.
+    fn run_with_tool(fails: bool) -> SpanCapture {
+        let capture = SpanCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+
+        let mut core = Core::new(ToolThenTextClient::new());
+        core.tool_executor.add_tool(EchoTool { fails });
+        core.auto_approve_tools = true;
+
+        let conv_id = uuid::Uuid::new_v4();
+        let messages = vec![
+            Message::system(conv_id, "be useful"),
+            Message::user(conv_id, "echo hi"),
+        ];
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        tracing::subscriber::with_default(subscriber, || {
+            runtime
+                .block_on(core.chat_with_tool_loop(messages, CancellationToken::new()))
+                .expect("the run should complete");
+        });
+
+        capture
+    }
+
+    /// The conventions name the span `execute_tool {tool}` and key tool
+    /// dashboards off `gen_ai.tool.*`. A span still called `tool_call` with a
+    /// field called `tool` is invisible to all of them.
+    #[test]
+    fn test_tool_execution_emits_a_genai_execute_tool_span() {
+        let fields = run_with_tool(false)
+            .fields_for("execute_tool")
+            .expect("a tool call should produce an execute_tool span");
+
+        assert_eq!(
+            fields.get("otel.name").map(String::as_str),
+            Some("execute_tool echo")
+        );
+        assert_eq!(
+            fields.get(genai::OPERATION_NAME).map(String::as_str),
+            Some("execute_tool")
+        );
+        assert_eq!(
+            fields.get(genai::TOOL_NAME).map(String::as_str),
+            Some("echo")
+        );
+        assert_eq!(
+            fields.get(genai::TOOL_CALL_ID).map(String::as_str),
+            Some("call_42")
+        );
+        assert_eq!(
+            fields.get(genai::TOOL_TYPE).map(String::as_str),
+            Some("function")
+        );
+        assert_eq!(fields.get("outcome").map(String::as_str), Some("success"));
+    }
+
+    /// A tool that runs and fails must be countable by why it failed, and the
+    /// span must report ERROR — the log for it is only WARN, so nothing else
+    /// would mark the span.
+    #[test]
+    fn test_failed_tool_execution_records_error_type_and_status() {
+        let fields = run_with_tool(true)
+            .fields_for("execute_tool")
+            .expect("a tool call should produce an execute_tool span");
+
+        assert_eq!(
+            fields.get(genai::ERROR_TYPE).map(String::as_str),
+            Some("tool_error")
+        );
+        assert_eq!(
+            fields.get("otel.status_code").map(String::as_str),
+            Some("ERROR")
+        );
+        assert_eq!(fields.get("outcome").map(String::as_str), Some("failure"));
+    }
+
+    /// Every span of one run must be joinable, so a backend can pull the whole
+    /// conversation without walking parent links.
+    #[test]
+    fn test_chat_turn_span_carries_the_conversation_id() {
+        let fields = run_with_tool(false)
+            .fields_for("chat_turn")
+            .expect("a run should produce a chat_turn span");
+
+        let conversation_id = fields
+            .get(genai::CONVERSATION_ID)
+            .expect("chat_turn should carry the conversation id");
+        assert!(
+            uuid::Uuid::parse_str(conversation_id).is_ok(),
+            "expected a uuid, got {conversation_id:?}"
         );
     }
 }
