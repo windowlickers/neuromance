@@ -485,7 +485,7 @@ impl LLMClient for AnthropicClient {
                 Ok(response)
             }
             Err(error) => {
-                op.finish_error(&error);
+                op.finish_error(&error, None);
                 Err(error)
             }
         }
@@ -531,7 +531,7 @@ impl LLMClient for AnthropicClient {
         }) {
             Ok(stream) => stream,
             Err(error) => {
-                op.finish_error(&error);
+                op.finish_error(&error, None);
                 return Err(error);
             }
         };

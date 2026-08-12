@@ -398,7 +398,7 @@ impl EmbeddingClient for OpenAIEmbedding {
                 Ok(response)
             }
             Err(error) => {
-                op.finish_error(&error);
+                op.finish_error(&error, None);
                 Err(error)
             }
         }

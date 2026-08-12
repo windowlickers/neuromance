@@ -161,7 +161,7 @@ impl LLMClient for ResponsesClient {
                 Ok(response)
             }
             Err(error) => {
-                op.finish_error(&error);
+                op.finish_error(&error, None);
                 Err(error)
             }
         }
@@ -206,7 +206,7 @@ impl LLMClient for ResponsesClient {
         }) {
             Ok(stream) => stream,
             Err(error) => {
-                op.finish_error(&error);
+                op.finish_error(&error, None);
                 return Err(error);
             }
         };

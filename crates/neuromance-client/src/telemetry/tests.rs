@@ -140,7 +140,7 @@ fn test_chat_span_carries_request_and_response_attributes() {
 fn test_failed_chat_span_records_the_error_type_and_status() {
     let spans = exported_spans(|| {
         let request = ChatRequest::new(Vec::new()).with_model("gpt-4o");
-        GenAiOp::chat(&config(), &request).finish_error(&ClientError::TimeoutError);
+        GenAiOp::chat(&config(), &request).finish_error(&ClientError::TimeoutError, None);
     });
 
     let span = spans.first().expect("one chat span");

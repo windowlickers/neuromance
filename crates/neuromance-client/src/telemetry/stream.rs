@@ -110,7 +110,7 @@ impl Stream for InstrumentedChunkStream {
             }
             Poll::Ready(Some(Err(error))) => {
                 if let Some(op) = this.op.take() {
-                    op.finish_error(&error);
+                    op.finish_error(&error, this.accumulated.usage.as_ref());
                 }
                 Poll::Ready(Some(Err(error)))
             }
@@ -190,6 +190,35 @@ mod tests {
         let request = ChatRequest::new(Vec::new()).with_model("gpt-4o");
         let op = GenAiOp::chat(&Config::new("openai", "gpt-4o"), &request);
         InstrumentedChunkStream::new(op, Box::pin(futures::stream::iter(chunks)))
+    }
+
+    /// Anthropic reports input tokens on the first event, so a stream that dies
+    /// late has real, already-billed prompt tokens in hand. Dropping them makes
+    /// cost dashboards undercount during exactly the provider incidents that
+    /// matter most, and nothing marks the sample as missing.
+    #[test]
+    fn test_a_failed_stream_keeps_the_usage_it_already_saw() {
+        let spans = exported_spans(|| {
+            drain(instrumented(vec![
+                Ok(chunk(Some(usage(900, 40)), None)),
+                Err(ClientError::TimeoutError),
+            ]));
+        });
+
+        let span = spans.first().expect("one chat span");
+        assert_eq!(
+            attribute(span, genai::USAGE_INPUT_TOKENS),
+            Some(&Value::I64(900)),
+        );
+        assert_eq!(
+            attribute(span, genai::USAGE_OUTPUT_TOKENS),
+            Some(&Value::I64(40)),
+        );
+        assert_eq!(
+            attribute(span, genai::ERROR_TYPE),
+            Some(&Value::from("timeout")),
+            "the failure must still be recorded",
+        );
     }
 
     /// The whole point of the adapter: `chat_stream` returns before any token

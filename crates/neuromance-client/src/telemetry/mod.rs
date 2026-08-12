@@ -153,9 +153,28 @@ impl GenAiOp {
     }
 
     /// Close an operation that produced no usable result.
-    pub fn finish_error(mut self, error: &ClientError) {
+    ///
+    /// `usage` carries whatever the provider reported before the failure. A
+    /// stream that dies late has already been billed for the prompt tokens it
+    /// received, so dropping them would make cost dashboards undercount during
+    /// exactly the provider incidents that matter most.
+    pub fn finish_error(mut self, error: &ClientError, usage: Option<&Usage>) {
         self.pending = false;
+        if let Some(usage) = usage {
+            self.record_usage(None, usage);
+        }
         self.record_failure(error.reason(), &error.to_string());
+    }
+
+    /// Record token usage on the span and the histogram.
+    fn record_usage(&self, response_model: Option<&str>, usage: &Usage) {
+        self.span
+            .record(genai::USAGE_INPUT_TOKENS, i64::from(usage.prompt_tokens));
+        self.span.record(
+            genai::USAGE_OUTPUT_TOKENS,
+            i64::from(usage.completion_tokens),
+        );
+        metrics::instruments().record_token_usage(&self.attrs, response_model, usage);
     }
 
     fn finish_ok(
@@ -174,13 +193,7 @@ impl GenAiOp {
         attrs::set_string_array(&self.span, genai::RESPONSE_FINISH_REASONS, finish_reasons);
 
         if let Some(usage) = usage {
-            self.span
-                .record(genai::USAGE_INPUT_TOKENS, i64::from(usage.prompt_tokens));
-            self.span.record(
-                genai::USAGE_OUTPUT_TOKENS,
-                i64::from(usage.completion_tokens),
-            );
-            metrics::instruments().record_token_usage(&self.attrs, response_model, usage);
+            self.record_usage(response_model, usage);
         }
         self.record_duration(response_model, None);
     }

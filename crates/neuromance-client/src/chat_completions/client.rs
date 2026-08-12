@@ -607,7 +607,7 @@ impl LLMClient for ChatCompletionsClient {
                 Ok(response)
             }
             Err(error) => {
-                op.finish_error(&error);
+                op.finish_error(&error, None);
                 Err(error)
             }
         }
@@ -654,7 +654,7 @@ impl LLMClient for ChatCompletionsClient {
         }) {
             Ok(stream) => stream,
             Err(error) => {
-                op.finish_error(&error);
+                op.finish_error(&error, None);
                 return Err(error);
             }
         };
