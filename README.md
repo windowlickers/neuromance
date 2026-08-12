@@ -446,6 +446,116 @@ description: Rust conventions
 Follow the repository's error-handling rules: no unwrap/expect outside tests.
 ```
 
+## Observability
+
+The runtime exports traces, logs, and GenAI metrics over OTLP, and operational
+metrics over a Prometheus scrape endpoint.
+
+### Enabling export
+
+`OTEL_EXPORTER_OTLP_ENDPOINT` is the master switch. When it is unset, the
+runtime emits stderr logs and Prometheus metrics only.
+
+| Variable | Effect |
+| --- | --- |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Enables OTLP export and sets the default endpoint |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `grpc` (default) or `http/protobuf` |
+| `OTEL_EXPORTER_OTLP_HEADERS` | Headers added to every export request |
+| `OTEL_SERVICE_NAME` | `service.name`; falls back to `agent.id` |
+| `OTEL_RESOURCE_ATTRIBUTES` | Merged on top of the default resource |
+| `OTEL_EXPORTER_OTLP_{TRACES,LOGS,METRICS}_ENDPOINT` | Per-signal endpoint override |
+| `OTEL_METRIC_EXPORT_INTERVAL` | Milliseconds between metric exports |
+| `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` | Capture prompts and completions; off by default |
+| `RUST_LOG_FORMAT=json` | Structured stderr logs, for cluster log ingestion |
+
+`RUST_LOG` gates span creation, not just log output. A `RUST_LOG=warn`
+deployment with OTLP configured exports no `gen_ai` spans at all. Use
+`RUST_LOG=info`, the runtime default.
+
+### Spans
+
+Instrumentation follows the [OpenTelemetry GenAI semantic
+conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/), pinned to
+v1.38.0. Attribute keys live in
+`crates/neuromance-common/src/telemetry/genai.rs`; update that file and its
+version pin together.
+
+```
+invoke_agent {agent}              neuromance-agent    INTERNAL
+└── chat_turn                     neuromance          INTERNAL
+    ├── chat {model}              neuromance-client   CLIENT   (one per retry attempt)
+    └── execute_tool {tool}       neuromance          INTERNAL
+```
+
+`chat_turn` is not a GenAI operation. It is one iteration of the orchestration
+loop, spanning both the model call and the tool executions that follow, and it
+keeps the turn grouping that makes a long agent run readable.
+
+| Span | Attributes |
+| --- | --- |
+| `chat {model}` | `gen_ai.operation.name`, `gen_ai.provider.name`, `gen_ai.request.{model,temperature,top_p,max_tokens,frequency_penalty,presence_penalty,stop_sequences,choice.count}`, `gen_ai.output.type`, `gen_ai.response.{model,id,finish_reasons}`, `gen_ai.usage.{input_tokens,output_tokens}`, `server.address`, `server.port`, `error.type` |
+| `embeddings {model}` | As above, minus the response and completion attributes. Prompt tokens only: an embeddings call generates nothing |
+| `execute_tool {tool}` | `gen_ai.operation.name`, `gen_ai.tool.{name,type}`, `gen_ai.tool.call.id`, `error.type` |
+| `invoke_agent {agent}` | `gen_ai.operation.name`, `gen_ai.agent.id`, `gen_ai.conversation.id` |
+
+`server.address` names the **upstream provider**, not the tokenizer proxy: the
+proxy is transport plumbing, and reporting it would make every provider look
+like one server. A streaming call keeps its `chat` span open until the stream
+ends, so the span times the whole generation and carries the final token
+counts. A retried request produces one `chat` span per attempt.
+
+### Metrics
+
+Two pipelines run side by side, and nothing is emitted to both.
+
+- **`gen_ai.client.token.usage`** and **`gen_ai.client.operation.duration`** go
+  out natively over OTLP, with the units and bucket boundaries the conventions
+  advise. A Prometheus round-trip would turn the dots into underscores and drop
+  the buckets. Attributes: `gen_ai.operation.name`, `gen_ai.provider.name`,
+  `gen_ai.request.model`, `server.address`, `server.port`, plus
+  `gen_ai.response.model` and `error.type` when known, and `gen_ai.token.type`
+  (`input` / `output`) on the token histogram.
+- **`neuromance_*`** operational metrics (queue depth, task outcomes, tool
+  durations, approvals, persistence) are Prometheus, scraped from
+  `GET /metrics` on `runtime.health_addr` (default `:8081`).
+
+A collector needs both a receiver for the OTLP push and a scrape job for
+`/metrics`:
+
+```yaml
+receivers:
+  otlp:
+    protocols:
+      grpc: { endpoint: 0.0.0.0:4317 }
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: neuromance
+          scrape_interval: 30s
+          static_configs:
+            - targets: ["neuromance:8081"]
+
+service:
+  pipelines:
+    traces:  { receivers: [otlp], exporters: [clickhouse] }
+    logs:    { receivers: [otlp], exporters: [clickhouse] }
+    metrics: { receivers: [otlp, prometheus], exporters: [clickhouse] }
+```
+
+### Capturing prompts and completions
+
+`OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true` adds
+`gen_ai.input.messages`, `gen_ai.output.messages`,
+`gen_ai.system_instructions`, `gen_ai.tool.call.arguments`, and
+`gen_ai.tool.call.result` to the spans above.
+
+**This ships conversation content to your trace backend.** Everything a user
+types, everything a model answers, and every argument and result of every tool
+call. API keys are not captured — they live in `SecretString` and are never
+part of a captured structure — but user data in prompts is. The flag is off by
+default; turn it on per-deployment, and only where the trace store has the same
+access controls as the conversations themselves.
+
 ## Model Context Protocol (MCP) Support
 
 Neuromance supports the [Model Context Protocol](https://modelcontextprotocol.io/) for connecting to external tool servers via the `neuromance-tools` crate.
