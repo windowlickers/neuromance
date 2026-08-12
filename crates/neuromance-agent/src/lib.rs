@@ -32,7 +32,7 @@
 use std::time::Instant;
 
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::info;
 use uuid::Uuid;
 
 use neuromance::Core;
@@ -144,16 +144,6 @@ impl<C: LLMClient + Send + Sync> Agent<C> {
     ///
     /// # Errors
     /// Same conditions as [`execute`](Self::execute).
-    #[tracing::instrument(
-        name = "agent.execute",
-        skip_all,
-        fields(
-            agent_id = %self.id,
-            conversation_id = %self.conversation_id,
-            parent_conversation_id = tracing::field::Empty,
-            task_id = tracing::field::Empty,
-        ),
-    )]
     /// Fold a completed run's stats into the agent's cumulative state and emit
     /// the per-run summary log (tokens, prompt-cache usage, tool outcomes).
     fn record_run_stats(&mut self, run_stats: &RunStats, exec_start: Instant) {
@@ -193,6 +183,16 @@ impl<C: LLMClient + Send + Sync> Agent<C> {
     /// leading system and user messages, and propagates any [`CoreError`] from
     /// the underlying chat/tool loop. Returns [`CoreError::NoResponse`] if the
     /// loop produces no assistant message.
+    #[tracing::instrument(
+        name = "agent.execute",
+        skip_all,
+        fields(
+            agent_id = %self.id,
+            conversation_id = %self.conversation_id,
+            parent_conversation_id = tracing::field::Empty,
+            task_id = tracing::field::Empty,
+        ),
+    )]
     pub async fn execute_with_history(
         &mut self,
         messages: Option<Vec<Message>>,

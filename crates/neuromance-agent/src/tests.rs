@@ -18,8 +18,10 @@ use neuromance_client::{ClientError, LLMClient};
 use neuromance_common::agents::{AgentMessage, AgentState, ContextUpdate};
 use neuromance_common::chat::{Message, MessageRole};
 use neuromance_common::client::{ChatChunk, ChatRequest, ChatResponse, Config, ToolChoice, Usage};
+use neuromance_common::delegation::{self, DelegationContext};
 use neuromance_common::tools::{Function, FunctionCall, Tool, ToolCall};
 use neuromance_tools::{ToolError, ToolImplementation};
+use tracing_subscriber::layer::SubscriberExt;
 
 use crate::Agent;
 
@@ -838,4 +840,145 @@ async fn test_execute_leaves_structured_empty_without_a_schema() {
         .unwrap();
 
     assert_eq!(response.structured, None);
+}
+
+// -- Span tests --
+
+/// A closed span's name and the stringified fields it carried.
+type ClosedSpan = (String, HashMap<String, String>);
+
+/// Collects the fields recorded on every closed span, keyed by span name.
+#[derive(Clone, Default)]
+struct SpanCapture(Arc<Mutex<Vec<ClosedSpan>>>);
+
+impl SpanCapture {
+    fn fields_for(&self, name: &str) -> Option<HashMap<String, String>> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(span, _)| span == name)
+            .map(|(_, fields)| fields.clone())
+    }
+}
+
+/// `tracing`'s visitor API hands values back one at a time; stringify each so a
+/// test can assert on it without knowing the field's static type.
+struct FieldVisitor<'a>(&'a mut HashMap<String, String>);
+
+impl tracing::field::Visit for FieldVisitor<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0
+            .insert(field.name().to_string(), format!("{value:?}"));
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.0.insert(field.name().to_string(), value.to_string());
+    }
+}
+
+impl<S> tracing_subscriber::Layer<S> for SpanCapture
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut fields = HashMap::new();
+        attrs.record(&mut FieldVisitor(&mut fields));
+        if let Some(span) = ctx.span(id) {
+            span.extensions_mut().insert(fields);
+        }
+    }
+
+    fn on_record(
+        &self,
+        id: &tracing::span::Id,
+        values: &tracing::span::Record<'_>,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if let Some(span) = ctx.span(id)
+            && let Some(fields) = span.extensions_mut().get_mut::<HashMap<String, String>>()
+        {
+            values.record(&mut FieldVisitor(fields));
+        }
+    }
+
+    fn on_close(&self, id: tracing::span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+        if let Some(span) = ctx.span(&id) {
+            let fields = span
+                .extensions()
+                .get::<HashMap<String, String>>()
+                .cloned()
+                .unwrap_or_default();
+            self.0
+                .lock()
+                .unwrap()
+                .push((span.name().to_string(), fields));
+        }
+    }
+}
+
+/// The run span must wrap the whole execution, not a helper called at the end of
+/// it. `execute_with_history` records `parent_conversation_id` onto the current
+/// span, so a span attached to the wrong function silently drops the field.
+#[test]
+fn test_execute_span_records_the_delegation_parent() {
+    let capture = SpanCapture::default();
+    let subscriber = tracing_subscriber::registry().with(capture.clone());
+
+    let parent_conversation = Uuid::new_v4();
+    let task = Uuid::new_v4();
+    let parent_ctx = DelegationContext {
+        conversation_id: Some(parent_conversation),
+        task_id: Some(task),
+        parent_message_id: None,
+        parent_tool_call_id: None,
+        workspace_dir: None,
+    };
+
+    let mut agent = Agent::new("child".into(), Core::new(MockLLMClient::new()));
+    let conversation_id = agent.conversation_id;
+
+    // A current-thread runtime keeps the whole run on the thread that
+    // `with_default` installed the subscriber on.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    tracing::subscriber::with_default(subscriber, || {
+        runtime
+            .block_on(delegation::scope(
+                parent_ctx,
+                agent.execute(
+                    Some(make_messages(Uuid::new_v4())),
+                    CancellationToken::new(),
+                ),
+            ))
+            .unwrap();
+    });
+
+    let fields = capture
+        .fields_for("agent.execute")
+        .expect("the run should produce an agent.execute span");
+    assert_eq!(
+        fields.get("parent_conversation_id").map(String::as_str),
+        Some(parent_conversation.to_string().as_str()),
+    );
+    assert_eq!(
+        fields.get("task_id").map(String::as_str),
+        Some(task.to_string().as_str()),
+    );
+    assert_eq!(
+        fields.get("agent_id").map(String::as_str),
+        Some("child"),
+        "the span must belong to the agent that ran",
+    );
+    assert_eq!(
+        fields.get("conversation_id").map(String::as_str),
+        Some(conversation_id.to_string().as_str()),
+    );
 }
