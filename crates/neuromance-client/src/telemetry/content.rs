@@ -129,15 +129,17 @@ fn capture_message(message: &Message) -> CapturedMessage {
     {
         parts.push(json!({"type": "reasoning", "content": reasoning.content}));
     }
-    if !message.content.is_empty() {
-        parts.push(json!({"type": "text", "content": message.content}));
-    }
+    // A tool message carries its content as a `tool_call_response` part only.
+    // Emitting the text part too would export the same string twice — and a tool
+    // result is the largest content in a typical run.
     if message.role == MessageRole::Tool {
         parts.push(json!({
             "type": "tool_call_response",
             "id": message.tool_call_id,
             "response": message.content,
         }));
+    } else if !message.content.is_empty() {
+        parts.push(json!({"type": "text", "content": message.content}));
     }
     parts.extend(message.tool_calls.iter().map(tool_call_part));
 
@@ -224,6 +226,29 @@ mod tests {
         assert_eq!(value["parts"][1]["type"], "tool_call");
         assert_eq!(value["parts"][1]["name"], "echo");
         assert_eq!(value["parts"][1]["id"], "call_1");
+    }
+
+    /// A tool result is the largest content in a typical run, so shipping it as
+    /// both a text part and a response part doubles the span payload and makes a
+    /// backend render the same string twice.
+    #[test]
+    fn test_a_tool_message_carries_its_content_once() {
+        let conversation = Uuid::new_v4();
+        let tool = Message::tool(conversation, "hi", "call_1".to_string(), "echo".to_string())
+            .expect("a tool message");
+
+        let captured = capture_message(&tool);
+        let value = serde_json::to_value(&captured).expect("serializable");
+
+        assert_eq!(value["role"], "tool");
+        assert_eq!(
+            value["parts"].as_array().map(Vec::len),
+            Some(1),
+            "expected a single part, got {value}",
+        );
+        assert_eq!(value["parts"][0]["type"], "tool_call_response");
+        assert_eq!(value["parts"][0]["id"], "call_1");
+        assert_eq!(value["parts"][0]["response"], "hi");
     }
 
     /// System instructions have their own attribute, so leaving them in the
