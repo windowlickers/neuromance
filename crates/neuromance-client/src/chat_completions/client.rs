@@ -122,7 +122,7 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
-use tracing::{error, warn};
+use tracing::{Instrument as _, error, warn};
 
 use neuromance_common::chat::Message;
 use neuromance_common::client::{
@@ -136,6 +136,7 @@ use crate::chat_completions::{
 use crate::error::ClientError;
 use crate::message::MessageBuilder;
 use crate::streaming::{StreamingProvider, run_sse_stream};
+use crate::telemetry::GenAiOp;
 use crate::transport::{add_proxy_headers, inject_trace_context, send_json};
 use crate::{LLMClient, build_client_resources};
 
@@ -595,8 +596,68 @@ impl LLMClient for ChatCompletionsClient {
     }
 
     async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, ClientError> {
+        // Validation failures never reach the provider, so they are not a
+        // GenAI operation and get no span.
         self.validate_request(request)?;
 
+        let op = GenAiOp::chat(&self.config, request);
+        match self.send_chat(request).instrument(op.span().clone()).await {
+            Ok(response) => {
+                op.finish_response(&response);
+                Ok(response)
+            }
+            Err(error) => {
+                op.finish_error(&error);
+                Err(error)
+            }
+        }
+    }
+
+    async fn chat_stream(
+        &self,
+        request: &ChatRequest,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatChunk, ClientError>> + Send>>, ClientError>
+    {
+        self.validate_request(request)?;
+
+        let mut chat_request = ChatCompletionRequest::from((request, self.config.as_ref()));
+        chat_request.stream = Some(true);
+        chat_request.stream_options = Some(serde_json::json!({
+            "include_usage": true
+        }));
+
+        let url = format!("{}/{}", self.base_url, "chat/completions");
+        reqwest::Url::parse(&url)
+            .map_err(|e| ClientError::ConfigurationError(format!("Invalid URL '{url}': {e}")))?;
+
+        let mut request_builder = self
+            .streaming_client
+            .post(&url)
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.api_key.expose_secret()),
+            )
+            .header("Content-Type", "application/json");
+
+        request_builder = inject_trace_context(add_proxy_headers(
+            request_builder,
+            self.proxy_config.as_ref(),
+            &self.api_key,
+        ));
+
+        let request_builder = request_builder.json(&chat_request);
+
+        run_sse_stream(self, request_builder)
+    }
+}
+
+impl ChatCompletionsClient {
+    /// Issue the request and map the provider's response.
+    ///
+    /// Split out of [`LLMClient::chat`] so the whole exchange runs inside the
+    /// GenAI span: the request builder injects `traceparent` from whatever
+    /// span is current, and it must name this operation, not its caller.
+    async fn send_chat(&self, request: &ChatRequest) -> Result<ChatResponse, ClientError> {
         let mut chat_request = ChatCompletionRequest::from((request, self.config.as_ref()));
         chat_request.stream = Some(false);
 
@@ -654,43 +715,6 @@ impl LLMClient for ChatCompletionsClient {
             response_id: Some(response.id),
             metadata: HashMap::new(),
         })
-    }
-
-    async fn chat_stream(
-        &self,
-        request: &ChatRequest,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatChunk, ClientError>> + Send>>, ClientError>
-    {
-        self.validate_request(request)?;
-
-        let mut chat_request = ChatCompletionRequest::from((request, self.config.as_ref()));
-        chat_request.stream = Some(true);
-        chat_request.stream_options = Some(serde_json::json!({
-            "include_usage": true
-        }));
-
-        let url = format!("{}/{}", self.base_url, "chat/completions");
-        reqwest::Url::parse(&url)
-            .map_err(|e| ClientError::ConfigurationError(format!("Invalid URL '{url}': {e}")))?;
-
-        let mut request_builder = self
-            .streaming_client
-            .post(&url)
-            .header(
-                "Authorization",
-                format!("Bearer {}", self.api_key.expose_secret()),
-            )
-            .header("Content-Type", "application/json");
-
-        request_builder = inject_trace_context(add_proxy_headers(
-            request_builder,
-            self.proxy_config.as_ref(),
-            &self.api_key,
-        ));
-
-        let request_builder = request_builder.json(&chat_request);
-
-        run_sse_stream(self, request_builder)
     }
 }
 

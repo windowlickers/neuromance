@@ -11,7 +11,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
-use tracing::{error, warn};
+use tracing::{Instrument as _, error, warn};
 
 use neuromance_common::chat::MessageRole;
 use neuromance_common::client::{ChatChunk, ChatRequest, ChatResponse, Config, ProxyConfig, Usage};
@@ -19,6 +19,7 @@ use neuromance_common::tools::{FunctionCall, ToolCall};
 
 use crate::error::ClientError;
 use crate::streaming::{StreamingProvider, run_sse_stream};
+use crate::telemetry::GenAiOp;
 use crate::transport::{
     add_proxy_headers, classify_provider_error, inject_trace_context, send_json,
 };
@@ -149,39 +150,21 @@ impl LLMClient for ResponsesClient {
     }
 
     async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, ClientError> {
+        // Validation failures never reach the provider, so they are not a
+        // GenAI operation and get no span.
         self.validate_request(request)?;
 
-        let mut responses_request = ResponsesRequest::from((request, self.config.as_ref()));
-        responses_request.stream = Some(false);
-
-        let response: ResponsesResponse = self.make_request(&responses_request).await?;
-
-        // Get conversation_id from first message
-        let conversation_id = request
-            .messages
-            .first()
-            .ok_or_else(|| {
-                error!("Request has no messages despite passing validation");
-                ClientError::InvalidRequest("Request must contain at least one message".to_string())
-            })?
-            .conversation_id;
-
-        let message = convert_response_to_message(&response, conversation_id);
-
-        let has_tool_calls = !message.tool_calls.is_empty();
-        let finish_reason = super::finish_reason_for_response(&response, has_tool_calls);
-
-        let usage = response.usage.map(Usage::from);
-
-        Ok(ChatResponse {
-            message,
-            model: response.model,
-            usage,
-            finish_reason,
-            created_at: DateTime::from_timestamp(response.created_at, 0).unwrap_or_else(Utc::now),
-            response_id: Some(response.id),
-            metadata: response.metadata,
-        })
+        let op = GenAiOp::chat(&self.config, request);
+        match self.send_chat(request).instrument(op.span().clone()).await {
+            Ok(response) => {
+                op.finish_response(&response);
+                Ok(response)
+            }
+            Err(error) => {
+                op.finish_error(&error);
+                Err(error)
+            }
+        }
     }
 
     async fn chat_stream(
@@ -217,6 +200,47 @@ impl LLMClient for ResponsesClient {
         let request_builder = request_builder.json(&responses_request);
 
         run_sse_stream(self, request_builder)
+    }
+}
+
+impl ResponsesClient {
+    /// Issue the request and map the provider's response.
+    ///
+    /// Split out of [`LLMClient::chat`] so the whole exchange runs inside the
+    /// GenAI span: the request builder injects `traceparent` from whatever
+    /// span is current, and it must name this operation, not its caller.
+    async fn send_chat(&self, request: &ChatRequest) -> Result<ChatResponse, ClientError> {
+        let mut responses_request = ResponsesRequest::from((request, self.config.as_ref()));
+        responses_request.stream = Some(false);
+
+        let response: ResponsesResponse = self.make_request(&responses_request).await?;
+
+        // Get conversation_id from first message
+        let conversation_id = request
+            .messages
+            .first()
+            .ok_or_else(|| {
+                error!("Request has no messages despite passing validation");
+                ClientError::InvalidRequest("Request must contain at least one message".to_string())
+            })?
+            .conversation_id;
+
+        let message = convert_response_to_message(&response, conversation_id);
+
+        let has_tool_calls = !message.tool_calls.is_empty();
+        let finish_reason = super::finish_reason_for_response(&response, has_tool_calls);
+
+        let usage = response.usage.map(Usage::from);
+
+        Ok(ChatResponse {
+            message,
+            model: response.model,
+            usage,
+            finish_reason,
+            created_at: DateTime::from_timestamp(response.created_at, 0).unwrap_or_else(Utc::now),
+            response_id: Some(response.id),
+            metadata: response.metadata,
+        })
     }
 }
 

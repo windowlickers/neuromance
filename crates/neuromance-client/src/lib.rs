@@ -31,6 +31,7 @@ pub(crate) mod message;
 pub mod responses;
 pub(crate) mod retry_logging;
 pub(crate) mod streaming;
+pub(crate) mod telemetry;
 pub(crate) mod transport;
 
 pub use anthropic::AnthropicClient;
