@@ -32,7 +32,7 @@
 use std::time::Instant;
 
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{Instrument as _, field, info, info_span};
 use uuid::Uuid;
 
 use neuromance::Core;
@@ -41,6 +41,7 @@ use neuromance::error::CoreError;
 use neuromance_client::LLMClient;
 use neuromance_common::chat::{Message, MessageRole};
 use neuromance_common::client::{ToolChoice, parse_structured_response};
+use neuromance_common::telemetry::genai;
 
 pub mod builder;
 pub mod subagent;
@@ -183,17 +184,31 @@ impl<C: LLMClient + Send + Sync> Agent<C> {
     /// leading system and user messages, and propagates any [`CoreError`] from
     /// the underlying chat/tool loop. Returns [`CoreError::NoResponse`] if the
     /// loop produces no assistant message.
-    #[tracing::instrument(
-        name = "agent.execute",
-        skip_all,
-        fields(
+    pub async fn execute_with_history(
+        &mut self,
+        messages: Option<Vec<Message>>,
+        cancel: CancellationToken,
+    ) -> Result<(AgentResponse, Vec<Message>), CoreError> {
+        // Written out rather than `#[tracing::instrument]`: only the macro form
+        // accepts the `{ expr }` field names the semantic-convention constants
+        // need. `otel.name` carries the `{operation} {agent}` name the
+        // conventions require, because a `tracing` span name must be a literal.
+        let span = info_span!(
+            "invoke_agent",
+            otel.name = %format!("{} {}", genai::op::INVOKE_AGENT, self.id),
             agent_id = %self.id,
             conversation_id = %self.conversation_id,
-            parent_conversation_id = tracing::field::Empty,
-            task_id = tracing::field::Empty,
-        ),
-    )]
-    pub async fn execute_with_history(
+            parent_conversation_id = field::Empty,
+            task_id = field::Empty,
+            { genai::OPERATION_NAME } = genai::op::INVOKE_AGENT,
+            { genai::AGENT_ID } = %self.id,
+            { genai::CONVERSATION_ID } = %self.conversation_id,
+        );
+        self.run(messages, cancel).instrument(span).await
+    }
+
+    /// The run itself, so [`Self::execute_with_history`] owns the span.
+    async fn run(
         &mut self,
         messages: Option<Vec<Message>>,
         cancel: CancellationToken,

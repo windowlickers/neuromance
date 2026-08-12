@@ -962,8 +962,8 @@ fn test_execute_span_records_the_delegation_parent() {
     });
 
     let fields = capture
-        .fields_for("agent.execute")
-        .expect("the run should produce an agent.execute span");
+        .fields_for("invoke_agent")
+        .expect("the run should produce an invoke_agent span");
     assert_eq!(
         fields.get("parent_conversation_id").map(String::as_str),
         Some(parent_conversation.to_string().as_str()),
@@ -979,6 +979,53 @@ fn test_execute_span_records_the_delegation_parent() {
     );
     assert_eq!(
         fields.get("conversation_id").map(String::as_str),
+        Some(conversation_id.to_string().as_str()),
+    );
+}
+
+/// Agent dashboards key off `gen_ai.agent.*` and the span name. A span called
+/// `agent.execute` with a field called `agent_id` is invisible to them.
+#[test]
+fn test_execute_span_carries_the_genai_agent_attributes() {
+    use neuromance_common::telemetry::genai;
+
+    let capture = SpanCapture::default();
+    let subscriber = tracing_subscriber::registry().with(capture.clone());
+
+    let mut agent = Agent::new("researcher".into(), Core::new(MockLLMClient::new()));
+    let conversation_id = agent.conversation_id;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    tracing::subscriber::with_default(subscriber, || {
+        runtime
+            .block_on(agent.execute(
+                Some(make_messages(Uuid::new_v4())),
+                CancellationToken::new(),
+            ))
+            .unwrap();
+    });
+
+    let fields = capture
+        .fields_for("invoke_agent")
+        .expect("the run should produce an invoke_agent span");
+
+    assert_eq!(
+        fields.get("otel.name").map(String::as_str),
+        Some("invoke_agent researcher")
+    );
+    assert_eq!(
+        fields.get(genai::OPERATION_NAME).map(String::as_str),
+        Some("invoke_agent")
+    );
+    assert_eq!(
+        fields.get(genai::AGENT_ID).map(String::as_str),
+        Some("researcher")
+    );
+    assert_eq!(
+        fields.get(genai::CONVERSATION_ID).map(String::as_str),
         Some(conversation_id.to_string().as_str()),
     );
 }
