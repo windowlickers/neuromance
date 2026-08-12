@@ -21,7 +21,13 @@ use super::GenAiOp;
 use crate::error::ClientError;
 
 /// Run `body` under a subscriber that exports finished spans in memory.
-fn exported_spans(body: impl FnOnce()) -> Vec<SpanData> {
+pub(super) fn exported_spans(body: impl FnOnce()) -> Vec<SpanData> {
+    exported_spans_observed(|_| body())
+}
+
+/// As [`exported_spans`], but `body` receives the exporter so it can check
+/// what has closed *while it is still running*.
+pub(super) fn exported_spans_observed(body: impl FnOnce(&InMemorySpanExporter)) -> Vec<SpanData> {
     let exporter = InMemorySpanExporter::default();
     let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exporter.clone())
@@ -29,13 +35,13 @@ fn exported_spans(body: impl FnOnce()) -> Vec<SpanData> {
     let subscriber = tracing_subscriber::registry()
         .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")));
 
-    tracing::subscriber::with_default(subscriber, body);
+    tracing::subscriber::with_default(subscriber, || body(&exporter));
     provider.force_flush().ok();
 
     exporter.get_finished_spans().expect("in-memory spans")
 }
 
-fn attribute<'a>(span: &'a SpanData, key: &str) -> Option<&'a Value> {
+pub(super) fn attribute<'a>(span: &'a SpanData, key: &str) -> Option<&'a Value> {
     span.attributes
         .iter()
         .find(|kv| kv.key.as_str() == key)

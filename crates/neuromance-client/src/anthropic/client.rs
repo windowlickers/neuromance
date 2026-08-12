@@ -498,33 +498,45 @@ impl LLMClient for AnthropicClient {
     {
         self.validate_request(request)?;
 
-        let mut anthropic_request = CreateMessageRequest::from((request, self.config.as_ref()));
-        anthropic_request.stream = Some(true);
+        // The span opens before the request is built so `inject_trace_context`
+        // sees it, and closes only when the returned stream ends.
+        let op = GenAiOp::chat(&self.config, request);
+        let stream = match op.in_scope(|| {
+            let mut anthropic_request = CreateMessageRequest::from((request, self.config.as_ref()));
+            anthropic_request.stream = Some(true);
 
-        let url = format!("{}/messages", self.base_url);
-        reqwest::Url::parse(&url)
-            .map_err(|e| ClientError::ConfigurationError(format!("Invalid URL '{url}': {e}")))?;
+            let url = format!("{}/messages", self.base_url);
+            reqwest::Url::parse(&url).map_err(|e| {
+                ClientError::ConfigurationError(format!("Invalid URL '{url}': {e}"))
+            })?;
 
-        let mut request_builder = self
-            .streaming_client
-            .post(&url)
-            .header("x-api-key", self.api_key.expose_secret())
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .header("Content-Type", "application/json");
+            let mut request_builder = self
+                .streaming_client
+                .post(&url)
+                .header("x-api-key", self.api_key.expose_secret())
+                .header("anthropic-version", ANTHROPIC_VERSION)
+                .header("Content-Type", "application/json");
 
-        if let Some(beta) = beta_features(request) {
-            request_builder = request_builder.header("anthropic-beta", beta);
-        }
+            if let Some(beta) = beta_features(request) {
+                request_builder = request_builder.header("anthropic-beta", beta);
+            }
 
-        request_builder = inject_trace_context(add_proxy_headers(
-            request_builder,
-            self.proxy_config.as_ref(),
-            &self.api_key,
-        ));
+            request_builder = inject_trace_context(add_proxy_headers(
+                request_builder,
+                self.proxy_config.as_ref(),
+                &self.api_key,
+            ));
 
-        let request_builder = request_builder.json(&anthropic_request);
+            run_sse_stream(self, request_builder.json(&anthropic_request))
+        }) {
+            Ok(stream) => stream,
+            Err(error) => {
+                op.finish_error(&error);
+                return Err(error);
+            }
+        };
 
-        run_sse_stream(self, request_builder)
+        Ok(Box::pin(op.into_instrumented(stream)))
     }
 }
 

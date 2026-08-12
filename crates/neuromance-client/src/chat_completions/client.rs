@@ -620,34 +620,46 @@ impl LLMClient for ChatCompletionsClient {
     {
         self.validate_request(request)?;
 
-        let mut chat_request = ChatCompletionRequest::from((request, self.config.as_ref()));
-        chat_request.stream = Some(true);
-        chat_request.stream_options = Some(serde_json::json!({
-            "include_usage": true
-        }));
+        // The span opens before the request is built so `inject_trace_context`
+        // sees it, and closes only when the returned stream ends.
+        let op = GenAiOp::chat(&self.config, request);
+        let stream = match op.in_scope(|| {
+            let mut chat_request = ChatCompletionRequest::from((request, self.config.as_ref()));
+            chat_request.stream = Some(true);
+            chat_request.stream_options = Some(serde_json::json!({
+                "include_usage": true
+            }));
 
-        let url = format!("{}/{}", self.base_url, "chat/completions");
-        reqwest::Url::parse(&url)
-            .map_err(|e| ClientError::ConfigurationError(format!("Invalid URL '{url}': {e}")))?;
+            let url = format!("{}/{}", self.base_url, "chat/completions");
+            reqwest::Url::parse(&url).map_err(|e| {
+                ClientError::ConfigurationError(format!("Invalid URL '{url}': {e}"))
+            })?;
 
-        let mut request_builder = self
-            .streaming_client
-            .post(&url)
-            .header(
-                "Authorization",
-                format!("Bearer {}", self.api_key.expose_secret()),
-            )
-            .header("Content-Type", "application/json");
+            let mut request_builder = self
+                .streaming_client
+                .post(&url)
+                .header(
+                    "Authorization",
+                    format!("Bearer {}", self.api_key.expose_secret()),
+                )
+                .header("Content-Type", "application/json");
 
-        request_builder = inject_trace_context(add_proxy_headers(
-            request_builder,
-            self.proxy_config.as_ref(),
-            &self.api_key,
-        ));
+            request_builder = inject_trace_context(add_proxy_headers(
+                request_builder,
+                self.proxy_config.as_ref(),
+                &self.api_key,
+            ));
 
-        let request_builder = request_builder.json(&chat_request);
+            run_sse_stream(self, request_builder.json(&chat_request))
+        }) {
+            Ok(stream) => stream,
+            Err(error) => {
+                op.finish_error(&error);
+                return Err(error);
+            }
+        };
 
-        run_sse_stream(self, request_builder)
+        Ok(Box::pin(op.into_instrumented(stream)))
     }
 }
 

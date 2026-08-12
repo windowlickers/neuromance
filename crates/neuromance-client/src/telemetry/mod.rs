@@ -10,6 +10,7 @@
 
 mod attrs;
 mod metrics;
+mod stream;
 #[cfg(test)]
 mod tests;
 
@@ -17,12 +18,14 @@ use std::time::Instant;
 
 use tracing::{Span, field, info_span};
 
-use neuromance_common::client::{ChatRequest, ChatResponse, Config, Usage};
+use neuromance_common::client::{ChatRequest, ChatResponse, Config, FinishReason, Usage};
 use neuromance_common::telemetry::genai;
 
 use crate::error::ClientError;
+use crate::streaming::ChatChunkStream;
 
 pub use attrs::GenAiAttrs;
+pub use stream::InstrumentedChunkStream;
 
 /// An in-flight GenAI operation and the span describing it.
 ///
@@ -57,6 +60,19 @@ impl GenAiOp {
         }
     }
 
+    /// Run `f` with the span current.
+    ///
+    /// Building the request inside the span is what makes the injected
+    /// `traceparent` name this operation rather than its caller.
+    pub fn in_scope<T>(&self, f: impl FnOnce() -> T) -> T {
+        self.span.in_scope(f)
+    }
+
+    /// Hand the operation to a stream, which closes it when the stream ends.
+    pub fn into_instrumented(self, inner: ChatChunkStream) -> InstrumentedChunkStream {
+        InstrumentedChunkStream::new(self, inner)
+    }
+
     /// The span, for entering or for instrumenting a future.
     pub const fn span(&self) -> &Span {
         &self.span
@@ -76,6 +92,20 @@ impl GenAiOp {
             finish_reasons,
             response.usage.as_ref(),
         );
+    }
+
+    /// Close a successful operation whose outcome was accumulated elsewhere,
+    /// such as a stream folded chunk by chunk.
+    pub fn finish_parts(
+        mut self,
+        response_model: Option<&str>,
+        response_id: Option<&str>,
+        finish_reasons: &[FinishReason],
+        usage: Option<&Usage>,
+    ) {
+        self.pending = false;
+        let reasons = finish_reasons.iter().map(ToString::to_string).collect();
+        self.finish_ok(response_model, response_id, reasons, usage);
     }
 
     /// Close an operation that produced no usable result.
