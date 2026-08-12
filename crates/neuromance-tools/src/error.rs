@@ -47,3 +47,41 @@ pub enum ToolExecutorError {
     #[error(transparent)]
     Tool(#[from] ToolError),
 }
+
+impl ToolExecutorError {
+    /// A stable, low-cardinality slug naming why the tool call failed.
+    ///
+    /// Reported as the `error.type` attribute on the `execute_tool` span.
+    /// Never derive this from [`Display`](fmt::Display) output — the inner
+    /// strings carry tool names, arguments, and provider text, any of which
+    /// would blow up cardinality in a metrics backend.
+    #[must_use]
+    pub const fn reason(&self) -> &'static str {
+        match self {
+            Self::UnknownTool(_) => "unknown_tool",
+            Self::Tool(ToolError::InvalidArguments(_)) => "invalid_arguments",
+            Self::Tool(ToolError::Execution(_)) => "tool_error",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_reason_separates_a_missing_tool_from_a_failing_one() {
+        assert_eq!(
+            ToolExecutorError::UnknownTool("grep".to_string()).reason(),
+            "unknown_tool"
+        );
+        assert_eq!(
+            ToolExecutorError::Tool(ToolError::InvalidArguments("no path".to_string())).reason(),
+            "invalid_arguments"
+        );
+        assert_eq!(
+            ToolExecutorError::Tool(ToolError::execution("boom")).reason(),
+            "tool_error"
+        );
+    }
+}
