@@ -748,22 +748,17 @@ impl<C: LLMClient> Core<C> {
                 .record(turn_duration.as_secs_f64());
                 counter!(
                     "neuromance_chat_turns_total",
-                    "model" => model_label.clone(),
+                    "model" => model_label,
                     "finish_reason" => finish_label.clone(),
                 )
                 .increment(1);
-                counter!(
-                    "neuromance_tokens_total",
-                    "kind" => "prompt",
-                    "model" => model_label.clone(),
-                )
-                .increment(u64::from(prompt_tokens));
-                counter!(
-                    "neuromance_tokens_total",
-                    "kind" => "completion",
-                    "model" => model_label,
-                )
-                .increment(u64::from(completion_tokens));
+                // Token counts belong to the OpenTelemetry pipeline alone
+                // (`gen_ai.client.token.usage`, recorded per provider call in
+                // `neuromance-client`). Counting them here as well would make a
+                // collector that both scrapes Prometheus and receives OTLP report
+                // the same tokens twice. The durations above do not overlap:
+                // `neuromance_turn_duration_seconds` measures a turn,
+                // `gen_ai.client.operation.duration` measures one provider call.
                 // Schema failures are checked before the empty-turn retry below: a
                 // refusal or a truncated response can arrive with empty content, and
                 // resubmitting it would only refuse or truncate again.
