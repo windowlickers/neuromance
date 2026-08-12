@@ -176,8 +176,16 @@ fn upstream_base_url(config: &Config) -> Option<String> {
 }
 
 /// Split a base URL into `server.address` and `server.port`.
+///
+/// An unparseable URL drops both attributes, which also removes the tiebreaker
+/// that tells one OpenAI-compatible endpoint from another, so say so.
 fn server_attrs(base_url: Option<&str>) -> (Option<String>, Option<i64>) {
-    let Some(url) = base_url.and_then(|raw| url::Url::parse(raw).ok()) else {
+    let parsed = base_url.map(|raw| {
+        url::Url::parse(raw).inspect_err(
+            |error| tracing::debug!(%error, base_url = raw, "base_url is not a URL; server.address and server.port are omitted"),
+        )
+    });
+    let Some(Ok(url)) = parsed else {
         return (None, None);
     };
     let port = url.port_or_known_default().map(i64::from);

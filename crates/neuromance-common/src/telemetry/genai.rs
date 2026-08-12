@@ -202,6 +202,11 @@ pub fn provider_name(provider: &str, base_url: Option<&str>) -> &'static str {
 }
 
 /// Identify an OpenAI-compatible endpoint from its host.
+///
+/// A host nobody recognises is reported as `openai` — the conventions define no
+/// "other" value, and the protocol such an endpoint speaks is `OpenAI`'s. The
+/// mislabel is stable and plausible, so a self-hosted vLLM folds silently into
+/// `OpenAI`'s cost and latency series; the log is the only hint an operator gets.
 fn compatible_provider_name(base_url: Option<&str>) -> &'static str {
     let Some(url) = base_url else {
         return "openai";
@@ -212,7 +217,13 @@ fn compatible_provider_name(base_url: Option<&str>) -> &'static str {
         "gcp.gemini"
     } else if url.contains("aiplatform.googleapis.com") {
         "gcp.vertex_ai"
+    } else if url.contains("api.openai.com") {
+        "openai"
     } else {
+        tracing::debug!(
+            base_url = url,
+            "unrecognised OpenAI-compatible host; reporting gen_ai.provider.name as openai"
+        );
         "openai"
     }
 }
