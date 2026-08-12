@@ -90,6 +90,32 @@ impl Usage {
             .map_or(0, |d| d.cached_tokens);
         Some(f64::from(cached) / f64::from(self.prompt_tokens))
     }
+
+    /// Fold another usage report into this one, keeping the larger count.
+    ///
+    /// Streaming providers report usage in pieces: Anthropic sends input
+    /// tokens on `message_start` and output tokens on `message_delta`, so a
+    /// later chunk carries a zero where an earlier one carried the real
+    /// value. Taking the maximum per field keeps every count that has been
+    /// seen instead of letting the last chunk overwrite it. `total_tokens` is
+    /// recomputed from the merged parts rather than maximised, because a
+    /// provider-supplied total from a partial report undercounts.
+    ///
+    /// Detail breakdowns are filled in only when this usage lacks them: the
+    /// provider sends each breakdown once, in full.
+    pub fn merge_max(&mut self, other: &Self) {
+        self.prompt_tokens = self.prompt_tokens.max(other.prompt_tokens);
+        self.completion_tokens = self.completion_tokens.max(other.completion_tokens);
+        self.total_tokens = self.prompt_tokens.saturating_add(self.completion_tokens);
+        if self.input_tokens_details.is_none() {
+            self.input_tokens_details
+                .clone_from(&other.input_tokens_details);
+        }
+        if self.output_tokens_details.is_none() {
+            self.output_tokens_details
+                .clone_from(&other.output_tokens_details);
+        }
+    }
 }
 
 /// Aggregate cache statistics across multiple LLM requests.
@@ -296,5 +322,99 @@ mod tests {
         // 1 of 2 requests had cache hits = 0.5
         let rate = m.request_hit_rate().unwrap();
         assert!((rate - 0.5).abs() < f64::EPSILON);
+    }
+}
+
+#[cfg(test)]
+mod merge_max_tests {
+    use super::*;
+
+    fn usage(prompt: u32, completion: u32) -> Usage {
+        Usage {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            total_tokens: prompt + completion,
+            cost: None,
+            input_tokens_details: None,
+            output_tokens_details: None,
+        }
+    }
+
+    /// Anthropic reports input tokens on `message_start` and output tokens on
+    /// `message_delta`, so the second report zeroes the first's field. The
+    /// merge must keep both counts.
+    #[test]
+    fn test_merge_max_keeps_counts_a_later_report_zeroes() {
+        let mut acc = usage(500, 0);
+        acc.merge_max(&usage(0, 120));
+
+        assert_eq!(acc.prompt_tokens, 500);
+        assert_eq!(acc.completion_tokens, 120);
+    }
+
+    #[test]
+    fn test_merge_max_recomputes_the_total_from_the_merged_parts() {
+        let mut acc = usage(500, 0);
+        // A partial report's own total undercounts; it must not win.
+        acc.merge_max(&Usage {
+            total_tokens: 120,
+            ..usage(0, 120)
+        });
+
+        assert_eq!(acc.total_tokens, 620);
+    }
+
+    #[test]
+    fn test_merge_max_saturates_instead_of_overflowing() {
+        let mut acc = usage(u32::MAX, 0);
+        acc.merge_max(&usage(0, u32::MAX));
+
+        assert_eq!(acc.total_tokens, u32::MAX);
+    }
+
+    #[test]
+    fn test_merge_max_adopts_details_it_does_not_have_yet() {
+        let mut acc = usage(500, 0);
+        let mut incoming = usage(0, 120);
+        incoming.input_tokens_details = Some(InputTokensDetails {
+            cached_tokens: 400,
+            cache_creation_tokens: 100,
+        });
+        incoming.output_tokens_details = Some(OutputTokensDetails {
+            reasoning_tokens: 40,
+        });
+
+        acc.merge_max(&incoming);
+
+        assert_eq!(
+            acc.input_tokens_details,
+            Some(InputTokensDetails {
+                cached_tokens: 400,
+                cache_creation_tokens: 100,
+            })
+        );
+        assert_eq!(
+            acc.output_tokens_details,
+            Some(OutputTokensDetails {
+                reasoning_tokens: 40,
+            })
+        );
+    }
+
+    /// A breakdown already held is the full one the provider sent; a later
+    /// chunk must not replace it.
+    #[test]
+    fn test_merge_max_keeps_details_it_already_has() {
+        let mut acc = usage(500, 0);
+        acc.input_tokens_details = Some(InputTokensDetails {
+            cached_tokens: 400,
+            cache_creation_tokens: 100,
+        });
+        let mut incoming = usage(0, 120);
+        incoming.input_tokens_details = Some(InputTokensDetails::default());
+
+        acc.merge_max(&incoming);
+
+        assert_eq!(acc.input_tokens_details.map(|d| d.cached_tokens), Some(400));
     }
 }

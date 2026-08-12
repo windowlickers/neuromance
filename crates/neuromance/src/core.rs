@@ -625,25 +625,10 @@ impl<C: LLMClient> Core<C> {
                         }
 
                         if let Some(ref chunk_usage) = chunk.usage {
-                            accumulated_usage = Some(match accumulated_usage {
-                                None => chunk_usage.clone(),
-                                Some(mut acc) => {
-                                    acc.prompt_tokens =
-                                        acc.prompt_tokens.max(chunk_usage.prompt_tokens);
-                                    acc.completion_tokens =
-                                        acc.completion_tokens.max(chunk_usage.completion_tokens);
-                                    acc.total_tokens = acc.prompt_tokens + acc.completion_tokens;
-                                    if acc.input_tokens_details.is_none() {
-                                        acc.input_tokens_details
-                                            .clone_from(&chunk_usage.input_tokens_details);
-                                    }
-                                    if acc.output_tokens_details.is_none() {
-                                        acc.output_tokens_details
-                                            .clone_from(&chunk_usage.output_tokens_details);
-                                    }
-                                    acc
-                                }
-                            });
+                            match accumulated_usage {
+                                None => accumulated_usage = Some(chunk_usage.clone()),
+                                Some(ref mut acc) => acc.merge_max(chunk_usage),
+                            }
                         }
 
                         response_metadata = Some(chunk);
