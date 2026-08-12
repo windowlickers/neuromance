@@ -111,7 +111,7 @@ Spans follow the OpenTelemetry GenAI semantic conventions. Rules for changing th
 - **One owner per span.** `chat` and `embeddings` in `neuromance-client`, `execute_tool` in `neuromance/src/core.rs`, `invoke_agent` in `neuromance-agent`. Never add a second span for the same operation — `ToolExecutor::execute_named` deliberately has none, because the sandbox process also calls it.
 - Span attributes and metric attributes both come from `GenAiAttrs` (`neuromance-client/src/telemetry/attrs.rs`). Add attributes there, not at call sites, or the two drift.
 - `neuromance_*` metrics use the `metrics` crate and the Prometheus scrape; `gen_ai.*` metrics use OpenTelemetry. Never both — a collector that scrapes and receives OTLP would double-count.
-- Message content goes through `neuromance-client/src/telemetry/content.rs`, which checks `capture_message_content()`. That is the only place the gate is checked.
+- Message content is gated on `capture_message_content()`. Prompts and completions go through `neuromance-client/src/telemetry/content.rs`, which is the only place that serializes them. Three other sites read the gate directly, because they guard work rather than a serializer: `telemetry/stream.rs` (buffering a completion chunk by chunk), and `neuromance/src/core.rs` twice (`gen_ai.tool.call.arguments` and `.result`, which `neuromance` cannot route through the client crate's `pub(crate)` telemetry module). Those four are the whole set — `rg 'capture_message_content\(\)'` must not grow a fifth.
 
 Three traps, all of which compile and export cleanly while producing wrong data:
 
