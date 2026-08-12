@@ -15,16 +15,29 @@
 
 use serde::Serialize;
 use serde_json::json;
+use tracing::debug;
 
 use neuromance_common::chat::{Message, MessageRole};
 use neuromance_common::client::ChatResponse;
-use neuromance_common::telemetry::capture_message_content;
+use neuromance_common::telemetry::{capture_message_content, genai};
 
 /// One entry of `gen_ai.input.messages` or `gen_ai.output.messages`.
 #[derive(Serialize)]
 struct CapturedMessage {
     role: String,
     parts: Vec<serde_json::Value>,
+}
+
+/// Serialize an attribute value, naming the failure instead of hiding it.
+///
+/// A failure here is very unlikely — these are `json!` values — which is the
+/// argument for logging it rather than for ignoring it. Without the log, a
+/// missing attribute is indistinguishable from the capture gate being off, and
+/// an operator who enabled capture would debug the collector instead.
+fn to_attribute_string<T: Serialize>(what: &str, value: &T) -> Option<String> {
+    serde_json::to_string(value)
+        .inspect_err(|error| debug!(%error, attribute = what, "genai content serialization failed"))
+        .ok()
 }
 
 /// The `gen_ai.system_instructions` value: the system-role messages.
@@ -46,7 +59,7 @@ fn system_instructions(messages: &[Message]) -> Option<String> {
     if parts.is_empty() {
         return None;
     }
-    serde_json::to_string(&parts).ok()
+    to_attribute_string(genai::SYSTEM_INSTRUCTIONS, &parts)
 }
 
 /// The `gen_ai.input.messages` value: everything but the system instructions,
@@ -66,7 +79,7 @@ fn input_messages(messages: &[Message]) -> Option<String> {
     if captured.is_empty() {
         return None;
     }
-    serde_json::to_string(&captured).ok()
+    to_attribute_string(genai::INPUT_MESSAGES, &captured)
 }
 
 /// The `gen_ai.output.messages` value for a non-streaming response.
@@ -79,14 +92,16 @@ pub fn output_messages_json(response: &ChatResponse) -> Option<String> {
 fn output_messages(response: &ChatResponse) -> Option<String> {
     let mut captured = capture_message(&response.message);
     if let Some(reason) = response.finish_reason {
-        return serde_json::to_string(&vec![json!({
-            "role": captured.role.clone(),
-            "parts": std::mem::take(&mut captured.parts),
-            "finish_reason": reason.to_string(),
-        })])
-        .ok();
+        return to_attribute_string(
+            genai::OUTPUT_MESSAGES,
+            &vec![json!({
+                "role": captured.role.clone(),
+                "parts": std::mem::take(&mut captured.parts),
+                "finish_reason": reason.to_string(),
+            })],
+        );
     }
-    serde_json::to_string(&vec![captured]).ok()
+    to_attribute_string(genai::OUTPUT_MESSAGES, &vec![captured])
 }
 
 /// The `gen_ai.output.messages` value for a stream, whose text and tool calls
@@ -114,12 +129,14 @@ fn streamed_output_messages(
     if parts.is_empty() {
         return None;
     }
-    serde_json::to_string(&vec![json!({
-        "role": "assistant",
-        "parts": parts,
-        "finish_reason": finish_reason,
-    })])
-    .ok()
+    to_attribute_string(
+        genai::OUTPUT_MESSAGES,
+        &vec![json!({
+            "role": "assistant",
+            "parts": parts,
+            "finish_reason": finish_reason,
+        })],
+    )
 }
 
 fn capture_message(message: &Message) -> CapturedMessage {
@@ -166,9 +183,13 @@ fn tool_call_part(call: &neuromance_common::tools::ToolCall) -> serde_json::Valu
 /// the exact names the conventions expect.
 fn role_name(role: MessageRole) -> String {
     serde_json::to_value(role)
+        .inspect_err(|error| debug!(%error, "genai role serialization failed"))
         .ok()
         .and_then(|value| value.as_str().map(str::to_owned))
-        .unwrap_or_else(|| "unknown".to_string())
+        .unwrap_or_else(|| {
+            debug!(?role, "genai role has no string form; labelling it unknown");
+            "unknown".to_string()
+        })
 }
 
 #[cfg(test)]
