@@ -9,6 +9,7 @@
 //! Attribute keys come from `neuromance_common::telemetry::genai`.
 
 mod attrs;
+mod content;
 mod metrics;
 mod stream;
 #[cfg(test)]
@@ -17,6 +18,7 @@ mod tests;
 use std::time::Instant;
 
 use tracing::{Span, field, info_span};
+use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 use neuromance_common::client::{ChatRequest, ChatResponse, Config, FinishReason, Usage};
 use neuromance_common::telemetry::genai;
@@ -48,6 +50,7 @@ impl GenAiOp {
         let attrs = GenAiAttrs::chat(config, request);
         let span = new_span(&attrs);
         record_chat_request(&span, request);
+        record_input_content(&span, &request.messages);
         Self::start(span, attrs)
     }
 
@@ -89,6 +92,9 @@ impl GenAiOp {
     /// Close a successful non-streaming operation.
     pub fn finish_response(mut self, response: &ChatResponse) {
         self.pending = false;
+        if let Some(messages) = content::output_messages_json(response) {
+            self.span.set_attribute(genai::OUTPUT_MESSAGES, messages);
+        }
         let finish_reasons = response
             .finish_reason
             .iter()
@@ -110,8 +116,18 @@ impl GenAiOp {
         response_id: Option<&str>,
         finish_reasons: &[FinishReason],
         usage: Option<&Usage>,
+        streamed: Option<&StreamedOutput<'_>>,
     ) {
         self.pending = false;
+        if let Some(output) = streamed
+            && let Some(messages) = content::streamed_output_messages_json(
+                output.content,
+                output.tool_calls,
+                finish_reasons.first().map(ToString::to_string).as_deref(),
+            )
+        {
+            self.span.set_attribute(genai::OUTPUT_MESSAGES, messages);
+        }
         let reasons = finish_reasons.iter().map(ToString::to_string).collect();
         self.finish_ok(response_model, response_id, reasons, usage);
     }
@@ -194,6 +210,29 @@ impl Drop for GenAiOp {
         if self.pending {
             self.record_failure("cancelled", "operation dropped before completion");
         }
+    }
+}
+
+/// The text and tool calls a stream produced, for content capture.
+pub struct StreamedOutput<'a> {
+    /// Concatenated assistant text.
+    pub content: &'a str,
+    /// Tool calls the model asked for.
+    pub tool_calls: &'a [neuromance_common::tools::ToolCall],
+}
+
+/// Attach the opt-in input content.
+///
+/// `gen_ai.input.messages` and `gen_ai.system_instructions` hold user data, so
+/// they go through [`content`], which returns `None` unless an operator has
+/// opted in. They are array-shaped JSON strings rather than `tracing` fields
+/// because their size makes them worth skipping entirely when the gate is off.
+fn record_input_content(span: &Span, messages: &[neuromance_common::chat::Message]) {
+    if let Some(instructions) = content::system_instructions_json(messages) {
+        span.set_attribute(genai::SYSTEM_INSTRUCTIONS, instructions);
+    }
+    if let Some(input) = content::input_messages_json(messages) {
+        span.set_attribute(genai::INPUT_MESSAGES, input);
     }
 }
 

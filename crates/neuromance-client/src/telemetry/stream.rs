@@ -12,8 +12,10 @@ use std::task::{Context, Poll};
 use futures::Stream;
 
 use neuromance_common::client::{ChatChunk, FinishReason, Usage};
+use neuromance_common::telemetry::capture_message_content;
+use neuromance_common::tools::ToolCall;
 
-use super::GenAiOp;
+use super::{GenAiOp, StreamedOutput};
 use crate::error::ClientError;
 use crate::streaming::ChatChunkStream;
 
@@ -28,10 +30,23 @@ struct StreamAccumulator {
     response_id: Option<String>,
     finish_reasons: Vec<FinishReason>,
     usage: Option<Usage>,
+    /// Only populated when content capture is on; a long completion is not
+    /// worth buffering twice for telemetry nobody asked for.
+    content: String,
+    tool_calls: Vec<ToolCall>,
 }
 
 impl StreamAccumulator {
     fn observe(&mut self, chunk: &ChatChunk) {
+        if capture_message_content() {
+            if let Some(ref delta) = chunk.delta_content {
+                self.content.push_str(delta);
+            }
+            if let Some(ref deltas) = chunk.delta_tool_calls {
+                self.tool_calls =
+                    ToolCall::merge_deltas(std::mem::take(&mut self.tool_calls), deltas);
+            }
+        }
         if self.response_model.is_none() && !chunk.model.is_empty() {
             self.response_model = Some(chunk.model.clone());
         }
@@ -102,11 +117,16 @@ impl Stream for InstrumentedChunkStream {
             Poll::Ready(None) => {
                 if let Some(op) = this.op.take() {
                     let accumulated = &this.accumulated;
+                    let streamed = StreamedOutput {
+                        content: &accumulated.content,
+                        tool_calls: &accumulated.tool_calls,
+                    };
                     op.finish_parts(
                         accumulated.response_model.as_deref(),
                         accumulated.response_id.as_deref(),
                         &accumulated.finish_reasons,
                         accumulated.usage.as_ref(),
+                        Some(&streamed),
                     );
                 }
                 Poll::Ready(None)

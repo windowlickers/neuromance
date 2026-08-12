@@ -27,7 +27,7 @@ use neuromance_common::client::{
 use neuromance_common::context::{ContextLedger, EditSource};
 use neuromance_common::features::ThinkingMode;
 use neuromance_common::hook::{CompactionStats, Hook, HookContext};
-use neuromance_common::telemetry::genai;
+use neuromance_common::telemetry::{capture_message_content, genai};
 use neuromance_common::tools::{ToolApproval, ToolCall};
 use neuromance_tools::{ToolExecutor, ToolExecutorError};
 
@@ -874,9 +874,19 @@ impl<C: LLMClient> Core<C> {
                         { genai::TOOL_NAME } = %tool_name,
                         { genai::TOOL_CALL_ID } = %call_id,
                         { genai::TOOL_TYPE } = genai::tool_type::FUNCTION,
+                        { genai::TOOL_CALL_ARGUMENTS } = field::Empty,
+                        { genai::TOOL_CALL_RESULT } = field::Empty,
                         { genai::ERROR_TYPE } = field::Empty,
                     );
                     let _tool_enter = tool_span.enter();
+                    // Tool arguments hold whatever the model decided to pass —
+                    // paths, queries, credentials it was handed. Gated.
+                    if capture_message_content() {
+                        tool_span.record(
+                            genai::TOOL_CALL_ARGUMENTS,
+                            tool_call.function.arguments.as_str(),
+                        );
+                    }
                     info!(tool = %tool_name, call_id = %call_id, "tool call requested");
                     debug!(arguments = ?tool_call.function.arguments, "tool arguments");
 
@@ -943,6 +953,9 @@ impl<C: LLMClient> Core<C> {
                                 Ok(result) => {
                                     let bytes = result.len();
                                     tool_span.record("outcome", "success");
+                                    if capture_message_content() {
+                                        tool_span.record(genai::TOOL_CALL_RESULT, result.as_str());
+                                    }
                                     tool_span.record("duration_ms", i64::try_from(tool_duration_ms).unwrap_or(i64::MAX));
                                     tool_span.record("otel.status_code", "OK");
                                     info!(
@@ -2733,6 +2746,11 @@ mod span_tests {
             Some("function")
         );
         assert_eq!(fields.get("outcome").map(String::as_str), Some("success"));
+
+        // Tool arguments and results hold user data, so they ship only when an
+        // operator opts in. A test process has the gate unset.
+        assert_eq!(fields.get(genai::TOOL_CALL_ARGUMENTS), None);
+        assert_eq!(fields.get(genai::TOOL_CALL_RESULT), None);
     }
 
     /// A tool that runs and fails must be countable by why it failed, and the

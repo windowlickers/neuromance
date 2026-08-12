@@ -254,3 +254,35 @@ fn test_embeddings_span_reports_no_output_tokens() {
     let span = spans.first().expect("one embeddings span");
     assert_eq!(attribute(span, genai::USAGE_OUTPUT_TOKENS), None);
 }
+
+/// The negative half is the one that matters. With the gate off — the default,
+/// and what a test process sees — no prompt, completion, or system prompt may
+/// reach the exporter.
+#[test]
+fn test_no_message_content_reaches_the_span_by_default() {
+    let conversation = uuid::Uuid::new_v4();
+    let history = vec![
+        Message::system(conversation, "you are a bank teller"),
+        Message::user(conversation, "my account number is 12345"),
+    ];
+
+    let spans = exported_spans(|| {
+        let request = ChatRequest::new(history).with_model("gpt-4o");
+        GenAiOp::chat(&config(), &request).finish_response(&response());
+    });
+
+    let span = spans.first().expect("one chat span");
+    for key in [
+        genai::INPUT_MESSAGES,
+        genai::OUTPUT_MESSAGES,
+        genai::SYSTEM_INSTRUCTIONS,
+    ] {
+        assert_eq!(attribute(span, key), None, "{key} must not be captured");
+    }
+
+    let rendered = format!("{:?}", span.attributes);
+    assert!(
+        !rendered.contains("12345") && !rendered.contains("bank teller"),
+        "no prompt text may appear anywhere on the span: {rendered}"
+    );
+}
