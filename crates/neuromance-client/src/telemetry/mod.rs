@@ -21,6 +21,7 @@ use tracing::{Span, field, info_span};
 use neuromance_common::client::{ChatRequest, ChatResponse, Config, FinishReason, Usage};
 use neuromance_common::telemetry::genai;
 
+use crate::embedding::{EmbeddingConfig, EmbeddingResponse};
 use crate::error::ClientError;
 use crate::streaming::ChatChunkStream;
 
@@ -47,6 +48,13 @@ impl GenAiOp {
         let attrs = GenAiAttrs::chat(config, request);
         let span = new_span(&attrs);
         record_chat_request(&span, request);
+        Self::start(span, attrs)
+    }
+
+    /// Open an `embeddings` span.
+    pub fn embeddings(config: &EmbeddingConfig) -> Self {
+        let attrs = GenAiAttrs::embeddings(config);
+        let span = new_span(&attrs);
         Self::start(span, attrs)
     }
 
@@ -106,6 +114,26 @@ impl GenAiOp {
         self.pending = false;
         let reasons = finish_reasons.iter().map(ToString::to_string).collect();
         self.finish_ok(response_model, response_id, reasons, usage);
+    }
+
+    /// Close a successful embeddings operation.
+    ///
+    /// Embeddings report prompt tokens only: there is no completion, no
+    /// response id, and no finish reason.
+    pub fn finish_embeddings(mut self, response: &EmbeddingResponse) {
+        self.pending = false;
+        let model = response.model.as_str();
+        self.span.record(genai::RESPONSE_MODEL, model);
+        if let Some(ref usage) = response.usage {
+            self.span
+                .record(genai::USAGE_INPUT_TOKENS, i64::from(usage.prompt_tokens));
+            metrics::instruments().record_input_tokens(
+                &self.attrs,
+                Some(model),
+                usage.prompt_tokens,
+            );
+        }
+        self.record_duration(Some(model), None);
     }
 
     /// Close an operation that produced no usable result.

@@ -9,7 +9,13 @@ use tracing::Span;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 use neuromance_common::client::{ChatRequest, Config, resolve_model_prefix};
+
+use crate::embedding::EmbeddingConfig;
 use neuromance_common::telemetry::genai;
+
+/// Where an embedding request goes when no base URL is configured.
+/// Mirrors the default in `chat_completions::embedding`.
+const OPENAI_DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
 /// Request-side identity of one GenAI operation.
 ///
@@ -33,15 +39,43 @@ pub struct GenAiAttrs {
 impl GenAiAttrs {
     /// Identity of a chat operation.
     pub fn chat(config: &Config, request: &ChatRequest) -> Self {
-        Self::new(genai::op::CHAT, config, request_model(config, request))
+        let upstream = upstream_base_url(config);
+        Self::from_parts(
+            genai::op::CHAT,
+            &config.provider,
+            upstream.as_deref(),
+            request_model(config, request),
+        )
     }
 
-    fn new(operation: &'static str, config: &Config, request_model: String) -> Self {
-        let upstream = upstream_base_url(config);
-        let (server_address, server_port) = server_attrs(upstream.as_deref());
+    /// Identity of an embeddings operation.
+    ///
+    /// [`EmbeddingConfig`] carries no provider prefix, so the provider is
+    /// identified from the endpoint host — the same path a `chat_completions`
+    /// client takes.
+    pub fn embeddings(config: &EmbeddingConfig) -> Self {
+        let upstream = config
+            .base_url
+            .as_deref()
+            .unwrap_or(OPENAI_DEFAULT_BASE_URL);
+        Self::from_parts(
+            genai::op::EMBEDDINGS,
+            "chat_completions",
+            Some(upstream),
+            config.model.clone(),
+        )
+    }
+
+    fn from_parts(
+        operation: &'static str,
+        provider: &str,
+        upstream: Option<&str>,
+        request_model: String,
+    ) -> Self {
+        let (server_address, server_port) = server_attrs(upstream);
         Self {
             operation,
-            provider: genai::provider_name(&config.provider, upstream.as_deref()),
+            provider: genai::provider_name(provider, upstream),
             request_model,
             server_address,
             server_port,

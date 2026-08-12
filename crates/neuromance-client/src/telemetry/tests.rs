@@ -195,3 +195,62 @@ fn test_output_type_reflects_a_requested_schema() {
         Some(&Value::from("json"))
     );
 }
+
+/// Embeddings are a distinct GenAI operation, and a backend separates their
+/// cost from chat by `gen_ai.operation.name`.
+#[test]
+fn test_embeddings_span_is_named_and_typed_as_an_embeddings_operation() {
+    use crate::embedding::{EmbeddingConfig, EmbeddingResponse, EmbeddingUsage};
+
+    let spans = exported_spans(|| {
+        let config = EmbeddingConfig::openai_small("sk-test");
+        let response = EmbeddingResponse {
+            embeddings: Vec::new(),
+            model: "text-embedding-3-small".to_string(),
+            usage: Some(EmbeddingUsage {
+                prompt_tokens: 17,
+                total_tokens: 17,
+            }),
+        };
+        GenAiOp::embeddings(&config).finish_embeddings(&response);
+    });
+
+    let span = spans.first().expect("one embeddings span");
+    assert_eq!(span.name, "embeddings text-embedding-3-small");
+    assert_eq!(span.span_kind, SpanKind::Client);
+    assert_eq!(
+        attribute(span, genai::OPERATION_NAME),
+        Some(&Value::from("embeddings"))
+    );
+    assert_eq!(
+        attribute(span, genai::USAGE_INPUT_TOKENS),
+        Some(&Value::I64(17))
+    );
+    assert_eq!(
+        attribute(span, genai::SERVER_ADDRESS),
+        Some(&Value::from("api.openai.com"))
+    );
+}
+
+/// An embeddings call generates no completion. Reporting a zero would put a
+/// spurious sample in every output-token query.
+#[test]
+fn test_embeddings_span_reports_no_output_tokens() {
+    use crate::embedding::{EmbeddingConfig, EmbeddingResponse, EmbeddingUsage};
+
+    let spans = exported_spans(|| {
+        let config = EmbeddingConfig::openai_small("sk-test");
+        let response = EmbeddingResponse {
+            embeddings: Vec::new(),
+            model: "text-embedding-3-small".to_string(),
+            usage: Some(EmbeddingUsage {
+                prompt_tokens: 17,
+                total_tokens: 17,
+            }),
+        };
+        GenAiOp::embeddings(&config).finish_embeddings(&response);
+    });
+
+    let span = spans.first().expect("one embeddings span");
+    assert_eq!(attribute(span, genai::USAGE_OUTPUT_TOKENS), None);
+}

@@ -32,12 +32,14 @@ use base64::prelude::*;
 use reqwest_middleware::ClientWithMiddleware;
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
+use tracing::Instrument as _;
 
 use crate::embedding::{
     Embedding, EmbeddingClient, EmbeddingConfig, EmbeddingInput, EmbeddingRequest,
     EmbeddingResponse, EmbeddingUsage, EncodingFormat, models,
 };
 use crate::error::ClientError;
+use crate::telemetry::GenAiOp;
 use crate::transport::{add_proxy_headers, inject_trace_context, send_json};
 
 /// Default `OpenAI` API endpoint, used when the config sets no base URL.
@@ -338,15 +340,13 @@ impl OpenAIEmbedding {
             models::TEXT_EMBEDDING_3_SMALL | models::TEXT_EMBEDDING_3_LARGE
         )
     }
-}
 
-#[async_trait]
-impl EmbeddingClient for OpenAIEmbedding {
-    fn config(&self) -> &EmbeddingConfig {
-        &self.config
-    }
-
-    async fn embed_request(
+    /// Issue the request and map the provider's response.
+    ///
+    /// Split out of [`EmbeddingClient::embed_request`] so the whole exchange
+    /// runs inside the GenAI span, which is what `inject_trace_context` reads
+    /// when it stamps `traceparent`.
+    async fn send_embedding(
         &self,
         request: &EmbeddingRequest,
     ) -> Result<EmbeddingResponse, ClientError> {
@@ -371,6 +371,37 @@ impl EmbeddingClient for OpenAIEmbedding {
                 total_tokens: openai_response.usage.total_tokens,
             }),
         })
+    }
+}
+
+#[async_trait]
+impl EmbeddingClient for OpenAIEmbedding {
+    fn config(&self) -> &EmbeddingConfig {
+        &self.config
+    }
+
+    /// Instrumented here rather than on the trait's default methods: `embed`
+    /// and `embed_batch` both call this, so a span on either would double-count
+    /// the one HTTP request.
+    async fn embed_request(
+        &self,
+        request: &EmbeddingRequest,
+    ) -> Result<EmbeddingResponse, ClientError> {
+        let op = GenAiOp::embeddings(&self.config);
+        match self
+            .send_embedding(request)
+            .instrument(op.span().clone())
+            .await
+        {
+            Ok(response) => {
+                op.finish_embeddings(&response);
+                Ok(response)
+            }
+            Err(error) => {
+                op.finish_error(&error);
+                Err(error)
+            }
+        }
     }
 
     fn default_dimensions(&self) -> Option<u32> {

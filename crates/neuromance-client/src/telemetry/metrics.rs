@@ -52,17 +52,49 @@ impl GenAiInstruments {
         response_model: Option<&str>,
         usage: &Usage,
     ) {
-        let base = attrs.metric_kv(response_model, None);
+        self.record_tokens(
+            attrs,
+            response_model,
+            genai::token_type::INPUT,
+            usage.prompt_tokens,
+        );
+        self.record_tokens(
+            attrs,
+            response_model,
+            genai::token_type::OUTPUT,
+            usage.completion_tokens,
+        );
+    }
 
-        let mut input = base.clone();
-        input.push(KeyValue::new(genai::TOKEN_TYPE, genai::token_type::INPUT));
-        self.token_usage
-            .record(u64::from(usage.prompt_tokens), &input);
+    /// Record prompt tokens alone.
+    ///
+    /// An embeddings call generates no completion, so recording a zero-valued
+    /// output series for it would put a spurious sample in every histogram
+    /// bucket query that spans both operations.
+    pub fn record_input_tokens(
+        &self,
+        attrs: &GenAiAttrs,
+        response_model: Option<&str>,
+        prompt_tokens: u32,
+    ) {
+        self.record_tokens(
+            attrs,
+            response_model,
+            genai::token_type::INPUT,
+            prompt_tokens,
+        );
+    }
 
-        let mut output = base;
-        output.push(KeyValue::new(genai::TOKEN_TYPE, genai::token_type::OUTPUT));
-        self.token_usage
-            .record(u64::from(usage.completion_tokens), &output);
+    fn record_tokens(
+        &self,
+        attrs: &GenAiAttrs,
+        response_model: Option<&str>,
+        token_type: &'static str,
+        tokens: u32,
+    ) {
+        let mut kv = attrs.metric_kv(response_model, None);
+        kv.push(KeyValue::new(genai::TOKEN_TYPE, token_type));
+        self.token_usage.record(u64::from(tokens), &kv);
     }
 
     /// Record how long the operation took, whether or not it succeeded.
