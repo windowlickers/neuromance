@@ -193,9 +193,17 @@ impl<C: LLMClient + Send + Sync> Agent<C> {
         // accepts the `{ expr }` field names the semantic-convention constants
         // need. `otel.name` carries the `{operation} {agent}` name the
         // conventions require, because a `tracing` span name must be a literal.
+        //
+        // `otel.status_code` is set explicitly rather than inferred:
+        // `tracing-opentelemetry` derives an error status only from an
+        // ERROR-level event, and a failed run returns its error to the caller
+        // instead of logging one. Without the explicit record every failed run
+        // would export as a successful span.
         let span = info_span!(
             "invoke_agent",
             otel.name = %format!("{} {}", genai::op::INVOKE_AGENT, self.id),
+            otel.status_code = field::Empty,
+            otel.status_description = field::Empty,
             agent_id = %self.id,
             conversation_id = %self.conversation_id,
             parent_conversation_id = field::Empty,
@@ -203,8 +211,18 @@ impl<C: LLMClient + Send + Sync> Agent<C> {
             { genai::OPERATION_NAME } = genai::op::INVOKE_AGENT,
             { genai::AGENT_ID } = %self.id,
             { genai::CONVERSATION_ID } = %self.conversation_id,
+            { genai::ERROR_TYPE } = field::Empty,
         );
-        self.run(messages, cancel).instrument(span).await
+        let result = self.run(messages, cancel).instrument(span.clone()).await;
+        match &result {
+            Ok(_) => span.record("otel.status_code", "OK"),
+            Err(error) => {
+                span.record(genai::ERROR_TYPE, error.reason());
+                span.record("otel.status_code", "ERROR");
+                span.record("otel.status_description", field::display(error))
+            }
+        };
+        result
     }
 
     /// The run itself, so [`Self::execute_with_history`] owns the span.

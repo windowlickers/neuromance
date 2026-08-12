@@ -1029,3 +1029,80 @@ fn test_execute_span_carries_the_genai_agent_attributes() {
         Some(conversation_id.to_string().as_str()),
     );
 }
+
+/// A failed run must be findable as a failure. `tracing-opentelemetry` derives an
+/// error status only from an ERROR-level event, and a failed run returns its error
+/// to the caller instead of logging one — so without the explicit record every
+/// failure would export as a successful span.
+#[test]
+fn test_execute_span_marks_a_failed_run_as_an_error() {
+    use neuromance_common::telemetry::genai;
+
+    let capture = SpanCapture::default();
+    let subscriber = tracing_subscriber::registry().with(capture.clone());
+
+    let mut agent = Agent::new("researcher".into(), Core::new(MockLLMClient::new()));
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    tracing::subscriber::with_default(subscriber, || {
+        // One message trips the leading system/user check, so the run fails
+        // before it reaches the client.
+        let result = runtime.block_on(agent.execute(
+            Some(vec![Message::user(Uuid::new_v4(), "Hello")]),
+            CancellationToken::new(),
+        ));
+        assert!(result.is_err(), "the run should fail");
+    });
+
+    let fields = capture
+        .fields_for("invoke_agent")
+        .expect("the run should produce an invoke_agent span");
+
+    assert_eq!(
+        fields.get("otel.status_code").map(String::as_str),
+        Some("ERROR"),
+    );
+    assert_eq!(
+        fields.get(genai::ERROR_TYPE).map(String::as_str),
+        Some("invalid_input"),
+    );
+    assert!(
+        fields.contains_key("otel.status_description"),
+        "the failure needs a description, got {fields:?}",
+    );
+}
+
+/// The success arm must set a status too: a span with no `otel.status_code` is
+/// `Unset`, which a backend renders the same as an unfinished call.
+#[test]
+fn test_execute_span_marks_a_successful_run_as_ok() {
+    let capture = SpanCapture::default();
+    let subscriber = tracing_subscriber::registry().with(capture.clone());
+
+    let mut agent = Agent::new("researcher".into(), Core::new(MockLLMClient::new()));
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    tracing::subscriber::with_default(subscriber, || {
+        runtime
+            .block_on(agent.execute(
+                Some(make_messages(Uuid::new_v4())),
+                CancellationToken::new(),
+            ))
+            .unwrap();
+    });
+
+    let fields = capture
+        .fields_for("invoke_agent")
+        .expect("the run should produce an invoke_agent span");
+
+    assert_eq!(
+        fields.get("otel.status_code").map(String::as_str),
+        Some("OK"),
+    );
+}
