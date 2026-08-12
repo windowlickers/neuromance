@@ -939,6 +939,11 @@ impl<C: LLMClient> Core<C> {
                             let tool_elapsed = tool_start.elapsed();
                             let tool_duration_ms =
                                 u64::try_from(tool_elapsed.as_millis()).unwrap_or(u64::MAX);
+                            // Widened once for both arms below: `tracing-opentelemetry`
+                            // implements no `record_u64`, so an unsigned value would
+                            // export as a string.
+                            let tool_duration_attr =
+                                i64::try_from(tool_duration_ms).unwrap_or(i64::MAX);
                             histogram!(
                                 "neuromance_tool_duration_seconds",
                                 "tool" => tool_name.clone(),
@@ -951,7 +956,7 @@ impl<C: LLMClient> Core<C> {
                                     if capture_message_content() {
                                         tool_span.record(genai::TOOL_CALL_RESULT, result.as_str());
                                     }
-                                    tool_span.record("duration_ms", i64::try_from(tool_duration_ms).unwrap_or(i64::MAX));
+                                    tool_span.record("duration_ms", tool_duration_attr);
                                     tool_span.record("otel.status_code", "OK");
                                     info!(
                                         tool = %tool_name,
@@ -982,7 +987,7 @@ impl<C: LLMClient> Core<C> {
                                 }
                                 Err(e) => {
                                     tool_span.record("outcome", "failure");
-                                    tool_span.record("duration_ms", i64::try_from(tool_duration_ms).unwrap_or(i64::MAX));
+                                    tool_span.record("duration_ms", tool_duration_attr);
                                     tool_span.record("error", field::display(&e));
                                     tool_span.record(genai::ERROR_TYPE, e.reason());
                                     tool_span.record("otel.status_code", "ERROR");
