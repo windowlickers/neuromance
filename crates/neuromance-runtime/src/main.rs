@@ -63,7 +63,7 @@ async fn main() -> Result<()> {
     init_tracing(otel_layer);
 
     if telemetry_guard.is_some() {
-        info!("OTLP telemetry export enabled");
+        info!("OTLP telemetry export enabled for traces, logs, and gen_ai metrics");
     }
 
     let cancel = CancellationToken::new();

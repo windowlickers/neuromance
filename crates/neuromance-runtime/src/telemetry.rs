@@ -1,13 +1,29 @@
-//! Optional OTLP telemetry export for traces and logs.
+//! Optional OTLP telemetry export for traces, logs, and GenAI metrics.
 //!
 //! Activated when `OTEL_EXPORTER_OTLP_ENDPOINT` is set in the environment.
 //! When absent, [`try_init`] returns `Ok(None)` and the runtime emits only
 //! Prometheus metrics and stderr logs, as before.
 //!
-//! Metrics are intentionally **not** dual-exported in-process. The
-//! recommended pattern is to point an OpenTelemetry Collector's
-//! `prometheus` receiver at this runtime's `/metrics` endpoint
-//! (default `:8081`) and have the collector forward them via OTLP.
+//! # Two metric pipelines
+//!
+//! Two pipelines run side by side, deliberately:
+//!
+//! - `neuromance_*` operational metrics use the `metrics` crate and a
+//!   Prometheus recorder, scraped from `GET /metrics` on `runtime.health_addr`
+//!   (default `:8081`). Point an OpenTelemetry Collector's `prometheus`
+//!   receiver at it.
+//! - `gen_ai.*` GenAI semantic-convention metrics
+//!   (`gen_ai.client.token.usage`, `gen_ai.client.operation.duration`) are
+//!   exported natively over OTLP by the meter provider installed here. A
+//!   Prometheus round-trip would mangle them: dots become underscores and the
+//!   spec's advised bucket boundaries are lost, and GenAI dashboards key off
+//!   the exact names.
+//!
+//! Nothing is emitted to both. A measurement recorded through the `metrics`
+//! crate must not also be recorded through the meter, or a deployment that
+//! both scrapes `/metrics` and receives OTLP double-counts it.
+//!
+//! # Environment
 //!
 //! Standard OTEL environment variables are honored:
 //!
@@ -17,14 +33,20 @@
 //! - `OTEL_SERVICE_NAME` — falls back to the runtime's `agent.id`
 //! - `OTEL_RESOURCE_ATTRIBUTES` — merged on top of defaults
 //! - Per-signal endpoint overrides (`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`,
-//!   `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`) — supported transparently
+//!   `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`,
+//!   `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`) — supported transparently
+//! - `OTEL_METRIC_EXPORT_INTERVAL` / `OTEL_METRIC_EXPORT_TIMEOUT` — pace the
+//!   periodic metric reader
+//!
+//! Span creation is still gated by `RUST_LOG`. A `RUST_LOG=warn` deployment
+//! with OTLP configured exports no `gen_ai` spans at all.
 
 use opentelemetry::{KeyValue, global, trace::TracerProvider as _};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
-use opentelemetry_otlp::{LogExporter, Protocol, SpanExporter, WithExportConfig};
+use opentelemetry_otlp::{LogExporter, MetricExporter, Protocol, SpanExporter, WithExportConfig};
 use opentelemetry_sdk::{
-    Resource, logs::SdkLoggerProvider, propagation::TraceContextPropagator,
-    trace::SdkTracerProvider,
+    Resource, logs::SdkLoggerProvider, metrics::SdkMeterProvider,
+    propagation::TraceContextPropagator, trace::SdkTracerProvider,
 };
 use opentelemetry_semantic_conventions::resource::{SERVICE_NAME, SERVICE_VERSION};
 use tracing::Subscriber;
@@ -36,20 +58,22 @@ const ENDPOINT_ENV: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
 const PROTOCOL_ENV: &str = "OTEL_EXPORTER_OTLP_PROTOCOL";
 const SERVICE_NAME_ENV: &str = "OTEL_SERVICE_NAME";
 
-/// Owns the OTLP trace and log providers for the process lifetime.
+/// Owns the OTLP trace, log, and metric providers for the process lifetime.
 ///
 /// [`shutdown`](Self::shutdown) flushes buffered exports and tears
 /// down the providers; the `Drop` impl invokes it if the caller forgets.
 pub struct TelemetryGuard {
-    tracer_provider: Option<SdkTracerProvider>,
-    logger_provider: Option<SdkLoggerProvider>,
+    tracer: Option<SdkTracerProvider>,
+    logger: Option<SdkLoggerProvider>,
+    meter: Option<SdkMeterProvider>,
 }
 
 impl std::fmt::Debug for TelemetryGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TelemetryGuard")
-            .field("tracer_provider", &self.tracer_provider.is_some())
-            .field("logger_provider", &self.logger_provider.is_some())
+            .field("tracer", &self.tracer.is_some())
+            .field("logger", &self.logger.is_some())
+            .field("meter", &self.meter.is_some())
             .finish()
     }
 }
@@ -61,15 +85,20 @@ impl TelemetryGuard {
     }
 
     fn shutdown_in_place(&mut self) {
-        if let Some(provider) = self.tracer_provider.take()
+        if let Some(provider) = self.tracer.take()
             && let Err(e) = provider.shutdown()
         {
             tracing::warn!(error = %e, "otel tracer provider shutdown failed");
         }
-        if let Some(provider) = self.logger_provider.take()
+        if let Some(provider) = self.logger.take()
             && let Err(e) = provider.shutdown()
         {
             tracing::warn!(error = %e, "otel logger provider shutdown failed");
+        }
+        if let Some(provider) = self.meter.take()
+            && let Err(e) = provider.shutdown()
+        {
+            tracing::warn!(error = %e, "otel meter provider shutdown failed");
         }
     }
 }
@@ -122,7 +151,13 @@ where
     global::set_text_map_propagator(TraceContextPropagator::new());
 
     let tracer_provider = build_tracer_provider(protocol, resource.clone())?;
-    let logger_provider = build_logger_provider(protocol, resource)?;
+    let logger_provider = build_logger_provider(protocol, resource.clone())?;
+    let meter_provider = build_meter_provider(protocol, resource)?;
+
+    // Metric instruments resolve through the global provider, and one fetched
+    // before this call caches a no-op meter for the process lifetime. Install
+    // it here, before anything can record.
+    global::set_meter_provider(meter_provider.clone());
 
     let tracer = tracer_provider.tracer("neuromance-runtime");
     let trace_layer = tracing_opentelemetry::layer().with_tracer(tracer);
@@ -139,8 +174,9 @@ where
 
     Ok(Some((
         TelemetryGuard {
-            tracer_provider: Some(tracer_provider),
-            logger_provider: Some(logger_provider),
+            tracer: Some(tracer_provider),
+            logger: Some(logger_provider),
+            meter: Some(meter_provider),
         },
         combined,
     )))
@@ -209,6 +245,28 @@ fn build_logger_provider(
         .build())
 }
 
+fn build_meter_provider(
+    protocol: Protocol,
+    resource: Resource,
+) -> Result<SdkMeterProvider, RuntimeError> {
+    let exporter = match protocol {
+        Protocol::Grpc => MetricExporter::builder()
+            .with_tonic()
+            .with_protocol(protocol)
+            .build(),
+        Protocol::HttpBinary | Protocol::HttpJson => MetricExporter::builder()
+            .with_http()
+            .with_protocol(protocol)
+            .build(),
+    }
+    .map_err(|e| RuntimeError::Telemetry(format!("build OTLP metric exporter: {e}")))?;
+
+    Ok(SdkMeterProvider::builder()
+        .with_periodic_exporter(exporter)
+        .with_resource(resource)
+        .build())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -255,6 +313,19 @@ mod tests {
         // caller must get a clear error rather than a silent fallback.
         let err = resolve_protocol(Some("http/json")).unwrap_err();
         assert!(matches!(err, RuntimeError::Telemetry(_)));
+    }
+
+    /// Every signal must accept the same protocol set. A meter exporter that
+    /// rejected `http/protobuf` would silently drop metrics in a deployment
+    /// whose traces and logs still flow.
+    #[tokio::test]
+    async fn test_every_signal_builds_for_every_supported_protocol() {
+        for protocol in [Protocol::Grpc, Protocol::HttpBinary] {
+            let resource = build_resource("protocol-check");
+            assert!(build_tracer_provider(protocol, resource.clone()).is_ok());
+            assert!(build_logger_provider(protocol, resource.clone()).is_ok());
+            assert!(build_meter_provider(protocol, resource).is_ok());
+        }
     }
 
     #[test]

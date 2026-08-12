@@ -9,6 +9,11 @@
 //!
 //! See [`crate::serve`] and `crates/neuromance/src/core.rs` for the
 //! instrumentation sites that emit values into the recorder.
+//!
+//! This recorder carries the `neuromance_*` operational metrics only. The
+//! `gen_ai.*` semantic-convention metrics go out natively over OTLP; see
+//! [`crate::telemetry`] for why, and for the rule that no measurement is
+//! emitted to both.
 
 use axum::{Router, response::IntoResponse, routing::get};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};

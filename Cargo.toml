@@ -71,6 +71,7 @@ opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.31", default-features = false, features = [
     "trace",
     "logs",
+    "metrics",
     "grpc-tonic",
     "http-proto",
     "reqwest-blocking-client",
