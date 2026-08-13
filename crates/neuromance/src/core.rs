@@ -67,6 +67,9 @@ pub struct Core<C: LLMClient> {
     /// When set, a terminal turn that is not a schema-valid JSON object fails the run — see
     /// [`Core::check_structured_output`]. `None` leaves responses unconstrained.
     pub output_schema: Option<OutputSchema>,
+    /// Stats of the most recent [`Core::chat_with_tool_loop`], readable through
+    /// [`Core::last_run_stats`] after the run fails.
+    last_run_stats: RunStats,
 }
 
 impl<C: LLMClient> Core<C> {
@@ -83,7 +86,19 @@ impl<C: LLMClient> Core<C> {
             thinking: ThinkingMode::Default,
             empty_turn_retries: 1,
             output_schema: None,
+            last_run_stats: RunStats::default(),
         }
+    }
+
+    /// Stats aggregated over the most recent [`Core::chat_with_tool_loop`].
+    ///
+    /// [`Core::chat_with_tool_loop`] returns these on success. This accessor is
+    /// how a caller reads them after a *failed* run: the tokens a run spent
+    /// before it failed are billed either way, and [`CoreError`] carries none
+    /// of them. Defaults until the first run completes or fails.
+    #[must_use]
+    pub const fn last_run_stats(&self) -> &RunStats {
+        &self.last_run_stats
     }
 
     /// Verify a terminal turn satisfies [`Core::output_schema`].
@@ -1113,26 +1128,39 @@ impl<C: LLMClient> Core<C> {
         cancel: CancellationToken,
     ) -> Result<(Vec<Message>, RunStats), CoreError> {
         let mut stats = RunStats::default();
-        let mut stream = Box::pin(self.run(messages, cancel));
-        while let Some(event) = stream.next().await {
-            let event = event?;
-            stats.observe(&event);
-            match event {
-                CoreEvent::Completed(msgs) => return Ok((msgs, stats)),
-                CoreEvent::ApprovalRequest { responder, .. } => {
-                    let _ = responder.send(ToolApproval::Denied(
-                        "No approval mechanism configured".into(),
+        // The stream borrows `&mut self`, so it is scoped: `last_run_stats` is
+        // written after it drops. A failed run has already spent tokens, and
+        // the error carries none of them — parking the stats on `Core` is what
+        // lets a caller report the cost of a run that never completed.
+        let outcome = {
+            let mut stream = Box::pin(self.run(messages, cancel));
+            loop {
+                let Some(event) = stream.next().await else {
+                    break Err(CoreError::NoResponse(
+                        "Stream ended without Completed event".to_string(),
                     ));
+                };
+                let event = match event {
+                    Ok(event) => event,
+                    Err(error) => break Err(error),
+                };
+                stats.observe(&event);
+                match event {
+                    CoreEvent::Completed(msgs) => break Ok(msgs),
+                    CoreEvent::ApprovalRequest { responder, .. } => {
+                        let _ = responder.send(ToolApproval::Denied(
+                            "No approval mechanism configured".into(),
+                        ));
+                    }
+                    CoreEvent::Delta(_)
+                    | CoreEvent::ToolResult { .. }
+                    | CoreEvent::Usage(_)
+                    | CoreEvent::Compaction { .. } => {}
                 }
-                CoreEvent::Delta(_)
-                | CoreEvent::ToolResult { .. }
-                | CoreEvent::Usage(_)
-                | CoreEvent::Compaction { .. } => {}
             }
-        }
-        Err(CoreError::NoResponse(
-            "Stream ended without Completed event".to_string(),
-        ))
+        };
+        self.last_run_stats = stats.clone();
+        outcome.map(|messages| (messages, stats))
     }
 }
 

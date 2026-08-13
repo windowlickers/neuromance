@@ -17,7 +17,9 @@ use neuromance::Core;
 use neuromance_client::{ClientError, LLMClient};
 use neuromance_common::agents::{AgentMessage, AgentState, ContextUpdate};
 use neuromance_common::chat::{Message, MessageRole};
-use neuromance_common::client::{ChatChunk, ChatRequest, ChatResponse, Config, ToolChoice, Usage};
+use neuromance_common::client::{
+    ChatChunk, ChatRequest, ChatResponse, Config, InputTokensDetails, ToolChoice, Usage,
+};
 use neuromance_common::delegation::{self, DelegationContext};
 use neuromance_common::tools::{Function, FunctionCall, Tool, ToolCall};
 use neuromance_tools::{ToolError, ToolImplementation};
@@ -875,6 +877,19 @@ impl tracing::field::Visit for FieldVisitor<'_> {
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
         self.0.insert(field.name().to_string(), value.to_string());
     }
+
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        self.0.insert(field.name().to_string(), value.to_string());
+    }
+
+    /// Tagged, because `tracing-opentelemetry` implements no `record_u64`: an
+    /// unsigned field exports as a string and breaks numeric queries in the
+    /// backend. A test asserting on the bare number fails if a value ever
+    /// takes this path instead of `record_i64`.
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.0
+            .insert(field.name().to_string(), format!("u64:{value}"));
+    }
 }
 
 impl<S> tracing_subscriber::Layer<S> for SpanCapture
@@ -1027,6 +1042,121 @@ fn test_execute_span_carries_the_genai_agent_attributes() {
     assert_eq!(
         fields.get(genai::CONVERSATION_ID).map(String::as_str),
         Some(conversation_id.to_string().as_str()),
+    );
+}
+
+/// "What did this run cost?" has to be answerable from the run's own span. The
+/// per-call `chat` spans carry usage already; without the roll-up here a backend
+/// can only price a run by joining every child span it can find.
+#[test]
+fn test_execute_span_carries_the_run_token_usage() {
+    use neuromance_common::telemetry::genai;
+
+    let capture = SpanCapture::default();
+    let subscriber = tracing_subscriber::registry().with(capture.clone());
+
+    let mut client = MockLLMClient::new();
+    client.usage.input_tokens_details = Some(InputTokensDetails {
+        cached_tokens: 40,
+        cache_creation_tokens: 10,
+    });
+    let mut agent = Agent::new("researcher".into(), Core::new(client));
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    tracing::subscriber::with_default(subscriber, || {
+        runtime
+            .block_on(agent.execute(
+                Some(make_messages(Uuid::new_v4())),
+                CancellationToken::new(),
+            ))
+            .unwrap();
+    });
+
+    let fields = capture
+        .fields_for("invoke_agent")
+        .expect("the run should produce an invoke_agent span");
+
+    // Bare numbers, not `u64:…`: an unsigned field would export as a string.
+    assert_eq!(
+        fields.get(genai::USAGE_INPUT_TOKENS).map(String::as_str),
+        Some("50"),
+    );
+    assert_eq!(
+        fields.get(genai::USAGE_OUTPUT_TOKENS).map(String::as_str),
+        Some("30"),
+    );
+    assert_eq!(
+        fields.get("cached_input_tokens").map(String::as_str),
+        Some("40")
+    );
+    assert_eq!(
+        fields
+            .get("cache_creation_input_tokens")
+            .map(String::as_str),
+        Some("10"),
+    );
+    assert_eq!(fields.get("llm_requests").map(String::as_str), Some("1"));
+    // Tokens price differently per model, so the count alone buys nothing.
+    assert_eq!(
+        fields.get(genai::REQUEST_MODEL).map(String::as_str),
+        Some("mock-model"),
+    );
+}
+
+/// A run that fails after it has called the provider is still billed for those
+/// tokens. The error carries none of them, so the stats come off `Core`.
+#[test]
+fn test_execute_span_carries_token_usage_for_a_failed_run() {
+    use neuromance_common::client::OutputSchema;
+    use neuromance_common::telemetry::genai;
+
+    let capture = SpanCapture::default();
+    let subscriber = tracing_subscriber::registry().with(capture.clone());
+
+    let mut core = Core::new(MockLLMClient::new());
+    // The mock answers with prose, so the schema check fails the run — after
+    // the call that spent the tokens.
+    core.output_schema = Some(
+        OutputSchema::new(
+            "verdict",
+            serde_json::json!({
+                "type": "object",
+                "properties": {"ok": {"type": "boolean"}},
+                "required": ["ok"],
+                "additionalProperties": false,
+            }),
+        )
+        .unwrap(),
+    );
+    let mut agent = Agent::new("researcher".into(), core);
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    tracing::subscriber::with_default(subscriber, || {
+        let result = runtime.block_on(agent.execute(
+            Some(make_messages(Uuid::new_v4())),
+            CancellationToken::new(),
+        ));
+        assert!(result.is_err(), "the schema violation should fail the run");
+    });
+
+    let fields = capture
+        .fields_for("invoke_agent")
+        .expect("the run should produce an invoke_agent span");
+
+    assert_eq!(
+        fields.get(genai::USAGE_INPUT_TOKENS).map(String::as_str),
+        Some("50"),
+        "a failed run must still report what it spent, got {fields:?}",
+    );
+    assert_eq!(
+        fields.get(genai::USAGE_OUTPUT_TOKENS).map(String::as_str),
+        Some("30"),
     );
 }
 

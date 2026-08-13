@@ -136,18 +136,19 @@ impl<C: LLMClient + Send + Sync> Agent<C> {
             .map(|(response, _)| response)
     }
 
-    /// Like [`execute`](Self::execute), but also returns the full message
-    /// history produced by [`Core::chat_with_tool_loop`] — including every
-    /// intermediate assistant turn from multi-step tool loops.
+    /// Fold a finished run's stats into the agent's cumulative state, attach the
+    /// run's token spend to the `invoke_agent` span, and emit the per-run
+    /// summary log (tokens, prompt-cache usage, tool outcomes).
     ///
-    /// Callers that want to drive a long-running conversation pass the returned
-    /// vec back as `Some(messages)` on the next call.
+    /// The span attributes are the whole run's, not one provider call's, so a
+    /// backend can answer "what did this run cost" from a single span instead
+    /// of summing its `chat` children. A subagent's tokens are not included:
+    /// its own `invoke_agent` span carries them, which is what keeps a sum over
+    /// a delegation tree from counting them twice.
     ///
-    /// # Errors
-    /// Same conditions as [`execute`](Self::execute).
-    /// Fold a completed run's stats into the agent's cumulative state and emit
-    /// the per-run summary log (tokens, prompt-cache usage, tool outcomes).
-    fn record_run_stats(&mut self, run_stats: &RunStats, exec_start: Instant) {
+    /// `outcome` is `"ok"` or `"error"` — a failed run is still billed, and its
+    /// tokens are recorded the same way.
+    fn record_run_stats(&mut self, run_stats: &RunStats, exec_start: Instant, outcome: &str) {
         let metrics = &run_stats.cache_metrics;
         #[allow(clippy::cast_possible_truncation)]
         {
@@ -157,8 +158,30 @@ impl<C: LLMClient + Send + Sync> Agent<C> {
             self.state.stats.failed_tool_calls += run_stats.failed_tool_calls as usize;
         }
 
+        // Widened to `i64` because `tracing-opentelemetry` has no `record_u64`:
+        // an unsigned field exports as a string and breaks every numeric query.
+        let span = tracing::Span::current();
+        span.record(
+            genai::USAGE_INPUT_TOKENS,
+            i64::try_from(metrics.total_input_tokens).unwrap_or(i64::MAX),
+        );
+        span.record(
+            genai::USAGE_OUTPUT_TOKENS,
+            i64::try_from(metrics.total_output_tokens).unwrap_or(i64::MAX),
+        );
+        span.record(
+            "cached_input_tokens",
+            i64::try_from(metrics.total_cached_tokens).unwrap_or(i64::MAX),
+        );
+        span.record(
+            "cache_creation_input_tokens",
+            i64::try_from(metrics.total_cache_creation_tokens).unwrap_or(i64::MAX),
+        );
+        span.record("llm_requests", i64::from(metrics.total_requests));
+
         let duration_ms = u64::try_from(exec_start.elapsed().as_millis()).unwrap_or(u64::MAX);
         info!(
+            outcome,
             duration_ms,
             turns = metrics.total_requests,
             input_tokens = metrics.total_input_tokens,
@@ -176,7 +199,11 @@ impl<C: LLMClient + Send + Sync> Agent<C> {
 
     /// Run the agent over the given history (or the agent's own messages when
     /// `None`), driving the tool-execution loop to completion and returning the
-    /// final response alongside the full message transcript.
+    /// final response alongside the full message transcript — including every
+    /// intermediate assistant turn from multi-step tool loops.
+    ///
+    /// Callers driving a long-running conversation pass the returned vec back
+    /// as `Some(messages)` on the next call.
     ///
     /// # Errors
     ///
@@ -212,6 +239,14 @@ impl<C: LLMClient + Send + Sync> Agent<C> {
             { genai::AGENT_ID } = %self.id,
             { genai::CONVERSATION_ID } = %self.conversation_id,
             { genai::ERROR_TYPE } = field::Empty,
+            // The run's token spend, so a backend can price a whole agent run
+            // without summing its `chat` children. See `record_run_stats`.
+            { genai::REQUEST_MODEL } = %self.core.client.config().model,
+            { genai::USAGE_INPUT_TOKENS } = field::Empty,
+            { genai::USAGE_OUTPUT_TOKENS } = field::Empty,
+            cached_input_tokens = field::Empty,
+            cache_creation_input_tokens = field::Empty,
+            llm_requests = field::Empty,
         );
         let result = self.run(messages, cancel).instrument(span.clone()).await;
         match &result {
@@ -290,11 +325,17 @@ impl<C: LLMClient + Send + Sync> Agent<C> {
             parent_tool_call_id: None,
             workspace_dir: enclosing.workspace_dir,
         };
-        let (messages, run_stats) =
-            delegation::scope(child_ctx, self.core.chat_with_tool_loop(messages, cancel)).await?;
+        let outcome =
+            delegation::scope(child_ctx, self.core.chat_with_tool_loop(messages, cancel)).await;
 
+        // Read the stats off `Core` rather than the `Ok` tuple: a failed run
+        // spent tokens too, and only `Core` still holds that count.
+        let run_stats = self.core.last_run_stats().clone();
+        let label = if outcome.is_ok() { "ok" } else { "error" };
+        self.record_run_stats(&run_stats, exec_start, label);
+
+        let (messages, _) = outcome?;
         self.state.stats.total_messages += messages.len();
-        self.record_run_stats(&run_stats, exec_start);
 
         let content = messages
             .iter()

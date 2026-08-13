@@ -496,7 +496,17 @@ keeps the turn grouping that makes a long agent run readable.
 | `chat {model}` | `gen_ai.operation.name`, `gen_ai.provider.name`, `gen_ai.request.{model,temperature,top_p,max_tokens,frequency_penalty,presence_penalty,stop_sequences,choice.count}`, `gen_ai.output.type`, `gen_ai.response.{model,id,finish_reasons}`, `gen_ai.usage.{input_tokens,output_tokens}`, `server.address`, `server.port`, `error.type` |
 | `embeddings {model}` | As above, minus the response and completion attributes. Prompt tokens only: an embeddings call generates nothing |
 | `execute_tool {tool}` | `gen_ai.operation.name`, `gen_ai.tool.{name,type}`, `gen_ai.tool.call.id`, `error.type` |
-| `invoke_agent {agent}` | `gen_ai.operation.name`, `gen_ai.agent.id`, `gen_ai.conversation.id` |
+| `invoke_agent {agent}` | `gen_ai.operation.name`, `gen_ai.agent.id`, `gen_ai.conversation.id`, `gen_ai.request.model`, `gen_ai.usage.{input_tokens,output_tokens}`, `cached_input_tokens`, `cache_creation_input_tokens`, `llm_requests`, `error.type` |
+
+The usage attributes on `invoke_agent` are the **whole run's**, so one span
+prices a run without a join across its `chat` children. Cached and
+cache-creation tokens are broken out because they bill at different rates, and
+`gen_ai.request.model` is the agent's configured model — a compactor
+configured with a different model bills against its own `chat` spans.
+The counts exclude subagents: each delegated run carries its own
+`invoke_agent` span, which is what keeps a sum over a delegation tree from
+counting the same tokens twice. A run that fails after calling the provider
+still reports what it spent.
 
 `server.address` names the **upstream provider**, not the tokenizer proxy: the
 proxy is transport plumbing, and reporting it would make every provider look
