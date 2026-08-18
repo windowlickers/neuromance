@@ -43,6 +43,13 @@ pub use error::ClientError;
 pub use responses::ResponsesClient;
 pub use streaming::ChatChunkStream;
 
+/// `User-Agent` sent on every outbound provider request.
+///
+/// Providers log this, so identifying ourselves makes our traffic separable
+/// from every other `reqwest` caller when debugging rate limits or errors.
+/// The version comes from the shared workspace version.
+pub const USER_AGENT: &str = concat!("neuromance/", env!("CARGO_PKG_VERSION"));
+
 /// Shared resources produced by client constructor logic.
 ///
 /// All provider clients need the same set of HTTP plumbing: a retry-aware
@@ -116,7 +123,7 @@ pub(crate) fn build_http_clients(
         .retry_bounds(retry_config.initial_delay, retry_config.max_delay)
         .build_with_max_retries(retry_config.max_retries);
 
-    let mut client_builder = reqwest::Client::builder();
+    let mut client_builder = reqwest::Client::builder().user_agent(USER_AGENT);
     if let Some(timeout) = timeout_seconds {
         client_builder = client_builder.timeout(Duration::from_secs(timeout));
     }
@@ -442,7 +449,7 @@ mod tests {
 
     use super::*;
     use neuromance_common::chat::Message;
-    use neuromance_common::client::{ChatResponse, ToolChoice};
+    use neuromance_common::client::{ChatResponse, RetryConfig, ToolChoice};
     use neuromance_common::features::{ReasoningLevel, ThinkingMode};
     use neuromance_common::tools::Tool;
     use std::collections::HashMap;
@@ -948,6 +955,43 @@ mod tests {
         assert_eq!(
             resources.proxy_config.map(|p| p.proxy_url),
             Some("http://tokenizer.internal:8080".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn both_http_clients_send_the_user_agent() {
+        use wiremock::matchers::{header, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(header("user-agent", USER_AGENT))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        // The middleware client carries chat traffic and the raw client carries
+        // streaming, so a User-Agent set on only one of them is a silent gap.
+        let (client, streaming_client) =
+            build_http_clients(&RetryConfig::default(), None, None).unwrap();
+        assert!(
+            client
+                .get(server.uri())
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .is_success()
+        );
+        assert!(
+            streaming_client
+                .get(server.uri())
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .is_success()
         );
     }
 
