@@ -485,6 +485,9 @@ impl<C: LLMClient> Core<C> {
         try_stream! {
             let mut turn_count: u32 = 0;
             let mut empty_turn_retries_used: u32 = 0;
+            // Set once the tool loop is done and the answer is asked for under
+            // `output_schema`. Tools and the schema never travel together.
+            let mut structured_pass = false;
             // `prompt_tokens` from each turn is the whole context sent that turn,
             // so the turn-over-turn delta shows how fast the conversation grows.
             let mut prev_prompt_tokens: u32 = 0;
@@ -521,13 +524,25 @@ impl<C: LLMClient> Core<C> {
 
                 let turn_ctx = HookContext::new(conversation_id, turn_count);
 
-                let mut request = ChatRequest::from((self.client.config(), ledger.snapshot()))
-                    .with_tools(self.tool_executor.get_all_tools())
-                    .with_tool_choice(self.tool_choice.clone());
-                request = request.with_thinking_mode(self.thinking);
-                if let Some(schema) = self.output_schema.clone() {
-                    request = request.with_output_schema(schema);
+                // The provider enforces `output_schema` on whatever turn carries it, so a
+                // turn offering tools must not carry it: the model would answer in the
+                // schema where it should have called a tool. The tool loop therefore runs
+                // unconstrained, and the schema goes on a final tool-free turn. With no
+                // tools registered there is nothing to loop over, so the first turn is
+                // already that final turn.
+                let tools = self.tool_executor.get_all_tools();
+                let schema_turn = self.output_schema.is_some() && (structured_pass || tools.is_empty());
+                let mut request = ChatRequest::from((self.client.config(), ledger.snapshot()));
+                if schema_turn {
+                    if let Some(schema) = self.output_schema.clone() {
+                        request = request.with_output_schema(schema);
+                    }
+                } else {
+                    request = request
+                        .with_tools(tools)
+                        .with_tool_choice(self.tool_choice.clone());
                 }
+                request = request.with_thinking_mode(self.thinking);
 
                 let turn_number = turn_count + 1;
                 let max_turns_label = self
@@ -777,7 +792,7 @@ impl<C: LLMClient> Core<C> {
                 // Schema failures are checked before the empty-turn retry below: a
                 // refusal or a truncated response can arrive with empty content, and
                 // resubmitting it would only refuse or truncate again.
-                if self.output_schema.is_some() && tool_calls.is_empty() {
+                if schema_turn && tool_calls.is_empty() {
                     Self::check_structured_output(&response)?;
                 }
 
@@ -808,6 +823,23 @@ impl<C: LLMClient> Core<C> {
                         "model" => response.model.clone(),
                     )
                     .increment(1);
+                    continue;
+                }
+
+                // The tool loop is done and this run owes a schema-conforming answer, so ask
+                // for it once more with the schema attached and no tools. The unconstrained
+                // prose answer is dropped rather than kept: it never enters the ledger, so
+                // hooks and the returned history hold one answer, not two. The re-ask sees
+                // the same history and restates that answer as JSON. `structured_pass`
+                // bounds this to one extra call, and like the empty-turn retry it does not
+                // consume the `max_turns` budget.
+                if self.output_schema.is_some() && !schema_turn && tool_calls.is_empty() {
+                    structured_pass = true;
+                    empty_turn_retries_used = 0;
+                    debug!(
+                        turn = turn_number,
+                        "tool loop finished: re-asking for the answer under the output schema"
+                    );
                     continue;
                 }
 
@@ -2380,7 +2412,8 @@ mod tests {
         (result, calls)
     }
 
-    /// The schema reaches the provider on every turn, not just the terminal one.
+    /// With no tools registered there is no tool loop to run first, so the schema goes on the
+    /// first turn and the run costs one provider call.
     #[tokio::test]
     async fn test_run_attaches_the_output_schema_to_the_request() {
         let client = ScriptedFinishClient::new(
@@ -2402,6 +2435,11 @@ mod tests {
                 .saw_schema
                 .load(std::sync::atomic::Ordering::SeqCst),
             "the request must carry the schema"
+        );
+        assert_eq!(
+            core.client.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a run with no tools needs no second, schema-only turn"
         );
         assert_eq!(
             messages
@@ -2815,6 +2853,179 @@ mod span_tests {
         assert!(
             uuid::Uuid::parse_str(conversation_id).is_ok(),
             "expected a uuid, got {conversation_id:?}"
+        );
+    }
+
+    /// Records what each request carried and answers accordingly: a tool call first, then
+    /// prose, and the scripted schema reply on any request that carries the schema.
+    struct SchemaPhaseClient {
+        config: Config,
+        schema_reply: &'static str,
+        /// One `(has_tools, has_schema)` entry per `chat` call, in order.
+        calls: Mutex<Vec<(bool, bool)>>,
+    }
+
+    impl SchemaPhaseClient {
+        fn new(schema_reply: &'static str) -> Self {
+            Self {
+                config: Config::new("mock", "mock-model"),
+                schema_reply,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<(bool, bool)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl LLMClient for SchemaPhaseClient {
+        fn config(&self) -> &Config {
+            &self.config
+        }
+
+        async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, ClientError> {
+            let has_tools = request.tools.as_ref().is_some_and(|t| !t.is_empty());
+            let has_schema = request.output_schema.is_some();
+            let first = {
+                let mut calls = self.calls.lock().unwrap();
+                calls.push((has_tools, has_schema));
+                calls.len() == 1
+            };
+
+            let conv_id = request
+                .messages
+                .first()
+                .map_or_else(uuid::Uuid::new_v4, |m| m.conversation_id);
+
+            if has_schema {
+                return Ok(schema_phase_response(Message::assistant(
+                    conv_id,
+                    self.schema_reply,
+                )));
+            }
+
+            let mut message =
+                Message::assistant(conv_id, if first { "" } else { "the answer is 42" });
+            if first {
+                message.tool_calls.push(ToolCall {
+                    id: "call_42".to_string(),
+                    function: FunctionCall {
+                        name: "echo".to_string(),
+                        arguments: r#"{"text":"hi"}"#.to_string(),
+                    },
+                    call_type: "function".to_string(),
+                    index: Some(0),
+                });
+            }
+            Ok(schema_phase_response(message))
+        }
+
+        async fn chat_stream(
+            &self,
+            _request: &ChatRequest,
+        ) -> Result<
+            std::pin::Pin<Box<dyn futures::Stream<Item = Result<ChatChunk, ClientError>> + Send>>,
+            ClientError,
+        > {
+            Ok(Box::pin(futures::stream::pending()))
+        }
+
+        fn supports_tools(&self) -> bool {
+            true
+        }
+
+        fn supports_streaming(&self) -> bool {
+            false
+        }
+
+        fn supports_structured_output(&self) -> bool {
+            true
+        }
+    }
+
+    fn schema_phase_response(message: Message) -> ChatResponse {
+        ChatResponse {
+            message,
+            model: "mock-model".to_string(),
+            usage: None,
+            finish_reason: Some(neuromance_common::client::FinishReason::Stop),
+            created_at: chrono::Utc::now(),
+            response_id: None,
+            metadata: HashMap::new(),
+        }
+    }
+
+    fn answer_schema() -> neuromance_common::client::OutputSchema {
+        neuromance_common::client::OutputSchema::new(
+            "answer",
+            serde_json::json!({
+                "type": "object",
+                "properties": {"answer": {"type": "string"}},
+                "required": ["answer"],
+                "additionalProperties": false
+            }),
+        )
+        .expect("valid schema")
+    }
+
+    async fn run_schema_phase(
+        client: SchemaPhaseClient,
+    ) -> (
+        Core<SchemaPhaseClient>,
+        Result<Vec<Message>, crate::CoreError>,
+    ) {
+        let mut core = Core::new(client);
+        core.tool_executor.add_tool(EchoTool { fails: false });
+        core.auto_approve_tools = true;
+        core.output_schema = Some(answer_schema());
+
+        let conv_id = uuid::Uuid::new_v4();
+        let result = core
+            .chat_with_tool_loop(vec![Message::user(conv_id, "go")], CancellationToken::new())
+            .await
+            .map(|(messages, _)| messages);
+        (core, result)
+    }
+
+    /// A turn that offers tools must not carry the schema, or the model answers in the schema
+    /// where it should call a tool. The schema goes on one final tool-free turn.
+    #[tokio::test]
+    async fn test_tool_loop_runs_unconstrained_then_asks_under_the_schema() {
+        let (core, result) = run_schema_phase(SchemaPhaseClient::new(r#"{"answer": "42"}"#)).await;
+        let messages = result.expect("the run should complete");
+
+        assert_eq!(
+            core.client.calls(),
+            vec![(true, false), (true, false), (false, true)],
+            "tool turns carry tools only; the final turn carries the schema only"
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .rfind(|m| m.role == MessageRole::Assistant)
+                .map(|m| m.content.as_str()),
+            Some(r#"{"answer": "42"}"#)
+        );
+        assert!(
+            !messages.iter().any(|m| m.content == "the answer is 42"),
+            "the discarded prose answer must not reach the history: {messages:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.role == MessageRole::Tool),
+            "the tool result must survive the schema pass"
+        );
+    }
+
+    /// The schema pass is validated like any schema turn: prose there fails the run.
+    #[tokio::test]
+    async fn test_schema_pass_that_answers_in_prose_fails_the_run() {
+        let (_core, result) = run_schema_phase(SchemaPhaseClient::new("still prose")).await;
+
+        assert!(
+            matches!(result, Err(crate::CoreError::SchemaViolation { .. })),
+            "unexpected: {result:?}"
         );
     }
 }

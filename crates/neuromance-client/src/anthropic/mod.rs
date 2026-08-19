@@ -845,15 +845,24 @@ impl From<(&ChatRequest, &Config)> for CreateMessageRequest {
             Some(SystemPrompt::Blocks(system_blocks))
         };
 
+        // An `output_config` constraint applies to every turn, so a request that carries both
+        // would force the schema onto a turn meant to call a tool. The schema wins: `Core` runs
+        // its tool loop unconstrained and asks for the answer on a tool-free turn.
+        let structured = request.output_schema.is_some();
+
         // Convert tools if present, with cache control on the last tool
         let tools: Option<Vec<AnthropicTool>> = request
             .tools
             .as_ref()
+            .filter(|_| !structured)
             .map(|t| convert_tools_with_caching(t));
 
         // Convert tool choice if present
-        let tool_choice: Option<AnthropicToolChoice> =
-            request.tool_choice.as_ref().map(AnthropicToolChoice::from);
+        let tool_choice: Option<AnthropicToolChoice> = request
+            .tool_choice
+            .as_ref()
+            .filter(|_| !structured)
+            .map(AnthropicToolChoice::from);
 
         // Create thinking config from ThinkingMode
         let thinking = request.thinking.budget().map(ThinkingConfig::new);

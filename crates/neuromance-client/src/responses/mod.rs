@@ -472,12 +472,20 @@ impl From<(&ChatRequest, &Config)> for ResponsesRequest {
     fn from((request, config): (&ChatRequest, &Config)) -> Self {
         let (input_items, instructions) = build_input_items(&request.messages);
 
+        // A `text.format` constraint applies to every turn, so a request that carries both
+        // would force the schema onto a turn meant to call a tool. The schema wins: `Core`
+        // runs its tool loop unconstrained and asks for the answer on a tool-free turn.
+        let structured = request.output_schema.is_some();
         let tools: Option<Vec<ResponsesTool>> = request
             .tools
             .as_ref()
+            .filter(|_| !structured)
             .map(|t| t.iter().map(ResponsesTool::from).collect());
-        let tool_choice: Option<ResponsesToolChoice> =
-            request.tool_choice.as_ref().map(ResponsesToolChoice::from);
+        let tool_choice: Option<ResponsesToolChoice> = request
+            .tool_choice
+            .as_ref()
+            .filter(|_| !structured)
+            .map(ResponsesToolChoice::from);
 
         // Server-side response chaining and persistence are Responses-only
         // knobs with no ChatRequest field, so they travel in metadata.

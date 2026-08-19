@@ -315,7 +315,15 @@ impl From<(&ChatRequest, &Config)> for ChatCompletionRequest {
             .map(ChatCompletionsMessage::from)
             .collect();
 
-        let tools: Option<Vec<Tool>> = request.tools.clone();
+        // A response-format constraint applies to every turn, so a request that carries
+        // both would force the schema onto a turn meant to call a tool. The schema wins:
+        // `Core` runs its tool loop unconstrained and asks for the answer on a tool-free turn.
+        let structured = request.output_schema.is_some();
+        let tools: Option<Vec<Tool>> = if structured {
+            None
+        } else {
+            request.tools.clone()
+        };
 
         // Map ReasoningLevel to ReasoningEffort
         let reasoning_effort = reasoning_level_to_effort(request.reasoning_level);
@@ -350,7 +358,13 @@ impl From<(&ChatRequest, &Config)> for ChatCompletionRequest {
             .user(request.user.clone())
             .stream(Some(request.stream))
             .tools(tools)
-            .tool_choice(request.tool_choice.as_ref().map(|tc| tc.clone().into()))
+            .tool_choice(
+                request
+                    .tool_choice
+                    .as_ref()
+                    .filter(|_| !structured)
+                    .map(|tc| tc.clone().into()),
+            )
             .enable_thinking(enable_thinking)
             .response_format(request.output_schema.as_ref().map(ResponseFormat::from))
             .build()

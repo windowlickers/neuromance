@@ -336,6 +336,13 @@ property to appear in `required`; that one is enforced by the provider, not here
 than 64 levels is rejected too. The optional `title` names the schema on the wire; it defaults to
 `output` and must be 1–64 characters of `a-z`, `A-Z`, `0-9`, `_` or `-`, the range OpenAI accepts.
 
+The constraint applies to whatever turn carries it, so it never rides on a turn that offers tools:
+the model would answer in the schema where it should call a tool. The agent runs its tool loop
+unconstrained, and when the model stops calling tools it is asked once more — with the schema and
+no tools — for the answer. That final tool-free turn is the one that must parse as a JSON object;
+the unconstrained answer it replaces is discarded and never reaches the conversation history. A
+task with no tools configured skips the extra call: its first turn is already the final one.
+
 Conformance beyond that is the provider's job. The runtime checks that the final turn parses as a
 JSON object; it does not re-validate the object against the schema, so a provider that ignores the
 constraint returns a `structured` field that satisfies no more than "is an object".

@@ -1765,10 +1765,13 @@ mod tests {
         );
     }
 
+    /// `response_format` constrains the turn it rides on, so a turn cannot both offer tools
+    /// and demand the schema. The schema wins and the tools are dropped.
     #[test]
-    fn test_output_schema_and_tools_serialize_together() {
+    fn test_output_schema_omits_tools() {
         let request = ChatRequest::new(vec![create_test_message()])
             .with_tools(vec![structured_output_tool()])
+            .with_tool_choice(neuromance_common::client::ToolChoice::Auto)
             .with_output_schema(structured_output_schema());
         let wire = crate::chat_completions::ChatCompletionRequest::from((
             &request,
@@ -1777,7 +1780,8 @@ mod tests {
 
         let value = serde_json::to_value(&wire).unwrap();
         assert_eq!(value["response_format"]["type"], "json_schema");
-        assert_eq!(value["tools"][0]["function"]["name"], "lookup");
+        assert!(value.get("tools").is_none());
+        assert!(value.get("tool_choice").is_none());
     }
 
     #[test]
