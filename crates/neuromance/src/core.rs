@@ -2562,7 +2562,7 @@ mod span_tests {
 
     use async_trait::async_trait;
     use neuromance_client::{ClientError, LLMClient};
-    use neuromance_common::chat::Message;
+    use neuromance_common::chat::{Message, MessageRole};
     use neuromance_common::client::{ChatChunk, ChatRequest, ChatResponse, Config};
     use neuromance_common::telemetry::genai;
     use neuromance_common::tools::{Function, FunctionCall, Tool, ToolCall};
