@@ -395,9 +395,9 @@ fn reject_unapproved_tools_under_auto_mode(
     }
     Err(RuntimeError::Config(format!(
         "approval.mode = \"auto\" but the following tools require explicit approval: [{}]. \
-         Either remove them from [[tools]], set approval.mode = \"async\" with an \
-         approval.webhook_url, or set approval.allow_unsafe_tools = true to opt out of this \
-         safety check.",
+         Either set auto_approve = true on their [[mcp_servers]] entry, set approval.mode = \
+         \"async\" with an approval.webhook_url, or set approval.allow_unsafe_tools = true to \
+         opt out of this safety check.",
         needs_approval.join(", ")
     )))
 }

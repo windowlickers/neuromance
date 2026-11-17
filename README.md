@@ -157,6 +157,8 @@ Migrations are embedded in `neuromance-db` and applied automatically at startup.
 
 ## MCP tools
 
+The runtime ships no native tools that touch the world. Files, shells, and network access come from [Model Context Protocol](https://modelcontextprotocol.io/) servers. The only native tools are the subagent delegate tools (see [Subagents](#subagents)) and `load_skill` (see [Skills](#skills)). The runtime rejects unknown top-level config keys, so a leftover `[[tools]]`, `[sandbox]`, or `[workspace]` section fails startup and the error names the key.
+
 Each `[[mcp_servers]]` entry connects an MCP server at startup. Every tool the server lists becomes an agent tool named `<id>__<tool>`, so `fs` serving `read_file` appears as `fs__read_file`. Characters a provider rejects in a tool name become `_`. The main agent and every subagent share the same connections, and a stdio server spawns once per process.
 
 A server that stays unreachable after about five seconds of retries fails startup. This covers a sidecar that starts after the runtime. A tool needs explicit approval unless its server sets `auto_approve = true`, so the `approval.mode = "auto"` startup gate applies to MCP tools too.
@@ -185,7 +187,7 @@ url = "http://hands.agents.svc:9000/mcp"
 
 A `[[subagents]]` section declares subagents the main agent can delegate to. A subagent that pins neither `provider` nor `model` runs whatever the main agent runs for that task — a serve task's per-task `provider`/`model` override included — so it only needs an `id` and `system_prompt`. Pinning either one keeps the subagent's own identity and ignores the per-task override: the effective model is then the subagent's `model`, then the chosen provider's default `model`, then the agent's configured model.
 
-A subagent is provisioned with the **same toolset as the main agent** — the capability tools from `[[tools]]`, the `[[mcp_servers]]` tools, and the delegate tools — so it can both use tools and delegate further. Its conversation loop is wired the same way too: it persists through `[database]`, compacts under `[context]`, carries the `[skills]` menu in its system prompt with `$mention` expansion in-loop, and receives `[rules]`. Two things are deliberately left off. Subagents never stream — a delegate tool returns only the final content. And subagent tool calls auto-approve inside the pod: they run autonomously within a single parent delegation, with no interactive approver in the loop, so the pod boundary (e.g. kata containers) is the isolation, the same way the whole agent pod is already sandboxed.
+A subagent is provisioned with the **same toolset as the main agent** — the `[[mcp_servers]]` tools, `load_skill` when `[skills]` is configured, and the delegate tools — so it can both use tools and delegate further. Its conversation loop is wired the same way too: it persists through `[database]`, compacts under `[context]`, carries the `[skills]` menu in its system prompt with `$mention` expansion in-loop, and receives `[rules]`. Two things are deliberately left off. Subagents never stream — a delegate tool returns only the final content. And subagent tool calls auto-approve inside the pod: they run autonomously within a single parent delegation, with no interactive approver in the loop, so the pod boundary (e.g. kata containers) is the isolation, the same way the whole agent pod is already sandboxed.
 
 **Self-delegation.** Setting `runtime.self_delegation = true` gives the main agent a `task` delegate tool that runs a fresh copy of *itself* — the same system prompt, provider, model, and turn budget — on a scoped subtask, with no `[[subagents]]` entry to write. It is exactly a synthesized subagent named `task`, so it joins the same `max_delegation_depth` tower and gets the same shared toolset. `task` is reserved while this is on: an explicit subagent or tool of that name is rejected at startup. Combine it with `[[subagents]]` freely — the `task` self-clone is added alongside any named subagents.
 
@@ -489,10 +491,6 @@ call. API keys are not captured — they live in `SecretString` and are never
 part of a captured structure — but user data in prompts is. The flag is off by
 default; turn it on per-deployment, and only where the trace store has the same
 access controls as the conversations themselves.
-
-## Model Context Protocol (MCP) Support
-
-Neuromance supports the [Model Context Protocol](https://modelcontextprotocol.io/) for connecting to external tool servers via the `neuromance-tools` crate.
 
 ## License
 

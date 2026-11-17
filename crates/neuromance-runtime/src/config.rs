@@ -25,7 +25,6 @@ use serde::{Deserialize, Serialize};
 use neuromance_common::client::OutputSchema;
 use neuromance_context::ContextConfig;
 use neuromance_context::compaction::CompactionStrategy;
-use neuromance_tools::ToolConfig;
 use neuromance_tools::mcp::McpServerConfig;
 
 use crate::error::RuntimeError;
@@ -45,7 +44,12 @@ pub enum ApprovalMode {
     Async,
 }
 
+/// The whole runtime config file.
+///
+/// Unknown top-level keys fail the load, so a removed or misspelled section
+/// (e.g. `[[tools]]`) is an error instead of a silent no-op.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
     pub mode: Mode,
     pub agent: AgentConfig,
@@ -53,8 +57,6 @@ pub struct RuntimeConfig {
     pub runtime: RuntimeSettings,
     #[serde(default)]
     pub approval: ApprovalConfig,
-    #[serde(default)]
-    pub tools: Vec<ToolConfig>,
     /// MCP servers whose tools the agent and every subagent can call. Each
     /// tool is advertised as `<id>__<tool>`. A server that stays unreachable
     /// fails startup.
@@ -272,9 +274,9 @@ const fn default_preserve_recent_turns() -> usize {
 ///
 /// Subagents inherit the parent agent's provider unless they name their own; a
 /// subagent may also override just the model. Each subagent is provisioned with
-/// the same toolset as the main agent — capability tools, MCP tools, and the
-/// delegate tools — so it can both use tools and delegate
-/// further, bounded by `runtime.max_delegation_depth`.
+/// the same toolset as the main agent — MCP tools, `load_skill`, and the
+/// delegate tools — so it can both use tools and delegate further, bounded by
+/// `runtime.max_delegation_depth`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SubagentConfig {
     /// Stable identifier, used as the delegate tool name; must be unique.
@@ -475,7 +477,8 @@ pub struct ApprovalConfig {
     pub timeout_seconds: u64,
     /// Skip the startup safety gate that refuses to start when
     /// `mode = "auto"` is paired with tools whose `is_auto_approved()`
-    /// returns false (`bash`, `edit`, `write`). The agentic loop already
+    /// returns false (tools from an MCP server without `auto_approve = true`).
+    /// The agentic loop already
     /// approves every tool under `Auto` — this flag opts out of the
     /// duplicate startup check, intended for deployments where the pod
     /// boundary itself provides isolation (e.g. kata containers).
@@ -1054,7 +1057,7 @@ mod tests {
         assert_eq!(config.runtime.shutdown_grace_seconds, 30);
         assert_eq!(config.runtime.max_queue_depth, 8);
         assert_eq!(config.approval.mode, ApprovalMode::Auto);
-        assert!(config.tools.is_empty());
+        assert!(config.mcp_servers.is_empty());
         assert!(config.oneshot.is_some());
     }
 
@@ -1932,21 +1935,53 @@ mod tests {
         assert_eq!(config.subagents[0].provider.as_deref(), Some("secondary"));
     }
 
+    /// Load `SERVE_PREAMBLE` plus `extra` from a file and return the error.
+    fn load_err(extra: &str) -> String {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), format!("{SERVE_PREAMBLE}{extra}")).unwrap();
+        RuntimeConfig::load(file.path())
+            .expect_err("config with an unknown top-level key must fail to load")
+            .to_string()
+    }
+
     #[test]
-    fn test_tools_section_parses() {
-        let config = serve_config(
+    fn test_load_accepts_the_serve_preamble() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), SERVE_PREAMBLE).unwrap();
+        RuntimeConfig::load(file.path()).unwrap();
+    }
+
+    #[test]
+    fn test_load_rejects_removed_tools_section() {
+        let err = load_err(
             r#"
             [[tools]]
             name = "read"
-
-            [[tools]]
-            name = "bash"
         "#,
         );
-        config.validate().unwrap();
-        assert_eq!(config.tools.len(), 2);
-        assert_eq!(config.tools[0].name, "read");
-        assert_eq!(config.tools[1].name, "bash");
+        assert!(err.contains("unknown field `tools`"), "{err}");
+    }
+
+    #[test]
+    fn test_load_rejects_removed_sandbox_section() {
+        let err = load_err(
+            r#"
+            [sandbox]
+            endpoint = "http://127.0.0.1:50051"
+        "#,
+        );
+        assert!(err.contains("unknown field `sandbox`"), "{err}");
+    }
+
+    #[test]
+    fn test_load_rejects_removed_workspace_section() {
+        let err = load_err(
+            r#"
+            [workspace]
+            root = "/workspace"
+        "#,
+        );
+        assert!(err.contains("unknown field `workspace`"), "{err}");
     }
 
     #[test]

@@ -4,9 +4,8 @@
 //! The cheap menu of `name: description` is injected elsewhere (once per
 //! conversation); this tool is how an autonomous agent loads the full
 //! instructions for a skill it has decided to use. It is read-only and
-//! auto-approved. Registration is programmatic — the runtime builds a
-//! [`SkillCatalog`] from config and constructs the tool with it — so there is
-//! no `ToolFactory`.
+//! auto-approved. The runtime builds a [`SkillCatalog`] from config and
+//! constructs the tool with it.
 
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -1,8 +1,7 @@
 //! Build the main agent's toolset and the subagent delegation tower from
 //! `[[subagents]]` config.
 //!
-//! A subagent is provisioned with the *same* toolset as the main agent:
-//! capability tools (the built-in factories plus anything in `[[tools]]`), the
+//! A subagent is provisioned with the *same* toolset as the main agent: the
 //! `[[mcp_servers]]` tools, `load_skill` when `[skills]` is configured, and the
 //! delegate tools that let it hand work to other subagents. Delegation is
 //! bounded by `runtime.max_delegation_depth`, and that bound is enforced
@@ -45,9 +44,9 @@ use neuromance_context::CompactionHook;
 use neuromance_context::rules::RulesHook;
 use neuromance_context::skills::SkillsHook;
 use neuromance_db::{PersistenceHook, PgConversationStore};
-use neuromance_tools::{ToolFactoryRegistry, ToolImplementation, ToolRegistry};
+use neuromance_tools::{ToolImplementation, ToolRegistry};
 
-use crate::config::{ProviderConfig, RuntimeConfig, SELF_DELEGATION_ID, SubagentConfig};
+use crate::config::{ProviderConfig, RuntimeConfig, SubagentConfig};
 use crate::error::RuntimeError;
 use crate::proxy::build_provider_config;
 use crate::skills::{SkillRuntime, fold_menu};
@@ -134,15 +133,14 @@ struct ChildHooks {
 /// Build the main agent's toolset, including delegate tools for every
 /// configured subagent.
 ///
-/// When no subagents are configured this is just the capability toolset built
-/// from `[[tools]]`. Otherwise it also builds the delegation tower down to
+/// When no subagents are configured this is just the MCP tools plus
+/// `load_skill`. Otherwise it also builds the delegation tower down to
 /// `runtime.max_delegation_depth` and wires the main agent's delegate tools to
 /// the top of that tower.
 ///
 /// # Errors
 /// Returns [`RuntimeError`] if a subagent's provider/model/credentials fail to
-/// resolve, a tool factory fails, or a subagent id collides with a configured
-/// tool name.
+/// resolve, or a tool name is taken twice.
 pub fn build_parent_toolset(
     config: &RuntimeConfig,
     params: &ToolsetParams<'_>,
@@ -353,15 +351,15 @@ fn build_child_core(
     core
 }
 
-/// Assemble the toolset for one agent level: the capability tools, the
-/// `shared_tools`, and a delegate tool per `child`.
+/// Assemble the toolset for one agent level: the `shared_tools` and a delegate
+/// tool per `child`.
 fn assemble_toolset(
     config: &RuntimeConfig,
     children: &HashMap<String, Arc<dyn Subagent>>,
     cancel: &CancellationToken,
     shared_tools: &[Arc<dyn ToolImplementation>],
 ) -> Result<Toolset, RuntimeError> {
-    let staged = ToolFactoryRegistry::with_builtin().build_all(&config.tools)?;
+    let staged = ToolRegistry::new();
 
     register_shared_tools(shared_tools, &staged)?;
     register_child_delegates(config, children, &staged, cancel)?;
@@ -376,8 +374,7 @@ fn assemble_toolset(
 /// Register the shared tools (MCP adapters and `load_skill`) into `staged`.
 ///
 /// # Errors
-/// Returns [`RuntimeError::Config`] if a shared tool name collides with a tool
-/// already in `staged`.
+/// Returns [`RuntimeError::Config`] if two shared tools advertise the same name.
 fn register_shared_tools(
     shared_tools: &[Arc<dyn ToolImplementation>],
     staged: &ToolRegistry,
@@ -386,8 +383,8 @@ fn register_shared_tools(
         let name = tool.get_definition().function.name;
         if staged.contains(&name) {
             return Err(RuntimeError::Config(format!(
-                "tool '{name}' collides with a configured tool of the same name; rename \
-                 the [[mcp_servers]] id or remove the [[tools]] entry"
+                "tool '{name}' is advertised twice; give each [[mcp_servers]] entry a \
+                 unique id and check that no server lists the same tool twice"
             )));
         }
         staged.register(Arc::clone(tool));
@@ -399,7 +396,7 @@ fn register_shared_tools(
 /// at this level can delegate to each child by its id.
 ///
 /// # Errors
-/// Returns [`RuntimeError::Config`] if a subagent id collides with a configured
+/// Returns [`RuntimeError::Config`] if a subagent id collides with a shared
 /// tool name.
 fn register_child_delegates(
     config: &RuntimeConfig,
@@ -413,9 +410,8 @@ fn register_child_delegates(
         };
         if staged.contains(&sub.id) {
             return Err(RuntimeError::Config(format!(
-                "subagent id '{}' collides with a configured tool of the same name; rename \
-                 whichever you control (the id is synthesized when it is \
-                 '{SELF_DELEGATION_ID}' and runtime.self_delegation is set)",
+                "subagent id '{}' collides with the tool of the same name (an \
+                 [[mcp_servers]] tool or load_skill); rename the [[subagents]] entry",
                 sub.id
             )));
         }
@@ -449,7 +445,6 @@ mod tests {
     use super::*;
     use crate::config::{ContextSettings, ProviderConfig, SELF_DELEGATION_ID, SubagentConfig};
     use crate::{AgentConfig, ApprovalConfig, Mode, RuntimeSettings};
-    use neuromance_tools::ToolConfig;
 
     /// A single-provider config whose `[agent]` points at provider "primary"
     /// (env-var credential `OPENAI_API_KEY`, model `openai:gpt-4o`).
@@ -479,7 +474,6 @@ mod tests {
             },
             runtime: RuntimeSettings::default(),
             approval: ApprovalConfig::default(),
-            tools: Vec::new(),
             oneshot: None,
             providers,
             database: None,
@@ -650,13 +644,6 @@ mod tests {
         )
     }
 
-    fn read_tool() -> ToolConfig {
-        ToolConfig {
-            name: "read".to_string(),
-            config: serde_json::Value::Null,
-        }
-    }
-
     /// A stand-in child subagent so toolset assembly can be exercised without
     /// building an LLM client.
     struct MockSubagent(&'static str);
@@ -692,80 +679,6 @@ mod tests {
             .collect()
     }
 
-    /// With no children, the toolset is exactly the configured capability tools
-    /// — no delegate tools appear.
-    #[test]
-    fn test_assemble_toolset_capability_only_without_children() {
-        let mut config = config_with_subagents(vec![subagent("worker")]);
-        config.tools = vec![read_tool()];
-
-        let tools =
-            assemble_toolset(&config, &HashMap::new(), &CancellationToken::new(), &[]).unwrap();
-        let names = tool_names(&tools);
-
-        assert_eq!(names, vec!["read".to_string()]);
-        assert!(!names.contains(&"worker".to_string()));
-    }
-
-    /// A non-empty child set adds one delegate tool per configured subagent,
-    /// named by its id, alongside the capability tools.
-    #[test]
-    fn test_assemble_toolset_adds_delegate_per_child() {
-        let mut config = config_with_subagents(vec![subagent("worker"), subagent("critic")]);
-        config.tools = vec![read_tool()];
-
-        let children = mock_children(&["worker", "critic"]);
-        let tools = assemble_toolset(&config, &children, &CancellationToken::new(), &[]).unwrap();
-        let mut names = tool_names(&tools);
-        names.sort();
-
-        assert_eq!(
-            names,
-            vec![
-                "critic".to_string(),
-                "read".to_string(),
-                "worker".to_string()
-            ]
-        );
-    }
-
-    /// With `runtime.self_delegation` set, the effective config gains a
-    /// synthesized `task` subagent, so assembling its toolset over the matching
-    /// child registers a `task` delegate tool alongside the capability tools —
-    /// no `[[subagents]]` entry required.
-    #[test]
-    fn test_self_delegation_adds_task_delegate() {
-        let mut config = config_with_subagents(vec![]);
-        config.tools = vec![read_tool()];
-        config.runtime.self_delegation = true;
-
-        let effective = config.with_self_delegation();
-        let children = mock_children(&[SELF_DELEGATION_ID]);
-        let tools =
-            assemble_toolset(&effective, &children, &CancellationToken::new(), &[]).unwrap();
-        let mut names = tool_names(&tools);
-        names.sort();
-
-        assert_eq!(names, vec!["read".to_string(), "task".to_string()]);
-    }
-
-    /// A subagent id that collides with a configured tool name is rejected when
-    /// delegate tools are wired in.
-    #[test]
-    fn test_assemble_toolset_rejects_id_tool_collision() {
-        let mut config = config_with_subagents(vec![subagent("read")]);
-        config.tools = vec![read_tool()];
-
-        let children = mock_children(&["read"]);
-        let err = assemble_toolset(&config, &children, &CancellationToken::new(), &[])
-            .err()
-            .expect("colliding subagent id must be rejected");
-        assert!(
-            matches!(err, RuntimeError::Config(ref msg) if msg.contains("collides")),
-            "unexpected error: {err}",
-        );
-    }
-
     /// A stand-in MCP tool adapter: only its advertised name matters here.
     struct NamedTool(&'static str);
 
@@ -789,34 +702,105 @@ mod tests {
         }
     }
 
-    /// MCP tools join the capability tools and delegate tools at every level.
-    #[test]
-    fn test_assemble_toolset_includes_mcp_tools() {
-        let mut config = config_with_subagents(vec![subagent("worker")]);
-        config.tools = vec![read_tool()];
-        let mcp: Vec<Arc<dyn ToolImplementation>> = vec![Arc::new(NamedTool("fs__read_file"))];
+    /// Stand-in MCP tool adapters with the given names.
+    fn mcp(names: &[&'static str]) -> Vec<Arc<dyn ToolImplementation>> {
+        names
+            .iter()
+            .map(|name| Arc::new(NamedTool(name)) as Arc<dyn ToolImplementation>)
+            .collect()
+    }
 
-        let children = mock_children(&["worker"]);
-        let tools = assemble_toolset(&config, &children, &CancellationToken::new(), &mcp).unwrap();
+    /// With no children, the toolset is exactly the shared tools — no delegate
+    /// tools appear.
+    #[test]
+    fn test_assemble_toolset_shared_only_without_children() {
+        let config = config_with_subagents(vec![subagent("worker")]);
+
+        let tools = assemble_toolset(
+            &config,
+            &HashMap::new(),
+            &CancellationToken::new(),
+            &mcp(&["fs__read_file"]),
+        )
+        .unwrap();
+
+        assert_eq!(tool_names(&tools), vec!["fs__read_file".to_string()]);
+    }
+
+    /// A non-empty child set adds one delegate tool per configured subagent,
+    /// named by its id, alongside the shared tools.
+    #[test]
+    fn test_assemble_toolset_adds_delegate_per_child() {
+        let config = config_with_subagents(vec![subagent("worker"), subagent("critic")]);
+
+        let children = mock_children(&["worker", "critic"]);
+        let tools = assemble_toolset(
+            &config,
+            &children,
+            &CancellationToken::new(),
+            &mcp(&["fs__read_file"]),
+        )
+        .unwrap();
         let mut names = tool_names(&tools);
         names.sort();
 
-        assert_eq!(names, vec!["fs__read_file", "read", "worker"]);
+        assert_eq!(names, vec!["critic", "fs__read_file", "worker"]);
     }
 
-    /// An MCP tool that shadows a configured tool is rejected rather than
-    /// silently replacing it.
+    /// With `runtime.self_delegation` set, the effective config gains a
+    /// synthesized `task` subagent, so assembling its toolset over the matching
+    /// child registers a `task` delegate tool alongside the shared tools — no
+    /// `[[subagents]]` entry required.
     #[test]
-    fn test_assemble_toolset_rejects_mcp_tool_collision() {
+    fn test_self_delegation_adds_task_delegate() {
         let mut config = config_with_subagents(vec![]);
-        config.tools = vec![read_tool()];
-        let mcp: Vec<Arc<dyn ToolImplementation>> = vec![Arc::new(NamedTool("read"))];
+        config.runtime.self_delegation = true;
 
-        let err = assemble_toolset(&config, &HashMap::new(), &CancellationToken::new(), &mcp)
+        let effective = config.with_self_delegation();
+        let children = mock_children(&[SELF_DELEGATION_ID]);
+        let tools = assemble_toolset(
+            &effective,
+            &children,
+            &CancellationToken::new(),
+            &mcp(&["fs__read_file"]),
+        )
+        .unwrap();
+        let mut names = tool_names(&tools);
+        names.sort();
+
+        assert_eq!(names, vec!["fs__read_file", "task"]);
+    }
+
+    /// A subagent id that collides with an MCP tool name is rejected when
+    /// delegate tools are wired in.
+    #[test]
+    fn test_assemble_toolset_rejects_id_tool_collision() {
+        let config = config_with_subagents(vec![subagent("fs__read_file")]);
+
+        let children = mock_children(&["fs__read_file"]);
+        let shared = mcp(&["fs__read_file"]);
+        let err = assemble_toolset(&config, &children, &CancellationToken::new(), &shared)
             .err()
-            .expect("colliding MCP tool must be rejected");
+            .expect("colliding subagent id must be rejected");
         assert!(
-            matches!(err, RuntimeError::Config(ref msg) if msg.contains("tool 'read' collides")),
+            matches!(err, RuntimeError::Config(ref msg) if msg.contains("collides")),
+            "unexpected error: {err}",
+        );
+    }
+
+    /// A shared tool advertised twice is rejected rather than silently
+    /// replacing the first.
+    #[test]
+    fn test_assemble_toolset_rejects_duplicate_shared_tool() {
+        let config = config_with_subagents(vec![]);
+        let shared = mcp(&["fs__read_file", "fs__read_file"]);
+
+        let err = assemble_toolset(&config, &HashMap::new(), &CancellationToken::new(), &shared)
+            .err()
+            .expect("a duplicate shared tool must be rejected");
+        assert!(
+            matches!(err, RuntimeError::Config(ref msg)
+                if msg.contains("tool 'fs__read_file' is advertised twice")),
             "unexpected error: {err}",
         );
     }
@@ -838,16 +822,23 @@ mod tests {
         );
     }
 
-    /// With no subagents configured, the toolset is the capability tools only
-    /// and no client is built.
+    /// With no subagents configured, the toolset is the MCP tools only and no
+    /// client is built.
     #[test]
-    fn test_no_subagents_yields_capability_tools_only() {
-        let mut config = config_with_subagents(vec![]);
-        config.tools = vec![read_tool()];
+    fn test_no_subagents_yields_mcp_tools_only() {
+        let config = config_with_subagents(vec![]);
+        let cancel = CancellationToken::new();
+        let shared = mcp(&["fs__read_file"]);
 
-        let tools =
-            build_parent_toolset(&config, &params(&config, &CancellationToken::new())).unwrap();
-        assert_eq!(tool_names(&tools), vec!["read".to_string()]);
+        let tools = build_parent_toolset(
+            &config,
+            &ToolsetParams {
+                mcp_tools: &shared,
+                ..params(&config, &cancel)
+            },
+        )
+        .unwrap();
+        assert_eq!(tool_names(&tools), vec!["fs__read_file".to_string()]);
     }
 
     /// With `[skills]` configured, the main agent gets `load_skill`, and it is
@@ -879,11 +870,11 @@ mod tests {
         let config = config_with_subagents(vec![subagent("worker")]);
         let skills = skill_runtime().await;
         let cancel = CancellationToken::new();
-        let mcp: Vec<Arc<dyn ToolImplementation>> = vec![Arc::new(NamedTool("fs__read_file"))];
+        let shared = mcp(&["fs__read_file"]);
 
         let ctx = ChildContext::new(&ToolsetParams {
             skills: Some(&skills),
-            mcp_tools: &mcp,
+            mcp_tools: &shared,
             ..params(&config, &cancel)
         });
 

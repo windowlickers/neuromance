@@ -13,8 +13,8 @@
 //! non-auto-approved tool call is `POST`ed to a webhook for an approve/deny
 //! decision).
 //!
-//! Tools are constructed at startup from `[[tools]]` entries via
-//! [`neuromance_tools::ToolFactoryRegistry::with_builtin`]. Serving state is
+//! Tools come from the `[[mcp_servers]]` entries, connected once at startup,
+//! plus the native delegate tools and `load_skill`. Serving state is
 //! in-memory; an optional `[database]` section additionally writes
 //! conversation history through to postgres as tasks run (see
 //! `neuromance-db`).
