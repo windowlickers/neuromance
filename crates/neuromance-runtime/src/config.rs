@@ -81,9 +81,8 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub subagents: Vec<SubagentConfig>,
     /// When set, skills are discovered from on-host roots and/or a remote
-    /// endpoint, materialized to local disk at startup, and their menu (listing
-    /// each skill's on-disk path) is folded into the system prompt so the agent
-    /// reads a skill's full instructions from a file on demand.
+    /// endpoint at startup. Their menu is folded into the system prompt, and the
+    /// agent loads a skill's full instructions on demand with `load_skill`.
     #[serde(default)]
     pub skills: Option<SkillsSettings>,
     /// When set, rule files are discovered from on-host roots and/or a remote
@@ -214,14 +213,15 @@ pub struct SkillsSettings {
     #[serde(default)]
     pub endpoint_token_env: Option<String>,
     /// Whether a `$mention` in user input expands the skill's body inline
-    /// (e.g. a `/thing-skill` slash command). The menu and on-demand bodies are
-    /// always available as files on disk regardless (default: `true`).
+    /// (e.g. a `/thing-skill` slash command). The menu and the `load_skill`
+    /// tool are available regardless (default: `true`).
     #[serde(default = "default_true")]
     pub mention: bool,
     /// Byte budget for the injected skills menu (default: 8192).
     #[serde(default = "default_skill_budget")]
     pub menu_budget_bytes: usize,
-    /// Byte budget for each loaded skill body (default: 8192).
+    /// Byte budget for each skill body, loaded by `load_skill` or a `$mention`
+    /// (default: 8192).
     #[serde(default = "default_skill_budget")]
     pub body_budget_bytes: usize,
 }

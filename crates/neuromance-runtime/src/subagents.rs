@@ -3,10 +3,11 @@
 //!
 //! A subagent is provisioned with the *same* toolset as the main agent:
 //! capability tools (the built-in factories plus anything in `[[tools]]`), the
-//! `[[mcp_servers]]` tools, and the delegate tools that let it hand work to
-//! other subagents. Delegation is bounded by `runtime.max_delegation_depth`,
-//! and that bound is enforced *structurally* by building a finite tower of
-//! subagent instances rather than threading a runtime counter:
+//! `[[mcp_servers]]` tools, `load_skill` when `[skills]` is configured, and the
+//! delegate tools that let it hand work to other subagents. Delegation is
+//! bounded by `runtime.max_delegation_depth`, and that bound is enforced
+//! *structurally* by building a finite tower of subagent instances rather than
+//! threading a runtime counter:
 //!
 //! - Every configured subagent exists at each depth level.
 //! - A subagent at depth *k* gets delegate tools wired to the subagents at
@@ -61,8 +62,9 @@ pub struct ToolsetParams<'a> {
     /// so child conversations persist and record their parent/child lineage
     /// just like the main agent's.
     pub store: Option<&'a Arc<PgConversationStore>>,
-    /// Materialized skill catalog: its menu is folded into every subagent's
-    /// system prompt, and its `$mention` hook is shared with them.
+    /// Skill catalog: its menu is folded into every subagent's system prompt,
+    /// its `load_skill` tool joins every toolset, and its `$mention` hook is
+    /// shared with them.
     pub skills: Option<&'a Arc<SkillRuntime>>,
     /// The main agent's rules hook, shared verbatim with every subagent.
     pub rules: Option<&'a Arc<RulesHook>>,
@@ -81,7 +83,9 @@ pub struct ToolsetParams<'a> {
 /// Resolved, tower-wide inputs threaded through every level of the recursion.
 struct ChildContext<'a> {
     store: Option<&'a Arc<PgConversationStore>>,
-    mcp_tools: &'a [Arc<dyn ToolImplementation>],
+    /// Tools every level carries unchanged: the `[[mcp_servers]]` adapters and,
+    /// when `[skills]` is configured, `load_skill`.
+    shared_tools: Vec<Arc<dyn ToolImplementation>>,
     cancel: &'a CancellationToken,
     /// `$mention`-expanding skills hook, built once for the whole tower: its
     /// injections are keyed by conversation, so one instance serves every level
@@ -96,9 +100,11 @@ struct ChildContext<'a> {
 
 impl<'a> ChildContext<'a> {
     fn new(params: &ToolsetParams<'a>) -> Self {
+        let mut shared_tools = params.mcp_tools.to_vec();
+        shared_tools.extend(params.skills.map(|skills| skills.tool()));
         Self {
             store: params.store,
-            mcp_tools: params.mcp_tools,
+            shared_tools,
             cancel: params.cancel,
             skills: params.skills.map(|skills| skills.hook()),
             rules: params.rules.map(Arc::clone),
@@ -145,15 +151,16 @@ pub fn build_parent_toolset(
     let effective = tower_config(config, menu.as_deref());
     let config: &RuntimeConfig = &effective;
 
+    let ctx = ChildContext::new(params);
     let children = if config.subagents.is_empty() {
         HashMap::new()
     } else {
         // The main agent is depth 0; its children may delegate `depth - 1`
         // further hops.
         let remaining = config.runtime.max_delegation_depth.saturating_sub(1);
-        build_subagents_at_depth(config, remaining, &ChildContext::new(params))?
+        build_subagents_at_depth(config, remaining, &ctx)?
     };
-    assemble_toolset(config, &children, params.cancel, params.mcp_tools)
+    assemble_toolset(config, &children, params.cancel, &ctx.shared_tools)
 }
 
 /// The config the whole tower is built from: the synthesized self-delegation
@@ -166,12 +173,10 @@ pub fn build_parent_toolset(
 /// self-clone's prompt ends up byte-identical to the main agent's seed, menu
 /// included.
 ///
-/// The menu is folded here rather than injected by the shared [`SkillsHook`]
-/// because that hook renders the menu variant instructing the model to call a
-/// `load_skill` tool, which this runtime never registers.
-/// [`SkillRuntime::menu`] renders the on-disk paths the materialized catalog
-/// actually hands out — the same text the host folds into the main agent's seed
-/// (`oneshot::run`, `serve::seed_new_conversation`).
+/// The menu is folded here rather than injected by the shared [`SkillsHook`],
+/// so each subagent's prompt carries the same text the host folds into the main
+/// agent's seed (`oneshot::run`, `serve::seed_new_conversation`). Every level
+/// registers the `load_skill` tool the menu points to (see [`ChildContext`]).
 ///
 /// Borrows `config` unchanged when neither transform applies.
 fn tower_config<'a>(
@@ -221,9 +226,9 @@ fn build_subagents_at_depth(
         let children = Arc::clone(&children);
         let cancel = ctx.cancel.clone();
         let hooks = ctx.hooks();
-        let mcp_tools = ctx.mcp_tools.to_vec();
+        let shared_tools = ctx.shared_tools.clone();
         let build_agent = move || {
-            let tools = assemble_toolset(&config, &children, &cancel, &mcp_tools)
+            let tools = assemble_toolset(&config, &children, &cancel, &shared_tools)
                 .map_err(SubagentError::execution)?;
             let mut core = build_child_core(&config, Arc::clone(&client), max_turns, &hooks);
             for tool in tools {
@@ -348,17 +353,17 @@ fn build_child_core(
     core
 }
 
-/// Assemble the toolset for one agent level: the capability tools, the shared
-/// `mcp_tools`, and a delegate tool per `child`.
+/// Assemble the toolset for one agent level: the capability tools, the
+/// `shared_tools`, and a delegate tool per `child`.
 fn assemble_toolset(
     config: &RuntimeConfig,
     children: &HashMap<String, Arc<dyn Subagent>>,
     cancel: &CancellationToken,
-    mcp_tools: &[Arc<dyn ToolImplementation>],
+    shared_tools: &[Arc<dyn ToolImplementation>],
 ) -> Result<Toolset, RuntimeError> {
     let staged = ToolFactoryRegistry::with_builtin().build_all(&config.tools)?;
 
-    register_mcp_tools(mcp_tools, &staged)?;
+    register_shared_tools(shared_tools, &staged)?;
     register_child_delegates(config, children, &staged, cancel)?;
 
     Ok(staged
@@ -368,20 +373,20 @@ fn assemble_toolset(
         .collect())
 }
 
-/// Register the shared MCP tool adapters into `staged`.
+/// Register the shared tools (MCP adapters and `load_skill`) into `staged`.
 ///
 /// # Errors
-/// Returns [`RuntimeError::Config`] if an MCP tool name collides with a tool
+/// Returns [`RuntimeError::Config`] if a shared tool name collides with a tool
 /// already in `staged`.
-fn register_mcp_tools(
-    mcp_tools: &[Arc<dyn ToolImplementation>],
+fn register_shared_tools(
+    shared_tools: &[Arc<dyn ToolImplementation>],
     staged: &ToolRegistry,
 ) -> Result<(), RuntimeError> {
-    for tool in mcp_tools {
+    for tool in shared_tools {
         let name = tool.get_definition().function.name;
         if staged.contains(&name) {
             return Err(RuntimeError::Config(format!(
-                "MCP tool '{name}' collides with a configured tool of the same name; rename \
+                "tool '{name}' collides with a configured tool of the same name; rename \
                  the [[mcp_servers]] id or remove the [[tools]] entry"
             )));
         }
@@ -593,6 +598,15 @@ mod tests {
         ))
     }
 
+    async fn skill_runtime() -> Arc<SkillRuntime> {
+        Arc::new(SkillRuntime {
+            catalog: Arc::new(SkillCatalog::build(Vec::new()).await),
+            menu_budget: 4096,
+            body_budget: 4096,
+            mention: true,
+        })
+    }
+
     fn child_hooks(skills: Option<Arc<SkillsHook>>, rules: Option<Arc<RulesHook>>) -> ChildHooks {
         ChildHooks {
             store: None,
@@ -610,7 +624,7 @@ mod tests {
     ) -> ChildContext<'a> {
         ChildContext {
             store: None,
-            mcp_tools: &[],
+            shared_tools: Vec::new(),
             cancel,
             skills: None,
             rules: None,
@@ -802,7 +816,7 @@ mod tests {
             .err()
             .expect("colliding MCP tool must be rejected");
         assert!(
-            matches!(err, RuntimeError::Config(ref msg) if msg.contains("MCP tool 'read'")),
+            matches!(err, RuntimeError::Config(ref msg) if msg.contains("tool 'read' collides")),
             "unexpected error: {err}",
         );
     }
@@ -834,6 +848,66 @@ mod tests {
         let tools =
             build_parent_toolset(&config, &params(&config, &CancellationToken::new())).unwrap();
         assert_eq!(tool_names(&tools), vec!["read".to_string()]);
+    }
+
+    /// With `[skills]` configured, the main agent gets `load_skill`, and it is
+    /// auto-approved, so `approval.mode = "auto"` still boots.
+    #[tokio::test]
+    async fn test_skills_add_auto_approved_load_skill_to_parent_toolset() {
+        let config = config_with_subagents(vec![]);
+        assert!(matches!(config.approval.mode, crate::ApprovalMode::Auto));
+        let skills = skill_runtime().await;
+        let cancel = CancellationToken::new();
+
+        let tools = build_parent_toolset(
+            &config,
+            &ToolsetParams {
+                skills: Some(&skills),
+                ..params(&config, &cancel)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(tool_names(&tools), vec!["load_skill".to_string()]);
+        assert!(tools.iter().all(|tool| tool.is_auto_approved()));
+    }
+
+    /// Every tower level assembles its toolset from the context's shared tools,
+    /// so `load_skill` reaches each subagent beside the MCP tools.
+    #[tokio::test]
+    async fn test_child_context_shares_load_skill_with_every_level() {
+        let config = config_with_subagents(vec![subagent("worker")]);
+        let skills = skill_runtime().await;
+        let cancel = CancellationToken::new();
+        let mcp: Vec<Arc<dyn ToolImplementation>> = vec![Arc::new(NamedTool("fs__read_file"))];
+
+        let ctx = ChildContext::new(&ToolsetParams {
+            skills: Some(&skills),
+            mcp_tools: &mcp,
+            ..params(&config, &cancel)
+        });
+
+        assert_eq!(
+            tool_names(&ctx.shared_tools),
+            vec!["fs__read_file", "load_skill"]
+        );
+    }
+
+    /// A subagent id that collides with `load_skill` is rejected rather than
+    /// shadowing the skill tool.
+    #[tokio::test]
+    async fn test_subagent_named_load_skill_collides() {
+        let config = config_with_subagents(vec![subagent("load_skill")]);
+        let shared = vec![skill_runtime().await.tool()];
+
+        let children = mock_children(&["load_skill"]);
+        let err = assemble_toolset(&config, &children, &CancellationToken::new(), &shared)
+            .err()
+            .expect("a subagent named load_skill must be rejected");
+        assert!(
+            matches!(err, RuntimeError::Config(ref msg) if msg.contains("collides")),
+            "unexpected error: {err}",
+        );
     }
 
     /// A subagent with no `provider` inherits the agent's provider, so its

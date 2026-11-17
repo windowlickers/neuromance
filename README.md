@@ -315,13 +315,13 @@ strategy = "one_shot"
 
 ## Skills
 
-An optional `[skills]` section gives the agent **skills** — directories containing a `SKILL.md` (YAML frontmatter with `name` and `description`, plus optional [agentskills.io](https://agentskills.io) fields, followed by a Markdown body of reusable instructions). Skills use progressive disclosure: a cheap menu of `name: description (file: …)` is folded into the system prompt, and a skill's full body lives on disk, read only when needed. This keeps the system prompt stable and cache-friendly.
+An optional `[skills]` section gives the agent **skills** — directories containing a `SKILL.md` (YAML frontmatter with `name` and `description`, plus optional [agentskills.io](https://agentskills.io) fields, followed by a Markdown body of reusable instructions). Skills use progressive disclosure: a cheap menu of `name: description` is folded into the system prompt, and the agent loads a skill's full body only when needed. This keeps the system prompt stable and cache-friendly.
 
 Skills are discovered from on-host directory `roots` (each immediate subdirectory containing a `SKILL.md` is a skill) and/or a corpus-shaped HTTP `endpoint` (`GET /skills` for the menu, `GET /skills/{id}` for a body). On-host roots take precedence over the endpoint when a skill name appears in both.
 
-At startup the runtime **materializes** every discovered skill to a local temp directory and rebuilds the catalog over it, so the corpus is only a boot-time dependency. The menu then lists each skill's on-disk path, and the agent loads a skill by **reading that file** with its `read` tool — no fetch at reasoning time. In addition, when `mention` is enabled a `$name`, `skill://id`, or `[text](skill://id)` link in user input (for example a `/thing-skill` slash command) injects the body inline as a message; common shell variables (`$PATH`, `$HOME`, …) are ignored.
+The runtime lists the skills at startup and registers the native `load_skill` tool. The menu tells the agent to call `load_skill` with a skill's name; the tool fetches the body from the skill's source on demand and returns it, truncated to `body_budget_bytes`. The endpoint must therefore stay reachable while tasks run. `load_skill` returns only text the harness holds, so it is auto-approved and boots under `approval.mode = "auto"`. A `[[subagents]]` entry named `load_skill` fails startup. In addition, when `mention` is enabled a `$name`, `skill://id`, or `[text](skill://id)` link in user input (for example a `/thing-skill` slash command) injects the body inline as a message; common shell variables (`$PATH`, `$HOME`, …) are ignored.
 
-Subagents see the same catalog. The menu is appended to each subagent's configured `system_prompt` (a subagent has no seed message to fold it into), and `$mention` expansion works inside a delegated run the same way it does for the main agent.
+Subagents see the same catalog. The menu is appended to each subagent's configured `system_prompt` (a subagent has no seed message to fold it into), every subagent gets `load_skill`, and `$mention` expansion works inside a delegated run the same way it does for the main agent.
 
 ```toml
 [skills]
@@ -333,7 +333,7 @@ endpoint = "https://corpus.internal/api/v1/skills"
 endpoint_token_env = "CORPUS_TOKEN"
 # Expand `$name` mentions in user input into the skill body (default true).
 mention = true
-# Byte budgets for the menu and each mention-injected body (default 8192 each).
+# Byte budgets for the menu and each loaded body (default 8192 each).
 menu_budget_bytes = 8192
 body_budget_bytes = 8192
 ```

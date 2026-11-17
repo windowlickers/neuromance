@@ -130,8 +130,8 @@ async fn run_orchestrator(config: &RuntimeConfig, cancel: CancellationToken) -> 
 
     readiness.set_ready(true);
 
-    // The menu lists each skill's materialized file path; fold it into the seed
-    // system prompt so the agent reads skills from disk.
+    // Fold the menu into the seed system prompt; the agent loads a listed skill
+    // with the `load_skill` tool.
     let skills_menu = skills.as_ref().and_then(|s| s.menu());
 
     let result = match config.mode {

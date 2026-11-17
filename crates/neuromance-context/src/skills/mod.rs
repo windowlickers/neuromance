@@ -5,9 +5,7 @@
 //! body of reusable instructions for a class of task. Skills are context: a
 //! cheap menu of `name: description` is injected once, and a skill's full body
 //! is loaded only when needed — summoned by the `load_skill` tool or a `$name`
-//! mention, or, for a filesystem-equipped agent, read from disk after the
-//! catalog is materialized with [`synthesize_skill_md`]. Either way the system
-//! prompt stays stable and cache-friendly.
+//! mention. The system prompt stays stable and cache-friendly.
 //!
 //! ```no_run
 //! use neuromance_context::skills::{HttpSkillSource, LocalSkillSource, SkillCatalog};
@@ -34,7 +32,7 @@ mod mention;
 mod model;
 mod source;
 
-pub use catalog::{DEFAULT_BUDGET_BYTES, SkillCatalog, synthesize_skill_md};
+pub use catalog::{DEFAULT_BUDGET_BYTES, SkillCatalog};
 pub use error::SkillError;
 pub use frontmatter::{ParsedSkill, parse_skill};
 pub use hook::SkillsHook;

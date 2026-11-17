@@ -104,30 +104,6 @@ impl SkillCatalog {
     /// "N omitted" line rather than silently truncated.
     #[must_use]
     pub fn menu(&self, budget_bytes: usize) -> Option<String> {
-        self.render_menu(
-            budget_bytes,
-            "To load a skill's full instructions, call the `load_skill` tool with its name, \
-             or write `$name` in your request.",
-        )
-    }
-
-    /// Render the menu for an agent that reads skill bodies from local disk.
-    ///
-    /// Identical to [`menu`](Self::menu) but the instruction tells the model to
-    /// read the file at the path shown in each line's `(file: …)` locator, which
-    /// is how a filesystem-equipped agent loads a skill once its catalog has been
-    /// materialized to disk.
-    #[must_use]
-    pub fn menu_filesystem(&self, budget_bytes: usize) -> Option<String> {
-        self.render_menu(
-            budget_bytes,
-            "To use a skill, read the file at the path shown in parentheses with your read tool.",
-        )
-    }
-
-    /// Shared menu renderer: one budgeted `<skills_instructions>` block whose
-    /// instruction sentence is supplied by the caller.
-    fn render_menu(&self, budget_bytes: usize, instruction: &str) -> Option<String> {
         if self.entries.is_empty() {
             return None;
         }
@@ -135,12 +111,7 @@ impl SkillCatalog {
         let mut used = 0usize;
         let mut omitted = 0usize;
         for entry in &self.entries {
-            let line = format!(
-                "- {}: {} ({})",
-                entry.meta.name,
-                entry.meta.description,
-                entry.meta.locator.render()
-            );
+            let line = format!("- {}: {}", entry.meta.name, entry.meta.description);
             if used + line.len() + 1 > budget_bytes {
                 omitted += 1;
                 continue;
@@ -155,8 +126,9 @@ impl SkillCatalog {
         }
         Some(format!(
             "<skills_instructions>\n\
-             The skills below are reusable instructions for specific tasks. {instruction} \
-             Only load a skill when its description matches the task at hand.\n\n\
+             The skills below are reusable instructions for specific tasks. To load a skill's \
+             full instructions, call the `load_skill` tool with its name, or write `$name` in \
+             your request. Only load a skill when its description matches the task at hand.\n\n\
              {}\n\
              </skills_instructions>",
             lines.join("\n")
@@ -214,27 +186,6 @@ impl SkillCatalog {
         let body = self.sources[entry.source].load_body(&entry.meta.id).await?;
         Ok(truncate_on_char_boundary(&body, budget_bytes))
     }
-}
-
-/// Render `meta` and `body` back into a `SKILL.md` string `parse_skill` accepts.
-///
-/// Used to materialize a catalog to local disk: the frontmatter carries `name`,
-/// `description`, and any retained `extra` keys, fenced with `---`, followed by
-/// the body. The inverse of [`parse_skill`](super::parse_skill).
-///
-/// # Errors
-/// Returns [`SkillError::Yaml`] if the frontmatter mapping cannot be serialized.
-pub fn synthesize_skill_md(meta: &SkillMetadata, body: &str) -> Result<String, SkillError> {
-    let mut map = serde_yaml::Mapping::new();
-    map.insert("name".into(), meta.name.as_str().into());
-    map.insert("description".into(), meta.description.as_str().into());
-    for (k, v) in meta.extra.clone() {
-        map.insert(k, v);
-    }
-    // serde_yaml emits a trailing newline after the last entry, so the closing
-    // fence lands on its own line as `split_frontmatter` requires.
-    let yaml = serde_yaml::to_string(&map)?;
-    Ok(format!("---\n{yaml}---\n{body}"))
 }
 
 /// Truncate `s` to at most `max_bytes`, never splitting a UTF-8 code point, and
@@ -322,6 +273,15 @@ mod tests {
         assert!(menu.contains("- alpha: desc of alpha"));
         assert!(menu.contains("- beta: desc of beta"));
         assert!(menu.contains("<skills_instructions>"));
+        assert!(menu.contains("call the `load_skill` tool"));
+    }
+
+    #[tokio::test]
+    async fn test_menu_hides_skill_locations_from_the_model() {
+        let cat = catalog(&[("alpha", "body")]).await;
+        let menu = cat.menu(4096).unwrap();
+        assert!(menu.contains("- alpha: desc of alpha\n"), "{menu}");
+        assert!(!menu.contains("mem://skills"), "{menu}");
     }
 
     #[tokio::test]
@@ -365,63 +325,5 @@ mod tests {
         let resolved = cat.resolve_mentions("use skill://deploy and also $deploy and $build");
         let names: Vec<&str> = resolved.iter().map(|m| m.name.as_str()).collect();
         assert_eq!(names, vec!["deploy", "build"]);
-    }
-
-    #[tokio::test]
-    async fn test_menu_variants_differ_only_in_instruction() {
-        let cat = catalog(&[("alpha", "a")]).await;
-        let tool_menu = cat.menu(DEFAULT_BUDGET_BYTES).unwrap();
-        let file_menu = cat.menu_filesystem(DEFAULT_BUDGET_BYTES).unwrap();
-
-        assert!(tool_menu.contains("call the `load_skill` tool"));
-        assert!(!tool_menu.contains("read the file"));
-
-        assert!(file_menu.contains("read the file at the path shown"));
-        assert!(!file_menu.contains("load_skill"));
-        // Both still wrap the same budgeted skill list.
-        assert!(file_menu.contains("<skills_instructions>"));
-        assert!(file_menu.contains("- alpha: desc of alpha"));
-    }
-
-    #[test]
-    fn test_synthesize_round_trips_through_parse() {
-        let meta = SkillMetadata {
-            id: SkillId::new("forgejo-cli"),
-            name: "forgejo-cli".to_string(),
-            description: "Use the fj CLI.".to_string(),
-            locator: SkillLocator::Remote {
-                endpoint: "mem://skills".to_string(),
-                id: "forgejo-cli".to_string(),
-            },
-            extra: serde_yaml::Mapping::new(),
-        };
-        let body = "# Heading\nA body that even contains a stray --- inside it.\n";
-        let rendered = synthesize_skill_md(&meta, body).unwrap();
-        let parsed = crate::skills::parse_skill(&rendered).unwrap();
-        assert_eq!(parsed.name, "forgejo-cli");
-        assert_eq!(parsed.description, "Use the fj CLI.");
-        assert_eq!(parsed.body, body);
-    }
-
-    #[test]
-    fn test_synthesize_preserves_extra_frontmatter() {
-        let mut extra = serde_yaml::Mapping::new();
-        extra.insert("license".into(), "MIT".into());
-        let meta = SkillMetadata {
-            id: SkillId::new("x"),
-            name: "x".to_string(),
-            description: "y".to_string(),
-            locator: SkillLocator::Local("/tmp/x/SKILL.md".into()),
-            extra,
-        };
-        let rendered = synthesize_skill_md(&meta, "body").unwrap();
-        let parsed = crate::skills::parse_skill(&rendered).unwrap();
-        assert_eq!(
-            parsed
-                .extra
-                .get(serde_yaml::Value::from("license"))
-                .and_then(serde_yaml::Value::as_str),
-            Some("MIT")
-        );
     }
 }

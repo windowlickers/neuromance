@@ -276,7 +276,7 @@ pub struct ServeState {
     task_store: Arc<dyn TaskStore>,
     work_tx: mpsc::Sender<WorkerJob>,
     system_prompt: Arc<str>,
-    /// File-oriented skills menu folded into each new conversation's system
+    /// Skills menu folded into each new conversation's system
     /// prompt; `None` when no skills are configured.
     skills_menu: Option<Arc<str>>,
     /// The runtime config, used at enqueue time to reject unknown provider
@@ -367,8 +367,8 @@ fn seed_new_conversation(state: &ServeState, system_prompt: Option<&str>) -> Uui
     let now = Utc::now();
     let prompt = system_prompt.unwrap_or_else(|| state.system_prompt.as_ref());
     // Fold the skills menu into the seed system message so the conversation
-    // opens as a clean [System(prompt+menu), …] — the menu lists on-disk paths
-    // the agent reads, and round-trips through persisted history thereafter.
+    // opens as a clean [System(prompt+menu), …] — the menu round-trips through
+    // persisted history thereafter.
     let seed = Message::system(id, fold_menu(prompt, state.skills_menu.as_deref()));
     // The durable conversation row is created fail-closed by `record_task_status`
     // in `try_enqueue` (it pre-inserts the row in the same transaction as the
@@ -1264,7 +1264,7 @@ mod tests {
     fn test_seed_folds_skills_menu_into_single_system_message() {
         let (mut state, store, _rx) = fresh_state(4);
         state.skills_menu = Some(Arc::from(
-            "<skills_instructions>\n- alpha: a (file: /tmp/x/SKILL.md)\n</skills_instructions>",
+            "<skills_instructions>\n- alpha: a (skill: alpha)\n</skills_instructions>",
         ));
 
         let id = seed_new_conversation(&state, None);
@@ -1278,7 +1278,7 @@ mod tests {
         assert_eq!(messages[0].role, MessageRole::System);
         assert!(messages[0].content.starts_with("system"));
         assert!(messages[0].content.contains("<skills_instructions>"));
-        assert!(messages[0].content.contains("file: /tmp/x/SKILL.md"));
+        assert!(messages[0].content.contains("- alpha: a (skill: alpha)"));
     }
 
     #[test]
