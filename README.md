@@ -226,48 +226,14 @@ max_turns = 4
 name = "execute_python"
 ```
 
-## Sandboxed tool execution
-
-Tool execution can run in a separate **sandbox** process so that a misbehaving agent — one that escapes the in-process Python sandbox or abuses `bash` — has no path to the database or the LLM credentials. The orchestrator and the sandbox run as two containers in one pod under different service accounts: the orchestrator (`sa/mancer`) holds the DB and provider credentials and runs the agent loop, approval, and persistence; the sandbox (`sa/mancer-sandbox`) executes the capability tools (`bash`, file tools, `grep`/`find`/`ls`, `execute_python`) against the workspace, with an egress `NetworkPolicy` blocking Postgres and no place in the database `AuthorizationPolicy`.
-
-The same binary runs both roles, selected by subcommand:
-
-```bash
-neuromance-runtime           # orchestrator (default; also `run`)
-neuromance-runtime sandbox   # sandbox tool executor
-```
-
-Both processes read the same config file. The `[sandbox]` section configures the boundary:
-
-```toml
-[sandbox]
-# Address the sandbox process binds its gRPC server to. Loopback-only: the
-# two containers share the pod network namespace, so the channel never leaves
-# the pod. Optional; defaults to 127.0.0.1:50051.
-listen_addr = "127.0.0.1:50051"
-# Endpoint the orchestrator dials. When set, the orchestrator advertises the
-# sandbox's tools to the LLM and routes every approved tool call there instead
-# of executing in-process. Unset (or no [sandbox] section) keeps tools local.
-endpoint = "http://127.0.0.1:50051"
-```
-
-The orchestrator fetches the sandbox's tool definitions once at startup (retrying while the sandbox container comes up) and mirrors each tool's auto-approval requirement, so the startup approval gate behaves exactly as it does for local tools. Approval is always decided by the orchestrator before a call crosses the boundary; the sandbox only executes. A tool that runs but fails is returned as a normal tool error; a transport failure degrades to a failed tool call rather than crashing the orchestrator.
-
-The channel is loopback-only within the pod (Istio mesh covers transport; the channel construction is left pluggable for future SPIFFE/SPIRE identities). With `[workspace]` configured, the workspace volume is an `emptyDir` shared by both containers: the sandbox executes tools inside it, while the orchestrator — which holds the storage and git credentials — seeds and snapshots it. Tool code still has no reachable credentials.
-
-The gRPC build needs `protoc` (provided by the Nix dev shell and build inputs).
-
-**Limitation (this release):** the Python `run_subagent`/`spawn_agents` bridge cannot cross the sandbox boundary — it needs the interpreter and the subagent tower in one process. A config that sets `sandbox.endpoint` together with an `execute_python` tool and any delegation (`[[subagents]]` or `runtime.self_delegation`) is rejected at startup. Delegation and a standalone `execute_python` each work under the sandbox individually.
-
 ## Workspaces
 
-Each conversation gets a working directory at `<root>/<conversation_id>`, created when its first task runs and reused by continuations. The directory is announced in the seed system message and injected as `bash`'s default `cwd` (an explicit `cwd` in a tool call always wins), on both the in-process and sandbox execution paths. Subagents inherit the parent's workspace, and each delegated task carries the same directory note — a subagent's system prompt is fixed at startup, before any conversation has a workspace, so the note is attached to the task instead.
+Each conversation gets a working directory at `<root>/<conversation_id>`, created when its first task runs and reused by continuations. The directory is announced in the seed system message and injected as `bash`'s default `cwd` (an explicit `cwd` in a tool call always wins). Subagents inherit the parent's workspace, and each delegated task carries the same directory note — a subagent's system prompt is fixed at startup, before any conversation has a workspace, so the note is attached to the task instead.
 
 ```toml
 [workspace]
 # Absolute root under which per-conversation directories are created.
-# In k8s this is an emptyDir mounted at the same path in the orchestrator
-# and sandbox containers.
+# In k8s this is typically an emptyDir.
 root = "/workspace"
 
 # S3-compatible object storage (garage). Required by object seeds and

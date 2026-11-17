@@ -24,34 +24,19 @@ use neuromance_runtime::{
     lifecycle::shutdown_handler,
     mcp, metrics as runtime_metrics, oneshot,
     proxy::build_provider_config,
-    rules, sandbox, serve, skills,
+    rules, serve, skills,
     telemetry::{self, BoxedLayer},
     workspace::WorkspaceManager,
 };
 use neuromance_tools::ToolImplementation;
 
-/// Process role. Defaults to the orchestrator when no subcommand is given, so
-/// existing no-argument invocations keep working.
-#[derive(Debug, Clone, Copy, Default, clap::Subcommand)]
-enum Command {
-    /// Run the orchestrator: HTTP task API, agent loop, and persistence.
-    #[default]
-    Run,
-    /// Run the sandbox tool executor: execute capability tools over gRPC on
-    /// behalf of an orchestrator, with no database access.
-    Sandbox,
-}
-
 #[derive(Debug, Parser)]
 #[command(name = "neuromance-runtime", about, version)]
-struct Cli {
-    #[command(subcommand)]
-    command: Option<Command>,
-}
+struct Cli {}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    Cli::parse();
 
     let config = RuntimeConfig::load_default().map_err(anyhow::Error::from)?;
 
@@ -69,10 +54,7 @@ async fn main() -> Result<()> {
     let cancel = CancellationToken::new();
     shutdown_handler(cancel.clone()).context("install shutdown handler")?;
 
-    let result = match cli.command.unwrap_or_default() {
-        Command::Run => run_orchestrator(&config, cancel.clone()).await,
-        Command::Sandbox => run_sandbox(&config, cancel.clone()).await,
-    };
+    let result = run_orchestrator(&config, cancel.clone()).await;
 
     cancel.cancel();
 
@@ -125,16 +107,6 @@ async fn run_orchestrator(config: &RuntimeConfig, cancel: CancellationToken) -> 
         .context("initialize workspace manager")?
         .map(Arc::new);
 
-    // One sandbox client, shared by tool execution and (in serve mode) per-task
-    // session cleanup. The channel connects lazily, so this never blocks on a
-    // not-yet-ready sandbox.
-    let sandbox_client = match config.sandbox.as_ref().and_then(|s| s.endpoint.as_ref()) {
-        Some(endpoint) => {
-            Some(sandbox::SandboxClient::connect(endpoint).map_err(anyhow::Error::from)?)
-        }
-        None => None,
-    };
-
     let mcp_tools = mcp::connect(&config.mcp_servers)
         .await
         .map_err(anyhow::Error::from)?;
@@ -149,7 +121,6 @@ async fn run_orchestrator(config: &RuntimeConfig, cancel: CancellationToken) -> 
     let factory = Arc::new(AgentFactory {
         config: Arc::new(config.clone()),
         store: store.clone(),
-        sandbox_client: sandbox_client.clone(),
         mcp_tools,
         skills: skills.clone(),
         rules: rules.clone(),
@@ -167,15 +138,8 @@ async fn run_orchestrator(config: &RuntimeConfig, cancel: CancellationToken) -> 
         .map_err(anyhow::Error::from)?;
 
     // Best-effort one-time tool setup before tasks (the pod has no persistent
-    // storage to cache credentials a tool writes to disk). Bootstrap must run in
-    // the process that hosts the tool executor. With a sandbox configured, tools
-    // run there and `run_sandbox` bootstraps instead — this orchestrator executes
-    // no tools, and its container has a separate home, so a login written here is
-    // invisible to the sandbox. Without a sandbox, capability tools run in-process
-    // here, so bootstrap here.
-    if sandbox_client.is_none() {
-        bootstrap::run(&config.bootstrap).await;
-    }
+    // storage to cache credentials a tool writes to disk).
+    bootstrap::run(&config.bootstrap).await;
 
     readiness.set_ready(true);
 
@@ -200,7 +164,6 @@ async fn run_orchestrator(config: &RuntimeConfig, cancel: CancellationToken) -> 
                 agent,
                 factory,
                 store,
-                sandbox_client,
                 local_python,
                 skills_menu.map(Arc::from),
                 workspace,
@@ -223,34 +186,6 @@ async fn run_orchestrator(config: &RuntimeConfig, cancel: CancellationToken) -> 
     }
 
     result
-}
-
-/// Run the sandbox role: serve the gRPC tool service until shutdown. No agent,
-/// database, or HTTP task API — just tool execution.
-async fn run_sandbox(config: &RuntimeConfig, cancel: CancellationToken) -> Result<()> {
-    let settings = config.sandbox.as_ref().ok_or_else(|| {
-        anyhow::anyhow!("the sandbox subcommand requires a [sandbox] config section")
-    })?;
-    let addr: SocketAddr = settings
-        .listen_addr
-        .parse()
-        .with_context(|| format!("invalid sandbox.listen_addr: {}", settings.listen_addr))?;
-
-    // The sandbox process hosts the tool executor, so any tool that caches
-    // credentials on disk (see `bootstrap`) must be set up here: this container's
-    // home is separate from the orchestrator's, so a login written there is
-    // invisible to tools running in the sandbox. Best-effort; never fails startup.
-    bootstrap::run(&config.bootstrap).await;
-
-    let toolset = Arc::new(sandbox::server::build_sandbox_toolset(
-        &config.tools,
-        config.workspace.as_ref().map(|w| w.root.clone()),
-    )?);
-    info!(%addr, tools = config.tools.len(), "neuromance-runtime sandbox starting");
-
-    sandbox::server::serve(toolset, addr, cancel)
-        .await
-        .map_err(anyhow::Error::from)
 }
 
 fn init_tracing(extra_layer: Option<BoxedLayer<Registry>>) {
@@ -286,7 +221,7 @@ async fn spawn_health_server(
     prometheus_handle: metrics_exporter_prometheus::PrometheusHandle,
     cancel: CancellationToken,
 ) -> Result<tokio::task::JoinHandle<()>> {
-    let addr: std::net::SocketAddr = config
+    let addr: SocketAddr = config
         .runtime
         .health_addr
         .parse()
@@ -375,10 +310,13 @@ fn apply_context_compaction(
     Ok(core)
 }
 
-async fn build_agent(
+/// An agent paired with the reset handle for its in-process Python interpreter.
+type BuiltAgent = (Agent<Box<dyn LLMClient>>, Option<SessionReset>);
+
+fn build_agent(
     inputs: &AgentFactory,
     overrides: &AgentOverrides,
-) -> Result<(Agent<Box<dyn LLMClient>>, Option<SessionReset>), RuntimeError> {
+) -> Result<BuiltAgent, RuntimeError> {
     let config: &RuntimeConfig = &inputs.config;
     let store = inputs.store.as_ref();
     let skills = inputs.skills.as_ref();
@@ -398,19 +336,11 @@ async fn build_agent(
         core.max_turns = Some(max);
     }
     core.empty_turn_retries = config.agent.empty_turn_retries;
-    core.output_schema = overrides.output_schema.clone();
+    core.output_schema.clone_from(&overrides.output_schema);
     if let Some(store) = store {
         let sink: Arc<PgConversationStore> = Arc::clone(store);
         core = core.with_hook(Arc::new(PersistenceHook::new(sink)));
     }
-
-    // When a sandbox endpoint is configured, capability tools execute in the
-    // sandbox process: fetch their definitions once and reuse the adapters
-    // across the main agent and every subagent.
-    let remote_capabilities = match &inputs.sandbox_client {
-        Some(client) => Some(sandbox::connect_tools(client).await?),
-        None => None,
-    };
 
     // The main agent's toolset, including delegate tools for every configured
     // subagent and the delegation tower beneath them (bounded by
@@ -423,7 +353,6 @@ async fn build_agent(
             store,
             skills,
             rules,
-            remote_capabilities: remote_capabilities.as_deref(),
             mcp_tools: &inputs.mcp_tools,
             parent_provider: provider,
             parent_model: model,
@@ -530,12 +459,11 @@ fn apply_approval(
 
 /// Owns the startup inputs `build_agent` needs so the serve worker can build a
 /// fresh agent per task when a task carries a model override. Every input is
-/// already cheap to share (`Arc`, a lazy sandbox channel, a token), so cloning
+/// already cheap to share (`Arc`, a token), so cloning
 /// it into the factory costs nothing meaningful.
 struct AgentFactory {
     config: Arc<RuntimeConfig>,
     store: Option<Arc<PgConversationStore>>,
-    sandbox_client: Option<sandbox::SandboxClient>,
     /// Adapters for every `[[mcp_servers]]` tool, connected once at startup.
     mcp_tools: Vec<Arc<dyn ToolImplementation>>,
     skills: Option<Arc<SkillRuntime>>,
@@ -549,7 +477,7 @@ impl AgentBuilder for AgentFactory {
         &self,
         overrides: &AgentOverrides,
     ) -> Result<(Agent<Box<dyn LLMClient>>, Option<SessionReset>), RuntimeError> {
-        build_agent(self, overrides).await
+        build_agent(self, overrides)
     }
 }
 
@@ -576,7 +504,6 @@ async fn run_serve(
     agent: Agent<Box<dyn LLMClient>>,
     builder: Arc<dyn AgentBuilder>,
     store: Option<Arc<PgConversationStore>>,
-    sandbox_client: Option<sandbox::SandboxClient>,
     local_python: Option<SessionReset>,
     skills_menu: Option<Arc<str>>,
     workspace: Option<Arc<WorkspaceManager>>,
@@ -587,7 +514,6 @@ async fn run_serve(
         agent,
         builder,
         store,
-        sandbox_client,
         local_python,
         skills_menu,
         workspace,

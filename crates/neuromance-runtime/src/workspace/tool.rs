@@ -1,9 +1,7 @@
 //! Ambient-workspace default cwd for locally-executed tools.
 //!
-//! The sandbox path injects the workspace as bash's default cwd server-side
-//! (see `sandbox/server.rs`); this wrapper is the in-process counterpart,
-//! reading the workspace from the ambient [`DelegationContext`] at execution
-//! time so one wrapped instance serves every task the worker runs.
+//! The wrapper reads the workspace from the ambient [`DelegationContext`] at
+//! execution time, so one wrapped instance serves every task the worker runs.
 
 use std::sync::Arc;
 

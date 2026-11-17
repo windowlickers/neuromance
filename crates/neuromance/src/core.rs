@@ -897,8 +897,7 @@ impl<C: LLMClient> Core<C> {
                     //
                     // Core owns this span rather than `ToolExecutor`: only here
                     // are the call id, the approval decision, and the result all
-                    // in scope, and `execute_named` is also called by the sandbox
-                    // process, where a second span would duplicate this one.
+                    // in scope.
                     //
                     // `gen_ai.tool.type` is `function` for every tool today.
                     // MCP-backed tools should report `extension`, which needs

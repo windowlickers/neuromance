@@ -12,9 +12,8 @@
 //!
 //! Tasks are processed sequentially by a single worker that owns the
 //! agent. Because that one agent is reused across tasks, the worker resets
-//! its `execute_python` interpreter after each run — the sandbox session
-//! when tools run remotely, the in-process interpreter otherwise — so one
-//! task's interpreter state never bleeds into the next. Without `[database]`,
+//! its in-process `execute_python` interpreter after each run, so one task's
+//! interpreter state never bleeds into the next. Without `[database]`,
 //! in-memory state is authoritative for serving and restarts lose pending and
 //! completed tasks.
 //!
@@ -63,7 +62,6 @@ use neuromance_db::PgConversationStore;
 
 use crate::SessionReset;
 use crate::config::{RuntimeConfig, SELF_DELEGATION_ID, WorkspaceDefinition};
-use crate::sandbox::{EXECUTE_PYTHON, SandboxClient};
 use crate::skills::fold_menu;
 use crate::task_store::{
     ConversationRecord, InMemoryTaskStore, PostgresTaskStore, TaskOutcome, TaskRecord, TaskStore,
@@ -751,14 +749,10 @@ struct WorkerCtx {
     agent: Arc<Mutex<ServeAgent>>,
     /// Builds a throwaway agent for a task that overrides the model.
     builder: Arc<dyn AgentBuilder>,
-    /// Sandbox handle used to release a task's `execute_python` interpreter once
-    /// the run completes. `Some` only when the sandbox hosts `execute_python`;
-    /// the interpreter is keyed by task id (see `RemoteToolAdapter`).
-    sandbox: Option<SandboxClient>,
     /// Reset handle for the main agent's in-process `execute_python`
     /// interpreter, called after each task so user state does not bleed into
-    /// the next. `Some` only when `execute_python` runs locally (not in the
-    /// sandbox) and the `python-repl` feature is built.
+    /// the next. `Some` only when `execute_python` is configured and the
+    /// `python-repl` feature is built.
     local_python: Option<SessionReset>,
     /// Prepares (and, with persistence, snapshots) per-conversation
     /// workspaces. `None` when no `[workspace]` is configured.
@@ -786,7 +780,6 @@ async fn worker_loop(mut rx: mpsc::Receiver<WorkerJob>, ctx: WorkerCtx, cancel: 
                 let (task_id, conversation_id) = (job.task_id, job.conversation_id);
                 let start_seq = ctx.task_store.begin_provenance(conversation_id).await;
                 let _ = process_job(&ctx, job, cancel.clone()).await;
-                release_sandbox_session(ctx.sandbox.as_ref(), task_id).await;
                 reset_local_python(ctx.local_python.as_ref()).await;
                 ctx.task_store
                     .record_provenance(task_id, conversation_id, start_seq)
@@ -796,26 +789,10 @@ async fn worker_loop(mut rx: mpsc::Receiver<WorkerJob>, ctx: WorkerCtx, cancel: 
     }
 }
 
-/// Free the sandbox `execute_python` interpreter a task used. The interpreter
-/// is keyed by task id, so closing it after each run keeps state from bleeding
-/// into the next task and stops interpreters accumulating in a long-lived serve
-/// process. Best-effort: a failed close leaks one interpreter but never fails
-/// the task. No-op when the sandbox is absent or hosts no `execute_python`.
-async fn release_sandbox_session(sandbox: Option<&SandboxClient>, task_id: Uuid) {
-    let Some(client) = sandbox else {
-        return;
-    };
-    if let Err(e) = client.close_session(task_id.to_string()).await {
-        warn!(%task_id, error = %e, "failed to release sandbox interpreter session");
-    }
-}
-
 /// Clear the main agent's in-process `execute_python` interpreter after a task.
 /// The single agent is reused across tasks, so without this a task's variables,
-/// imports, and definitions would still be visible to the next one. The
-/// in-sandbox interpreter is handled separately by [`release_sandbox_session`];
-/// this is the local counterpart. No-op when there is no local interpreter to
-/// reset; the handle itself logs on failure.
+/// imports, and definitions would still be visible to the next one. No-op when
+/// there is no local interpreter to reset; the handle itself logs on failure.
 async fn reset_local_python(local_python: Option<&SessionReset>) {
     if let Some(reset) = local_python {
         reset().await;
@@ -1099,7 +1076,6 @@ pub async fn run(
     agent: ServeAgent,
     builder: Arc<dyn AgentBuilder>,
     store: Option<Arc<PgConversationStore>>,
-    sandbox_client: Option<SandboxClient>,
     local_python: Option<SessionReset>,
     skills_menu: Option<Arc<str>>,
     workspace: Option<Arc<WorkspaceManager>>,
@@ -1117,18 +1093,12 @@ pub async fn run(
     let (work_tx, work_rx) = mpsc::channel::<WorkerJob>(config.runtime.max_queue_depth);
     let system_prompt: Arc<str> = Arc::from(config.agent.system_prompt.as_str());
 
-    // Per-task interpreter cleanup is only needed when the sandbox actually hosts
-    // execute_python; stateless tools create no session to release.
-    let session_closer =
-        sandbox_client.filter(|_| config.tools.iter().any(|t| t.name == EXECUTE_PYTHON));
-
     let worker = tokio::spawn(worker_loop(
         work_rx,
         WorkerCtx {
             task_store: Arc::clone(&task_store),
             agent: Arc::clone(&agent),
             builder,
-            sandbox: session_closer,
             local_python,
             workspace,
         },
@@ -1344,7 +1314,6 @@ mod tests {
                 task_store: Arc::clone(&store) as Arc<dyn TaskStore>,
                 agent: Arc::clone(&agent),
                 builder: stub_builder(),
-                sandbox: None,
                 local_python: None,
                 workspace: None,
             },
@@ -1542,7 +1511,6 @@ mod tests {
             task_store: Arc::clone(&state.task_store),
             agent,
             builder: stub_builder(),
-            sandbox: None,
             local_python: None,
             workspace: None,
         }
@@ -2044,7 +2012,6 @@ mod tests {
             builder: Arc::new(TestBuilder {
                 reply: "from-override".to_string(),
             }),
-            sandbox: None,
             local_python: None,
             workspace: None,
         };
@@ -2100,7 +2067,6 @@ mod tests {
             builder: Arc::new(TestBuilder {
                 reply: "from-override".to_string(),
             }),
-            sandbox: None,
             local_python: None,
             workspace: None,
         };
@@ -2185,7 +2151,6 @@ mod tests {
             task_store: Arc::clone(&state.task_store),
             agent,
             builder: stub_builder(),
-            sandbox: None,
             local_python: None,
             workspace: None,
         }

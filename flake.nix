@@ -50,8 +50,7 @@
             path: type:
             (craneLib.filterCargoSources path type)
             || (builtins.match ".*/migrations/.*\\.sql$" path != null)
-            || (builtins.match ".*/\\.sqlx/query-.*\\.json$" path != null)
-            || (builtins.match ".*\\.proto$" path != null);
+            || (builtins.match ".*/\\.sqlx/query-.*\\.json$" path != null);
         };
 
         # Default Python package set for the embedded REPL — empty by design.
@@ -76,14 +75,12 @@
           nativeBuildInputs = [
             pkgs.pkg-config
             pkgs.mold
-            pkgs.protobuf
             # neuromance-tools' proxied-clone test spawns the `git` CLI, the
             # same binary the toolkit runtime image carries. Every
             # buildPackage runs the suite in its checkPhase, so `git` belongs
             # here rather than on a single check.
             pkgs.git
           ];
-          PROTOC = "${pkgs.protobuf}/bin/protoc";
           PYO3_PYTHON = "${pythonEnv}/bin/python3";
           # Compile sqlx query macros from the committed .sqlx/ metadata —
           # build sandboxes have no database.
@@ -561,12 +558,10 @@
             sqlx-cli
             postgresql
             mold
-            protobuf
           ]);
 
           RUST_BACKTRACE = "1";
           PYO3_PYTHON = "${defaultPythonEnv}/bin/python3";
-          PROTOC = "${pkgs.protobuf}/bin/protoc";
           RUSTFLAGS = "-C link-arg=-fuse-ld=mold";
         };
 

@@ -31,7 +31,6 @@ pub mod metrics;
 pub mod oneshot;
 pub mod proxy;
 pub mod rules;
-pub mod sandbox;
 pub mod serve;
 pub mod skills;
 pub mod subagents;
@@ -42,7 +41,7 @@ pub mod workspace;
 pub use config::{
     AgentConfig, ApprovalConfig, ApprovalMode, ContextSettings, DatabaseSettings, GitSeed, Mode,
     ObjectSeed, OneshotConfig, ProviderConfig, ProviderProxyConfig, RulesSettings, RuntimeConfig,
-    RuntimeSettings, SandboxConfig, SkillsSettings, SubagentConfig, WorkspaceDefinition,
+    RuntimeSettings, SkillsSettings, SubagentConfig, WorkspaceDefinition,
     WorkspacePersistenceSettings, WorkspaceSettings, WorkspaceStorageSettings,
 };
 pub use error::RuntimeError;

@@ -5,8 +5,8 @@
 //! does, the worker builds a throwaway agent bound to that provider/model
 //! through an [`AgentBuilder`], runs the single turn, and drops it. The trait
 //! lives here so `serve` (this library) can depend on it while the concrete
-//! builder — which owns the full set of startup inputs (config, store, sandbox,
-//! skills, rules) — is assembled in the binary alongside `build_agent`.
+//! builder — which owns the full set of startup inputs (config, store, MCP
+//! tools, skills, rules) — is assembled in the binary alongside `build_agent`.
 
 use async_trait::async_trait;
 use neuromance_agent::Agent;

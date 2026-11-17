@@ -54,17 +54,19 @@ use neuromance_tools::{ToolConfig, ToolFactoryRegistry, ToolImplementation, Tool
 use crate::config::{ProviderConfig, RuntimeConfig, SELF_DELEGATION_ID, SubagentConfig};
 use crate::error::RuntimeError;
 use crate::proxy::build_provider_config;
-use crate::sandbox::EXECUTE_PYTHON;
 use crate::skills::{SkillRuntime, fold_menu};
 use crate::workspace::WorkspaceNoteSubagent;
+
+/// Name of the in-process Python REPL tool, built by the runtime rather than a
+/// tool factory so it can bridge subagents and reset between tasks.
+pub(crate) const EXECUTE_PYTHON: &str = "execute_python";
 
 /// A per-task cleanup handle for the main agent's in-process `execute_python`
 /// interpreter. Calling it clears the interpreter's user namespace so state
 /// from one serve task never bleeds into the next.
 ///
 /// `None` accompanies a toolset with no resettable interpreter: `execute_python`
-/// is unconfigured, runs in the sandbox (keyed by task there instead), or the
-/// `python-repl` feature is disabled.
+/// is unconfigured or the `python-repl` feature is disabled.
 pub type SessionReset = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 /// An assembled toolset paired with the optional reset handle for its
@@ -84,10 +86,6 @@ pub struct ToolsetParams<'a> {
     pub skills: Option<&'a Arc<SkillRuntime>>,
     /// The main agent's rules hook, shared verbatim with every subagent.
     pub rules: Option<&'a Arc<RulesHook>>,
-    /// Sandbox-backed capability tools (`bash`, file tools, `execute_python`, …)
-    /// replacing the locally-built ones. Shared (cloned) across the main agent
-    /// and every subagent; delegate tools are still built locally per level.
-    pub remote_capabilities: Option<&'a [Arc<dyn ToolImplementation>]>,
     /// Tools from the connected `[[mcp_servers]]`, shared (cloned) across the
     /// main agent and every subagent.
     pub mcp_tools: &'a [Arc<dyn ToolImplementation>],
@@ -103,7 +101,6 @@ pub struct ToolsetParams<'a> {
 /// Resolved, tower-wide inputs threaded through every level of the recursion.
 struct ChildContext<'a> {
     store: Option<&'a Arc<PgConversationStore>>,
-    remote_capabilities: Option<&'a [Arc<dyn ToolImplementation>]>,
     mcp_tools: &'a [Arc<dyn ToolImplementation>],
     cancel: &'a CancellationToken,
     /// `$mention`-expanding skills hook, built once for the whole tower: its
@@ -121,7 +118,6 @@ impl<'a> ChildContext<'a> {
     fn new(params: &ToolsetParams<'a>) -> Self {
         Self {
             store: params.store,
-            remote_capabilities: params.remote_capabilities,
             mcp_tools: params.mcp_tools,
             cancel: params.cancel,
             skills: params.skills.map(|skills| skills.hook()),
@@ -178,13 +174,7 @@ pub fn build_parent_toolset(
         let remaining = config.runtime.max_delegation_depth.saturating_sub(1);
         build_subagents_at_depth(config, remaining, &ChildContext::new(params))?
     };
-    assemble_toolset(
-        config,
-        &children,
-        params.cancel,
-        params.mcp_tools,
-        params.remote_capabilities,
-    )
+    assemble_toolset(config, &children, params.cancel, params.mcp_tools)
 }
 
 /// The config the whole tower is built from: the synthesized self-delegation
@@ -257,25 +247,14 @@ fn build_subagents_at_depth(
         let children = Arc::clone(&children);
         let cancel = ctx.cancel.clone();
         let hooks = ctx.hooks();
-        // Shared sandbox capability tools (stateless handles), cloned into each
-        // run's toolset. Under the sandbox a subagent never carries
-        // execute_python (rejected by config validation), so there is no
-        // interpreter state to keep fresh across runs.
-        let remote_capabilities = ctx.remote_capabilities.map(<[_]>::to_vec);
         let mcp_tools = ctx.mcp_tools.to_vec();
         let build_agent = move || {
             // Reassemble the toolset per run so a fresh Python interpreter is
             // built each time; nothing persists across runs of one subagent or
             // across concurrent sibling runs. A subagent rebuilds per run, so it
             // has no need of the parent's between-task reset handle.
-            let (tools, _reset) = assemble_toolset(
-                &config,
-                &children,
-                &cancel,
-                &mcp_tools,
-                remote_capabilities.as_deref(),
-            )
-            .map_err(SubagentError::execution)?;
+            let (tools, _reset) = assemble_toolset(&config, &children, &cancel, &mcp_tools)
+                .map_err(SubagentError::execution)?;
             let mut core = build_child_core(&config, Arc::clone(&client), max_turns, &hooks);
             for tool in tools {
                 core.tool_executor.add_tool_arc(tool);
@@ -409,73 +388,52 @@ fn build_child_core(
 /// configured and `children` is non-empty) the Python delegation bridge over
 /// `children`.
 ///
-/// When `remote_capabilities` is `Some`, the capability tools are the
-/// sandbox-backed adapters rather than locally-built tools; the Python bridge
-/// is never built in that case (config validation forbids the combination).
-/// With empty `children` and no sandbox, this is the capability toolset only,
-/// and any configured `execute_python` is built as a plain REPL (no bridge).
+/// With empty `children`, any configured `execute_python` is built as a plain
+/// REPL (no bridge).
 ///
 /// The second return value is a reset handle for the in-process
-/// `execute_python` interpreter, or `None` when there is none to reset (no
-/// local interpreter, or the sandbox hosts it). Callers that reuse one agent
-/// across tasks (serve mode) call it between tasks; callers that rebuild per
-/// run (subagents) ignore it.
+/// `execute_python` interpreter, or `None` when there is none to reset.
+/// Callers that reuse one agent across tasks (serve mode) call it between
+/// tasks; callers that rebuild per run (subagents) ignore it.
 fn assemble_toolset(
     config: &RuntimeConfig,
     children: &HashMap<String, Arc<dyn Subagent>>,
     cancel: &CancellationToken,
     mcp_tools: &[Arc<dyn ToolImplementation>],
-    remote_capabilities: Option<&[Arc<dyn ToolImplementation>]>,
 ) -> Result<Toolset, RuntimeError> {
-    // The Python->subagent bridge runs the interpreter in-process and cannot
-    // cross the sandbox boundary, so it is only ever built for the local path.
-    #[cfg_attr(not(feature = "python-repl"), allow(unused_variables))]
-    let bridge = remote_capabilities.is_none() && bridge_python(config, children);
-
-    let staged = if let Some(remote) = remote_capabilities {
-        let registry = ToolRegistry::new();
-        for tool in remote {
-            registry.register(Arc::clone(tool));
-        }
-        registry
+    // The runtime builds `execute_python` explicitly below (plain or bridged)
+    // so it can hold a typed handle to reset the interpreter; keep the factory
+    // from also building one. Without the python-repl feature there is no
+    // explicit build, so leave it in for `build_all` to reject.
+    let factory_configs: Vec<ToolConfig> = if cfg!(feature = "python-repl") {
+        config
+            .tools
+            .iter()
+            .filter(|t| t.name != EXECUTE_PYTHON)
+            .cloned()
+            .collect()
     } else {
-        // The runtime builds `execute_python` explicitly below (plain or
-        // bridged) so it can hold a typed handle to reset the interpreter; keep
-        // the factory from also building one. Without the python-repl feature
-        // there is no explicit build, so leave it in for `build_all` to reject.
-        let factory_configs: Vec<ToolConfig> = if cfg!(feature = "python-repl") {
-            config
-                .tools
-                .iter()
-                .filter(|t| t.name != EXECUTE_PYTHON)
-                .cloned()
-                .collect()
-        } else {
-            config.tools.clone()
-        };
-
-        let factories = ToolFactoryRegistry::with_builtin();
-        factories.build_all(&factory_configs)?
+        config.tools.clone()
     };
+    let staged = ToolFactoryRegistry::with_builtin().build_all(&factory_configs)?;
 
     register_mcp_tools(mcp_tools, &staged)?;
     register_child_delegates(config, children, &staged, cancel)?;
 
-    // Only the in-process interpreter carries resettable state; the sandbox
-    // path keys it by task instead, so no reset handle is produced there.
     #[cfg(feature = "python-repl")]
-    let reset = if remote_capabilities.is_none() {
-        register_local_python(config, children, &staged, cancel, bridge)?
-    } else {
-        None
-    };
+    let reset = register_local_python(
+        config,
+        children,
+        &staged,
+        cancel,
+        bridge_python(config, children),
+    )?;
     #[cfg(not(feature = "python-repl"))]
     let reset = None;
 
-    // With a workspace configured and tools running in-process, wrap bash so
-    // its cwd defaults to the ambient workspace dir. The sandbox path injects
-    // the default server-side instead (see sandbox/server.rs).
-    let wrap_bash = config.workspace.is_some() && remote_capabilities.is_none();
+    // With a workspace configured, wrap bash so its cwd defaults to the
+    // ambient workspace dir.
+    let wrap_bash = config.workspace.is_some();
     let tools = staged
         .tool_names()
         .into_iter()
@@ -641,11 +599,6 @@ fn bridge_python(config: &RuntimeConfig, children: &HashMap<String, Arc<dyn Suba
     !children.is_empty() && config.tools.iter().any(|t| t.name == EXECUTE_PYTHON)
 }
 
-#[cfg(not(feature = "python-repl"))]
-fn bridge_python(_config: &RuntimeConfig, _children: &HashMap<String, Arc<dyn Subagent>>) -> bool {
-    false
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -705,12 +658,11 @@ mod tests {
             rules: None,
             bootstrap: Vec::new(),
             mcp_servers: Vec::new(),
-            sandbox: None,
             workspace: None,
         }
     }
 
-    /// Default tower params for `config`: no store, skills, rules, or sandbox,
+    /// Default tower params for `config`: no store, skills, rules, or MCP tools,
     /// with the parent's provider/model resolved from `[agent]` exactly as
     /// `build_agent` does for a task that carries no override.
     fn params<'a>(config: &'a RuntimeConfig, cancel: &'a CancellationToken) -> ToolsetParams<'a> {
@@ -720,7 +672,6 @@ mod tests {
             store: None,
             skills: None,
             rules: None,
-            remote_capabilities: None,
             mcp_tools: &[],
             parent_provider,
             parent_model,
@@ -834,7 +785,6 @@ mod tests {
     ) -> ChildContext<'a> {
         ChildContext {
             store: None,
-            remote_capabilities: None,
             mcp_tools: &[],
             cancel,
             skills: None,
@@ -910,14 +860,8 @@ mod tests {
         let mut config = config_with_subagents(vec![subagent("worker")]);
         config.tools = vec![read_tool()];
 
-        let (tools, _reset) = assemble_toolset(
-            &config,
-            &HashMap::new(),
-            &CancellationToken::new(),
-            &[],
-            None,
-        )
-        .unwrap();
+        let (tools, _reset) =
+            assemble_toolset(&config, &HashMap::new(), &CancellationToken::new(), &[]).unwrap();
         let names = tool_names(&tools);
 
         assert_eq!(names, vec!["read".to_string()]);
@@ -933,7 +877,7 @@ mod tests {
 
         let children = mock_children(&["worker", "critic"]);
         let (tools, _reset) =
-            assemble_toolset(&config, &children, &CancellationToken::new(), &[], None).unwrap();
+            assemble_toolset(&config, &children, &CancellationToken::new(), &[]).unwrap();
         let mut names = tool_names(&tools);
         names.sort();
 
@@ -961,7 +905,7 @@ mod tests {
 
         let children = mock_children(&["worker"]);
         let (tools, _reset) =
-            assemble_toolset(&config, &children, &CancellationToken::new(), &[], None).unwrap();
+            assemble_toolset(&config, &children, &CancellationToken::new(), &[]).unwrap();
         let names = tool_names(&tools);
 
         assert_eq!(
@@ -985,7 +929,7 @@ mod tests {
         let effective = config.with_self_delegation();
         let children = mock_children(&[SELF_DELEGATION_ID]);
         let (tools, _reset) =
-            assemble_toolset(&effective, &children, &CancellationToken::new(), &[], None).unwrap();
+            assemble_toolset(&effective, &children, &CancellationToken::new(), &[]).unwrap();
         let mut names = tool_names(&tools);
         names.sort();
 
@@ -1000,7 +944,7 @@ mod tests {
         config.tools = vec![read_tool()];
 
         let children = mock_children(&["read"]);
-        let err = assemble_toolset(&config, &children, &CancellationToken::new(), &[], None)
+        let err = assemble_toolset(&config, &children, &CancellationToken::new(), &[])
             .err()
             .expect("colliding subagent id must be rejected");
         assert!(
@@ -1041,7 +985,7 @@ mod tests {
 
         let children = mock_children(&["worker"]);
         let (tools, _reset) =
-            assemble_toolset(&config, &children, &CancellationToken::new(), &mcp, None).unwrap();
+            assemble_toolset(&config, &children, &CancellationToken::new(), &mcp).unwrap();
         let mut names = tool_names(&tools);
         names.sort();
 
@@ -1056,15 +1000,9 @@ mod tests {
         config.tools = vec![read_tool()];
         let mcp: Vec<Arc<dyn ToolImplementation>> = vec![Arc::new(NamedTool("read"))];
 
-        let err = assemble_toolset(
-            &config,
-            &HashMap::new(),
-            &CancellationToken::new(),
-            &mcp,
-            None,
-        )
-        .err()
-        .expect("colliding MCP tool must be rejected");
+        let err = assemble_toolset(&config, &HashMap::new(), &CancellationToken::new(), &mcp)
+            .err()
+            .expect("colliding MCP tool must be rejected");
         assert!(
             matches!(err, RuntimeError::Config(ref msg) if msg.contains("MCP tool 'read'")),
             "unexpected error: {err}",
@@ -1159,7 +1097,7 @@ mod tests {
         let children = mock_children(&["worker"]);
 
         let (tools, reset) =
-            assemble_toolset(&config, &children, &CancellationToken::new(), &[], None).unwrap();
+            assemble_toolset(&config, &children, &CancellationToken::new(), &[]).unwrap();
         let reset = reset.expect("a bridged execute_python must yield a reset handle");
 
         let python = tools

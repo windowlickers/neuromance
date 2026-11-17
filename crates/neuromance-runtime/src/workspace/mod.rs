@@ -1,9 +1,7 @@
 //! Per-conversation workspaces.
 //!
 //! A workspace is a directory at `<root>/<conversation_id>` where a task's
-//! tools do their file work. The root is a volume shared with the sandbox
-//! container (a k8s `emptyDir`), so the orchestrator — which holds the
-//! credentials — can seed and snapshot what the sandbox executes against.
+//! tools do their file work. The root is typically a k8s `emptyDir`.
 //!
 //! [`WorkspaceManager`] is the mechanism only: it creates, seeds, and hands
 //! out directories. Policy — which definition applies to a task — lives in
