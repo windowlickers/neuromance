@@ -185,7 +185,7 @@ url = "http://hands.agents.svc:9000/mcp"
 
 A `[[subagents]]` section declares subagents the main agent can delegate to. A subagent that pins neither `provider` nor `model` runs whatever the main agent runs for that task — a serve task's per-task `provider`/`model` override included — so it only needs an `id` and `system_prompt`. Pinning either one keeps the subagent's own identity and ignores the per-task override: the effective model is then the subagent's `model`, then the chosen provider's default `model`, then the agent's configured model.
 
-A subagent is provisioned with the **same toolset as the main agent** — the capability tools from `[[tools]]`, the `[[mcp_servers]]` tools, and the delegate tools — so it can both use tools and delegate further. Its conversation loop is wired the same way too: it persists through `[database]`, compacts under `[context]`, carries the `[skills]` menu in its system prompt with `$mention` expansion in-loop, receives `[rules]`, and is told its `[workspace]` directory. Two things are deliberately left off. Subagents never stream — a delegate tool returns only the final content. And subagent tool calls auto-approve inside the pod: they run autonomously within a single parent delegation, with no interactive approver in the loop, so the pod boundary (e.g. kata containers) is the isolation, the same way the whole agent pod is already sandboxed.
+A subagent is provisioned with the **same toolset as the main agent** — the capability tools from `[[tools]]`, the `[[mcp_servers]]` tools, and the delegate tools — so it can both use tools and delegate further. Its conversation loop is wired the same way too: it persists through `[database]`, compacts under `[context]`, carries the `[skills]` menu in its system prompt with `$mention` expansion in-loop, and receives `[rules]`. Two things are deliberately left off. Subagents never stream — a delegate tool returns only the final content. And subagent tool calls auto-approve inside the pod: they run autonomously within a single parent delegation, with no interactive approver in the loop, so the pod boundary (e.g. kata containers) is the isolation, the same way the whole agent pod is already sandboxed.
 
 **Self-delegation.** Setting `runtime.self_delegation = true` gives the main agent a `task` delegate tool that runs a fresh copy of *itself* — the same system prompt, provider, model, and turn budget — on a scoped subtask, with no `[[subagents]]` entry to write. It is exactly a synthesized subagent named `task`, so it joins the same `max_delegation_depth` tower and gets the same shared toolset. `task` is reserved while this is on: an explicit subagent or tool of that name is rejected at startup. Combine it with `[[subagents]]` freely — the `task` self-clone is added alongside any named subagents.
 
@@ -216,71 +216,6 @@ model = "anthropic:claude-opus-4-8"
 max_turns = 4
 ```
 
-## Workspaces
-
-Each conversation gets a working directory at `<root>/<conversation_id>`, created when its first task runs and reused by continuations. The directory is announced in the seed system message and injected as `bash`'s default `cwd` (an explicit `cwd` in a tool call always wins). Subagents inherit the parent's workspace, and each delegated task carries the same directory note — a subagent's system prompt is fixed at startup, before any conversation has a workspace, so the note is attached to the task instead.
-
-```toml
-[workspace]
-# Absolute root under which per-conversation directories are created.
-# In k8s this is typically an emptyDir.
-root = "/workspace"
-
-# S3-compatible object storage (garage). Required by object seeds and
-# persistence; credentials come from the environment, never this file.
-[workspace.storage]
-endpoint = "http://garage.storage.svc.cluster.local:3900"
-bucket = "workspaces"
-# region defaults to "garage"
-access_key_id_env = "GARAGE_KEY_ID"
-secret_access_key_env = "GARAGE_SECRET"
-
-# Snapshot/restore across replicas. Optional — omit for pod-local
-# workspaces only.
-[workspace.persistence]
-# Object key prefix; a conversation's snapshot lives at
-# <prefix><conversation_id>.tar.zst. Defaults to "snapshots/".
-prefix = "snapshots/"
-# Globs excluded from snapshots, relative to the workspace dir.
-exclude = ["target/**", "**/node_modules/**", "**/__pycache__/**"]
-
-# Tokenizer-proxy auth for git seeds, shaped like [providers.proxy].
-# Omit for anonymous clones. Remotes must be http:// so the proxy can
-# read the sealed header (it upgrades to TLS upstream); a non-http:// git
-# seed url is rejected at config load.
-#
-# Proxied clones run the `git` CLI, so they need a git binary on PATH:
-# use the toolkit image (`neuromance-toolkit`), which carries one. The
-# minimal image does not. Anonymous clones use libgit2 in process and
-# run on either image.
-[workspace.git_proxy]
-base_url = "http://tokenizer-proxy.windowlickers.svc.cluster.local:8080"
-token_file = "/var/run/neuromance/tokens/git"
-
-# Named seed definitions. Selected per task by the `workspace` field on
-# POST /tasks/new (or `[oneshot].workspace`); with no field, the sole
-# definition is used when exactly one is configured. Seeding runs exactly
-# once, when the conversation's workspace is first created.
-[[workspace.definitions]]
-name = "org-dev"
-
-# Repositories pre-cloned into the workspace.
-[[workspace.definitions.git]]
-url = "http://git.windowlicke.rs/windowlickers/neuromance.git"
-ref = "main"                      # branch, tag, or SHA; optional
-# dest defaults to the repo basename ("neuromance")
-
-# tar.zst archives from workspace.storage, unpacked into the workspace —
-# scratch files and other goodies.
-[[workspace.definitions.objects]]
-key = "seeds/scratch.tar.zst"
-dest = "scratch"                  # optional; defaults to the workspace dir
-```
-
-With persistence on, the worker snapshots the workspace after every run (success, failure, or drain cancellation) and restores the latest snapshot before a continuation that lands on a different replica — a marker file carrying the snapshot's ETag lets a task that lands on the replica which produced the snapshot skip the restore. Snapshot refs are written through to postgres when `[database]` is configured (the `workspace_snapshots` table), for audit and retention sweeps; the object store stays authoritative for restore. A restored workspace is never re-seeded, and a continuation naming a different `workspace` keeps the one it was seeded with (logged, not an error).
-
-Retention is expiry-based and external: point a garage lifecycle rule at the snapshot prefix rather than deleting from the runtime. Size the pod's `terminationGracePeriodSeconds` above `runtime.shutdown_grace_seconds` plus the time to pack and upload a snapshot of your workspace's working set — the drain-time snapshot runs inside that window.
-
 ## Structured outputs
 
 A task can require the agent's final answer to be a JSON object matching a schema. The schema is
@@ -293,7 +228,7 @@ In `serve` mode the schema is per task, in the `POST /tasks/new` body:
 
 ```json
 {
-  "task": "Rate the pull request in the workspace.",
+  "task": "Rate the pull request.",
   "output_schema": {
     "title": "verdict",
     "type": "object",

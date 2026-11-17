@@ -26,7 +26,6 @@ use neuromance_runtime::{
     proxy::build_provider_config,
     rules, serve, skills,
     telemetry::{self, BoxedLayer},
-    workspace::WorkspaceManager,
 };
 use neuromance_tools::ToolImplementation;
 
@@ -95,18 +94,6 @@ async fn run_orchestrator(config: &RuntimeConfig, cancel: CancellationToken) -> 
         .await
         .context("initialize database store")?;
 
-    // Workspace manager: resolves storage credentials and the git sealed
-    // token at startup, so a misconfiguration fails the boot, not the first
-    // task. `None` when no `[workspace]` is configured. Snapshot refs write
-    // through to postgres when a database is configured.
-    let workspace = config
-        .workspace
-        .as_ref()
-        .map(|settings| WorkspaceManager::from_config(settings, store.as_ref()))
-        .transpose()
-        .context("initialize workspace manager")?
-        .map(Arc::new);
-
     let mcp_tools = mcp::connect(&config.mcp_servers)
         .await
         .map_err(anyhow::Error::from)?;
@@ -149,23 +136,16 @@ async fn run_orchestrator(config: &RuntimeConfig, cancel: CancellationToken) -> 
 
     let result = match config.mode {
         Mode::Oneshot => {
-            run_oneshot(
-                config,
-                agent,
-                skills_menu.as_deref(),
-                workspace,
-                cancel.clone(),
-            )
-            .await
+            let mut agent = agent;
+            oneshot::run(config, &mut agent, skills_menu.as_deref(), cancel.clone()).await
         }
         Mode::Serve => {
-            run_serve(
+            serve::run(
                 config,
                 agent,
                 factory,
                 store,
                 skills_menu.map(Arc::from),
-                workspace,
                 cancel.clone(),
             )
             .await
@@ -475,43 +455,4 @@ impl AgentBuilder for AgentFactory {
     ) -> Result<Agent<Box<dyn LLMClient>>, RuntimeError> {
         build_agent(self, overrides)
     }
-}
-
-async fn run_oneshot(
-    config: &RuntimeConfig,
-    mut agent: Agent<Box<dyn LLMClient>>,
-    skills_menu: Option<&str>,
-    workspace: Option<Arc<WorkspaceManager>>,
-    cancel: CancellationToken,
-) -> Result<()> {
-    oneshot::run(
-        config,
-        &mut agent,
-        skills_menu,
-        workspace.as_deref(),
-        cancel,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_serve(
-    config: &RuntimeConfig,
-    agent: Agent<Box<dyn LLMClient>>,
-    builder: Arc<dyn AgentBuilder>,
-    store: Option<Arc<PgConversationStore>>,
-    skills_menu: Option<Arc<str>>,
-    workspace: Option<Arc<WorkspaceManager>>,
-    cancel: CancellationToken,
-) -> Result<()> {
-    serve::run(
-        config,
-        agent,
-        builder,
-        store,
-        skills_menu,
-        workspace,
-        cancel,
-    )
-    .await
 }

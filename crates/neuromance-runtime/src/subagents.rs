@@ -50,7 +50,6 @@ use crate::config::{ProviderConfig, RuntimeConfig, SELF_DELEGATION_ID, SubagentC
 use crate::error::RuntimeError;
 use crate::proxy::build_provider_config;
 use crate::skills::{SkillRuntime, fold_menu};
-use crate::workspace::WorkspaceNoteSubagent;
 
 type Toolset = Vec<Arc<dyn ToolImplementation>>;
 
@@ -209,9 +208,6 @@ fn build_subagents_at_depth(
     // builder; each run assembles its own toolset from these.
     let children = Arc::new(children);
     let config = Arc::new(config.clone());
-    // A subagent has no seed message to carry the workspace note, so a decorator
-    // appends it per task from the ambient delegation scope.
-    let note_workspace = config.workspace.is_some();
 
     let mut registry: HashMap<String, Arc<dyn Subagent>> = HashMap::new();
     for sub in &config.subagents {
@@ -236,13 +232,8 @@ fn build_subagents_at_depth(
             Ok(Agent::new(id.clone(), core))
         };
 
-        let local = LocalSubagent::new(sub.id.clone(), sub.system_prompt.clone(), build_agent);
-        let subagent: Arc<dyn Subagent> = if note_workspace {
-            Arc::new(WorkspaceNoteSubagent::new(Arc::new(local)))
-        } else {
-            Arc::new(local)
-        };
-        registry.insert(sub.id.clone(), subagent);
+        let subagent = LocalSubagent::new(sub.id.clone(), sub.system_prompt.clone(), build_agent);
+        registry.insert(sub.id.clone(), Arc::new(subagent));
     }
 
     Ok(registry)
@@ -370,25 +361,11 @@ fn assemble_toolset(
     register_mcp_tools(mcp_tools, &staged)?;
     register_child_delegates(config, children, &staged, cancel)?;
 
-    // With a workspace configured, wrap bash so its cwd defaults to the
-    // ambient workspace dir.
-    let wrap_bash = config.workspace.is_some();
-    let tools = staged
+    Ok(staged
         .tool_names()
         .into_iter()
-        .filter_map(|name| {
-            let tool = staged.get(&name)?;
-            if wrap_bash && name == "bash" {
-                Some(
-                    Arc::new(crate::workspace::tool::WorkspaceCwdTool::new(tool))
-                        as Arc<dyn ToolImplementation>,
-                )
-            } else {
-                Some(tool)
-            }
-        })
-        .collect();
-    Ok(tools)
+        .filter_map(|name| staged.get(&name))
+        .collect())
 }
 
 /// Register the shared MCP tool adapters into `staged`.
@@ -507,7 +484,6 @@ mod tests {
             rules: None,
             bootstrap: Vec::new(),
             mcp_servers: Vec::new(),
-            workspace: None,
         }
     }
 

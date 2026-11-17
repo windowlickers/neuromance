@@ -8,7 +8,6 @@
 //! visible to every child run on that task.
 
 use std::future::Future;
-use std::path::PathBuf;
 
 use uuid::Uuid;
 
@@ -26,10 +25,6 @@ pub struct DelegationContext {
     /// Id of the specific tool call within [`Self::parent_message_id`] that
     /// spawned the subagent.
     pub parent_tool_call_id: Option<String>,
-    /// Absolute per-conversation workspace directory for tool execution,
-    /// when the runtime has one configured. Subagents inherit the parent's —
-    /// same conversation tree, same workspace.
-    pub workspace_dir: Option<PathBuf>,
 }
 
 tokio::task_local! {
@@ -66,7 +61,6 @@ mod tests {
             task_id: Some(Uuid::new_v4()),
             parent_message_id: Some(Uuid::new_v4()),
             parent_tool_call_id: Some("call_abc".to_string()),
-            workspace_dir: Some(std::path::PathBuf::from("/workspace/test")),
         };
         let observed = scope(ctx.clone(), async { current() }).await;
         assert_eq!(observed, ctx);

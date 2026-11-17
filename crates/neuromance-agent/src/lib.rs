@@ -314,8 +314,7 @@ impl<C: LLMClient + Send + Sync> Agent<C> {
         }
 
         // Scope this agent's conversation as the parent for any subagent it
-        // delegates to during the run, inheriting the same runtime task id
-        // and workspace — one delegation tree, one workspace.
+        // delegates to during the run, inheriting the same runtime task id.
         let child_ctx = DelegationContext {
             conversation_id: Some(self.conversation_id),
             task_id,
@@ -323,7 +322,6 @@ impl<C: LLMClient + Send + Sync> Agent<C> {
             // this agent delegates; a fresh scope starts without it.
             parent_message_id: None,
             parent_tool_call_id: None,
-            workspace_dir: enclosing.workspace_dir,
         };
         let outcome =
             delegation::scope(child_ctx, self.core.chat_with_tool_loop(messages, cancel)).await;

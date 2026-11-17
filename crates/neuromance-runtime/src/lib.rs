@@ -36,13 +36,11 @@ pub mod skills;
 pub mod subagents;
 pub mod task_store;
 pub mod telemetry;
-pub mod workspace;
 
 pub use config::{
-    AgentConfig, ApprovalConfig, ApprovalMode, ContextSettings, DatabaseSettings, GitSeed, Mode,
-    ObjectSeed, OneshotConfig, ProviderConfig, ProviderProxyConfig, RulesSettings, RuntimeConfig,
-    RuntimeSettings, SkillsSettings, SubagentConfig, WorkspaceDefinition,
-    WorkspacePersistenceSettings, WorkspaceSettings, WorkspaceStorageSettings,
+    AgentConfig, ApprovalConfig, ApprovalMode, ContextSettings, DatabaseSettings, Mode,
+    OneshotConfig, ProviderConfig, ProviderProxyConfig, RulesSettings, RuntimeConfig,
+    RuntimeSettings, SkillsSettings, SubagentConfig,
 };
 pub use error::RuntimeError;
 pub use factory::{AgentBuilder, AgentOverrides};

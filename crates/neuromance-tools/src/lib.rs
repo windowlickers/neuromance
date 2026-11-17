@@ -104,7 +104,7 @@
 //! The [`ToolRegistry`] uses `DashMap` for concurrent access, making it safe to use
 //! from multiple async tasks without additional synchronization.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -119,8 +119,6 @@ mod error;
 pub mod factory;
 mod find_tool;
 pub mod generic;
-#[cfg(feature = "git")]
-pub mod git;
 mod grep_tool;
 mod ls_tool;
 pub mod mcp;
@@ -163,33 +161,6 @@ pub(crate) fn resolve_search_path(raw: Option<&str>) -> Result<PathBuf, ToolErro
         }
         None => std::env::current_dir()
             .map_err(|e| ToolError::execution(format!("cannot determine current directory: {e}"))),
-    }
-}
-
-/// Injects `workspace_root` as the default `cwd` for a `bash` tool call.
-///
-/// Any other tool, an explicit caller-supplied `cwd`, and non-object
-/// arguments pass through unchanged — injection is only ever a default,
-/// never an override.
-#[must_use]
-pub fn with_default_cwd(name: &str, args: Value, workspace_root: &Path) -> Value {
-    if name != "bash" {
-        return args;
-    }
-    match args {
-        Value::Object(mut map) => {
-            // An explicit `null` cwd is treated as absent: BashTool ignores a
-            // null cwd, so leaving it would drop the workspace default. A
-            // present string cwd still wins.
-            if matches!(map.get("cwd"), None | Some(Value::Null)) {
-                map.insert(
-                    "cwd".to_string(),
-                    Value::String(workspace_root.display().to_string()),
-                );
-            }
-            Value::Object(map)
-        }
-        other => other,
     }
 }
 
@@ -434,38 +405,6 @@ mod tests {
     #[test]
     fn test_parse_arguments_boolean_string() {
         assert_eq!(ToolExecutor::parse_arguments("true"), json!(true));
-    }
-
-    #[test]
-    fn test_with_default_cwd_injects_when_absent() {
-        let out = with_default_cwd("bash", json!({"command": "ls"}), Path::new("/ws"));
-        assert_eq!(out, json!({"command": "ls", "cwd": "/ws"}));
-    }
-
-    #[test]
-    fn test_with_default_cwd_injects_over_explicit_null() {
-        let out = with_default_cwd(
-            "bash",
-            json!({"command": "ls", "cwd": null}),
-            Path::new("/ws"),
-        );
-        assert_eq!(out, json!({"command": "ls", "cwd": "/ws"}));
-    }
-
-    #[test]
-    fn test_with_default_cwd_preserves_explicit_cwd() {
-        let out = with_default_cwd(
-            "bash",
-            json!({"command": "ls", "cwd": "/elsewhere"}),
-            Path::new("/ws"),
-        );
-        assert_eq!(out, json!({"command": "ls", "cwd": "/elsewhere"}));
-    }
-
-    #[test]
-    fn test_with_default_cwd_ignores_non_bash_tool() {
-        let out = with_default_cwd("read", json!({"path": "/f"}), Path::new("/ws"));
-        assert_eq!(out, json!({"path": "/f"}));
     }
 
     /// A tool that echoes the `value` argument back so dispatch can be observed.

@@ -11,11 +11,9 @@ use neuromance::CoreError;
 use neuromance_agent::Agent;
 use neuromance_client::LLMClient;
 use neuromance_common::chat::Message;
-use neuromance_common::delegation::{self, DelegationContext};
 
 use crate::config::RuntimeConfig;
 use crate::skills::fold_menu;
-use crate::workspace::{self, WorkspaceManager};
 
 #[derive(Debug, Serialize)]
 pub struct OneshotOutput {
@@ -40,7 +38,6 @@ pub async fn run<C: LLMClient + Send + Sync>(
     config: &RuntimeConfig,
     agent: &mut Agent<C>,
     skills_menu: Option<&str>,
-    workspace: Option<&WorkspaceManager>,
     cancel: CancellationToken,
 ) -> Result<()> {
     let oneshot = config
@@ -50,58 +47,21 @@ pub async fn run<C: LLMClient + Send + Sync>(
 
     let conversation_id = agent.conversation_id;
 
-    // Prepare the workspace before the run: seed from the definition named by
-    // `[oneshot].workspace`, or the sole definition when exactly one exists.
-    let workspace_dir = match workspace {
-        Some(mgr) => {
-            let definition = match oneshot.workspace.as_deref() {
-                Some(name) => Some(config.workspace_definition(name).with_context(|| {
-                    format!("[oneshot].workspace names no [[workspace.definitions]]: {name}")
-                })?),
-                None => config.sole_workspace_definition(),
-            };
-            Some(
-                mgr.prepare(conversation_id, definition)
-                    .await
-                    .context("prepare workspace")?,
-            )
-        }
-        None => None,
-    };
-
-    let mut system_prompt = fold_menu(&config.agent.system_prompt, skills_menu);
-    if let Some(dir) = &workspace_dir {
-        system_prompt = format!("{system_prompt}\n\n{}", workspace::note(dir));
-    }
+    let system_prompt = fold_menu(&config.agent.system_prompt, skills_menu);
     let messages = vec![
         Message::system(conversation_id, system_prompt),
         Message::user(conversation_id, &oneshot.input),
     ];
 
     info!(agent=%agent.id, conversation_id=%conversation_id, "running oneshot");
-    let scope_ctx = DelegationContext {
-        workspace_dir,
-        ..DelegationContext::default()
-    };
     // Keep the typed error rather than erasing it to `anyhow` here: the outcome
     // metric below needs `CoreError::reason()`. The conversion to `anyhow`
     // happens at the `bail!` at the end.
     let result: Result<_, CoreError> = tokio::select! {
         biased;
         () = cancel.cancelled() => Err(CoreError::Cancelled("oneshot cancelled".to_string())),
-        res = delegation::scope(
-            scope_ctx,
-            agent.execute(Some(messages), cancel.child_token()),
-        ) => res,
+        res = agent.execute(Some(messages), cancel.child_token()) => res,
     };
-
-    // Best-effort final snapshot so a follow-up conversation on another pod
-    // can pick the files up. No-op when persistence is off.
-    if let Some(mgr) = workspace
-        && let Err(e) = mgr.snapshot(conversation_id).await
-    {
-        error!(conversation_id = %conversation_id, error = %e, "workspace snapshot failed");
-    }
 
     let output = record_outcome(&agent.id, conversation_id, result);
 

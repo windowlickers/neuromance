@@ -952,7 +952,6 @@ fn test_execute_span_records_the_delegation_parent() {
         task_id: Some(task),
         parent_message_id: None,
         parent_tool_call_id: None,
-        workspace_dir: None,
     };
 
     let mut agent = Agent::new("child".into(), Core::new(MockLLMClient::new()));

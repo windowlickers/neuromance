@@ -57,21 +57,12 @@
           inherit src;
           pname = "neuromance";
           inherit version;
-          # zlib serves the git2 crate's vendored libgit2 (vendored because
-          # libgit2-sys pins a minimum system libgit2 that nixpkgs
-          # periodically trails; the C sources ship in the crate).
           buildInputs = [
             pkgs.openssl
-            pkgs.zlib
           ];
           nativeBuildInputs = [
             pkgs.pkg-config
             pkgs.mold
-            # neuromance-tools' proxied-clone test spawns the `git` CLI, the
-            # same binary the toolkit runtime image carries. Every
-            # buildPackage runs the suite in its checkPhase, so `git` belongs
-            # here rather than on a single check.
-            pkgs.git
           ];
           # Compile sqlx query macros from the committed .sqlx/ metadata —
           # build sandboxes have no database.
