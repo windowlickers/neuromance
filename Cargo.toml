@@ -6,7 +6,6 @@ members = [
   "crates/neuromance-common",
   "crates/neuromance-client",
   "crates/neuromance-db",
-  "crates/neuromance-repl",
   "crates/neuromance-runtime",
   "crates/neuromance-context",
   "crates/neuromance-tools",
@@ -45,7 +44,6 @@ neuromance-tools = { version = "0.1.0", path = "crates/neuromance-tools" }
 neuromance-agent = { version = "0.1.0", path = "crates/neuromance-agent" }
 neuromance = { version = "0.1.0", path = "crates/neuromance" }
 neuromance-runtime = { version = "0.1.0", path = "crates/neuromance-runtime" }
-neuromance-repl = { version = "0.1.0", path = "crates/neuromance-repl" }
 neuromance-db = { version = "0.1.0", path = "crates/neuromance-db" }
 
 # External dependencies

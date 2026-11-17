@@ -13,7 +13,7 @@ use neuromance_agent::Agent;
 use neuromance_client::LLMClient;
 use neuromance_common::client::OutputSchema;
 
-use crate::{RuntimeError, SessionReset};
+use crate::RuntimeError;
 
 /// Per-task overrides applied to a freshly built [`Agent`].
 ///
@@ -43,8 +43,7 @@ impl AgentOverrides {
 /// Builds an [`Agent`] on demand, applying per-task [`AgentOverrides`].
 #[async_trait]
 pub trait AgentBuilder: Send + Sync {
-    /// Construct a fresh agent, returning it alongside the in-process Python
-    /// interpreter reset handle (`None` when no local interpreter exists).
+    /// Construct a fresh agent.
     ///
     /// # Errors
     /// Returns [`RuntimeError`] when the provider names no configured entry, the
@@ -53,5 +52,5 @@ pub trait AgentBuilder: Send + Sync {
     async fn build(
         &self,
         overrides: &AgentOverrides,
-    ) -> Result<(Agent<Box<dyn LLMClient>>, Option<SessionReset>), RuntimeError>;
+    ) -> Result<Agent<Box<dyn LLMClient>>, RuntimeError>;
 }

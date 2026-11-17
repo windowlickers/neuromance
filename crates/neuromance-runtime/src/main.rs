@@ -16,8 +16,8 @@ use neuromance_context::CompactionHook;
 use neuromance_context::rules::RulesHook;
 use neuromance_db::{PersistenceHook, PgConversationStore};
 use neuromance_runtime::{
-    AgentBuilder, AgentOverrides, ApprovalMode, Mode, RuntimeConfig, RuntimeError, SessionReset,
-    SkillRuntime, ToolsetParams,
+    AgentBuilder, AgentOverrides, ApprovalMode, Mode, RuntimeConfig, RuntimeError, SkillRuntime,
+    ToolsetParams,
     approval::WebhookApprover,
     bootstrap, build_parent_toolset,
     health::{ReadinessGate, router as health_router},
@@ -132,7 +132,7 @@ async fn run_orchestrator(config: &RuntimeConfig, cancel: CancellationToken) -> 
         output_schema: config.oneshot_output_schema()?,
         ..AgentOverrides::default()
     };
-    let (agent, local_python) = factory
+    let agent = factory
         .build(&initial_overrides)
         .await
         .map_err(anyhow::Error::from)?;
@@ -164,7 +164,6 @@ async fn run_orchestrator(config: &RuntimeConfig, cancel: CancellationToken) -> 
                 agent,
                 factory,
                 store,
-                local_python,
                 skills_menu.map(Arc::from),
                 workspace,
                 cancel.clone(),
@@ -310,13 +309,10 @@ fn apply_context_compaction(
     Ok(core)
 }
 
-/// An agent paired with the reset handle for its in-process Python interpreter.
-type BuiltAgent = (Agent<Box<dyn LLMClient>>, Option<SessionReset>);
-
 fn build_agent(
     inputs: &AgentFactory,
     overrides: &AgentOverrides,
-) -> Result<BuiltAgent, RuntimeError> {
+) -> Result<Agent<Box<dyn LLMClient>>, RuntimeError> {
     let config: &RuntimeConfig = &inputs.config;
     let store = inputs.store.as_ref();
     let skills = inputs.skills.as_ref();
@@ -347,7 +343,7 @@ fn build_agent(
     // runtime.max_delegation_depth). The tower gets the same startup handles the
     // main agent does, and the provider/model resolved above — so a subagent
     // that pins neither follows this task's override too.
-    let (tools, local_python) = build_parent_toolset(
+    let tools = build_parent_toolset(
         config,
         &ToolsetParams {
             store,
@@ -381,7 +377,7 @@ fn build_agent(
         core = core.with_hook(Arc::clone(rules) as Arc<dyn neuromance_common::hook::Hook>);
     }
 
-    Ok((Agent::new(config.agent.id.clone(), core), local_python))
+    Ok(Agent::new(config.agent.id.clone(), core))
 }
 
 /// Fail startup when `approval.mode = "auto"` would silently auto-approve tools
@@ -476,7 +472,7 @@ impl AgentBuilder for AgentFactory {
     async fn build(
         &self,
         overrides: &AgentOverrides,
-    ) -> Result<(Agent<Box<dyn LLMClient>>, Option<SessionReset>), RuntimeError> {
+    ) -> Result<Agent<Box<dyn LLMClient>>, RuntimeError> {
         build_agent(self, overrides)
     }
 }
@@ -504,7 +500,6 @@ async fn run_serve(
     agent: Agent<Box<dyn LLMClient>>,
     builder: Arc<dyn AgentBuilder>,
     store: Option<Arc<PgConversationStore>>,
-    local_python: Option<SessionReset>,
     skills_menu: Option<Arc<str>>,
     workspace: Option<Arc<WorkspaceManager>>,
     cancel: CancellationToken,
@@ -514,7 +509,6 @@ async fn run_serve(
         agent,
         builder,
         store,
-        local_python,
         skills_menu,
         workspace,
         cancel,

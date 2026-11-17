@@ -11,9 +11,7 @@
 //! probes at the task port.
 //!
 //! Tasks are processed sequentially by a single worker that owns the
-//! agent. Because that one agent is reused across tasks, the worker resets
-//! its in-process `execute_python` interpreter after each run, so one task's
-//! interpreter state never bleeds into the next. Without `[database]`,
+//! agent. Without `[database]`,
 //! in-memory state is authoritative for serving and restarts lose pending and
 //! completed tasks.
 //!
@@ -60,7 +58,6 @@ use neuromance_common::client::{Config, OutputSchema, SchemaError};
 use neuromance_common::delegation::{self, DelegationContext};
 use neuromance_db::PgConversationStore;
 
-use crate::SessionReset;
 use crate::config::{RuntimeConfig, SELF_DELEGATION_ID, WorkspaceDefinition};
 use crate::skills::fold_menu;
 use crate::task_store::{
@@ -749,11 +746,6 @@ struct WorkerCtx {
     agent: Arc<Mutex<ServeAgent>>,
     /// Builds a throwaway agent for a task that overrides the model.
     builder: Arc<dyn AgentBuilder>,
-    /// Reset handle for the main agent's in-process `execute_python`
-    /// interpreter, called after each task so user state does not bleed into
-    /// the next. `Some` only when `execute_python` is configured and the
-    /// `python-repl` feature is built.
-    local_python: Option<SessionReset>,
     /// Prepares (and, with persistence, snapshots) per-conversation
     /// workspaces. `None` when no `[workspace]` is configured.
     workspace: Option<Arc<WorkspaceManager>>,
@@ -780,22 +772,11 @@ async fn worker_loop(mut rx: mpsc::Receiver<WorkerJob>, ctx: WorkerCtx, cancel: 
                 let (task_id, conversation_id) = (job.task_id, job.conversation_id);
                 let start_seq = ctx.task_store.begin_provenance(conversation_id).await;
                 let _ = process_job(&ctx, job, cancel.clone()).await;
-                reset_local_python(ctx.local_python.as_ref()).await;
                 ctx.task_store
                     .record_provenance(task_id, conversation_id, start_seq)
                     .await;
             }
         }
-    }
-}
-
-/// Clear the main agent's in-process `execute_python` interpreter after a task.
-/// The single agent is reused across tasks, so without this a task's variables,
-/// imports, and definitions would still be visible to the next one. No-op when
-/// there is no local interpreter to reset; the handle itself logs on failure.
-async fn reset_local_python(local_python: Option<&SessionReset>) {
-    if let Some(reset) = local_python {
-        reset().await;
     }
 }
 
@@ -967,7 +948,7 @@ async fn process_job_inner(
         let provider = job.provider.as_deref();
         let model = job.model.as_deref();
         match ctx.builder.build(&overrides).await {
-            Ok((mut agent, _local_python)) => {
+            Ok(mut agent) => {
                 info!(
                     provider,
                     model, "task running on per-task provider/model override"
@@ -1076,7 +1057,6 @@ pub async fn run(
     agent: ServeAgent,
     builder: Arc<dyn AgentBuilder>,
     store: Option<Arc<PgConversationStore>>,
-    local_python: Option<SessionReset>,
     skills_menu: Option<Arc<str>>,
     workspace: Option<Arc<WorkspaceManager>>,
     cancel: CancellationToken,
@@ -1099,7 +1079,6 @@ pub async fn run(
             task_store: Arc::clone(&task_store),
             agent: Arc::clone(&agent),
             builder,
-            local_python,
             workspace,
         },
         cancel.clone(),
@@ -1314,7 +1293,6 @@ mod tests {
                 task_store: Arc::clone(&store) as Arc<dyn TaskStore>,
                 agent: Arc::clone(&agent),
                 builder: stub_builder(),
-                local_python: None,
                 workspace: None,
             },
             cancel.clone(),
@@ -1492,9 +1470,9 @@ mod tests {
         async fn build(
             &self,
             _overrides: &AgentOverrides,
-        ) -> Result<(ServeAgent, Option<SessionReset>), crate::RuntimeError> {
+        ) -> Result<ServeAgent, crate::RuntimeError> {
             let core = Core::new(Box::new(EchoClient::new(&self.reply)) as Box<dyn LLMClient>);
-            Ok((Agent::new("override-agent".into(), core), None))
+            Ok(Agent::new("override-agent".into(), core))
         }
     }
 
@@ -1511,7 +1489,6 @@ mod tests {
             task_store: Arc::clone(&state.task_store),
             agent,
             builder: stub_builder(),
-            local_python: None,
             workspace: None,
         }
     }
@@ -2012,7 +1989,6 @@ mod tests {
             builder: Arc::new(TestBuilder {
                 reply: "from-override".to_string(),
             }),
-            local_python: None,
             workspace: None,
         };
         process_job(
@@ -2067,7 +2043,6 @@ mod tests {
             builder: Arc::new(TestBuilder {
                 reply: "from-override".to_string(),
             }),
-            local_python: None,
             workspace: None,
         };
         process_job(
@@ -2151,7 +2126,6 @@ mod tests {
             task_store: Arc::clone(&state.task_store),
             agent,
             builder: stub_builder(),
-            local_python: None,
             workspace: None,
         }
     }

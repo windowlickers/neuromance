@@ -15,7 +15,6 @@ Neuromance provides high-level abstractions for building LLM-powered application
 - **`neuromance-client`** - Client implementations for various LLM providers
 - **`neuromance-agent`** - Agent framework for autonomous task execution with LLMs
 - **`neuromance-tools`** - Tool execution framework with MCP support
-- **`neuromance-repl`** - Embedded Python REPL (PyO3) with stateful sessions and Rust-backed callbacks
 
 Neuromance also provides a container runtime for kubernetes.
 
@@ -84,7 +83,6 @@ neuromance/
 │   ├── neuromance-client/    # Client implementations
 │   ├── neuromance-agent/     # Agent framework
 │   ├── neuromance-tools/     # Tool execution framework
-│   ├── neuromance-repl/      # Embedded Python REPL
 │   ├── neuromance-db/        # Postgres persistence for conversations
 │   └── neuromance-runtime/   # Container runtime binary
 ├── Cargo.toml                # Workspace configuration
@@ -187,20 +185,17 @@ url = "http://hands.agents.svc:9000/mcp"
 
 A `[[subagents]]` section declares subagents the main agent can delegate to. A subagent that pins neither `provider` nor `model` runs whatever the main agent runs for that task — a serve task's per-task `provider`/`model` override included — so it only needs an `id` and `system_prompt`. Pinning either one keeps the subagent's own identity and ignores the per-task override: the effective model is then the subagent's `model`, then the chosen provider's default `model`, then the agent's configured model.
 
-A subagent is provisioned with the **same toolset as the main agent** — the capability tools from `[[tools]]`, the `[[mcp_servers]]` tools, the `execute_python` bridge, and the delegate tools — so it can both use tools and delegate further. Its conversation loop is wired the same way too: it persists through `[database]`, compacts under `[context]`, carries the `[skills]` menu in its system prompt with `$mention` expansion in-loop, receives `[rules]`, and is told its `[workspace]` directory. Two things are deliberately left off. Subagents never stream — a delegate tool returns only the final content. And subagent tool calls auto-approve inside the pod: they run autonomously within a single parent delegation, with no interactive approver in the loop, so the pod boundary (e.g. kata containers) is the isolation, the same way the whole agent pod is already sandboxed.
+A subagent is provisioned with the **same toolset as the main agent** — the capability tools from `[[tools]]`, the `[[mcp_servers]]` tools, and the delegate tools — so it can both use tools and delegate further. Its conversation loop is wired the same way too: it persists through `[database]`, compacts under `[context]`, carries the `[skills]` menu in its system prompt with `$mention` expansion in-loop, receives `[rules]`, and is told its `[workspace]` directory. Two things are deliberately left off. Subagents never stream — a delegate tool returns only the final content. And subagent tool calls auto-approve inside the pod: they run autonomously within a single parent delegation, with no interactive approver in the loop, so the pod boundary (e.g. kata containers) is the isolation, the same way the whole agent pod is already sandboxed.
 
-**Self-delegation.** Setting `runtime.self_delegation = true` gives the main agent a `task` delegate tool that runs a fresh copy of *itself* — the same system prompt, provider, model, and turn budget — on a scoped subtask, with no `[[subagents]]` entry to write. It is exactly a synthesized subagent named `task`, so it joins the same `max_delegation_depth` tower, gets the same shared toolset, and (when `execute_python` is configured) the same `run_subagent`/`spawn_agents` bridge. `task` is reserved while this is on: an explicit subagent or tool of that name is rejected at startup. Combine it with `[[subagents]]` freely — the `task` self-clone is added alongside any named subagents.
+**Self-delegation.** Setting `runtime.self_delegation = true` gives the main agent a `task` delegate tool that runs a fresh copy of *itself* — the same system prompt, provider, model, and turn budget — on a scoped subtask, with no `[[subagents]]` entry to write. It is exactly a synthesized subagent named `task`, so it joins the same `max_delegation_depth` tower and gets the same shared toolset. `task` is reserved while this is on: an explicit subagent or tool of that name is rejected at startup. Combine it with `[[subagents]]` freely — the `task` self-clone is added alongside any named subagents.
 
 One divergence: a serve task that supplies its own `system_prompt` overrides the main agent's seed message only. The `task` clone still carries `agent.system_prompt`, because a subagent's prompt is fixed when the delegation tower is built and the per-task prompt is not known then.
 
 Nested delegation is bounded by `runtime.max_delegation_depth`, which counts subagent hops from the main agent (depth 0). At `1` the main agent reaches subagents but those subagents carry no delegate tools; at `2` (the default) a subagent may delegate one further hop, and so on. The deepest subagents are still fully tool-capable — they simply cannot delegate. The bound is enforced structurally (a finite tower of subagent instances built at startup), so the chain depth cannot run away; it is capped at 5.
 
-The bound is on depth alone. Each delegated run carries its own `agent.max_turns` budget rather than drawing down the parent's, so within the depth limit an agent may still delegate many times — and `spawn_agents` runs a batch concurrently. Set a finite `agent.max_turns` to bound the work a single task can generate, especially with `self_delegation` on, where the clone inherits the same instructions that told the parent to delegate.
+The bound is on depth alone. Each delegated run carries its own `agent.max_turns` budget rather than drawing down the parent's, so within the depth limit an agent may still delegate many times. Set a finite `agent.max_turns` to bound the work a single task can generate, especially with `self_delegation` on, where the clone inherits the same instructions that told the parent to delegate.
 
-Every configured subagent is reachable two ways:
-
-- **As a delegate tool** — an agent gets a tool named after the subagent's `id`, taking `instructions` and optional `context`. Like other tools, a delegate tool is not auto-approved, so the main agent's tool calls under `approval.mode = "auto"` are subject to the same startup safety gate (set `approval.allow_unsafe_tools = true` or use async approval).
-- **From the Python REPL** — when an `execute_python` tool is also configured (requires the `python-repl` build feature), the runtime builds the REPL with the subagents bridged in as `run_subagent(name, instructions, context=None)` and `spawn_agents([Agent(name, instructions), ...])`, so the agent can write its own orchestration in Python. The bridge runs in restricted mode; an `execute_python` entry with `restricted = false` alongside subagents is rejected. The deepest subagents, having no children to delegate to, get a plain `execute_python` (no `run_subagent`/`spawn_agents`). Each subagent run gets its own fresh interpreter — including each concurrent run in a `spawn_agents` fan-out — so interpreter state never bleeds across runs.
+Each configured subagent is a delegate tool named after its `id`, taking `instructions` and optional `context`. A delegate tool is not auto-approved, so under `approval.mode = "auto"` it is subject to the startup safety gate (set `approval.allow_unsafe_tools = true` or use async approval).
 
 ```toml
 [runtime]
@@ -219,11 +214,6 @@ system_prompt = "You critique a draft and list concrete fixes."
 description = "Delegate a draft to the critic for review."
 model = "anthropic:claude-opus-4-8"
 max_turns = 4
-
-# Capability tools and the Python bridge are shared by the main agent and every
-# subagent. Bridge the subagents into Python (run_subagent / spawn_agents):
-[[tools]]
-name = "execute_python"
 ```
 
 ## Workspaces
@@ -372,7 +362,7 @@ An optional `[context]` section enables automatic conversation compaction in the
 
 Conversation size is measured from the provider-reported usage of the most recent response, so no tokenizer is downloaded at startup. One known lag: the first request of a resumed conversation is sent uncompacted because no usage exists yet in that run — compaction at the end of the previous run keeps stored histories under target.
 
-Subagents compact too, on the same settings and against their own conversations. Each subagent run gets its own compactor, so concurrent runs in a `spawn_agents` fan-out never influence each other's decisions. Long delegated runs therefore summarize instead of walking into the context window, at the cost of the summarization calls that implies.
+Subagents compact too, on the same settings and against their own conversations. Each subagent run gets its own compactor, so concurrent runs never influence each other's decisions. Long delegated runs therefore summarize instead of walking into the context window, at the cost of the summarization calls that implies.
 
 ```toml
 [context]

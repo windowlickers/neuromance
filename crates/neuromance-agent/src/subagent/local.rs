@@ -15,11 +15,8 @@ use crate::Agent;
 /// Each run builds a fresh [`Agent`] from the stored factory and hands it a
 /// `[system, user]` message pair derived from the [`Task`]. Constructing per
 /// run (rather than reusing one agent behind a lock) keeps concurrent runs of
-/// the *same* subagent genuinely parallel — fan-outs like `spawn_agents` would
-/// otherwise serialize on a shared agent. Nothing persists across runs,
-/// including any stateful tools (e.g. a Python interpreter): the factory builds
-/// the agent's whole toolset fresh, so concurrent runs never share interpreter
-/// state. Agents are cheap to build because clients share their connection
+/// the *same* subagent genuinely parallel; concurrent runs would otherwise
+/// serialize on a shared agent. Agents are cheap to build because clients share their connection
 /// pools via `Arc`.
 ///
 /// The factory is fallible so it can perform per-run work that may fail (such

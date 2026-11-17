@@ -53,14 +53,7 @@
             || (builtins.match ".*/\\.sqlx/query-.*\\.json$" path != null);
         };
 
-        # Default Python package set for the embedded REPL — empty by design.
-        # Downstream flakes pass a custom selector to `lib.mkRuntimeImage` to
-        # bundle additional packages (e.g. `ps: with ps; [ requests numpy ]`).
-        defaultPythonPackages = _ps: [ ];
-
-        defaultPythonEnv = pkgs.python3.withPackages defaultPythonPackages;
-
-        mkCommonArgs = pythonEnv: {
+        commonArgs = {
           inherit src;
           pname = "neuromance";
           inherit version;
@@ -70,7 +63,6 @@
           buildInputs = [
             pkgs.openssl
             pkgs.zlib
-            pythonEnv
           ];
           nativeBuildInputs = [
             pkgs.pkg-config
@@ -81,7 +73,6 @@
             # here rather than on a single check.
             pkgs.git
           ];
-          PYO3_PYTHON = "${pythonEnv}/bin/python3";
           # Compile sqlx query macros from the committed .sqlx/ metadata —
           # build sandboxes have no database.
           SQLX_OFFLINE = "true";
@@ -90,27 +81,14 @@
           RUSTFLAGS = "-C link-arg=-fuse-ld=mold";
         };
 
-        commonArgs = mkCommonArgs defaultPythonEnv;
-
         # Build deps with `--all-features` so every downstream package and
-        # check reuses the same artifact. Without this, feature-gated deps
-        # (pyo3 from runtime's `python-repl`) get recompiled in each package
-        # build.
-        #
-        # Parameterized by `pythonEnv` because PYO3_PYTHON keys pyo3's build
-        # script; runtimes built against a custom pythonEnv need their own
-        # deps artifact. Nix dedupes identical inputs, so callers using
-        # `defaultPythonEnv` share the cached `cargoArtifacts` below.
-        mkCargoArtifacts =
-          pythonEnv:
-          craneLib.buildDepsOnly (
-            (mkCommonArgs pythonEnv)
-            // {
-              cargoExtraArgs = "--all-features";
-            }
-          );
-
-        cargoArtifacts = mkCargoArtifacts defaultPythonEnv;
+        # check reuses the same artifact.
+        cargoArtifacts = craneLib.buildDepsOnly (
+          commonArgs
+          // {
+            cargoExtraArgs = "--all-features";
+          }
+        );
 
         fmtCheck = craneLib.cargoFmt { inherit src; };
 
@@ -165,31 +143,21 @@
           ];
         };
 
-        # Build a runtime binary linked against `pythonEnv`. PyO3 picks up the
-        # interpreter via `PYO3_PYTHON`; the embedded REPL loads its
-        # `libpython3.so` from the same store path at runtime.
         mkRuntime =
-          {
-            pname,
-            pythonEnv,
-          }:
+          { pname }:
           craneLib.buildPackage (
-            (mkCommonArgs pythonEnv)
+            commonArgs
             // {
-              cargoArtifacts = mkCargoArtifacts pythonEnv;
-              inherit pname;
-              cargoExtraArgs = "--package neuromance-runtime --features python-repl";
+              inherit cargoArtifacts pname;
+              cargoExtraArgs = "--package neuromance-runtime";
               meta = runtimeMeta;
             }
           );
 
-        # Bundle a pre-built `neuromance-runtime` binary with its matching
-        # `pythonEnv` into a container image. The runtime and pythonEnv must
-        # have been built together so the dlopened libpython matches.
+        # Package a pre-built `neuromance-runtime` binary into a container image.
         mkRuntimeImage =
           {
             runtime,
-            pythonEnv,
             variant ? "minimal",
             extraTools ? [ ],
             includeShell ? false,
@@ -203,7 +171,6 @@
               variant
               extraTools
               includeShell
-              pythonEnv
               ;
             package = runtime;
             binName = "neuromance-runtime";
@@ -217,29 +184,22 @@
             configDir = "etc/neuromance";
           };
 
-        # Convenience: build runtime + image together from a `pythonPackages`
-        # selector. Returns `{ runtime, image }`.
+        # Convenience: build runtime + image together. Returns `{ runtime, image }`.
         mkRuntimeBundle =
           {
             variant ? "minimal",
-            pythonPackages ? defaultPythonPackages,
             extraTools ? [ ],
             includeShell ? false,
             extraEnv ? [ ],
           }:
           let
-            pythonEnv = pkgs.python3.withPackages pythonPackages;
-            runtime = mkRuntime {
-              pname = "neuromance-runtime-${variant}";
-              inherit pythonEnv;
-            };
+            runtime = mkRuntime { pname = "neuromance-runtime-${variant}"; };
           in
           {
             inherit runtime;
             image = mkRuntimeImage {
               inherit
                 runtime
-                pythonEnv
                 variant
                 extraTools
                 includeShell
@@ -474,12 +434,11 @@
           default = neuromance;
         };
 
-        # Exposed for downstream flakes that want to bundle additional Python
-        # packages into the runtime image:
+        # Exposed for downstream flakes that bake extra tools into the image:
         #
         #   neuromance.lib.${system}.mkRuntimeBundle {
-        #     variant = "data-science";
-        #     pythonPackages = ps: with ps; [ requests numpy pandas ];
+        #     variant = "toolkit";
+        #     extraTools = with pkgs; [ git jq ];
         #   }
         #
         # Returns `{ runtime, image }`. Use `mkRuntime` / `mkRuntimeImage`
@@ -543,9 +502,7 @@
 
         devShells.default = craneLib.devShell {
           checks = self.checks.${system};
-          packages = [
-            defaultPythonEnv
-          ] ++ (with pkgs; [
+          packages = with pkgs; [
             cargo-watch
             cargo-edit
             cargo-outdated
@@ -558,10 +515,9 @@
             sqlx-cli
             postgresql
             mold
-          ]);
+          ];
 
           RUST_BACKTRACE = "1";
-          PYO3_PYTHON = "${defaultPythonEnv}/bin/python3";
           RUSTFLAGS = "-C link-arg=-fuse-ld=mold";
         };
 

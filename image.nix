@@ -2,7 +2,6 @@
   pkgs,
   package,
   binName,
-  pythonEnv ? null,
   version,
   revision,
   title,
@@ -27,18 +26,10 @@ let
     mkdir -p ${configDir}
   '';
 
-  # PyO3 dlopens libpython at startup, so when a pythonEnv is provided the
-  # interpreter store path must be in the image and PYTHONPATH must point at
-  # the bundled site-packages.
-  pythonContents = pkgs.lib.optional (pythonEnv != null) pythonEnv;
-  pythonEnvVars = pkgs.lib.optional (
-    pythonEnv != null
-  ) "PYTHONPATH=${pythonEnv}/${pythonEnv.sitePackages}";
-
   contents = [
     package
     pkgs.cacert
-  ] ++ pythonContents ++ shellPackages ++ extraTools;
+  ] ++ shellPackages ++ extraTools;
 
   variantSuffix = pkgs.lib.optionalString (variant != null) "-${variant}";
   variantTitleSuffix = pkgs.lib.optionalString (variant != null) " (${variant})";
@@ -111,7 +102,7 @@ pkgs.dockerTools.buildLayeredImage {
       "XDG_CONFIG_HOME=/home/nonroot/.config"
       "XDG_STATE_HOME=/home/nonroot/.local/state"
       "RUST_BACKTRACE=1"
-    ] ++ pythonEnvVars ++ extraEnv;
+    ] ++ extraEnv;
 
     Labels = {
       "org.opencontainers.image.title" = "${title}${variantTitleSuffix}";

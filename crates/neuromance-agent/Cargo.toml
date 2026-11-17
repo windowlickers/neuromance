@@ -37,7 +37,6 @@ chrono = { workspace = true }
 clap = { workspace = true }
 colored = { workspace = true }
 serde_yaml = { workspace = true }
-neuromance-repl = { workspace = true, features = ["subagent"] }
 tokio = { workspace = true }
 tracing-subscriber = { workspace = true }
 
@@ -52,7 +51,3 @@ path = "examples/sequential_agents_builder.rs"
 [[example]]
 name = "fanout_vote"
 path = "examples/fanout_vote.rs"
-
-[[example]]
-name = "adversarial_repl"
-path = "examples/adversarial_repl.rs"

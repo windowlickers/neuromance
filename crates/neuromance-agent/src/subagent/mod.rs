@@ -11,8 +11,8 @@
 //! [`Outcome`](neuromance_common::task::Outcome) contract.
 //!
 //! The [`Subagent`] trait and [`SubagentError`] live in `neuromance-common` so
-//! crates below the agent layer (e.g. the Python REPL bridge) can depend on the
-//! contract without depending on this crate. They are re-exported here for
+//! crates below the agent layer can depend on the contract without depending on
+//! this crate. They are re-exported here for
 //! consumers that already use `neuromance-agent`.
 
 pub use neuromance_common::subagent::{Subagent, SubagentError};

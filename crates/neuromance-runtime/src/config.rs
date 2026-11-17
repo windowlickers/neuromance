@@ -77,9 +77,7 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub context: Option<ContextSettings>,
     /// Leaf subagents the main agent can delegate to. Each is exposed as a
-    /// delegate tool (named by its `id`) and, when an `execute_python` tool is
-    /// configured, through the Python REPL's `run_subagent`/`spawn_agents`
-    /// bridge.
+    /// delegate tool named by its `id`.
     #[serde(default)]
     pub subagents: Vec<SubagentConfig>,
     /// When set, skills are discovered from on-host roots and/or a remote
@@ -279,13 +277,12 @@ const fn default_preserve_recent_turns() -> usize {
 ///
 /// Subagents inherit the parent agent's provider unless they name their own; a
 /// subagent may also override just the model. Each subagent is provisioned with
-/// the same toolset as the main agent — capability tools, the `execute_python`
-/// bridge, and the delegate tools — so it can both use tools and delegate
+/// the same toolset as the main agent — capability tools, MCP tools, and the
+/// delegate tools — so it can both use tools and delegate
 /// further, bounded by `runtime.max_delegation_depth`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SubagentConfig {
-    /// Stable identifier. Used as the delegate tool name and the
-    /// `run_subagent`/`spawn_agents` registry key; must be unique.
+    /// Stable identifier, used as the delegate tool name; must be unique.
     pub id: String,
     /// System prompt prepended to every delegated task.
     pub system_prompt: String,
@@ -426,9 +423,7 @@ pub struct RuntimeSettings {
     /// itself — the configured system prompt, and the provider, model, and turn
     /// budget the parent is running — on a delegated subtask. A
     /// zero-boilerplate form of `[[subagents]]`: the synthesized subagent joins
-    /// the same `max_delegation_depth`-bounded tower and, when an
-    /// `execute_python` tool is configured, the same
-    /// `run_subagent`/`spawn_agents` bridge. Off by default.
+    /// the same `max_delegation_depth`-bounded tower. Off by default.
     ///
     /// One divergence: a serve task that supplies its own `system_prompt`
     /// overrides only the parent's seed message. The clone still carries
@@ -730,9 +725,9 @@ impl RuntimeConfig {
 
     /// This config with the synthesized self-delegation subagent appended when
     /// `runtime.self_delegation` is set; borrowed unchanged otherwise. Injecting
-    /// it into `subagents` lets the whole delegation tower, `SubagentTool`
-    /// registration, and Python bridge treat self-delegation exactly like a
-    /// configured `[[subagents]]` entry.
+    /// it into `subagents` lets the delegation tower and `SubagentTool`
+    /// registration treat self-delegation exactly like a configured
+    /// `[[subagents]]` entry.
     #[must_use]
     pub fn with_self_delegation(&self) -> Cow<'_, Self> {
         self.self_delegation_subagent()
