@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info};
 
-use super::adapter::McpToolAdapter;
+use super::adapter::{McpToolAdapter, NAME_SEPARATOR};
 use super::client::McpClientWrapper;
 use super::config::McpConfig;
 use crate::ToolImplementation;
@@ -169,16 +169,11 @@ impl McpManager {
     /// # Errors
     /// Returns an error if the tool name format is invalid, server is not connected, or tool not found.
     pub async fn get_tool(&self, full_name: &str) -> Result<Arc<dyn ToolImplementation>> {
-        // Parse full name (format: server_id.tool_name)
-        let parts: Vec<&str> = full_name.splitn(2, '.').collect();
-        if parts.len() != 2 {
-            return Err(anyhow::anyhow!(
-                "Invalid tool name format. Expected: server_id.tool_name"
-            ));
-        }
-
-        let server_id = parts[0];
-        let tool_name = parts[1];
+        let (server_id, tool_name) = full_name.split_once(NAME_SEPARATOR).ok_or_else(|| {
+            anyhow::anyhow!(
+                "invalid MCP tool name '{full_name}': expected server_id{NAME_SEPARATOR}tool_name"
+            )
+        })?;
 
         let client = self
             .clients

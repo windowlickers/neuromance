@@ -82,23 +82,12 @@
 //! to external tool servers and exposing tools via MCP:
 //!
 //! ```rust,ignore
-//! use neuromance_tools::mcp::{McpManager, McpClientConfig};
+//! use neuromance_tools::mcp::{McpConfig, McpManager};
 //!
-//! # async fn example() -> Result<()> {
-//! let mut manager = McpManager::new();
-//!
-//! // Connect to an MCP server
-//! let config = McpClientConfig {
-//!     name: "filesystem".to_string(),
-//!     command: "npx".to_string(),
-//!     args: vec!["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
-//!         .into_iter()
-//!         .map(String::from)
-//!         .collect(),
-//!     env: None,
-//! };
-//!
-//! manager.add_server(config).await?;
+//! # async fn example() -> anyhow::Result<()> {
+//! let config = McpConfig::from_file(std::path::Path::new("mcp.toml"))?;
+//! let manager = McpManager::new(config).await?;
+//! // Each tool is advertised as `<server_id>__<tool_name>`.
 //! let tools = manager.get_all_tools().await?;
 //! # Ok(())
 //! # }
