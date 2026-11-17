@@ -22,7 +22,7 @@ use neuromance_runtime::{
     bootstrap, build_parent_toolset,
     health::{ReadinessGate, router as health_router},
     lifecycle::shutdown_handler,
-    metrics as runtime_metrics, oneshot,
+    mcp, metrics as runtime_metrics, oneshot,
     proxy::build_provider_config,
     rules, sandbox, serve, skills,
     telemetry::{self, BoxedLayer},
@@ -135,6 +135,10 @@ async fn run_orchestrator(config: &RuntimeConfig, cancel: CancellationToken) -> 
         None => None,
     };
 
+    let mcp_tools = mcp::connect(&config.mcp_servers)
+        .await
+        .map_err(anyhow::Error::from)?;
+
     let skills = skills::build(config.skills.as_ref()).await;
 
     let rules = rules::build(config.rules.as_ref()).await;
@@ -146,6 +150,7 @@ async fn run_orchestrator(config: &RuntimeConfig, cancel: CancellationToken) -> 
         config: Arc::new(config.clone()),
         store: store.clone(),
         sandbox_client: sandbox_client.clone(),
+        mcp_tools,
         skills: skills.clone(),
         rules: rules.clone(),
         cancel: cancel.clone(),
@@ -371,14 +376,14 @@ fn apply_context_compaction(
 }
 
 async fn build_agent(
-    config: &RuntimeConfig,
-    store: Option<&Arc<PgConversationStore>>,
-    sandbox_client: Option<&sandbox::SandboxClient>,
-    skills: Option<&Arc<SkillRuntime>>,
-    rules: Option<&Arc<RulesHook>>,
-    cancel: &CancellationToken,
+    inputs: &AgentFactory,
     overrides: &AgentOverrides,
 ) -> Result<(Agent<Box<dyn LLMClient>>, Option<SessionReset>), RuntimeError> {
+    let config: &RuntimeConfig = &inputs.config;
+    let store = inputs.store.as_ref();
+    let skills = inputs.skills.as_ref();
+    let rules = inputs.rules.as_ref();
+    let cancel = &inputs.cancel;
     let (provider, model) = config
         .resolve_provider_and_model(overrides.provider.as_deref(), overrides.model.as_deref())?;
     let llm_config = build_provider_config(provider, model)?;
@@ -402,7 +407,7 @@ async fn build_agent(
     // When a sandbox endpoint is configured, capability tools execute in the
     // sandbox process: fetch their definitions once and reuse the adapters
     // across the main agent and every subagent.
-    let remote_capabilities = match sandbox_client {
+    let remote_capabilities = match &inputs.sandbox_client {
         Some(client) => Some(sandbox::connect_tools(client).await?),
         None => None,
     };
@@ -419,6 +424,7 @@ async fn build_agent(
             skills,
             rules,
             remote_capabilities: remote_capabilities.as_deref(),
+            mcp_tools: &inputs.mcp_tools,
             parent_provider: provider,
             parent_model: model,
             cancel,
@@ -530,6 +536,8 @@ struct AgentFactory {
     config: Arc<RuntimeConfig>,
     store: Option<Arc<PgConversationStore>>,
     sandbox_client: Option<sandbox::SandboxClient>,
+    /// Adapters for every `[[mcp_servers]]` tool, connected once at startup.
+    mcp_tools: Vec<Arc<dyn ToolImplementation>>,
     skills: Option<Arc<SkillRuntime>>,
     rules: Option<Arc<RulesHook>>,
     cancel: CancellationToken,
@@ -541,16 +549,7 @@ impl AgentBuilder for AgentFactory {
         &self,
         overrides: &AgentOverrides,
     ) -> Result<(Agent<Box<dyn LLMClient>>, Option<SessionReset>), RuntimeError> {
-        build_agent(
-            &self.config,
-            self.store.as_ref(),
-            self.sandbox_client.as_ref(),
-            self.skills.as_ref(),
-            self.rules.as_ref(),
-            &self.cancel,
-            overrides,
-        )
-        .await
+        build_agent(self, overrides).await
     }
 }
 

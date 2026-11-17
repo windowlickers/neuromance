@@ -157,11 +157,37 @@ run_migrations = true          # optional, default true
 
 Migrations are embedded in `neuromance-db` and applied automatically at startup. Set `run_migrations = false` when an external owner (an operator or a shared schema service) manages the database — the runtime then connects to and uses the existing schema without attempting any DDL. The embedded migrations remain the source of truth for neuromance's tables regardless of who applies them. See the `neuromance-db` crate docs for the schema and the `cargo sqlx prepare` workflow when changing queries.
 
+## MCP tools
+
+Each `[[mcp_servers]]` entry connects an MCP server at startup. Every tool the server lists becomes an agent tool named `<id>__<tool>`, so `fs` serving `read_file` appears as `fs__read_file`. Characters a provider rejects in a tool name become `_`. The main agent and every subagent share the same connections, and a stdio server spawns once per process.
+
+A server that stays unreachable after about five seconds of retries fails startup. This covers a sidecar that starts after the runtime. A tool needs explicit approval unless its server sets `auto_approve = true`, so the `approval.mode = "auto"` startup gate applies to MCP tools too.
+
+```toml
+# Subprocess speaking MCP over stdin/stdout.
+[[mcp_servers]]
+id = "fs"
+name = "Filesystem"
+protocol = "stdio"
+command = "mcp-server-filesystem"
+args = ["/work"]
+env = { LOG_LEVEL = "warn" }   # optional
+working_directory = "/work"    # optional
+auto_approve = true
+
+# Remote server over streamable HTTP ("sse" is accepted as an alias).
+[[mcp_servers]]
+id = "hands"
+name = "Remote hands"
+protocol = "http"
+url = "http://hands.agents.svc:9000/mcp"
+```
+
 ## Subagents
 
 A `[[subagents]]` section declares subagents the main agent can delegate to. A subagent that pins neither `provider` nor `model` runs whatever the main agent runs for that task — a serve task's per-task `provider`/`model` override included — so it only needs an `id` and `system_prompt`. Pinning either one keeps the subagent's own identity and ignores the per-task override: the effective model is then the subagent's `model`, then the chosen provider's default `model`, then the agent's configured model.
 
-A subagent is provisioned with the **same toolset as the main agent** — the capability tools from `[[tools]]`, the `execute_python` bridge, and the delegate tools — so it can both use tools and delegate further. Its conversation loop is wired the same way too: it persists through `[database]`, compacts under `[context]`, carries the `[skills]` menu in its system prompt with `$mention` expansion in-loop, receives `[rules]`, and is told its `[workspace]` directory. Two things are deliberately left off. Subagents never stream — a delegate tool returns only the final content. And subagent tool calls auto-approve inside the pod: they run autonomously within a single parent delegation, with no interactive approver in the loop, so the pod boundary (e.g. kata containers) is the isolation, the same way the whole agent pod is already sandboxed.
+A subagent is provisioned with the **same toolset as the main agent** — the capability tools from `[[tools]]`, the `[[mcp_servers]]` tools, the `execute_python` bridge, and the delegate tools — so it can both use tools and delegate further. Its conversation loop is wired the same way too: it persists through `[database]`, compacts under `[context]`, carries the `[skills]` menu in its system prompt with `$mention` expansion in-loop, receives `[rules]`, and is told its `[workspace]` directory. Two things are deliberately left off. Subagents never stream — a delegate tool returns only the final content. And subagent tool calls auto-approve inside the pod: they run autonomously within a single parent delegation, with no interactive approver in the loop, so the pod boundary (e.g. kata containers) is the isolation, the same way the whole agent pod is already sandboxed.
 
 **Self-delegation.** Setting `runtime.self_delegation = true` gives the main agent a `task` delegate tool that runs a fresh copy of *itself* — the same system prompt, provider, model, and turn budget — on a scoped subtask, with no `[[subagents]]` entry to write. It is exactly a synthesized subagent named `task`, so it joins the same `max_delegation_depth` tower, gets the same shared toolset, and (when `execute_python` is configured) the same `run_subagent`/`spawn_agents` bridge. `task` is reserved while this is on: an explicit subagent or tool of that name is rejected at startup. Combine it with `[[subagents]]` freely — the `task` self-clone is added alongside any named subagents.
 

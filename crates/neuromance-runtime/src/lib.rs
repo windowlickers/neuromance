@@ -26,6 +26,7 @@ pub mod error;
 pub mod factory;
 pub mod health;
 pub mod lifecycle;
+pub mod mcp;
 pub mod metrics;
 pub mod oneshot;
 pub mod proxy;

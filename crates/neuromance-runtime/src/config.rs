@@ -27,6 +27,7 @@ use neuromance_common::client::OutputSchema;
 use neuromance_context::ContextConfig;
 use neuromance_context::compaction::CompactionStrategy;
 use neuromance_tools::ToolConfig;
+use neuromance_tools::mcp::McpServerConfig;
 
 use crate::error::RuntimeError;
 use crate::sandbox::EXECUTE_PYTHON;
@@ -56,6 +57,11 @@ pub struct RuntimeConfig {
     pub approval: ApprovalConfig,
     #[serde(default)]
     pub tools: Vec<ToolConfig>,
+    /// MCP servers whose tools the agent and every subagent can call. Each
+    /// tool is advertised as `<id>__<tool>`. A server that stays unreachable
+    /// fails startup.
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerConfig>,
     #[serde(default)]
     pub oneshot: Option<OneshotConfig>,
     /// Named providers: each bundles an endpoint, a credential, and a default
@@ -945,8 +951,29 @@ impl RuntimeConfig {
             context.validate()?;
         }
 
+        self.validate_mcp_servers()?;
         self.validate_sandbox()?;
         self.validate_workspace()?;
+        Ok(())
+    }
+
+    /// Validate `[[mcp_servers]]`: non-empty, unique ids. The id prefixes every
+    /// tool the server advertises, so a duplicate would shadow tools.
+    fn validate_mcp_servers(&self) -> Result<(), RuntimeError> {
+        let mut seen_ids = std::collections::HashSet::new();
+        for server in &self.mcp_servers {
+            if server.id.trim().is_empty() {
+                return Err(RuntimeError::Config(
+                    "mcp_servers entry id must not be empty".to_string(),
+                ));
+            }
+            if !seen_ids.insert(server.id.as_str()) {
+                return Err(RuntimeError::Config(format!(
+                    "duplicate mcp_servers id '{}'; each server needs a unique id",
+                    server.id
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -1302,6 +1329,7 @@ mod tests {
     #![allow(clippy::expect_used)]
 
     use super::*;
+    use neuromance_tools::mcp::McpTransportConfig;
 
     fn minimal_oneshot_toml() -> &'static str {
         r#"
@@ -2349,6 +2377,85 @@ mod tests {
         let sandbox = config.sandbox.expect("sandbox section present");
         assert_eq!(sandbox.listen_addr, "127.0.0.1:50051");
         assert!(sandbox.endpoint.is_none());
+    }
+
+    #[test]
+    fn test_mcp_servers_parse_stdio_and_http_transports() {
+        let config = serve_config(
+            r#"
+            [[mcp_servers]]
+            id = "fs"
+            name = "Filesystem"
+            protocol = "stdio"
+            command = "mcp-fs"
+            args = ["/work"]
+            auto_approve = true
+
+            [[mcp_servers]]
+            id = "hands"
+            name = "Remote hands"
+            protocol = "http"
+            url = "http://127.0.0.1:9000/mcp"
+        "#,
+        );
+        config.validate().unwrap();
+        assert_eq!(config.mcp_servers.len(), 2);
+        assert!(matches!(
+            &config.mcp_servers[0].transport,
+            McpTransportConfig::Stdio { command, args, .. }
+                if command == "mcp-fs" && args == &["/work"]
+        ));
+        assert!(config.mcp_servers[0].auto_approve);
+        assert!(matches!(
+            &config.mcp_servers[1].transport,
+            McpTransportConfig::Http { url } if url == "http://127.0.0.1:9000/mcp"
+        ));
+        assert!(!config.mcp_servers[1].auto_approve);
+    }
+
+    #[test]
+    fn test_mcp_servers_duplicate_id_rejected() {
+        let config = serve_config(
+            r#"
+            [[mcp_servers]]
+            id = "fs"
+            name = "a"
+            protocol = "http"
+            url = "http://127.0.0.1:9000/mcp"
+
+            [[mcp_servers]]
+            id = "fs"
+            name = "b"
+            protocol = "http"
+            url = "http://127.0.0.1:9001/mcp"
+        "#,
+        );
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RuntimeError::Config(ref m) if m.contains("duplicate mcp_servers id 'fs'")
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_mcp_servers_blank_id_rejected() {
+        let config = serve_config(
+            r#"
+            [[mcp_servers]]
+            id = " "
+            name = "a"
+            protocol = "http"
+            url = "http://127.0.0.1:9000/mcp"
+        "#,
+        );
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::Config(ref m) if m.contains("id must not be empty")),
+            "{err}"
+        );
     }
 
     #[test]

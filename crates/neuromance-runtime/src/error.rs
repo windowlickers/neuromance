@@ -26,6 +26,16 @@ pub enum RuntimeError {
     #[error("telemetry: {0}")]
     Telemetry(String),
 
+    #[error(
+        "connect MCP server '{server}': {source:#}; check its [[mcp_servers]] entry \
+         and that the server is running"
+    )]
+    Mcp {
+        server: String,
+        #[source]
+        source: anyhow::Error,
+    },
+
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 
